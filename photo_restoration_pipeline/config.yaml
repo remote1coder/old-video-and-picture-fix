@@ -1,0 +1,95 @@
+# ============================================
+# 老影像修复 - 照片修复套件配置文件
+# 参数优先级：命令行 > user_overrides > paths > global > 内置默认值
+# ============================================
+
+global:
+  output_dir: "./output"
+  temp_dir: "./temp"
+  encoder: "avifenc"
+  crf: 24
+  preset: 4
+  pix_fmt: "yuv420p10le"
+  color_range: "limited"
+  platform: "auto"
+  gpu_priority: ["cuda", "rocm", "mps", "cpu"]
+  log_level: "INFO"
+  log_dir: "./logs"
+  manifest_format: "yaml"
+  log_max_lines: 10000
+  log_backup_count: 5
+  log_max_line_bytes: 1048576
+  cleanup_intermediates: true
+  retry_count: 2
+  no_wsl_redirect: false
+
+photo:
+  max_long_edge: 3840
+  max_short_edge: 2160
+  dpi_threshold: 1200
+  channel_degradation_std_threshold: 0.15
+  channel_degradation_mean_threshold: 0.08
+  channel_degradation_mean_threshold_severe: 0.15
+  channel_degradation_std_threshold_severe: 0.25
+  channel_correction_linear_space: true
+  channel_correction_formula: "iec61966-2-1"
+  channel_correction_normalize: true
+  channel_correction_round: true
+  channel_correction_clamp: true
+  channel_correction_soft_compress: true
+  channel_correction_float_precision: "float32"
+  photo_bit_depth: 16
+  avif_params:
+    depth: 10
+    yuv: "420"
+    range: "limited"
+    cicp: "1/13/1"
+    cicp_rgb444: "1/13/0"
+    speed: 4
+    jobs: "all"
+  avif_rgb444_params:
+    lossless: true
+    yuv: "444"
+    depth: 16
+    range: "limited"
+    cicp: "1/13/0"
+    speed: 4
+    jobs: "all"
+  scratch_remove: true
+  scratch_remove_strength: 20
+  deblock_strength: 25
+  deband_threshold: 1.2
+  grain_synthesis: true
+  grain_strength: 0.3
+  grain_size: 1.0
+  grain_roughness: 0.5
+  gmic_windows_quote: "double"
+  gmic_windows_disable_delayed_expansion: true
+  gmic_windows_shell: false
+  gmic_windows_whitelist: "[a-zA-Z0-9_\\-\\.\\/\\\\]"
+
+# 照片场景不使用 GrainFactory3（使用 G'MIC 颗粒合成），保留空占位以兼容统一配置系统
+grain_factory3:
+  enabled: false
+
+# 照片场景不使用音频处理，保留空占位以兼容统一配置系统
+audio:
+  enabled: false
+
+ai:
+  enabled: false
+  face_restore: "GFPGAN"
+  upscale_model: "RealESRGAN_x2plus"
+  upscale_scale: 2
+  max_scale: 4
+  lanczos_target: "auto"
+  grain_strength: 0.3
+  force_traditional_first: true
+  force_allow_banned_upscale: false
+  gpu_memory_fallback: true
+  face_detect_fallback: ["RetinaFace", "YOLOv8-face", "MTCNN"]
+  face_detect_threshold: 0.8
+  face_detect_threshold_lowres: 0.6
+  face_detect_lowres_max_dimension: 720
+  ban_original_input_pixels: true
+  ban_intermediate_pixels: true

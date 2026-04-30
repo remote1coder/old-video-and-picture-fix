@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""
+Stage 0: Audio Extraction
+Extracts original audio stream from video without any processing.
+Audio is stored temporarily for stage7 to process and mux.
+
+Exit codes: 0=success, 3=skipped, 82=IO error
+"""
+
+import os
+import sys
+import json
+import argparse
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_utils"))
+
+from logger import get_logger  # noqa: E402
+from audio_utils import extract_audio  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--job-id", required=True)
+    parser.add_argument("--params")
+    parser.add_argument("--config")
+    parser.add_argument("--no-wsl-redirect", action="store_true")
+    parser.add_argument("--cleanup-intermediates", action="store_true")
+    args = parser.parse_args()
+
+    params = json.loads(args.params) if args.params else {}
+    log_dir = params.get("log_dir", "./logs")
+    logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+
+    # Determine output path
+    temp_dir = params.get("temp_dir", "./temp")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    input_name = Path(args.input).stem
+    output_audio = os.path.join(temp_dir, f"{args.job_id}_{input_name}_audio_raw.wav")
+
+    # Check if already exists
+    if os.path.exists(output_audio) and os.path.getsize(output_audio) > 0:
+        logger.info("STAGE0_SKIP", "Audio already extracted", path=output_audio)
+        return 3
+
+    logger.info("STAGE0_START", "Extracting audio", input=args.input)
+
+    success = extract_audio(args.input, output_audio, codec="copy")
+
+    if success:
+        logger.info("STAGE0_DONE", "Audio extracted", output=output_audio)
+        return 0
+    else:
+        logger.error("STAGE0_FAILED", "Audio extraction failed")
+        return 82
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
