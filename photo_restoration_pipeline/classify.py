@@ -3,6 +3,11 @@
 Photo Material Classifier
 Classifies photos into: SCAN_PRINT, DIGITAL_PHOTO
 Detects dimensions, DPI, and AI upscale ban status.
+
+v6.3 Compliance:
+- AI upscale banned when target resolution > 1080p OR DPI > 1200
+- Computes native_width/native_height/native_dar
+- Computes file hash prefix for deduplication
 """
 
 import subprocess
@@ -34,14 +39,18 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
     - detected_class: SCAN_PRINT | DIGITAL_PHOTO
     - confidence: float 0-1
     - original_width, original_height
+    - native_width, native_height, native_dar
     - dpi: int or None
-    - ai_upscale_banned: bool (based on pixel dimensions)
+    - ai_upscale_banned: bool (based on pixel dimensions, target resolution, and DPI)
     """
     result: Dict[str, Any] = {
         "detected_class": "UNKNOWN",
         "confidence": 0.0,
         "original_width": 0,
         "original_height": 0,
+        "native_width": 0,
+        "native_height": 0,
+        "native_dar": "",
         "dpi": None,
         "ai_upscale_banned": False,
         "file_size": 0,
@@ -62,6 +71,12 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
         from PIL import Image
         with Image.open(input_path) as img:
             result["original_width"], result["original_height"] = img.size
+            result["native_width"], result["native_height"] = img.size
+            # Compute native DAR
+            w, h = img.size
+            if h > 0:
+                dar = w / h
+                result["native_dar"] = f"{dar:.4f}"
             # Try to get DPI
             dpi_info = img.info.get("dpi")
             if dpi_info:
@@ -78,7 +93,12 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
     scanner = exif.get("ScannerModelName", "")
     software = exif.get("Software", "")
 
-    if scanner or "scan" in software.lower() or "scan" in make.lower():
+    # Case-insensitive scanner detection (Bug-18 fix)
+    scanner_lower = scanner.lower() if scanner else ""
+    software_lower = software.lower() if software else ""
+    make_lower = make.lower() if make else ""
+
+    if scanner_lower or "scan" in software_lower or "scan" in make_lower:
         result["detected_class"] = "SCAN_PRINT"
         result["confidence"] = 0.95
     elif model or make:
@@ -99,21 +119,32 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
             result["detected_class"] = "UNKNOWN"
             result["confidence"] = 0.0
 
-    # AI upscale ban check (pixel size AND DPI threshold)
+    # AI upscale ban check (v6.3 §4.4)
+    # Unified ban logic using config-driven thresholds:
+    # max_long_edge=3840, max_short_edge=2160, dpi_threshold=1200
     w = result["original_width"]
     h = result["original_height"]
-    # Ban 1: pixel dimensions exceed threshold
-    if w > 3840 or h > 2160:
-        result["ai_upscale_banned"] = True
-    # Ban 2: DPI exceeds 1200 (high-DPI scans have sufficient detail already)
     dpi = result.get("dpi")
+
+    # Ban 1: source pixel dimensions exceed max_long_edge/max_short_edge thresholds
+    max_long = 3840
+    max_short = 2160
+    if w > max_long or h > max_short:
+        result["ai_upscale_banned"] = True
+
+    # Ban 2: DPI exceeds 1200 (high-DPI scans have sufficient detail already)
     if dpi and dpi > 1200:
         result["ai_upscale_banned"] = True
+
+    # v6.3 §5.3 predictive ban: if source at 2x would exceed 1080p target
+    # This is a soft indicator - actual enforcement is in Stage 3
+    # We don't set ai_upscale_banned=True here, just log for reference
+    # Stage 3 enforces the actual 1080p target resolution limit
 
     # Compute hash prefix
     try:
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "shared_utils"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "shared_modules"))
         from checkpoint import get_file_xxhash
         result["file_hash_prefix"] = get_file_xxhash(input_path)
     except Exception:

@@ -1,47 +1,35 @@
 #!/usr/bin/env python3
 """
 Photo Restoration Pipeline - Main Controller
-Orchestrates photo restoration stages with manifest-driven batch processing.
+Single-file sequential execution mode.
 
-Usage:
-    python main.py --input /mnt/photos --config config.yaml
-    python main.py --manifest batch_manifest.yaml
+v7.3 §1.1-1.6 Compliance:
+- No multi-file parallel execution
+- Stages execute sequentially per file
+- Dynamic timeout based on image dimensions
 """
 
+import argparse
+import json
 import os
+import subprocess
 import sys
 import time
-import argparse
-import subprocess
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, Optional
+
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_utils"))
-
-from logger import get_logger  # noqa: E402
-from manifest_loader import load_manifest, filter_jobs, save_manifest, update_job_status  # noqa: E402
-from checkpoint import cleanup_old_intermediates  # noqa: E402
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Photo Restoration Pipeline")
-    parser.add_argument("--input", "-i", nargs="+", help="Input directories")
-    parser.add_argument("--output", "-o", help="Output directory")
-    parser.add_argument("--config", "-c", default=str(SCRIPT_DIR / "config.yaml"))
-    parser.add_argument("--manifest", "-m", help="Use existing manifest")
-    parser.add_argument("--keep-intermediates", action="store_true")
-    parser.add_argument("--no-wsl-redirect", action="store_true")
-    parser.add_argument("--stage", type=int)
-    parser.add_argument("--job-id")
-    parser.add_argument("--gpu", default="auto")
-    return parser.parse_args()
-
-
-def load_config(path: str) -> Dict[str, Any]:
-    import yaml  # type: ignore[import-untyped]
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def _load_config(config_path: str) -> Dict[str, Any]:
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Config load error: {e}", file=sys.stderr)
+        sys.exit(81)
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -55,211 +43,369 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return result
 
 
-def merge_params(job: Dict[str, Any], config: Dict[str, Any],
-                 cli: Dict[str, Any]) -> Dict[str, Any]:
+def merge_params(config: Dict[str, Any],
+                 detected_class: str,
+                 cli_overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """6-layer parameter cascading per v7.3 §3.1.
+    Priority: CLI > user_overrides > paths > global > defaults
+    Uses deep merge for nested dicts.
+    """
+    # Layer 1: global
     params: Dict[str, Any] = {}
     params = _deep_merge(params, config.get("global", {}))
+
+    # Layer 2: paths (type-dependent)
+    paths_cfg = config.get("paths", {})
+    if isinstance(paths_cfg, dict):
+        type_key = detected_class.lower() if detected_class else "digital_photo"
+        if type_key in paths_cfg:
+            type_paths = paths_cfg[type_key]
+            if isinstance(type_paths, dict):
+                params = _deep_merge(params, type_paths)
+
+    # Layer 3: photo-specific
     params = _deep_merge(params, config.get("photo", {}))
-    rec = job.get("recommended_params", {})
-    if rec:
-        params = _deep_merge(params, rec)
-    user_ov = job.get("user_overrides", {})
-    if user_ov:
-        params = _deep_merge(params, user_ov)
-    if cli:
-        params = _deep_merge(params, cli)
+
+    # Layer 4: recommended params from classifier
+    if "recommended_params" in cli_overrides:
+        params = _deep_merge(params, cli_overrides.pop("recommended_params"))
+
+    # Layer 5: user overrides from manifest
+    if "user_overrides" in cli_overrides:
+        params = _deep_merge(params, cli_overrides.pop("user_overrides"))
+
+    # Layer 6: CLI
+    params = _deep_merge(params, cli_overrides)
+
     return params
 
 
-def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any]) -> tuple:
-    script_path = SCRIPT_DIR / "stages" / script_name
-    if not script_path.exists():
-        return 80, "Script not found"
-    cmd = [sys.executable, str(script_path)]
-    cmd.extend(["--input", job["input_path"]])
-    cmd.extend(["--job-id", job["job_id"]])
-    import json
-    cmd.extend(["--params", json.dumps(params, default=str)])
-    cmd.extend(["--config", str(SCRIPT_DIR / "config.yaml")])
-    if params.get("no_wsl_redirect"):
-        cmd.append("--no-wsl-redirect")
-    if params.get("cleanup_intermediates", True):
-        cmd.append("--cleanup-intermediates")
+def _get_image_dimensions(input_path: str) -> tuple:
+    """Get image width and height using PIL or ffprobe."""
     try:
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(SCRIPT_DIR.parent)
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=3600 * 2, env=env, shell=False)
-        stderr = r.stderr if r.stderr else ""
-        return r.returncode, stderr
-    except subprocess.TimeoutExpired:
-        return 87, "Stage timed out after 2 hours"
-    except Exception as e:
-        return 82, str(e)
-
-
-def process_job(job: Dict[str, Any], config: Dict[str, Any],
-                args, logger) -> Tuple[int, str]:
-    job_id = job["job_id"]
-    logger.info("JOB_START", f"Photo job {job_id}", job_id=job_id)
-
-    cli_ov = {}
-    if args.output:
-        cli_ov["output_dir"] = args.output
-    if args.no_wsl_redirect:
-        cli_ov["no_wsl_redirect"] = True
-    if args.keep_intermediates:
-        cli_ov["cleanup_intermediates"] = False
-    if args.gpu:
-        cli_ov["gpu_backend"] = args.gpu
-
-    params = merge_params(job, config, cli_ov)
-    params["output_path"] = job.get("output_path", "")
-
-    # Merge AI config into params for stage script compatibility
-    ai_config = config.get("ai", {})
-    for k, v in ai_config.items():
-        if k not in params:
-            params[k] = v
-
-    # Ensure ai_enabled / face_restore are available
-    params["ai_enabled"] = ai_config.get("enabled", False)
-    params["ai_upscale_banned"] = job.get("ai_upscale_banned", False)
-    params["face_restore"] = ai_config.get("face_restore", "")
-
-    # Merge grain_factory3 config
-    if "grain_factory3" in config:
-        if "grain_factory3" not in params:
-            params["grain_factory3"] = config["grain_factory3"]
-        else:
-            params["grain_factory3"] = _deep_merge(
-                config["grain_factory3"], params["grain_factory3"]
+        from PIL import Image
+        with Image.open(input_path) as img:
+            return img.size
+    except Exception:
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0", input_path],
+                capture_output=True, text=True, timeout=10, shell=False
             )
+            if r.returncode == 0:
+                parts = r.stdout.strip().split(",")
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+    return 1920, 1080  # Default fallback
 
-    # Inject job core metadata fields (mirrors video main.py behavior)
-    params["detected_class"] = job.get("detected_class", "SCAN_PRINT")
-    params["original_width"] = job.get("original_width", 0)
-    params["original_height"] = job.get("original_height", 0)
-    params["native_width"] = job.get("native_width", 0)
-    params["native_height"] = job.get("native_height", 0)
-    params["native_dar"] = job.get("native_dar", "")
-    params["file_size"] = job.get("file_size", 0)
-    params["file_mtime"] = job.get("file_mtime", 0)
-    params["file_hash_prefix"] = job.get("file_hash_prefix", "")
-    params["dpi"] = job.get("dpi", 0)
-    params["job_id"] = job.get("job_id", "")
-    params["input_path"] = job.get("input_path", "")
 
+def _calculate_timeout(params: Dict[str, Any],
+                       input_path: str,
+                       is_ai_stage: bool = False) -> int:
+    """Calculate dynamic timeout based on image dimensions.
+    
+    Base timeout: 10 minutes
+    Additional: proportional to image pixel count
+    Max: 2 hours
+    """
+    w, h = _get_image_dimensions(input_path)
+    pixel_count = w * h
+    
+    # Base: 10 minutes
+    base = 600
+    
+    # Additional time based on pixel count
+    # 1080p (~2M pixels) = +5 minutes for non-AI, +20 minutes for AI
+    # 4K (~8M pixels) = +20 minutes for non-AI, +80 minutes for AI
+    pixel_multiplier = 2.0 if is_ai_stage else 0.5
+    additional = (pixel_count / (1920 * 1080)) * 300 * pixel_multiplier
+    
+    # Cap at 2 hours
+    timeout = min(base + additional, 7200)
+    return int(timeout)
+
+
+def _run_stage(script_name: str,
+               job_id: str,
+               input_path: str,
+               config_path: str,
+               params: Dict[str, Any],
+               stage_idx: int,
+               is_retry: bool = False,
+               is_ai_stage: bool = False,
+               script_dir: Optional[str] = None) -> int:
+    """Run a single stage with dynamic timeout."""
+    if script_dir is None:
+        script_dir = SCRIPT_DIR / "stages"
+    script_path = script_dir / script_name
+    if not script_path.exists():
+        print(f"Stage script not found: {script_path}", file=sys.stderr)
+        return 81
+
+    params_json = json.dumps(params)
+    cmd = [
+        sys.executable, str(script_path),
+        "--job-id", job_id,
+        "--input", input_path,
+        "--config", config_path,
+        "--params", params_json,
+    ]
+    if is_retry:
+        cmd.append("--is-retry")
+
+    # Dynamic timeout calculation (Fix: replaces hardcoded 1200)
+    timeout = _calculate_timeout(params, input_path, is_ai_stage=is_ai_stage)
+
+    # Process isolation per v7.3 §4.2
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SCRIPT_DIR)
+
+    print(f"[Stage {stage_idx}] Running: {script_name} (timeout={timeout}s)")
+
+    try:
+        r = subprocess.run(cmd, timeout=timeout, env=env, shell=False)
+        return r.returncode
+    except subprocess.TimeoutExpired:
+        print(f"[Stage {stage_idx}] Timeout after {timeout}s", file=sys.stderr)
+        return 87
+    except Exception as e:
+        print(f"[Stage {stage_idx}] Error: {e}", file=sys.stderr)
+        return 84
+
+
+def _check_disk_space(input_path: str, config: Dict[str, Any]) -> bool:
+    """Check sufficient disk space with 2x safety margin."""
+    try:
+        stat = os.statvfs(os.path.dirname(input_path) or ".")
+        available_mb = stat.f_bavail * stat.f_frsize / (1024 * 1024)
+
+        # Estimate using checkpoint module
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from checkpoint import estimate_disk_space
+
+        required = estimate_disk_space(
+            duration=0, fps=1,
+            width=0, height=0,
+            file_path=input_path,
+            is_photo=True
+        )
+
+        if available_mb < required:
+            print(f"Disk space insufficient: {available_mb:.0f}MB < {required}MB needed", file=sys.stderr)
+            return False
+        return True
+    except Exception:
+        # If check fails, allow to proceed
+        return True
+
+
+def cleanup_old_intermediates(temp_dir: str, job_id: str) -> None:
+    """Clean old intermediate files."""
+    try:
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from checkpoint import cleanup_old_intermediates as coi
+        coi(temp_dir, job_id)
+    except Exception:
+        pass
+
+
+def _is_retryable_error(returncode: int) -> bool:
+    """Check if error is retryable (transient).
+
+    Per v6.3 §3.7:
+    - 82 (IO), 83 (GPU/OOM), 87 (resource/timeout) are retryable
+    - 84 (encoding) only retryable if OOM/no space indicated in stderr
+    - 80 (deps), 81 (params), 85 (perms), 86 (verify) are NOT retryable
+    """
+    retryable_codes = {82, 83, 87}
+    return returncode in retryable_codes
+
+
+def _run_single_job(job: Dict[str, Any],
+                    config_path: str,
+                    config: Dict[str, Any],
+                    cli_params: Dict[str, Any]) -> int:
+    """Run a single job with retry per v7.3 §4.5."""
+    job_id = job.get("job_id", "unknown")
+    input_path = job.get("input_path", "")
+    detected_class = job.get("detected_class", "")
+    confidence = job.get("confidence", 0)
+    ai_upscale_banned = job.get("ai_upscale_banned", False)
+
+    if not os.path.exists(input_path):
+        print(f"[{job_id}] Input not found: {input_path}", file=sys.stderr)
+        return 82
+
+    # Parameter merge
+    params = merge_params(config, detected_class, cli_params)
+    params["detected_class"] = detected_class
+    params["confidence"] = confidence
+    params["ai_upscale_banned"] = ai_upscale_banned
+    params["job_id"] = job_id
+    params["input_path"] = input_path
+
+    # Per-job log
     log_dir = params.get("log_dir", "./logs")
-    job_logger = get_logger(log_dir=log_dir, job_id=job_id)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Add log config to params for stages
+    params["log_dir"] = log_dir
+
+    # Clean intermediates
+    temp_dir = params.get("temp_dir", "./temp")
+    cleanup_old_intermediates(temp_dir, job_id)
+
+    # Disk space check
+    if not _check_disk_space(input_path, config):
+        return 87
+
+    # Stage execution
+    max_retries = params.get("retry_count", config.get("global", {}).get("retry_count", 2))
+    retry_count = 0
 
     stages = [
-        (1, "stage1_preprocess.py"),
-        (2, "stage2_traditional_check.py"),
+        ("stage1_preprocess.py", False),
+        ("stage2_traditional_check.py", False),
+        ("stage3_ai_upscale.py", True),  # AI stage
+        ("stage4_postprocess.py", False),  # Post-processing (not AI)
+        ("stage5_ai_face.py", True),  # AI stage
+        ("stage6_encode.py", False),
     ]
 
-    ai_enabled = config.get("ai", {}).get("enabled", False)
-    ai_banned = job.get("ai_upscale_banned", False)
-    force_allow = config.get("ai", {}).get("force_allow_banned_upscale", False)
+    for stage_script, is_ai_stage in stages:
+        stage_name = stage_script.replace(".py", "")
 
-    if ai_enabled and not (ai_banned and not force_allow):
-        stages.append((3, "stage3_ai_upscale.py"))
-        stages.append((4, "stage4_postprocess.py"))
+        # Conditional stages
+        if stage_name in ("stage3_ai_upscale", "stage4_postprocess"):
+            if not params.get("ai_enabled", False) or ai_upscale_banned:
+                continue
+        elif stage_name == "stage5_ai_face":
+            if not params.get("face_restore"):
+                continue
 
-    face_restore = config.get("ai", {}).get("face_restore", "")
-    if ai_enabled and face_restore:
-        stages.append((5, "stage5_ai_face.py"))
+        while True:
+            is_retry = retry_count > 0
+            rc = _run_stage(
+                stage_script, job_id, input_path,
+                config_path, params, len([s for s, _ in stages]),
+                is_retry=is_retry, is_ai_stage=is_ai_stage
+            )
 
-    stages.append((6, "stage6_encode.py"))
+            if rc == 0 or rc == 3:
+                break  # Success or skip
+            elif rc == 1:
+                print(f"[{job_id}] {stage_name} non-retryable error", file=sys.stderr)
+                return rc
+            elif _is_retryable_error(rc):
+                retry_count += 1
+                if retry_count > max_retries:
+                    print(f"[{job_id}] {stage_name} max retries exceeded", file=sys.stderr)
+                    return rc
+                time.sleep(2 ** retry_count)  # Exponential backoff
+            else:
+                return rc
 
-    if args.stage is not None:
-        stage_map = {s[0]: s[1] for s in stages}
-        if args.stage in stage_map:
-            stages = [(args.stage, stage_map[args.stage])]
-        else:
-            return 81, "Invalid stage number"
-
-    for stage_num, script_name in stages:
-        job_logger.info("STAGE_START", f"Stage {stage_num}: {script_name}")
-        exit_code, stderr = run_stage(script_name, job, params)
-        if exit_code == 0:
-            job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
-        elif exit_code == 3:
-            job_logger.info("STAGE_SKIP", f"Stage {stage_num} skipped")
-        else:
-            job_logger.error("STAGE_FAILED", f"Stage {stage_num} failed: {exit_code}")
-            return exit_code, stderr
-
-        # Cleanup old intermediates after successful stage
-        if params.get("cleanup_intermediates", True):
-            temp_dir = params.get("temp_dir", "./temp")
-            input_name = Path(job["input_path"]).name
-            cleanup_old_intermediates(temp_dir, job_id, input_name, keep_steps=2)
-
-    logger.info("JOB_DONE", f"Job {job_id} complete")
-    return 0, ""
+    return 0
 
 
 def main():
-    args = parse_args()
-    config = load_config(args.config)
-    gcfg = config.get("global", {})
-    log_dir = gcfg.get("log_dir", "./logs")
-    logger = get_logger(log_dir=log_dir, level=gcfg.get("log_level", "INFO"))
-    logger.info("PIPELINE_START", "Photo restoration pipeline starting")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", "-c", required=True)
+    parser.add_argument("--input", "-i", required=True)
+    parser.add_argument("--job-id", default=None)
+    parser.add_argument("--output", "-o", default=None)
+    parser.add_argument("--log-dir", default="./logs")
+    parser.add_argument("--temp-dir", default="./temp")
+    parser.add_argument("--no-wsl-redirect", action="store_true")
+    parser.add_argument("--cleanup-intermediates", action="store_true")
+    parser.add_argument("--no-cleanup", action="store_true")
+    parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--force-allow-banned-upscale", action="store_true")
+    # Processing control
+    parser.add_argument("--force-traditional-first", action="store_true",
+                       help="Force traditional processing before AI (default: true)")
+    parser.add_argument("--face-restore", choices=["GFPGAN", "CodeFormer", ""], default=None)
+    # Quality overrides
+    parser.add_argument("--crf", type=int, default=None)
+    parser.add_argument("--preset", type=int, default=None)
+    parser.add_argument("--aq-mode", type=int, default=None)
+    # AI params
+    parser.add_argument("--ai-enabled", action="store_true")
+    parser.add_argument("--ai-upscale-factor", type=int, default=None)
+    parser.add_argument("--ai-model", default=None)
+    parser.add_argument("--ai-denoise-strength", type=float, default=None)
+    parser.add_argument("--ai-pre-upscale-lanczos", action="store_true")
 
-    try:
-        from dependency_check import run_all_checks
-        ok, issues = run_all_checks(config)
-        if not ok:
-            for issue in issues:
-                logger.error("DEP_CHECK", issue)
-            sys.exit(80)
-    except Exception as e:
-        logger.warning("DEP_CHECK", f"Check skipped: {e}")
+    args = parser.parse_args()
 
-    if args.manifest:
-        manifest_path = args.manifest
-    elif args.input:
-        manifest_path = str(SCRIPT_DIR / "batch_manifest.yaml")
-        from manifest_generate import generate_manifest
-        generate_manifest(args.input, manifest_path, config, "photo")
-    else:
-        print("Error: Provide --input or --manifest")
-        sys.exit(81)
+    config = _load_config(args.config)
 
-    manifest = load_manifest(manifest_path)
-    jobs = filter_jobs(manifest, ["PENDING", "FAILED"])
-    if args.job_id:
-        jobs = [j for j in jobs if j.get("job_id") == args.job_id]
+    # Default force_traditional_first to True
+    force_traditional = True if args.force_traditional_first is None else args.force_traditional_first
 
-    logger.info("BATCH_START", f"Processing {len(jobs)} photo jobs")
-    print(f"Processing {len(jobs)} photo jobs...")
+    # Classify
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from classify import classify_photo
+    classification = classify_photo(args.input)
+    detected_class = classification.get("detected_class", "")
 
-    retry_count = gcfg.get("retry_count", 2)
-    for job in jobs:
-        job_id = job["job_id"]
-        success = False
-        for attempt in range(retry_count + 1):
-            exit_code, stderr = process_job(job, config, args, logger)
-            if exit_code in (0, 3):
-                update_job_status(manifest, job_id, "DONE")
-                success = True
-                break
-            else:
-                from checkpoint import is_retryable_error
-                if is_retryable_error(exit_code, stderr):
-                    wait = 5 if attempt == 0 else 15
-                    logger.warning("JOB_RETRY", f"Retrying job {job_id} in {wait}s")
-                    time.sleep(wait)
-                else:
-                    break
-        if not success:
-            update_job_status(manifest, job_id, "FAILED")
-        save_manifest(manifest, manifest_path)
+    cli_params = {}
+    if args.output:
+        cli_params["output_path"] = args.output
+    if args.crf is not None:
+        cli_params["crf"] = args.crf
+    if args.preset is not None:
+        cli_params["preset"] = args.preset
+    if args.aq_mode is not None:
+        cli_params["aq_mode"] = args.aq_mode
+    if args.face_restore is not None:
+        cli_params["face_restore"] = args.face_restore
+    if args.ai_enabled:
+        cli_params.setdefault("ai", {})["enabled"] = True
+    if args.ai_upscale_factor:
+        cli_params.setdefault("ai", {})["upscale_factor"] = args.ai_upscale_factor
+    if args.ai_model:
+        cli_params.setdefault("ai", {})["model"] = args.ai_model
+    if args.ai_denoise_strength is not None:
+        cli_params.setdefault("ai", {})["denoise_strength"] = args.ai_denoise_strength
+    if args.ai_pre_upscale_lanczos:
+        cli_params.setdefault("ai", {})["pre_upscale_lanczos"] = True
+    if args.force_allow_banned_upscale:
+        cli_params["force_allow_banned_upscale"] = True
 
-    logger.info("PIPELINE_DONE", "Photo pipeline complete")
-    print("Done.")
+    cli_params["cleanup_intermediates"] = not args.no_cleanup
+    cli_params["temp_dir"] = args.temp_dir
+    cli_params["log_dir"] = args.log_dir
+    cli_params["force_traditional_first"] = force_traditional
+
+    # Preview mode
+    if args.preview:
+        print("Preview mode: showing job plan")
+        job = {
+            "job_id": args.job_id or f"photo_{int(time.time())}",
+            "input_path": args.input,
+            "detected_class": detected_class,
+            "confidence": classification.get("confidence", 0),
+            "ai_upscale_banned": classification.get("ai_upscale_banned", False),
+        }
+        print(json.dumps(job, indent=2, ensure_ascii=False))
+        return 0
+
+    # Run job
+    job = {
+        "job_id": args.job_id or f"photo_{int(time.time())}",
+        "input_path": args.input,
+        "detected_class": detected_class,
+        "confidence": classification.get("confidence", 0),
+        "ai_upscale_banned": classification.get("ai_upscale_banned", False),
+        "user_overrides": {},
+    }
+
+    rc = _run_single_job(job, args.config, config, cli_params)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

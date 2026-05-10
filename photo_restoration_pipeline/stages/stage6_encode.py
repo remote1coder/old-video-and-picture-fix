@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
 Stage 6: Photo Final Encoding
-- Grain synthesis (G'MIC film_grain)
 - AVIF encoding with avifenc (10bit YUV420 or 16bit RGB444)
 - CICP metadata
+- Archival mode: RGB444 lossless when archival_mode=true
+
+v6.3/v7.3 Compliance:
+- Supports both avif_params (YUV420 10-bit) and avif_rgb444_params (RGB444 16-bit lossless)
+- Grain synthesis moved to stage4_postprocess.py per v7.3 spec
+- Proper CICP tagging
 """
 
 import os
@@ -15,9 +20,10 @@ import subprocess
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
-sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_utils"))
+sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
+from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
 
 
 def _get_avifenc_version() -> tuple:
@@ -48,15 +54,31 @@ def _resolve_jobs_value(jobs: str) -> str:
     return str(min(os.cpu_count() or 1, 32))
 
 
-def run_avifenc(input_path: str, output_path: str, config: dict) -> bool:
-    """Run avifenc with proper parameters."""
-    avif_params = config.get("avif_params") or {}
-    depth = avif_params.get("depth", 10)
-    yuv = avif_params.get("yuv", "420")
-    rng = avif_params.get("range", "limited")
-    cicp = avif_params.get("cicp", "1/13/1")
-    speed = avif_params.get("speed", 4)
-    jobs = avif_params.get("jobs", "all")
+def _build_avifenc_cmd(input_path: str, output_path: str, params: dict, use_rgb444: bool = False) -> list:
+    """Build avifenc command from config parameters.
+
+    When use_rgb444=True, uses avif_rgb444_params (16-bit lossless).
+    Otherwise uses avif_params (10-bit YUV420).
+    """
+    if use_rgb444:
+        avif_params = params.get("avif_rgb444_params", {})
+        # Defaults for archival RGB444
+        depth = avif_params.get("depth", 16)
+        yuv = avif_params.get("yuv", "444")
+        rng = avif_params.get("range", "limited")
+        cicp = avif_params.get("cicp", "1/13/0")
+        speed = avif_params.get("speed", 4)
+        jobs = avif_params.get("jobs", "all")
+        lossless = avif_params.get("lossless", True)
+    else:
+        avif_params = params.get("avif_params", {})
+        depth = avif_params.get("depth", 10)
+        yuv = avif_params.get("yuv", "420")
+        rng = avif_params.get("range", "limited")
+        cicp = avif_params.get("cicp", "1/13/1")
+        speed = avif_params.get("speed", 4)
+        jobs = avif_params.get("jobs", "all")
+        lossless = False
 
     cmd = [
         "avifenc",
@@ -67,40 +89,20 @@ def run_avifenc(input_path: str, output_path: str, config: dict) -> bool:
         "--speed", str(speed),
     ]
 
-    # jobs handling: version-aware
-    cmd.extend(["--jobs", _resolve_jobs_value(jobs)])
-
-    # For RGB444 lossless archival
-    if yuv == "444" and depth == 16:
+    if lossless:
         cmd.append("--lossless")
-        # Use RGB CICP (matrix=0 Identity)
-        cicp_rgb = avif_params.get("cicp_rgb444", "1/13/0")
-        # Replace cicp parameter
-        for i, arg in enumerate(cmd):
-            if arg == "--cicp":
-                cmd[i + 1] = cicp_rgb
-                break
 
+    cmd.extend(["--jobs", _resolve_jobs_value(jobs)])
     cmd.extend([input_path, output_path])
 
+    return cmd
+
+
+def run_avifenc(input_path: str, output_path: str, params: dict, use_rgb444: bool = False) -> bool:
+    """Run avifenc with proper parameters."""
+    cmd = _build_avifenc_cmd(input_path, output_path, params, use_rgb444)
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=600, shell=False)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def add_grain_gmic(input_path: str, output_path: str,
-                   strength: float, size: float, roughness: float) -> bool:
-    """Add film grain using G'MIC."""
-    try:
-        cmd = [
-            "gmic", input_path,
-            "-film_grain", str(int(strength * 100)),
-            str(size), str(roughness),
-            "-o", output_path,
-        ]
-        r = subprocess.run(cmd, capture_output=True, timeout=300, shell=False)
         return r.returncode == 0
     except Exception:
         return False
@@ -123,12 +125,13 @@ def main():
     job_id = args.job_id
     input_name = Path(args.input).name
 
-    # Find input: stage5 > stage4 > stage3 > stage1
+    # Find input: stage5 > stage4 > stage3 > stage1 - sort by mtime
     input_source = None
     for pat in ["step5_face*", "step4_postprocess*", "step3_upscale*", "step1_preprocess*"]:
         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
         if candidates:
+            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             input_source = candidates[0]
             break
 
@@ -143,36 +146,37 @@ def main():
         output_path = os.path.join(output_dir,
             f"{Path(input_name).stem}_restored.avif")
 
+    # WSL2 redirect
+    no_wsl_redirect = params.get("no_wsl_redirect", False)
+    platform = params.get("platform", "auto")
+    redirected_path, original_output_path = wsl_redirect_path(output_path, no_wsl_redirect, platform)
+    if original_output_path:
+        logger.info("STAGE6_WSL_REDIRECT",
+                   f"WSL redirect: {output_path} -> {redirected_path}")
+        output_path = redirected_path
+
     logger.info("STAGE6_START", "Final photo encoding",
                 input=input_source, output=output_path)
 
-    # Grain synthesis
-    grain_enabled = params.get("grain_synthesis", True)
     working_path = input_source
 
-    if grain_enabled:
-        grain_strength = params.get("grain_strength", 0.3)
-        grain_size = params.get("grain_size", 1.0)
-        grain_roughness = params.get("grain_roughness", 0.5)
-
-        grain_out = os.path.join(temp_dir,
-            f"{job_id}_{Path(input_name).stem}_grain.png")
-
-        logger.info("STAGE6_GRAIN", "Adding film grain")
-        if add_grain_gmic(working_path, grain_out,
-                         grain_strength, grain_size, grain_roughness):
-            working_path = grain_out
+    # Determine archival mode
+    archival_mode = params.get("archival_mode", False)
+    use_rgb444 = archival_mode
 
     # AVIF encoding
-    photo_config = {
-        "avif_params": params.get("avif_params", {
-            "depth": 10, "yuv": "420", "range": "limited",
-            "cicp": "1/13/1", "speed": 4, "jobs": "all"
-        }),
-    }
-
-    logger.info("STAGE6_ENCODE", "Encoding AVIF")
-    if run_avifenc(working_path, output_path, photo_config):
+    logger.info("STAGE6_ENCODE", f"Encoding AVIF (archival={use_rgb444})")
+    if run_avifenc(working_path, output_path, params, use_rgb444=use_rgb444):
+        # WSL redirect: copy back to original Linux path
+        if original_output_path:
+            if wsl_copy_back(output_path, original_output_path):
+                logger.info("STAGE6_WSL_COPYBACK",
+                           f"Copied result back to {original_output_path}")
+                output_path = original_output_path
+            else:
+                logger.error("STAGE6_WSL_COPYBACK_FAIL",
+                            f"Failed to copy {output_path} back to {original_output_path}")
+                return 82
         logger.info("STAGE6_DONE", "Photo encoding complete", output=output_path)
         return 0
     else:

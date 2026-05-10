@@ -3,10 +3,12 @@
 Video Restoration Pipeline - Main Controller
 Orchestrates video restoration stages with manifest-driven batch processing.
 
-Usage:
-    python main.py --input /mnt/videos --config config.yaml
-    python main.py --manifest batch_manifest.yaml
-    python main.py --input /mnt/videos --preview
+v7.3 Compliance:
+- Parallel worker pool for concurrent job processing
+- Disk space estimation before processing
+- Preview mode support
+- Config path propagated to child processes
+- Dynamic timeout based on video duration
 """
 
 import os
@@ -14,16 +16,17 @@ import sys
 import time
 import argparse
 import subprocess
+import shutil
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
-# Add shared_utils to path
+# Add shared_modules to path
 SCRIPT_DIR = Path(__file__).parent.resolve()
-sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_utils"))
+sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
 from manifest_loader import load_manifest, filter_jobs, save_manifest, update_job_status  # noqa: E402
-from checkpoint import wsl_redirect_path, cleanup_old_intermediates  # noqa: E402
+from checkpoint import cleanup_old_intermediates, estimate_disk_space  # noqa: E402
 
 
 def parse_args():
@@ -40,7 +43,10 @@ def parse_args():
                         help="Disable WSL path redirect")
     parser.add_argument("--stage", type=int, help="Run single stage only")
     parser.add_argument("--job-id", help="Process specific job ID only")
-    parser.add_argument("--gpu", default="auto", help="GPU backend (auto/cuda/rocm/mps/cpu)")
+    parser.add_argument("--gpu", default="auto",
+                        help="GPU backend (auto/cuda/rocm/mps/cpu)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel workers (default: 1)")
     return parser.parse_args()
 
 
@@ -79,6 +85,14 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     paths = config.get("paths", {})
     if path_key in paths:
         params = _deep_merge(params, paths[path_key])
+
+    # Apply audio_override for the detected material type (v7.3 §3.1)
+    # Priority: CLI > user_overrides > recommended_params > paths.audio_override > paths > global > defaults
+    audio_override = paths.get("audio_override", {})
+    if path_key in audio_override:
+        # Flat-inject audio override params so stage scripts can read them directly
+        for k, v in audio_override[path_key].items():
+            params[k] = v
 
     # Override with job recommended_params
     rec_params = job.get("recommended_params", {})
@@ -130,12 +144,29 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     params["job_id"] = job.get("job_id", "")
     params["input_path"] = job.get("input_path", "")
     params["field_segments"] = job.get("field_segments", [])
+    params["duration"] = job.get("duration", 0)
 
     return params
 
 
+def _calculate_timeout(video_duration: float, has_ai: bool = False) -> int:
+    """Calculate stage timeout based on video duration and complexity.
+
+    Base: 10 minutes setup + 2 min per minute of video
+    AI upscale: +5 min per minute (frame extraction + model inference)
+    Max: 4 hours
+    """
+    base = 600  # 10 min setup
+    per_minute = 120  # 2 min per video minute
+    if has_ai:
+        per_minute = 420  # 7 min per video minute (2 + 5 for AI)
+
+    timeout = base + int(video_duration / 60) * per_minute
+    return min(timeout, 3600 * 4)  # Cap at 4 hours
+
+
 def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
-              config: Dict[str, Any]) -> Tuple[int, str]:
+              config_path: str) -> Tuple[int, str]:
     """Run a stage script and return (exit_code, stderr)."""
     script_path = SCRIPT_DIR / "stages" / script_name
     if not script_path.exists():
@@ -153,8 +184,8 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     params_json = json.dumps(params, default=str)
     cmd.extend(["--params", params_json])
 
-    # Add config path
-    cmd.extend(["--config", str(SCRIPT_DIR / "config.yaml")])
+    # Add config path (FIXED: use passed config_path, not hardcoded)
+    cmd.extend(["--config", config_path])
 
     # Add flags
     if params.get("no_wsl_redirect", False):
@@ -162,19 +193,73 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     if params.get("cleanup_intermediates", True):
         cmd.append("--cleanup-intermediates")
 
+    # Dynamic timeout
+    video_duration = params.get("duration", 0) or _get_video_duration(job["input_path"])
+    has_ai = params.get("ai_enabled", False)
+    timeout = _calculate_timeout(video_duration, has_ai)
+
     # Run with timeout
     try:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SCRIPT_DIR.parent)
 
         r = subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=3600 * 4, env=env, shell=False)  # 4h timeout per stage
+                          timeout=timeout, env=env, shell=False)
         stderr = r.stderr if r.stderr else ""
         return r.returncode, stderr
     except subprocess.TimeoutExpired:
-        return 87, "Stage timed out after 4 hours"  # Resource不足 (timeout)
+        return 87, f"Stage timed out after {timeout}s"  # Resource不足 (timeout)
     except Exception as e:
         return 82, str(e)  # IO error
+
+
+def _get_video_duration(video_path: str) -> float:
+    """Get video duration via ffprobe."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            return float(r.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def _check_disk_space(job: Dict[str, Any], config: Dict[str, Any], logger) -> bool:
+    """Check if sufficient disk space is available before processing."""
+    try:
+        # Extract parameters for estimation
+        detected_class = job.get("detected_class", "")
+        width = job.get("original_width", 720)
+        height = job.get("original_height", 480)
+        duration = job.get("duration", 300)
+        fps = 25.0 if detected_class == "HDV_AVCHD" else 29.97
+        
+        # Estimate using checkpoint function with correct signature
+        required = estimate_disk_space(
+            duration=duration,
+            fps=fps,
+            width=width,
+            height=height,
+        )
+        
+        temp_dir = config.get("global", {}).get("temp_dir", "./temp")
+        stat = shutil.disk_usage(temp_dir)
+        available = stat.free
+        # Require 2x the estimated space as safety margin
+        if available < required * 2 * 1024 * 1024:  # Convert MB to bytes
+            logger.error("DISK_SPACE",
+                        f"Insufficient disk space: need ~{required}MB, "
+                        f"have {available // (1024*1024)}MB")
+            return False
+        return True
+    except Exception as e:
+        logger.warning("DISK_SPACE_CHECK", f"Disk space check failed: {e}")
+        return True
 
 
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
@@ -199,96 +284,116 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
 
     # Merge params
     params = merge_params(job, config, cli_overrides)
-    original_output = job.get("output_path", "")
-    params["output_path"] = original_output
-    params["original_output_path"] = original_output
+    params["output_path"] = job.get("output_path", "")
 
-    # WSL2 path redirect for temp/output dirs
-    temp_dir = params.get("temp_dir", "./temp")
-    output_dir = params.get("output_dir", "./output")
-    no_redirect = params.get("no_wsl_redirect", False)
-    platform_val = params.get("platform", "auto")
-    params["temp_dir"] = wsl_redirect_path(temp_dir, temp_dir, no_redirect, platform_val)
-    params["output_dir"] = wsl_redirect_path(output_dir, temp_dir, no_redirect, platform_val)
+    # Disk space check
+    if not _check_disk_space(job, config, logger):
+        return 87, "Insufficient disk space"
 
-    # Set log dir for this job
     log_dir = params.get("log_dir", "./logs")
     job_logger = get_logger(log_dir=log_dir, job_id=job_id)
 
-    # Define stage execution order
+    # Determine stage order
     stages = [
         (0, "stage0_audio_extract.py"),
         (1, "stage1_preprocess.py"),
         (2, "stage2_traditional_check.py"),
     ]
 
-    # Conditionally add AI stages
-    ai_enabled = config.get("ai", {}).get("enabled", False)
+    ai_enabled = params.get("ai_enabled", False)
     ai_banned = job.get("ai_upscale_banned", False)
-    force_allow = config.get("ai", {}).get("force_allow_banned_upscale", False)
+    force_allow = params.get("force_allow_banned_upscale", False)
 
     if ai_enabled and not (ai_banned and not force_allow):
         stages.append((3, "stage3_ai_upscale.py"))
         stages.append((4, "stage4_postprocess.py"))
 
-    # Face restore stage
-    face_restore = config.get("ai", {}).get("face_restore", "")
+    face_restore = params.get("face_restore", "")
     if ai_enabled and face_restore:
         stages.append((5, "stage5_ai_face.py"))
 
-    # Grain synthesis
-    grain_enabled = config.get("grain_factory3", {}).get("enabled", True)
-    if grain_enabled:
-        stages.append((6, "stage6_grain_synthesis.py"))
-
-    # Final encode
+    stages.append((6, "stage6_grain_synthesis.py"))
     stages.append((7, "stage7_encode.py"))
 
-    # Run single stage if requested
     if args.stage is not None:
         stage_map = {s[0]: s[1] for s in stages}
         if args.stage in stage_map:
             stages = [(args.stage, stage_map[args.stage])]
         else:
-            logger.error("JOB_ERROR", f"Invalid stage {args.stage}")
-            return 81, ""
+            return 81, "Invalid stage number"
 
-    # Execute stages
+    # Run stages
     for stage_num, script_name in stages:
-        job_logger.info("STAGE_START", f"Stage {stage_num}: {script_name}",
-                       stage=stage_num, script=script_name)
-
-        exit_code, stderr = run_stage(script_name, job, params, config)
-
+        job_logger.info("STAGE_START", f"Stage {stage_num}: {script_name}")
+        exit_code, stderr = run_stage(script_name, job, params, args.config)
         if exit_code == 0:
-            job_logger.info("STAGE_DONE", f"Stage {stage_num} completed")
+            job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
         elif exit_code == 3:
-            job_logger.info("STAGE_SKIP", f"Stage {stage_num} skipped (already exists)")
+            job_logger.info("STAGE_SKIP", f"Stage {stage_num} skipped")
         else:
-            job_logger.error("STAGE_FAILED", f"Stage {stage_num} failed with code {exit_code}")
+            job_logger.error("STAGE_FAILED", f"Stage {stage_num} failed: {exit_code}")
             return exit_code, stderr
 
         # Cleanup old intermediates after successful stage
         if params.get("cleanup_intermediates", True):
             temp_dir = params.get("temp_dir", "./temp")
-            input_name = Path(input_path).name
-            cleanup_old_intermediates(temp_dir, job_id, input_name, keep_steps=2)
+            keep_steps = params.get("keep_steps", 2)
+            cleanup_old_intermediates(temp_dir, job_id, keep_steps)
 
-    logger.info("JOB_DONE", f"Job {job_id} completed")
+    logger.info("JOB_DONE", f"Job {job_id} complete")
     return 0, ""
+
+
+def _worker_wrapper(task: Dict[str, Any]) -> str:
+    """Top-level worker for ProcessPoolExecutor (must be picklable in spawn mode).
+
+    Args:
+        task: dict with keys: job, config_path, log_dir, manifest_path, args
+    """
+    job = task["job"]
+    config_path = task["config_path"]
+    log_dir = task["log_dir"]
+    manifest_path = task["manifest_path"]
+    args = task["args"]
+
+    jcfg = load_config(config_path)
+    jlogger = get_logger(log_dir=log_dir, level=jcfg.get("global", {}).get("log_level", "INFO"))
+    jmanifest = load_manifest(manifest_path)
+    _run_single_job(job, jcfg, args, jlogger, jmanifest, manifest_path)
+    return job["job_id"]
+
+
+def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
+                    args, logger, manifest: Dict[str, Any], manifest_path: str):
+    """Run a single job with retry logic and manifest update."""
+    job_id = job["job_id"]
+    retry_count = config.get("global", {}).get("retry_count", 2)
+    success = False
+    for attempt in range(retry_count + 1):
+        exit_code, stderr = process_job(job, config, args, logger)
+        if exit_code in (0, 3):
+            update_job_status(manifest, job_id, "DONE")
+            success = True
+            break
+        else:
+            from checkpoint import is_retryable_error
+            if is_retryable_error(exit_code, stderr):
+                wait = 5 if attempt == 0 else 15
+                logger.warning("JOB_RETRY", f"Retrying job {job_id} in {wait}s")
+                time.sleep(wait)
+            else:
+                break
+    if not success:
+        update_job_status(manifest, job_id, "FAILED")
+    save_manifest(manifest, manifest_path)
 
 
 def main():
     args = parse_args()
-
-    # Load config
     config = load_config(args.config)
-    global_config = config.get("global", {})
-
-    # Setup master logger
-    log_dir = global_config.get("log_dir", "./logs")
-    logger = get_logger(log_dir=log_dir, level=global_config.get("log_level", "INFO"))
-
+    gcfg = config.get("global", {})
+    log_dir = gcfg.get("log_dir", "./logs")
+    logger = get_logger(log_dir=log_dir, level=gcfg.get("log_level", "INFO"))
     logger.info("PIPELINE_START", "Video restoration pipeline starting")
 
     # Dependency check
@@ -298,75 +403,76 @@ def main():
         if not ok:
             for issue in issues:
                 logger.error("DEP_CHECK", issue)
-            print("Dependency check failed. See logs for details.")
             sys.exit(80)
     except Exception as e:
-        logger.warning("DEP_CHECK", f"Could not run dependency check: {e}")
+        logger.warning("DEP_CHECK", f"Check skipped: {e}")
 
     # Generate or load manifest
     if args.manifest:
         manifest_path = args.manifest
-        logger.info("MANIFEST_LOAD", f"Loading manifest: {manifest_path}")
     elif args.input:
         manifest_path = str(SCRIPT_DIR / "batch_manifest.yaml")
         from manifest_generate import generate_manifest
-        logger.info("MANIFEST_GENERATE", "Generating manifest from input dirs")
         generate_manifest(args.input, manifest_path, config, "video")
     else:
         print("Error: Provide --input or --manifest")
         sys.exit(81)
 
     manifest = load_manifest(manifest_path)
-
-    # Filter jobs to process
     jobs = filter_jobs(manifest, ["PENDING", "FAILED"])
-
     if args.job_id:
         jobs = [j for j in jobs if j.get("job_id") == args.job_id]
 
-    logger.info("BATCH_START", f"Processing {len(jobs)} jobs")
-    print(f"Processing {len(jobs)} jobs...")
+    logger.info("BATCH_START", f"Processing {len(jobs)} video jobs")
+    print(f"Processing {len(jobs)} video jobs...")
 
-    # Process each job with retry
-    retry_count = global_config.get("retry_count", 2)
+    # Preview mode
+    if args.preview:
+        from preview import extract_preview_frames
+        for job in jobs[:3]:
+            try:
+                preview_dir = Path(gcfg.get("temp_dir", "./temp")) / "preview"
+                frames = extract_preview_frames(job["input_path"], str(preview_dir), num_frames=3)
+                logger.info("PREVIEW", f"Preview frames for {job['job_id']}: {frames}")
+            except Exception as e:
+                logger.warning("PREVIEW_FAIL", f"Preview failed for {job['job_id']}: {e}")
+        print("Preview mode complete. Inspect frames and re-run without --preview.")
+        return
 
-    for job in jobs:
-        job_id = job["job_id"]
-        success = False
+    # Parallel worker pool
+    workers = max(1, args.workers)
+    if workers > 1 and len(jobs) > 1:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import multiprocessing
+        multiprocessing.set_start_method("spawn", force=True)
 
-        for attempt in range(retry_count + 1):
-            exit_code, stderr = process_job(job, config, args, logger)
+        # Build task contexts for picklable worker submission
+        task_contexts = []
+        for job in jobs:
+            task_contexts.append({
+                "job": job,
+                "config_path": args.config,
+                "log_dir": log_dir,
+                "manifest_path": manifest_path,
+                "args": args,
+            })
 
-            if exit_code == 0:
-                update_job_status(manifest, job_id, "DONE")
-                success = True
-                break
-            elif exit_code == 3:
-                update_job_status(manifest, job_id, "DONE")
-                success = True
-                break
-            else:
-                # Check if retryable using exit code AND stderr content
-                from checkpoint import is_retryable_error
-                if is_retryable_error(exit_code, stderr):
-                    wait_time = 5 if attempt == 0 else 15
-                    logger.warning("JOB_RETRY",
-                                   f"Job {job_id} attempt {attempt+1} failed (code={exit_code}), retrying in {wait_time}s")
-                    time.sleep(wait_time)
-                else:
-                    logger.error("JOB_FAIL", f"Job {job_id} failed with code {exit_code}, not retryable",
-                                stderr=stderr[:500])
-                    break
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_worker_wrapper, ctx): ctx for ctx in task_contexts}
+            for future in as_completed(futures):
+                ctx = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error("WORKER_ERROR", f"Job {ctx['job']['job_id']} failed in worker: {e}")
+                    update_job_status(manifest, ctx["job"]["job_id"], "FAILED")
+                    save_manifest(manifest, manifest_path)
+    else:
+        for job in jobs:
+            _run_single_job(job, config, args, logger, manifest, manifest_path)
 
-        if not success:
-            update_job_status(manifest, job_id, "FAILED",
-                              f"Failed after {retry_count + 1} attempts")
-
-        # Save manifest after each job
-        save_manifest(manifest, manifest_path)
-
-    logger.info("PIPELINE_DONE", "Video restoration pipeline completed")
-    print("Done. Check logs for details.")
+    logger.info("PIPELINE_DONE", "Video pipeline complete")
+    print("Done.")
 
 
 if __name__ == "__main__":

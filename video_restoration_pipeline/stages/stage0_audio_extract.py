@@ -14,7 +14,7 @@ import argparse
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
-sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_utils"))
+sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
 from audio_utils import extract_audio  # noqa: E402

@@ -22,6 +22,22 @@ global:
   cleanup_intermediates: true
   retry_count: 2
   no_wsl_redirect: false
+  workers: 1
+
+paths:
+  # Path-specific parameters for photo categories
+  scan_print:
+    scratch_remove: true
+    scratch_remove_strength: 20
+    deblock_strength: 25
+    deband_threshold: 1.2
+    grain_synthesis: true
+  digital_photo:
+    scratch_remove: false
+    scratch_remove_strength: 0
+    deblock_strength: 15
+    deband_threshold: 0.8
+    grain_synthesis: false
 
 photo:
   max_long_edge: 3840
@@ -67,6 +83,12 @@ photo:
   gmic_windows_disable_delayed_expansion: true
   gmic_windows_shell: false
   gmic_windows_whitelist: "[a-zA-Z0-9_\\-\\.\\/\\\\]"
+  # v6.3 Stage 4 selective local processing
+  local_mask_denoise: true
+  local_mask_edge_threshold: 0.05
+  local_mask_smooth_radius: 3
+  # Archival mode: use RGB444 lossless instead of YUV420
+  archival_mode: false
 
 # 照片场景不使用 GrainFactory3（使用 G'MIC 颗粒合成），保留空占位以兼容统一配置系统
 grain_factory3:
