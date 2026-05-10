@@ -229,8 +229,10 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
     if has_tt and has_bb:
         # Mixed field order detected
         # Overall confidence = average of segment confidences (approximate)
+        # v6.3: field_order valid values are tt/bb/psf/progressive/unknown ONLY.
+        # "mixed" is not a valid field_order; use "unknown" with field_segments.
         avg_conf = sum(w["confidence"] for w in windows) / len(windows)
-        return "mixed", avg_conf, frame_segments
+        return "unknown", avg_conf, frame_segments
 
     # Not mixed, return global result
     if gprog_ratio > 0.95:
@@ -472,7 +474,7 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     # Compute hash prefix
     try:
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "shared_utils"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "shared_modules"))
         from checkpoint import get_file_xxhash
         result["file_hash_prefix"] = get_file_xxhash(input_path)
     except Exception:
@@ -540,7 +542,7 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     # IVTC detection: analog tape with TFF/BFF likely needs IVTC
     # Mixed field order materials skip IVTC (IVTC assumes consistent field order globally)
     interlaced_orders = ("tt", "bb")
-    if field_order == "mixed":
+    if field_order == "unknown" and field_segments:
         # Skip IVTC for mixed field order; per-segment QTGMC handles deinterlacing
         result["needs_ivtc"] = False
     elif result["detected_class"] == "ANALOG_TAPE" and field_order in interlaced_orders:
@@ -548,6 +550,13 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     elif result["detected_class"] == "DV_DIGITAL" and field_order in interlaced_orders:
         # DV may need IVTC if it has pulldown
         result["needs_ivtc"] = True  # Auto-detect will verify
+
+    # AI upscale banned: HDV/AVCHD 1080p or any video >=1080p height
+    # v6.3: base ban on original input pixel dimensions
+    if height >= 1080 or width >= 1920:
+        result["ai_upscale_banned"] = True
+    else:
+        result["ai_upscale_banned"] = False
 
     # Adjust confidence with field order info
     result["confidence"] = min(float(result.get("confidence", 0.0)), fo_confidence + 0.1)

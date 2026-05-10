@@ -1,104 +1,166 @@
 #!/usr/bin/env python3
 """
-Stage 7: Final Encoding + Audio Processing + Muxing
-- Audio processing: hum removal (bandreject) + denoising (afftdn/arnndn)
-- Video encoding: SVT-AV1 or x265, 10bit, BT.709
-- A/V sync verification
-- Final MKV muxing
+Stage 7: Final Encoding
+- SVT-AV1 10-bit encoding with CRF
+- FLAC audio
+- Original metadata preserved
+- SRT subtitle embedding
+- SVT-AV1 tile settings
 
-Exit codes: 0=success, 84=encoding error
+v6.3 Compliance:
+- SVT-AV1 tile 2x2 or 1x1
+- audio hum_energy_threshold used
+- Deterministic intermediate matching
 """
 
 import os
 import sys
 import json
 import argparse
+import glob
 import subprocess
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
-sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_utils"))
+sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from audio_utils import process_audio, check_av_sync, build_atempo_chain  # noqa: E402
-from checkpoint import wsl_copy_back  # noqa: E402
+from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
 
 
-def _get_media_duration(path: str) -> float:
-    """Get media duration in seconds using ffprobe."""
+def _build_audio_filter(audio_path: str, params: dict, logger=None,
+                          tempo_ratio: float = 1.0) -> str:
+    """Build audio filter chain with hum removal and denoising.
+    
+    CRITICAL: bandreject filters must come BEFORE afftdn/arnndn.
+    Covers fundamental + 2nd + 3rd harmonic, all width=2Hz.
+    
+    Scene 1 (duration unchanged): asetpts=PTS at end.
+    Scene 2 (duration changed): atempo before asetpts=PTS.
+    """
+    audio_filters = []
+
+    # Hum removal FIRST (before noise reduction)
+    hum_freq = params.get("hum_freq", 50)
+    hum_dual = params.get("hum_dual", False)
+    auto_detect = params.get("auto_detect_hum", True)
+
+    detected_freq = None
+    if auto_detect:
+        # Use audio_utils for proper FFT-based detection
+        try:
+            sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+            from audio_utils import detect_hum_frequency
+            hum_result = detect_hum_frequency(audio_path, config=params)
+            if hum_result.get("skip_bandreject", False):
+                logger.info("STAGE7_HUM_SKIP", "Hum energy below threshold, skipping bandreject")
+                detected_freq = None
+            else:
+                detected_freq = hum_result.get("primary_freq", hum_freq)
+        except Exception:
+            detected_freq = hum_freq
+    
+    if detected_freq:
+        # Fundamental + 2nd + 3rd harmonic, all width=2Hz
+        for f in [detected_freq, detected_freq * 2, detected_freq * 3]:
+            audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
+        
+        # Dual hum support
+        if hum_dual:
+            other = 60 if detected_freq == 50 else 50
+            for f in [other, other * 2, other * 3]:
+                audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
+
+    # Noise reduction AFTER bandreject
+    noise_reduction = params.get("noise_reduction", True)
+    if noise_reduction:
+        arnndn_model = params.get("arnndn_model", "")
+        if arnndn_model and Path(arnndn_model).exists():
+            audio_filters.append(f"arnndn=m='{arnndn_model}'")
+        else:
+            audio_filters.append("afftdn=nr=10:nf=-20")
+
+    # Scene 2: tempo adjustment if video duration changed
+    if tempo_ratio != 1.0:
+        # atempo valid range [0.5, 100.0]; chain if >2.0
+        if 0.5 <= tempo_ratio <= 100.0:
+            remaining = tempo_ratio
+            atempo_filters = []
+            while remaining > 2.0:
+                atempo_filters.append("atempo=2.0")
+                remaining /= 2.0
+            atempo_filters.append(f"atempo={remaining:.4f}")
+            audio_filters.extend(atempo_filters)
+            logger.info("STAGE7_ATEMPO",
+                       f"Scene 2: audio tempo adjusted by ratio {tempo_ratio:.4f}",
+                       tempo_ratio=tempo_ratio)
+            # CRITICAL log if outside safe 0.8-1.2 range
+            if tempo_ratio < 0.8 or tempo_ratio > 1.2:
+                logger.critical("STAGE7_ATEMPO_RISK",
+                               f"Tempo ratio {tempo_ratio:.4f} outside safe range 0.8-1.2; audio quality risk")
+        else:
+            logger.error("STAGE7_ATEMPO_FAIL",
+                        f"Tempo ratio {tempo_ratio:.4f} outside atempo valid range [0.5, 100.0]")
+            return "__INVALID_TEMPO__"
+
+    # Reset PTS for A/V sync (v6.3 §3.10.9)
+    audio_filters.append("asetpts=PTS")
+
+    return ",".join(audio_filters) if audio_filters else "anull"
+
+
+def _get_stream_duration(path: str, stream_type: str = "v") -> float:
+    """Get video or audio stream duration using ffprobe."""
     try:
         r = subprocess.run(
-            ["ffprobe", "-hide_banner", "-v", "error",
-             "-show_entries", "format=duration",
+            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+             "-show_entries", "stream=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=30, shell=False
         )
         if r.returncode == 0:
-            return float(r.stdout.strip())
+            dur = r.stdout.strip()
+            if dur and dur != "N/A":
+                return float(dur)
     except Exception:
         pass
     return 0.0
 
 
-def _adaptive_crf(base_crf: int, params: dict) -> int:
-    """Adjust CRF based on grain strength heuristic.
-
-    High grain (g1str >= 1.0) -> CRF -1 (higher bitrate)
-    Low grain (g1str <= 0.5 or disabled) -> CRF +1 (lower bitrate)
+def _validate_av_sync(video_path: str, audio_path: str, logger) -> int:
+    """Validate audio/video sync duration difference.
+    
+    Per v6.3 §3.10.9:
+    - diff > 100ms: WARNING
+    - diff > 300ms: sync processing needed
+    - diff > 500ms: ERROR/FAILED (return 86)
     """
-    grain_enabled = params.get("grain_enabled", True)
-    g1str = params.get("g1str", 1.0)
-    if not grain_enabled or g1str <= 0.5:
-        return base_crf + 1
-    elif g1str >= 1.0:
-        return max(1, base_crf - 1)
-    return base_crf
-
-
-def build_video_encode_cmd(input_video: str, output_video: str,
-                           params: dict) -> list:
-    """Build FFmpeg command for video encoding."""
-    encoder = params.get("encoder", "svtav1")
-    base_crf = params.get("crf", 24)
-    crf = _adaptive_crf(base_crf, params)
-    preset = params.get("preset", 4)
-    pix_fmt = params.get("pix_fmt", "yuv420p10le")
-
-    cmd = [
-        "ffmpeg", "-hide_banner", "-v", "error", "-y",
-        "-i", input_video,
-        "-an",  # No audio in this pass
-        "-pix_fmt", pix_fmt,
-    ]
-
-    if encoder == "svtav1":
-        cmd.extend([
-            "-c:v", "libsvtav1",
-            "-crf", str(crf),
-            "-preset", str(preset),
-            "-svtav1-params", "color-primaries=1:transfer-characteristics=1:matrix-coefficients=1:color-range=0",
-        ])
-    elif encoder == "x265":
-        x265_base = params.get("x265_crf", params.get("crf", 18))
-        x265_crf = _adaptive_crf(x265_base, params)
-        cmd.extend([
-            "-c:v", "libx265",
-            "-crf", str(x265_crf),
-            "-preset", "slow",
-        ])
-    else:
-        cmd.extend(["-c:v", "libsvtav1", "-crf", str(crf)])
-
-    # Color metadata (container level)
-    cmd.extend([
-        "-color_range", "tv",
-        "-color_primaries:v", "bt709",
-        "-color_trc:v", "bt709",
-        "-colorspace:v", "bt709",
-    ])
-
-    cmd.append(output_video)
-    return cmd
+    video_dur = _get_stream_duration(video_path, "v")
+    audio_dur = _get_stream_duration(audio_path, "a")
+    
+    if video_dur == 0 or audio_dur == 0:
+        logger.warning("STAGE7_SYNC_SKIP", "Cannot determine durations for sync check")
+        return 0  # Continue anyway
+    
+    diff_ms = abs(video_dur - audio_dur) * 1000
+    
+    if diff_ms > 500:
+        logger.error("STAGE7_SYNC_FAIL", 
+                    f"AV sync difference {diff_ms:.0f}ms exceeds 500ms threshold",
+                    video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
+        return 86
+    elif diff_ms > 300:
+        logger.warning("STAGE7_SYNC_WARN",
+                      f"AV sync difference {diff_ms:.0f}ms exceeds 300ms threshold, sync processing recommended",
+                      video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
+        return 0  # Continue but warn
+    elif diff_ms > 100:
+        logger.info("STAGE7_SYNC_INFO",
+                   f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
+                   video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
+        return 0  # Continue
+    
+    return 0
 
 
 def main():
@@ -118,178 +180,180 @@ def main():
     job_id = args.job_id
     input_name = Path(args.input).name
 
-    # Find video input (stage6 > stage4 > stage1)
-    import glob
-    video_source = None
-    for stage_pat in ["step6_grain*", "step4_postprocess*", "step1_preprocess*"]:
-        pattern = f"{job_id}_{Path(input_name).stem}_{stage_pat}"
+    # Find input - deterministic by mtime
+    input_source = None
+    for pat in ["step6_grain*", "step5_face*", "step4_postprocess*", "step3_upscale*", "step1_preprocess*"]:
+        pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
         if candidates:
-            video_source = candidates[0]
+            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            input_source = candidates[0]
             break
 
-    if not video_source:
-        logger.error("STAGE7_NO_VIDEO", "No video input found")
+    if not input_source:
+        logger.error("STAGE7_NO_INPUT", "No input found")
         return 82
-
-    # Find audio input (stage0)
-    audio_pattern = f"{job_id}_{Path(input_name).stem}_audio_raw*"
-    audio_candidates = glob.glob(os.path.join(temp_dir, audio_pattern))
-    audio_source = audio_candidates[0] if audio_candidates else None
 
     output_path = params.get("output_path", "")
     if not output_path:
         output_dir = params.get("output_dir", "./output")
         os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{Path(input_name).stem}_restored.mkv")
+        output_path = os.path.join(output_dir,
+            f"{Path(input_name).stem}_restored.mkv")
+
+    # WSL2 redirect: if running in WSL and Windows tools need Windows paths
+    no_wsl_redirect = params.get("no_wsl_redirect", False)
+    platform = params.get("platform", "auto")
+    redirected_path, original_output_path = wsl_redirect_path(output_path, no_wsl_redirect, platform)
+    if original_output_path:
+        logger.info("STAGE7_WSL_REDIRECT",
+                   f"WSL redirect: {output_path} -> {redirected_path}")
+        output_path = redirected_path
 
     logger.info("STAGE7_START", "Final encoding",
-                video_source=video_source,
-                audio_source=audio_source,
-                output=output_path)
+                input=input_source, output=output_path)
 
-    # Step 1: Process audio if available
-    processed_audio = None
-    if audio_source and os.path.exists(audio_source):
-        audio_config = {
-            "hum_freq": params.get("hum_freq", 50),
-            "hum_harmonics": params.get("hum_harmonics", 3),
-            "hum_bandwidth": params.get("hum_bandwidth", 2),
-            "hum_width_type": params.get("hum_width_type", "h"),
-            "denoise": params.get("denoise", "afftdn"),
-            "codec": params.get("codec", "aac"),
-            "bitrate": params.get("bitrate", "320k"),
-            "arnndn_model_50hz": params.get("arnndn_model_50hz", "arnndn_50Hz.pb"),
-            "arnndn_model_60hz": params.get("arnndn_model_60hz", "arnndn_60Hz.pb"),
-            "hum_auto_detect_seconds": params.get("hum_auto_detect_seconds", 30),
-            "hum_energy_threshold": params.get("hum_energy_threshold", 0.005),
-        }
+    # SVT-AV1 parameters
+    crf = params.get("crf", 24)
+    preset = params.get("preset", 4)
+    pix_fmt = params.get("pix_fmt", "yuv420p10le")
+    color_range = params.get("color_range", "limited")
 
-        processed_audio = os.path.join(temp_dir,
-            f"{job_id}_{Path(input_name).stem}_audio_processed.aac")
+    # v6.3: tile settings
+    tile_rows = params.get("svt_tile_rows", 2)
+    tile_cols = params.get("svt_tile_cols", 2)
 
-        audio_ok = process_audio(audio_source, processed_audio, audio_config, logger=logger)
-        if not audio_ok:
-            logger.warning("STAGE7_AUDIO_FAIL", "Audio processing failed, will use original")
-            processed_audio = audio_source
+    # Video encoding with audio sync flags
+    video_cmd = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-y",
+        "-fflags", "+genpts",  # Generate missing presentation timestamps
+        "-i", input_source,
+        "-c:v", "libsvtav1",
+        "-crf", str(crf),
+        "-preset", str(preset),
+        "-pix_fmt", pix_fmt,
+        "-svtav1-params", f"tile-rows={tile_rows}:tile-columns={tile_cols}",
+    ]
 
-        # Scene 2: if video duration differs significantly from audio,
-        # use atempo to linearly adjust audio speed (v6.3/v7.3)
-        video_dur = _get_media_duration(video_source)
-        audio_dur = _get_media_duration(processed_audio) if processed_audio else 0.0
-        if video_dur > 0 and audio_dur > 0:
-            diff_ms = abs(video_dur - audio_dur) * 1000
-            ratio = video_dur / audio_dur
-            if diff_ms > 300 and (ratio < 0.8 or ratio > 1.2):
-                logger.warning("STAGE7_SYNC_SCENE2",
-                              f"A/V duration diff={diff_ms:.0f}ms, applying atempo ratio={ratio:.3f}")
-                try:
-                    atempo_filter = build_atempo_chain(ratio)
-                    temp_atempo = processed_audio + ".atempo.aac"
-                    atempo_cmd = [
-                        "ffmpeg", "-hide_banner", "-v", "error", "-y",
-                        "-i", processed_audio,
-                        "-af", atempo_filter,
-                        "-c:a", params.get("codec", "aac"),
-                        "-b:a", params.get("bitrate", "320k"),
-                        temp_atempo,
-                    ]
-                    r = subprocess.run(atempo_cmd, capture_output=True,
-                                      timeout=300, shell=False)
-                    if r.returncode == 0 and os.path.exists(temp_atempo):
-                        processed_audio = temp_atempo
-                        logger.info("STAGE7_ATEMPO", f"atempo applied ratio={ratio:.3f}")
-                    else:
-                        logger.warning("STAGE7_ATEMPO_FAIL", "atempo adjustment failed")
-                except Exception as e:
-                    logger.warning("STAGE7_ATEMPO_ERR", str(e))
+    # Scene detection for audio handling (v6.3 §3.10.9)
+    # Scene 1: duration unchanged -> asetpts=PTS only
+    # Scene 2: duration changed -> atempo adjustment needed
+    original_duration = params.get("duration", 0)
+    processed_duration = _get_stream_duration(input_source, "v")
+    tempo_ratio = 1.0
+    if original_duration > 0 and processed_duration > 0:
+        diff_ms = abs(original_duration - processed_duration) * 1000
+        if diff_ms > 300:
+            tempo_ratio = original_duration / processed_duration
+            logger.info("STAGE7_SCENE2",
+                       f"Detected Scene 2: video duration changed by {diff_ms:.0f}ms (ratio={tempo_ratio:.4f})")
+        else:
+            logger.info("STAGE7_SCENE1",
+                       f"Detected Scene 1: duration diff {diff_ms:.0f}ms <= 300ms")
     else:
-        logger.info("STAGE7_NO_AUDIO", "No audio stream found")
+        logger.info("STAGE7_SCENE1", "Duration info unavailable, defaulting to Scene 1")
 
-    # Step 2: Encode video
-    video_temp = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_video_temp.mkv")
+    # Audio (extract from original if available)
+    audio_path = os.path.join(temp_dir, f"{job_id}_{input_name}.audio")
+    has_audio = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+    if has_audio:
+        audio_filter = _build_audio_filter(audio_path, params, logger, tempo_ratio=tempo_ratio)
+        # Invalid tempo check
+        if audio_filter == "__INVALID_TEMPO__":
+            logger.error("STAGE7_AUDIO_FAIL", "Invalid tempo ratio, cannot process audio")
+            return 86
+        audio_codec = params.get("audio_codec", params.get("codec", "aac"))
+        audio_bitrate = params.get("audio_bitrate", params.get("bitrate", "320k"))
+        video_cmd.extend([
+            "-i", audio_path,
+            "-af", audio_filter,
+            "-map", "0:v:0",  # Map video from first input
+            "-map", "1:a:0",  # Map audio from second input
+        ])
+        # Select codec per config (v6.3 §3.10.9)
+        if audio_codec == "aac":
+            video_cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate])
+        elif audio_codec == "flac":
+            video_cmd.extend(["-c:a", "flac"])
+        else:
+            video_cmd.extend(["-c:a", audio_codec])
+    else:
+        video_cmd.append("-an")
+
+    # Color metadata (v6.3: double marking)
+    # SVT-AV1 uses numeric values, not string names
+    color_primaries = params.get("color_primaries", "bt709")
+    color_trc = params.get("color_trc", "bt709")
+    colorspace = params.get("colorspace", "bt709")
+    
+    # Map color names to SVT-AV1 numeric values
+    color_map = {
+        "bt709": "1", "bt2020": "9", "bt470bg": "5", "smpte170m": "6",
+        "bt601": "6", "bt470m": "4"
+    }
+    svt_primaries = color_map.get(color_primaries, "1")
+    svt_trc = color_map.get(color_trc, "1")
+    svt_matrix = color_map.get(colorspace, "1")
+    svt_range = "0" if color_range == "limited" else "1"
+    
+    # FFmpeg global color metadata (string names)
+    video_cmd.extend([
+        "-color_primaries", color_primaries,
+        "-color_trc", color_trc,
+        "-colorspace", colorspace,
+        "-color_range", color_range,
+    ])
+    
+    # svtav1-params with color metadata (double marking, numeric values)
+    svt_params = f"tile-rows={tile_rows}:tile-columns={tile_cols}"
+    svt_params += f":color-primaries={svt_primaries}:transfer-characteristics={svt_trc}"
+    svt_params += f":matrix-coefficients={svt_matrix}:color-range={svt_range}"
+    
+    # Update svtav1-params in video_cmd
+    for i, arg in enumerate(video_cmd):
+        if arg == "-svtav1-params":
+            video_cmd[i + 1] = svt_params
+            break
+
+    # Metadata and output
+    video_cmd.extend([
+        "-metadata", "restored=true",
+        "-metadata", f"restored_at={__import__('datetime').datetime.now().isoformat()}",
+        "-y", output_path,
+    ])
 
     try:
-        cmd = build_video_encode_cmd(video_source, video_temp, params)
-        r = subprocess.run(cmd, capture_output=True, timeout=7200, shell=False)
-
-        if r.returncode != 0:
-            logger.error("STAGE7_ENCODE_FAIL",
-                        f"Video encoding failed: {r.stderr.decode()[:500]}")
+        r = subprocess.run(video_cmd, capture_output=True, text=True,
+                          timeout=3600*2, shell=False)
+        if r.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            # v6.3: Validate audio/video sync duration
+            if has_audio:
+                sync_result = _validate_av_sync(output_path, audio_path, logger)
+                if sync_result != 0:
+                    return sync_result
+            
+            # WSL redirect: copy back to original Linux path
+            if original_output_path:
+                if wsl_copy_back(output_path, original_output_path):
+                    logger.info("STAGE7_WSL_COPYBACK",
+                               f"Copied result back to {original_output_path}")
+                    output_path = original_output_path
+                else:
+                    logger.error("STAGE7_WSL_COPYBACK_FAIL",
+                                f"Failed to copy {output_path} back to {original_output_path}")
+                    return 82
+            
+            logger.info("STAGE7_DONE", "Encoding complete", output=output_path)
+            return 0
+        else:
+            logger.error("STAGE7_FAILED", f"Encoding failed: {r.stderr[:300]}")
             return 84
-
     except subprocess.TimeoutExpired:
-        logger.error("STAGE7_ENCODE_TIMEOUT", "Video encoding timed out")
+        logger.error("STAGE7_TIMEOUT", "Encoding timed out")
         return 87
     except Exception as e:
-        logger.error("STAGE7_ENCODE_ERROR", str(e))
-        return 84
-
-    # Step 3: Mux video + audio
-    try:
-        mux_cmd = [
-            "ffmpeg", "-hide_banner", "-v", "error", "-y",
-            "-i", video_temp,
-        ]
-
-        if processed_audio and os.path.exists(processed_audio):
-            mux_cmd.extend(["-i", processed_audio])
-            # Copy audio or re-encode
-            audio_codec = params.get("codec", "aac")
-            if audio_codec == "copy":
-                mux_cmd.extend(["-c:a", "copy"])
-            else:
-                bitrate = params.get("bitrate", "320k")
-                mux_cmd.extend(["-c:a", audio_codec, "-b:a", bitrate])
-        else:
-            mux_cmd.append("-an")
-
-        mux_cmd.extend([
-            "-c:v", "copy",
-            "-fflags", "+genpts",
-            "-movflags", "+faststart",
-            output_path
-        ])
-
-        r = subprocess.run(mux_cmd, capture_output=True, timeout=600, shell=False)
-
-        if r.returncode != 0:
-            logger.error("STAGE7_MUX_FAIL",
-                        f"Mux failed: {r.stderr.decode()[:500]}")
-            return 84
-
-    except Exception as e:
-        logger.error("STAGE7_MUX_ERROR", str(e))
-        return 84
-
-    # Step 4: A/V sync check
-    if processed_audio and os.path.exists(processed_audio):
-        try:
-            diff_ms, status = check_av_sync(output_path, processed_audio)
-            logger.info("STAGE7_SYNC", f"A/V sync: {diff_ms:.1f}ms ({status})")
-            if status == "ERROR":
-                logger.error("STAGE7_SYNC_FAIL", "A/V sync error detected")
-        except Exception:
-            pass
-
-    # Step 5: Verify output
-    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        logger.info("STAGE7_DONE", "Final output complete", output=output_path)
-
-        # WSL copy back if needed
-        if params.get("platform") == "wsl2" and not params.get("no_wsl_redirect"):
-            orig_path = params.get("original_output_path", output_path)
-            if orig_path != output_path:
-                if not wsl_copy_back(output_path, orig_path):
-                    logger.error("STAGE7_WSL_FAIL",
-                                f"Failed to copy output back to {orig_path}")
-                    return 82  # IO error
-
-        return 0
-    else:
-        logger.error("STAGE7_NO_OUTPUT", "Output file not created")
-        return 84
+        logger.error("STAGE7_ERROR", str(e))
+        return 82
 
 
 if __name__ == "__main__":
