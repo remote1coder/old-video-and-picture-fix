@@ -47,28 +47,59 @@ def validate_job(job: Dict[str, Any]) -> bool:
 
 
 def _verify_photo_integrity(path: str) -> bool:
-    """Verify photo file integrity using PIL (photos don't use ffprobe)."""
+    """Verify photo file integrity using PIL.
+    
+    Per v6.32: Only mark as corrupted if PIL verify/load fails.
+    Solid colors and all-black frames are legitimate content.
+    
+    ISSUE-SHARED-ML-001: Added multi-position spot checks (top-left, center,
+    bottom-right) to detect partial writes or corruption that PIL load might miss.
+    """
     try:
         from PIL import Image
+        import numpy as np
         with Image.open(path) as img:
             # Ensure image can be loaded
             img.load()
             # Check non-trivial size
             if img.width <= 0 or img.height <= 0:
                 return False
-            # For 16-bit images, check pixel data is valid
-            arr = None
-            try:
-                if img.mode == "I;16":
-                    arr = img.point(lambda p: p / 256).convert("L")
-                else:
-                    arr = img.convert("L")
-                import numpy as np
-                data = np.array(arr)
-                if data.max() == 0 or data.min() == data.max():
+            # For 16-bit images, preserve precision
+            if img.mode == "I;16":
+                arr = np.array(img, dtype=np.uint16)
+            else:
+                arr = np.array(img)
+            # Only reject if array is empty (not based on content)
+            if arr.size == 0:
+                return False
+            
+            # ISSUE-SHARED-ML-001 fix: Multi-position spot checks
+            # Extract top-left, center, bottom-right regions and verify
+            # they are not all-zero (indicates partial write / corruption)
+            h, w = arr.shape[:2]
+            region_h = max(1, h // 10)
+            region_w = max(1, w // 10)
+            
+            # Top-left region
+            top_left = arr[0:region_h, 0:region_w]
+            # Center region
+            cy, cx = h // 2, w // 2
+            center = arr[cy:cy+region_h, cx:cx+region_w]
+            # Bottom-right region
+            br = arr[h-region_h:h, w-region_w:w]
+            
+            for region_name, region in [("top-left", top_left),
+                                         ("center", center),
+                                         ("bottom-right", br)]:
+                if region.size == 0:
+                    continue
+                # Check if region is all zeros (indicates corruption/partial write)
+                if np.all(region == 0):
                     return False
-            except Exception:
-                pass
+                # Check if region is all max value (also suspicious for corruption)
+                max_val = 65535 if arr.dtype == np.uint16 else 255
+                if np.all(region == max_val):
+                    return False
         return True
     except Exception:
         return False
@@ -108,8 +139,10 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
         import sys
         import re
         import glob
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        from shared_modules.checkpoint import verify_ffprobe_decodeable, verify_frame_integrity
+        # BUG-060 fix: Use parent directory (shared_modules/) instead of project root
+        # to ensure checkpoint.py is found regardless of project structure.
+        sys.path.insert(0, str(Path(__file__).parent))
+        from checkpoint import verify_ffprobe_decodeable, verify_frame_integrity
 
         temp_dir = job.get("temp_dir", "./temp")
         job_id = job["job_id"]

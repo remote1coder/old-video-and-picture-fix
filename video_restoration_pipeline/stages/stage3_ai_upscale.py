@@ -43,7 +43,12 @@ def estimate_gpu_memory(width: int, height: int, scale: int,
 
 
 def check_gpu_memory(required_bytes: int) -> tuple:
-    """Check GPU availability. Returns (sufficient: bool, backend: str)."""
+    """Check GPU availability. Returns (sufficient: bool, backend: str).
+
+    Backend priority: cuda > rocm > mps > cpu.
+    Bug 13.30/13.31 fix: Detect PyTorch version, ROCm, and MPS.
+    """
+    # 1. nvidia-smi (native CUDA)
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free",
@@ -58,12 +63,37 @@ def check_gpu_memory(required_bytes: int) -> tuple:
     except Exception:
         pass
 
+    # 2. PyTorch backends (cuda / rocm / mps)
     try:
         import torch
+        torch_ver = torch.__version__
+
+        # CUDA
         if torch.cuda.is_available():
-            free, total = torch.cuda.mem_get_info()
-            if free >= required_bytes * 1.2:
-                return True, "cuda"
+            try:
+                free, total = torch.cuda.mem_get_info()
+                if free >= required_bytes * 1.2:
+                    return True, "cuda"
+            except Exception:
+                pass
+
+        # ROCm (AMD GPU)
+        if hasattr(torch.version, "hip") and torch.version.hip is not None:
+            try:
+                free, total = torch.cuda.mem_get_info()
+                if free >= required_bytes * 1.2:
+                    return True, "rocm"
+            except Exception:
+                pass
+
+        # Apple Metal (MPS)
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # MPS does not expose free memory via API; assume sufficient
+            return True, "mps"
+
+        # CPU-only PyTorch detection
+        if "cpu" in torch_ver.lower():
+            return False, "cpu"
     except Exception:
         pass
 
@@ -105,30 +135,40 @@ def run_realesrgan(input_path: str, output_dir: str, model_name: str,
         except Exception:
             pass
 
-    # Fallback: Python API via subprocess
+    # V-P-036 fix: Python API via dedicated temp script instead of inline -c
     try:
         env = os.environ.copy()
         if gpu_id < 0:
             env["CUDA_VISIBLE_DEVICES"] = ""
-        cmd = [
-            sys.executable, "-c",
-            f"from realesrgan import RealESRGANer; "
-            f"from basicsr.utils.download_util import load_file_from_url; "
-            f"import torch; "
-            f"model = RealESRGANer(scale={scale}, model_path='{model_path}', "
-            f"prepad=10, half={'False' if gpu_id < 0 else 'not torch.cuda.is_available()'}); "
-            f"from PIL import Image; "
-            f"import os; "
-            f"import glob; "
-            f"os.makedirs('{output_dir}', exist_ok=True); "
-            f"for f in sorted(glob.glob(os.path.join('{input_path}', '*.png'))): "
-            f"    img = Image.open(f).convert('RGB'); "
-            f"    import numpy as np; "
-            f"    output, _ = model.enhance(np.array(img)); "
-            f"    Image.fromarray(output).save(os.path.join('{output_dir}', os.path.basename(f)))"
-        ]
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            script_path = f.name
+            f.write(
+                "from realesrgan import RealESRGANer\n"
+                "import torch\n"
+                "from PIL import Image\n"
+                "import os\n"
+                "import glob\n"
+                "import numpy as np\n"
+                f"scale = {scale}\n"
+                f"model_path = {repr(model_path)}\n"
+                f"input_path = {repr(input_path)}\n"
+                f"output_dir = {repr(output_dir)}\n"
+                f"use_half = not torch.cuda.is_available() if {gpu_id} >= 0 else False\n"
+                "os.makedirs(output_dir, exist_ok=True)\n"
+                "model = RealESRGANer(scale=scale, model_path=model_path, prepad=10, half=use_half)\n"
+                "for fp in sorted(glob.glob(os.path.join(input_path, '*.png'))):\n"
+                "    img = Image.open(fp).convert('RGB')\n"
+                "    output, _ = model.enhance(np.array(img))\n"
+                "    Image.fromarray(output).save(os.path.join(output_dir, os.path.basename(fp)))\n"
+            )
+        cmd = [sys.executable, script_path]
         r = subprocess.run(cmd, capture_output=True, text=True,
                           timeout=3600, shell=False, env=env)
+        try:
+            os.unlink(script_path)
+        except Exception:
+            pass
         return r.returncode == 0
     except Exception:
         return False
@@ -143,6 +183,7 @@ def extract_frames_with_pts(video_path: str, output_dir: str,
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    # V-P-033 fix: extract 16bit PNG for preservation
     # Use ffmpeg with -vsync 0 to preserve original timestamps
     # Extract only the window range
     cmd = [
@@ -156,6 +197,7 @@ def extract_frames_with_pts(video_path: str, output_dir: str,
     cmd.extend([
         "-vsync", "0",
         "-frame_pts", "1",
+        "-pix_fmt", "rgb48",
         os.path.join(output_dir, "frame_%08d.png")
     ])
 
@@ -252,16 +294,24 @@ def _count_video_frames(video_path: str) -> int:
     return 0
 
 
+def _load_params(args):
+    if getattr(args, "params_file", None):
+        with open(args.params_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(args.params) if args.params else {}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
+    parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
-    params = json.loads(args.params) if args.params else {}
+    params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
@@ -269,13 +319,6 @@ def main():
     ai_enabled = params.get("ai_enabled", False)
     if not ai_enabled:
         logger.info("STAGE3_SKIP", "AI not enabled")
-        return 3
-
-    # Check upscale ban
-    ai_banned = params.get("ai_upscale_banned", False)
-    force_allow = params.get("force_allow_banned_upscale", False)
-    if ai_banned and not force_allow:
-        logger.info("STAGE3_BANNED", "AI upscale banned for this file")
         return 3
 
     scale = params.get("upscale_scale", 2)
@@ -288,6 +331,33 @@ def main():
     if scale > max_scale:
         logger.error("STAGE3_INVALID_SCALE", f"Scale {scale} exceeds max_scale={max_scale}")
         return 81
+
+    # Bug 13.30 fix: PyTorch version / backend check
+    require_cuda = params.get("require_cuda", True)
+    if require_cuda:
+        try:
+            import torch
+            torch_ver = torch.__version__
+            if "cpu" in torch_ver.lower():
+                logger.error("STAGE3_CPU_TORCH",
+                             f"PyTorch {torch_ver} is CPU-only but require_cuda=True")
+                return 1
+        except Exception:
+            pass
+
+    # Check upscale ban
+    ai_banned = params.get("ai_upscale_banned", False)
+    force_allow = params.get("force_allow_banned_upscale", False)
+    if ai_banned and not force_allow:
+        logger.info("STAGE3_BANNED", "AI upscale banned for this file")
+        return 3
+    # V-P-030 fix: force_allow CRITICAL log
+    if ai_banned and force_allow:
+        logger.critical("STAGE3_FORCE",
+                       "Force-allowing banned upscale per user override",
+                       original_width=params.get("original_width"),
+                       original_height=params.get("original_height"),
+                       upscale_scale=scale)
 
     model = params.get("upscale_model", "RealESRGAN_x2plus")
     temp_dir = params.get("temp_dir", "./temp")
@@ -360,6 +430,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     all_success = True
+    gpu_oom_retry_done = False  # v6.3 §7.14: max 1 OOM retry per job
     for win_start in range(0, total_frames, win_size):
         win_end = min(win_start + win_size, total_frames)
         actual_win_size = win_end - win_start
@@ -380,17 +451,35 @@ def main():
 
         success = run_realesrgan(frames_dir, win_output_dir, model, scale)
 
-        if not success and backend != "cpu":
-            # GPU OOM retry: clear cache, wait, then retry on CPU
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            import time
-            time.sleep(0.1)
-            logger.warning("STAGE3_RETRY_CPU", "Retrying on CPU after GPU failure")
-            success = run_realesrgan(frames_dir, win_output_dir, model, scale, gpu_id=-1)
+        # ISSUE-043 fix: runtime GPU OOM downgrade (4x->2x->CPU) with del model + empty_cache + 100ms
+        if not success and backend != "cpu" and not gpu_oom_retry_done:
+            # Step 1: 4x -> 2x downgrade
+            if scale == 4:
+                logger.warning("STAGE3_OOM_DOWNSCALE", "GPU OOM detected, downgrading 4x->2x")
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                scale = 2
+                model = _get_model_for_scale(model, 2)
+                success = run_realesrgan(frames_dir, win_output_dir, model, scale)
+
+            # Step 2: GPU -> CPU downgrade
+            if not success:
+                logger.warning("STAGE3_OOM_CPU", "GPU still failing, downgrading to CPU")
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                import time
+                time.sleep(0.1)
+                success = run_realesrgan(frames_dir, win_output_dir, model, scale, gpu_id=-1)
+                if success:
+                    backend = "cpu"
+
+            gpu_oom_retry_done = True  # v6.3: limit 1 retry per job
 
         if not success:
             logger.error("STAGE3_WINDOW_FAIL", f"AI upscale failed for window {win_start}")
@@ -420,12 +509,60 @@ def main():
         logger.error("STAGE3_NO_OUTPUT", "No upscaled frames produced")
         return 83
 
+    # V-P-034 fix: Lanczos secondary scaling when target != AI output resolution
+    lanczos_target = params.get("lanczos_target", "auto")
+    if lanczos_target != "auto" and lanczos_target:
+        try:
+            if "x" in lanczos_target:
+                target_lw, target_lh = map(int, lanczos_target.split("x"))
+                if target_lw != target_w or target_lh != target_h:
+                    logger.info("STAGE3_LANCZOS",
+                               f"Scaling AI output {target_w}x{target_h} -> {target_lw}x{target_lh}")
+                    lanczos_dir = os.path.join(temp_dir, f"{job_id}_lanczos")
+                    os.makedirs(lanczos_dir, exist_ok=True)
+                    for src in sorted(Path(output_dir).glob("*.png")):
+                        lanczos_cmd = [
+                            "ffmpeg", "-hide_banner", "-v", "error", "-y",
+                            "-i", str(src),
+                            "-vf", f"zscale=w={target_lw}:h={target_lh}:f=lanczos",
+                            "-pix_fmt", "rgb48",
+                            str(Path(lanczos_dir) / src.name)
+                        ]
+                        subprocess.run(lanczos_cmd, capture_output=True, timeout=60, shell=False)
+                    if list(Path(lanczos_dir).glob("*.png")):
+                        import shutil as _shutil
+                        _shutil.rmtree(output_dir, ignore_errors=True)
+                        os.rename(lanczos_dir, output_dir)
+                        target_w, target_h = target_lw, target_lh
+        except Exception as e:
+            logger.warning("STAGE3_LANCZOS_FAIL", f"Lanczos scaling failed: {e}")
+
+    # V-P-035 fix: preserve original frame rate
+    fps_cmd = [
+        "ffprobe", "-hide_banner", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        stage1_output,
+    ]
+    fps_str = "25"
+    try:
+        r = subprocess.run(fps_cmd, capture_output=True, text=True, timeout=10, shell=False)
+        if r.returncode == 0:
+            fps_str = r.stdout.strip()
+    except Exception:
+        pass
+
+    # V-P-031 fix: force_allow suffix
+    inter_name = f"{job_id}_{Path(input_name).stem}_step3_upscale"
+    if ai_banned and force_allow:
+        inter_name = inter_name.replace("_upscale_", "_forced_upscale_")
+
     # Encode PNG frames to intermediate MKV for stage4 consumption
-    output_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step3_upscale.mkv")
+    output_path = os.path.join(temp_dir, f"{inter_name}.mkv")
     encode_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
-        "-framerate", "25",  # TODO: preserve original frame rate
+        "-framerate", fps_str,
         "-i", os.path.join(output_dir, "frame_%08d.png"),
         "-c:v", "ffv1",
         "-pix_fmt", "yuv420p16le",

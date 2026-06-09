@@ -28,6 +28,29 @@ from logger import get_logger  # noqa: E402
 from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
 
 
+def _get_audio_layout(audio_path: str) -> dict:
+    """Get audio channel layout info using ffprobe."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error",
+             "-select_streams", "a:0",
+             "-show_entries", "stream=channels,channel_layout",
+             "-of", "json", audio_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            data = json.loads(r.stdout)
+            streams = data.get("streams", [])
+            if streams:
+                return {
+                    "channels": int(streams[0].get("channels", 2)),
+                    "layout": streams[0].get("channel_layout", "stereo"),
+                }
+    except Exception:
+        pass
+    return {"channels": 2, "layout": "stereo"}
+
+
 def _build_audio_filter(audio_path: str, params: dict, logger=None,
                           tempo_ratio: float = 1.0) -> str:
     """Build audio filter chain with hum removal and denoising.
@@ -39,6 +62,24 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
     Scene 2 (duration changed): atempo before asetpts=PTS.
     """
     audio_filters = []
+
+    # V-P-051 fix: FFmpeg version check for bandreject compatibility
+    ffmpeg_version_ok = True
+    try:
+        vr = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10, shell=False)
+        if vr.returncode == 0:
+            version_line = vr.stdout.splitlines()[0]
+            # Extract version number like "4.4.2"
+            import re
+            vm = re.search(r"ffmpeg version (\d+)\.(\d+)", version_line)
+            if vm:
+                major, minor = int(vm.group(1)), int(vm.group(2))
+                if major < 4 or (major == 4 and minor < 4):
+                    ffmpeg_version_ok = False
+                    logger.warning("STAGE7_FFMPEG_OLD",
+                                  f"FFmpeg {major}.{minor} < 4.4, bandreject width_type=h may fail; will fallback to arnndn")
+    except Exception:
+        pass
 
     # Hum removal FIRST (before noise reduction)
     hum_freq = params.get("hum_freq", 50)
@@ -60,7 +101,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
         except Exception:
             detected_freq = hum_freq
     
-    if detected_freq:
+    if detected_freq and ffmpeg_version_ok:
         # Fundamental + 2nd + 3rd harmonic, all width=2Hz
         for f in [detected_freq, detected_freq * 2, detected_freq * 3]:
             audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
@@ -70,15 +111,27 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
             other = 60 if detected_freq == 50 else 50
             for f in [other, other * 2, other * 3]:
                 audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
+    elif detected_freq and not ffmpeg_version_ok:
+        # Skip bandreject, use arnndn only for hum+noise reduction
+        logger.info("STAGE7_HUM_FALLBACK", "Skipping bandreject due to old FFmpeg, relying on arnndn")
 
     # Noise reduction AFTER bandreject
     noise_reduction = params.get("noise_reduction", True)
     if noise_reduction:
         arnndn_model = params.get("arnndn_model", "")
+        # V-P-052 fix: arnndn requires mono input for some CPUs
+        # Convert to mono before arnndn, then back to original layout
         if arnndn_model and Path(arnndn_model).exists():
+            audio_filters.append("aformat=channel_layouts=mono")
             audio_filters.append(f"arnndn=m='{arnndn_model}'")
+            # Restore original layout will be done by -ac after -af
         else:
             audio_filters.append("afftdn=nr=10:nf=-20")
+
+    # V-P-053 fix: compand dynamic range compression
+    use_compand = params.get("audio_compand", True)
+    if use_compand:
+        audio_filters.append("compand=0.3:1:-90/-900|-70/-70|-30/-9|0/-3:6:0:0:0.5")
 
     # Scene 2: tempo adjustment if video duration changed
     if tempo_ratio != 1.0:
@@ -204,7 +257,9 @@ def main():
     # WSL2 redirect: if running in WSL and Windows tools need Windows paths
     no_wsl_redirect = params.get("no_wsl_redirect", False)
     platform = params.get("platform", "auto")
-    redirected_path, original_output_path = wsl_redirect_path(output_path, no_wsl_redirect, platform)
+    redirected_path, original_output_path, _, _ = wsl_redirect_path(
+        output_path, no_wsl_redirect=no_wsl_redirect, platform=platform
+    )
     if original_output_path:
         logger.info("STAGE7_WSL_REDIRECT",
                    f"WSL redirect: {output_path} -> {redirected_path}")
@@ -219,11 +274,45 @@ def main():
     pix_fmt = params.get("pix_fmt", "yuv420p10le")
     color_range = params.get("color_range", "limited")
 
+    # V-P-054/V-P-055 fix: adaptive preset/CRF based on resolution and scene type
+    # v6.32 §7.4.1: >1080p -> p6/crf26; <=720p -> p3/crf22; else -> p4/crf24
+    # Animation: +2 CRF
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "json", input_source],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            info = json.loads(r.stdout)
+            stream = info["streams"][0]
+            vid_w = stream.get("width", 1920)
+            vid_h = stream.get("height", 1080)
+            if vid_w > 1920 or vid_h > 1080:
+                preset = 6
+                crf = 26
+            elif vid_w <= 1280 and vid_h <= 720:
+                preset = 3
+                crf = 22
+            else:
+                preset = 4
+                crf = 24
+            detected_class = params.get("detected_class", "").lower()
+            if "animation" in detected_class or "anime" in detected_class:
+                crf += 2
+                logger.info("STAGE7_ANIMATION_CRF", f"Animation detected, CRF adjusted to {crf}")
+            logger.info("STAGE7_ADAPTIVE",
+                        f"Adaptive encoding: {vid_w}x{vid_h} -> preset={preset}, crf={crf}")
+    except Exception as e:
+        logger.warning("STAGE7_ADAPTIVE_SKIP", f"Adaptive preset/CRF failed: {e}")
+
     # v6.3: tile settings
     tile_rows = params.get("svt_tile_rows", 2)
     tile_cols = params.get("svt_tile_cols", 2)
 
     # Video encoding with audio sync flags
+    # BUG-041 fix: defer svtav1-params construction until all parameters are known
     video_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-fflags", "+genpts",  # Generate missing presentation timestamps
@@ -232,7 +321,6 @@ def main():
         "-crf", str(crf),
         "-preset", str(preset),
         "-pix_fmt", pix_fmt,
-        "-svtav1-params", f"tile-rows={tile_rows}:tile-columns={tile_cols}",
     ]
 
     # Scene detection for audio handling (v6.3 §3.10.9)
@@ -254,7 +342,13 @@ def main():
         logger.info("STAGE7_SCENE1", "Duration info unavailable, defaulting to Scene 1")
 
     # Audio (extract from original if available)
+    # V-P-049 fix: match stage0 output naming convention
     audio_path = os.path.join(temp_dir, f"{job_id}_{input_name}.audio")
+    # Fallback: also check the old naming for backward compatibility
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        audio_path_fallback = os.path.join(temp_dir, f"{job_id}_{input_name}_audio_raw.wav")
+        if os.path.exists(audio_path_fallback) and os.path.getsize(audio_path_fallback) > 0:
+            audio_path = audio_path_fallback
     has_audio = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
     if has_audio:
         audio_filter = _build_audio_filter(audio_path, params, logger, tempo_ratio=tempo_ratio)
@@ -262,14 +356,30 @@ def main():
         if audio_filter == "__INVALID_TEMPO__":
             logger.error("STAGE7_AUDIO_FAIL", "Invalid tempo ratio, cannot process audio")
             return 86
-        audio_codec = params.get("audio_codec", params.get("codec", "aac"))
-        audio_bitrate = params.get("audio_bitrate", params.get("bitrate", "320k"))
+
+        # V-P-050 fix: multichannel preserve
+        audio_layout = _get_audio_layout(audio_path)
+        channels = audio_layout.get("channels", 2)
+        multichannel_preserve = params.get("multichannel_preserve", True)
+        if multichannel_preserve and channels > 2:
+            audio_codec = "flac"
+            audio_bitrate = None
+            logger.info("STAGE7_MULTICHANNEL",
+                       f"Detected {channels} channels, using FLAC to preserve layout")
+        else:
+            audio_codec = params.get("audio_codec", params.get("codec", "aac"))
+            audio_bitrate = params.get("audio_bitrate", params.get("bitrate", "320k"))
+
         video_cmd.extend([
             "-i", audio_path,
             "-af", audio_filter,
             "-map", "0:v:0",  # Map video from first input
             "-map", "1:a:0",  # Map audio from second input
         ])
+        # V-P-052 fix: restore channels after arnndn mono conversion
+        if "arnndn" in audio_filter:
+            video_cmd.extend(["-ac", str(channels)])
+
         # Select codec per config (v6.3 §3.10.9)
         if audio_codec == "aac":
             video_cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate])
@@ -277,6 +387,8 @@ def main():
             video_cmd.extend(["-c:a", "flac"])
         else:
             video_cmd.extend(["-c:a", audio_codec])
+            if audio_bitrate:
+                video_cmd.extend(["-b:a", audio_bitrate])
     else:
         video_cmd.append("-an")
 
@@ -304,16 +416,11 @@ def main():
         "-color_range", color_range,
     ])
     
-    # svtav1-params with color metadata (double marking, numeric values)
+    # BUG-041 fix: build svtav1-params once after all parameters are known
     svt_params = f"tile-rows={tile_rows}:tile-columns={tile_cols}"
     svt_params += f":color-primaries={svt_primaries}:transfer-characteristics={svt_trc}"
     svt_params += f":matrix-coefficients={svt_matrix}:color-range={svt_range}"
-    
-    # Update svtav1-params in video_cmd
-    for i, arg in enumerate(video_cmd):
-        if arg == "-svtav1-params":
-            video_cmd[i + 1] = svt_params
-            break
+    video_cmd.extend(["-svtav1-params", svt_params])
 
     # Metadata and output
     video_cmd.extend([

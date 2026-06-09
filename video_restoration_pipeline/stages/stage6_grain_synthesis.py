@@ -160,18 +160,45 @@ def main() -> int:
     # Get video dimensions for vspipe
     width, height, fps = get_video_dimensions(input_source)
 
+    # V-P-046 fix: 16bit processing space
     # Generate VapourSynth script
     # v6.3: Only g1str/g2str/g3str are valid GrainFactory3 params.
-    # taps/shutter/correlation are AddGrainC params, NOT GrainFactory3 params.
-    vs_script = f"""import vapoursynth as vs
+    vs_bit_depth = params.get("vs_bit_depth", 16)
+    if vs_bit_depth == 16:
+        vs_format = "vs.YUV420P16"
+        pix_fmt = "yuv420p16le"
+    elif vs_bit_depth == 10:
+        vs_format = "vs.YUV420P10"
+        pix_fmt = "yuv420p10le"
+    else:
+        vs_format = "vs.YUV420P8"
+        pix_fmt = "yuv420p"
+
+    def _build_vs_script(use_addgrainc: bool = False) -> str:
+        if use_addgrainc:
+            # V-P-047 fix: AddGrainC fallback when GrainFactory3 unavailable
+            # Map g1str to AddGrainC var (variance); uvar/vvar for chroma
+            var = max(0.1, g1str * 2.0)
+            uvar = max(0.0, g2str * 1.0)
+            vvar = max(0.0, g3str * 1.0)
+            return f"""import vapoursynth as vs
+core = vs.core
+clip = core.ffms2.Source(source={repr(input_source)})
+clip = core.resize.Bicubic(clip, format={vs_format})
+clip = core.grain.Add(clip, var={var}, uvar={uvar}, vvar={vvar}, constant=False)
+clip.set_output()
+"""
+        return f"""import vapoursynth as vs
 core = vs.core
 import havsfunc as haf
 clip = core.ffms2.Source(source={repr(input_source)})
+clip = core.resize.Bicubic(clip, format={vs_format})
 clip = haf.GrainFactory3(clip, g1str={g1str}, g2str={g2str}, g3str={g3str})
 clip.set_output()
 """
 
     vs_path = os.path.join(temp_dir, f"{job_id}_{input_name}_grain.vpy")
+    vs_script = _build_vs_script(use_addgrainc=False)
     with open(vs_path, "w", encoding="utf-8") as f:
         f.write(vs_script)
 
@@ -181,40 +208,61 @@ clip.set_output()
         vs_path, "-"
     ]
 
+    # V-P-048 fix: lossless FFV1 intermediate instead of lossy SVT-AV1
     ffmpeg_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-i", "-",
-        "-c:v", "libsvtav1",
-        "-crf", str(cfg.get("global", {}).get("crf", 24)),
-        "-preset", str(cfg.get("global", {}).get("preset", 4)),
-        "-pix_fmt", "yuv420p10le",
+        "-c:v", "ffv1",
+        "-pix_fmt", pix_fmt,
         output_path
     ]
 
-    try:
-        vspipe_proc = subprocess.Popen(vspipe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
-        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=vspipe_proc.stdout, stderr=subprocess.PIPE, shell=False)
-        vspipe_proc.stdout.close()  # Allow vspipe to receive SIGPIPE when ffmpeg exits
-
-        stdout, stderr = ffmpeg_proc.communicate(timeout=3600)
-        vspipe_stderr = vspipe_proc.stderr.read() if vspipe_proc.stderr else b""
-        vspipe_proc.wait()
-
-        if ffmpeg_proc.returncode == 0:
-            logger.info("STAGE6_DONE", "Grain synthesis complete", output=output_path)
-            return 0
-        else:
+    # BUG-036 fix: unify return type to tuple (status_code_or_str, detail_str)
+    def _run_grain_pipeline(vs_script_str: str, fallback_label: str = "") -> tuple:
+        with open(vs_path, "w", encoding="utf-8") as f:
+            f.write(vs_script_str)
+        try:
+            vspipe_proc = subprocess.Popen(vspipe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+            ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=vspipe_proc.stdout, stderr=subprocess.PIPE, shell=False)
+            vspipe_proc.stdout.close()
+            stdout, stderr = ffmpeg_proc.communicate(timeout=3600)
+            vspipe_stderr = vspipe_proc.stderr.read() if vspipe_proc.stderr else b""
+            vspipe_proc.wait()
+            if ffmpeg_proc.returncode == 0:
+                if fallback_label:
+                    logger.info("STAGE6_DONE", f"Grain synthesis complete ({fallback_label})", output=output_path)
+                else:
+                    logger.info("STAGE6_DONE", "Grain synthesis complete", output=output_path)
+                return (0, "")
             err = stderr.decode("utf-8", errors="replace") if stderr else ""
             v_err = vspipe_stderr.decode("utf-8", errors="replace") if vspipe_stderr else ""
-            logger.error("STAGE6_FAIL", "Grain synthesis failed", ffmpeg_err=err, vspipe_err=v_err)
-            return 84
-    except subprocess.TimeoutExpired:
-        vspipe_proc.kill()
-        ffmpeg_proc.kill()
-        logger.error("STAGE6_TIMEOUT", "Grain synthesis timed out")
-        return 87
-    except Exception as e:
-        logger.error("STAGE6_ERROR", f"Grain synthesis error: {e}")
+            return (err, v_err)
+        except subprocess.TimeoutExpired:
+            vspipe_proc.kill()
+            ffmpeg_proc.kill()
+            return ("TIMEOUT", "")
+        except Exception as e:
+            return (str(e), "")
+
+    result = _run_grain_pipeline(vs_script)
+    if result[0] == 0:
+        return 0
+
+    # If GrainFactory3 failed, try AddGrainC fallback
+    err_str, v_err_str = result
+    if "GrainFactory3" in err_str or "GrainFactory3" in v_err_str or "haf" in err_str or "havsfunc" in err_str:
+        logger.warning("STAGE6_FALLBACK", "GrainFactory3 failed, trying AddGrainC fallback",
+                       grainfactory3_err=err_str[:500])
+        addgrain_script = _build_vs_script(use_addgrainc=True)
+        result2 = _run_grain_pipeline(addgrain_script, fallback_label="AddGrainC")
+        if result2 == 0:
+            return 0
+        err_str2 = result2[0] if isinstance(result2, tuple) else str(result2)
+        logger.error("STAGE6_FAIL", "Grain synthesis failed (AddGrainC fallback also failed)",
+                    addgrainc_err=err_str2[:500])
+        return 84
+    else:
+        logger.error("STAGE6_FAIL", "Grain synthesis failed", ffmpeg_err=err_str[:500], vspipe_err=v_err_str[:500])
         return 84
 
 

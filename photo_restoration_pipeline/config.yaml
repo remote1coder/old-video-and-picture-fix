@@ -103,6 +103,7 @@ ai:
   face_restore: "GFPGAN"
   upscale_model: "RealESRGAN_x2plus"
   upscale_scale: 2
+  model_dir: ""  # Empty = auto-detect PROJECT_ROOT/models; set explicit path if needed
   max_scale: 4
   lanczos_target: "auto"
   grain_strength: 0.3

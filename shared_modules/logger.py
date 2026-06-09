@@ -46,7 +46,6 @@ class StructuredLogger:
         self.log_max_lines = log_max_lines
         self.log_backup_count = log_backup_count
         self.log_max_line_bytes = log_max_line_bytes
-        self.line_count = 0
         self.lock = threading.Lock()
 
         # Determine log file
@@ -55,25 +54,41 @@ class StructuredLogger:
         else:
             self.log_file = self.log_dir / f"general_{int(time.time())}.log"
 
-        # Initialize line count
-        self._init_line_count()
-
-    def _init_line_count(self):
-        """Count existing lines in log file."""
-        if self.log_file.exists():
+    def _get_current_line_count(self) -> int:
+        """Count current lines in log file (called before each write)."""
+        if not self.log_file.exists():
+            return 0
+        try:
             with open(self.log_file, "r", encoding="utf-8") as f:
-                self.line_count = sum(1 for _ in f)
+                return sum(1 for _ in f)
+        except Exception:
+            return 0
 
     def _rotate_if_needed(self):
-        """Rotate log file if line count exceeds limit."""
-        if self.line_count >= self.log_max_lines:
-            # Rotate: job.log -> job.log.1 -> job.log.2 -> ...
-            for i in range(self.log_backup_count, 0, -1):
-                old = self.log_file.parent / f"{self.log_file.name}.{i-1}" if i > 1 else self.log_file
-                new = self.log_file.parent / f"{self.log_file.name}.{i}"
-                if old.exists():
-                    old.rename(new)
-            self.line_count = 0
+        """Rotate log file if line count exceeds limit.
+        
+        Uses timestamp-based backup names to avoid rename race conditions
+        in multi-process environments.
+        """
+        line_count = self._get_current_line_count()
+        if line_count >= self.log_max_lines:
+            # Use timestamp-based unique name to avoid rename race
+            ts = int(time.time() * 1000)
+            backup = self.log_file.parent / f"{self.log_file.name}.{ts}"
+            try:
+                self.log_file.rename(backup)
+                # Clean up old backups if exceeding log_backup_count
+                backups = sorted(
+                    self.log_file.parent.glob(f"{self.log_file.name}.*"),
+                    key=lambda p: p.stat().st_mtime
+                )
+                while len(backups) > self.log_backup_count:
+                    try:
+                        backups.pop(0).unlink()
+                    except OSError:
+                        pass
+            except OSError:
+                pass
 
     def log(self, level: str, event: str, message: str, **kwargs):
         """Write a structured log entry."""
@@ -105,17 +120,19 @@ class StructuredLogger:
                 if _HAS_FCNTL:
                     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                     f.write(line_bytes)
+                    f.flush()
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
                 elif _HAS_MSVCRT:
-                    # Windows: lock the entire file
+                    # Windows: use LK_LOCK (blocking) instead of LK_NBLCK
                     f.seek(0, 2)  # EOF
-                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, len(line_bytes))
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, len(line_bytes))
                     f.write(line_bytes)
+                    f.flush()
                     msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, len(line_bytes))
                 else:
                     # Fallback: no locking (single-process only)
                     f.write(line_bytes)
-            self.line_count += 1
+                    f.flush()
 
     def info(self, event: str, message: str, **kwargs):
         self.log("INFO", event, message, **kwargs)
@@ -134,7 +151,17 @@ class StructuredLogger:
 
     def param_override(self, param_name: str, old_value: Any, new_value: Any,
                        source: str = "unknown"):
-        """Log a parameter override event per v7.3 §3.10.12."""
+        """Log a parameter override event per v7.3 §3.10.12.
+        
+        Source must be one of: user_overrides, paths, global, cli, unknown.
+        """
+        # BUG-016 fix: restrict source to allowed enumeration values
+        allowed_sources = ("user_overrides", "paths", "global", "cli", "unknown")
+        if source not in allowed_sources:
+            self.log("WARN", "PARAM_OVERRIDE_INVALID_SOURCE",
+                     f"Invalid source '{source}' for param_override, defaulting to 'unknown'",
+                     invalid_source=source, allowed=list(allowed_sources))
+            source = "unknown"
         self.log("INFO", "PARAM_OVERRIDE",
                  f"Parameter '{param_name}' overridden from '{old_value}' to '{new_value}'",
                  param_name=param_name, old_value=old_value,

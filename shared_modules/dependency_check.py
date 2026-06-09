@@ -8,12 +8,15 @@ v7.3 Compliance:
 - Pipeline-type-aware checks (photo skips video-specific deps)
 - Checks AI CLI tools (not just model files)
 - G'MIC filter validation
+- GPU backend extension detection (CUDA → ROCm → MPS → CPU)
+- PyTorch spawn compliance pre-check
 """
 
 import sys
 import shutil
 import subprocess
 import importlib.util
+import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -34,6 +37,8 @@ def check_external_tools(pipeline_type: str = "photo") -> List[str]:
     """Check external tools. Photo skips video-specific tools."""
     if pipeline_type == "photo":
         required = {
+            "ffmpeg": "FFmpeg (metadata reading for photos)",
+            "ffprobe": "FFprobe (stream analysis for photos)",
             "avifenc": "avifenc (AVIF encoding for photos)",
             "exiftool": "ExifTool (metadata reading for photos)",
             "gmic": "G'MIC (photo processing)",
@@ -61,13 +66,54 @@ def check_external_tools(pipeline_type: str = "photo") -> List[str]:
     return missing
 
 
+def check_avifenc_version() -> Tuple[bool, str, str]:
+    """Check avifenc version and determine appropriate --jobs argument.
+    
+    Per v6.32 §7.29 / v7.32 §3.10.20:
+    - libavif <0.9.2: --jobs not supported
+    - 0.9.2-1.0.x: --jobs requires numeric value (e.g., --jobs 4)
+    - 1.1.0+: --jobs all supported (and is default)
+    
+    Returns (ok, version_str, jobs_argument).
+    """
+    code, out, err = run_cmd(["avifenc", "--version"])
+    if code != 0:
+        # Try --help as fallback for older versions
+        code2, out2, _ = run_cmd(["avifenc", "--help"])
+        if code2 != 0:
+            return False, "unknown", ""
+        # Version unknown; assume recent enough for --jobs all
+        return True, "unknown (assumed >=1.1.0)", "all"
+    
+    version_line = out.splitlines()[0] if out else ""
+    # Parse version: avifenc output usually contains version number
+    m = re.search(r'(\d+\.\d+(?:\.\d+)?)', version_line)
+    if not m:
+        return True, version_line.strip() or "unknown", "all"
+    
+    version = m.group(1)
+    def v2tuple(v: str):
+        parts = v.split(".")
+        return tuple(int(p) for p in parts[:3])
+    vt = v2tuple(version)
+    
+    if vt < (0, 9, 2):
+        return True, version, ""  # --jobs not supported
+    elif vt < (1, 1, 0):
+        # Numeric jobs required
+        import os
+        nproc = os.cpu_count() or 1
+        return True, version, str(min(nproc, 32))
+    else:
+        return True, version, "all"
+
+
 def check_ffmpeg_version(min_version: str = "4.4") -> Tuple[bool, str]:
     """Check FFmpeg version >= min_version."""
     code, out, err = run_cmd(["ffmpeg", "-version"])
     if code != 0:
         return False, "FFmpeg not found"
     first_line = out.splitlines()[0] if out else ""
-    import re
     m = re.search(r'version\s+(\d+\.\d+(?:\.\d+)?)', first_line)
     if not m:
         return False, f"Cannot parse FFmpeg version from: {first_line}"
@@ -89,10 +135,79 @@ def check_ffmpeg_filters(pipeline_type: str = "photo") -> List[str]:
     if code != 0:
         return ["  - Cannot list FFmpeg filters"]
     missing = []
+    # Parse filter list for exact filter name matches
+    # ffmpeg -filters output format:  ... filter_name ...
+    available = set()
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            # Filter names are in the second column (after the flags like "A..T")
+            fname = parts[1].strip()
+            available.add(fname)
     for f in required_filters:
-        if f not in out:
+        if f not in available:
             missing.append(f"  - FFmpeg filter '{f}' not available")
     return missing
+
+
+def check_ffmpeg_filters_minimal_calls(pipeline_type: str = "photo") -> List[str]:
+    """Execute minimal parameter set test calls for critical FFmpeg filters.
+    
+    Per v7.32 §3.6: must verify filters work with actual parameters, not just names.
+    """
+    if pipeline_type == "photo":
+        return []
+    errors = []
+    # Use a 1-second testsrc to avoid needing real input files
+    test_src = "testsrc=duration=1:size=320x240:rate=1"
+    
+    # Test 1: bandreject with width_type=h (critical for hum removal)
+    code, _, err = run_cmd([
+        "ffmpeg", "-f", "lavfi", "-i", f"sine=frequency=50:duration=1",
+        "-af", "bandreject=f=50:width_type=h:width=2",
+        "-f", "null", "-"
+    ], timeout=15)
+    if code != 0:
+        errors.append(f"  - bandreject test failed: {err[:200]}")
+    
+    # Test 2: afftdn (noise reduction)
+    code, _, err = run_cmd([
+        "ffmpeg", "-f", "lavfi", "-i", f"sine=frequency=1000:duration=1",
+        "-af", "afftdn=nf=-25",
+        "-f", "null", "-"
+    ], timeout=15)
+    if code != 0:
+        errors.append(f"  - afftdn test failed: {err[:200]}")
+    
+    # Test 3: asetpts=PTS (audio sync)
+    code, _, err = run_cmd([
+        "ffmpeg", "-f", "lavfi", "-i", f"sine=frequency=1000:duration=1",
+        "-af", "asetpts=PTS",
+        "-f", "null", "-"
+    ], timeout=15)
+    if code != 0:
+        errors.append(f"  - asetpts test failed: {err[:200]}")
+    
+    # Test 4: atempo (speed change)
+    code, _, err = run_cmd([
+        "ffmpeg", "-f", "lavfi", "-i", f"sine=frequency=1000:duration=1",
+        "-af", "atempo=1.0",
+        "-f", "null", "-"
+    ], timeout=15)
+    if code != 0:
+        errors.append(f"  - atempo test failed: {err[:200]}")
+    
+    # Test 5: zscale (color space conversion)
+    code, _, err = run_cmd([
+        "ffmpeg", "-f", "lavfi", "-i", test_src,
+        "-vf", "zscale=matrixin=bt470bg:matrix=bt709:rangein=limited:range=limited",
+        "-frames:v", "1",
+        "-f", "null", "-"
+    ], timeout=15)
+    if code != 0:
+        errors.append(f"  - zscale test failed: {err[:200]}")
+    
+    return errors
 
 
 def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
@@ -154,7 +269,9 @@ def check_havsfunc_version() -> Tuple[bool, str]:
             src_file = inspect.getfile(haf)
             return False, (f"havsfunc found at {src_file} but version cannot be detected. "
                           f"Please install r33: pip install 'havsfunc==33'")
-        if "33" in str(version):
+        # Strict match: r33, 33, 33.0, but not 133, 33.1, or 33a
+        vstr = str(version)
+        if re.match(r"^r?33($|\.0*$)", vstr):
             return True, f"havsfunc r{version}"
         return False, f"havsfunc version {version} (requires r33, install: pip install 'havsfunc==33')"
     except ImportError:
@@ -260,16 +377,25 @@ def check_python_packages(pipeline_type: str = "photo") -> List[str]:
 
 
 def check_face_detection_packages(config: Optional[Dict] = None) -> List[str]:
-    """Check face detection Python packages (if AI enabled)."""
+    """Check face detection Python packages (if AI enabled).
+    
+    Per v7.32 §3.6: Must confirm 'retina-face' (PyPI package name),
+    'ultralytics', 'mtcnn' are installed.
+    Note: The Python import module name for retina-face is 'retinaface'.
+    """
     if config and not config.get("ai", {}).get("enabled", False):
         return []
-    # Corrected package names (Bug-27 fix)
-    required = ["retinaface", "ultralytics", "mtcnn"]
+    # (module_name, pip_package_name)
+    required = [
+        ("retinaface", "retina-face"),
+        ("ultralytics", "ultralytics"),
+        ("mtcnn", "mtcnn"),
+    ]
     missing = []
-    for pkg in required:
-        spec = importlib.util.find_spec(pkg)
+    for mod_name, pip_name in required:
+        spec = importlib.util.find_spec(mod_name)
         if spec is None:
-            missing.append(f"  - {pkg}: not installed (pip install {pkg})")
+            missing.append(f"  - {pip_name}: not installed (pip install {pip_name})")
     return missing
 
 
@@ -278,12 +404,10 @@ def check_ai_cli_tools() -> List[str]:
     missing = []
     # Check realesrgan-ncnn-vulkan
     if not shutil.which("realesrgan-ncnn-vulkan"):
-        # Check if Python module has CLI
         spec = importlib.util.find_spec("realesrgan")
         if spec is None:
             missing.append("  - realesrgan: neither realesrgan-ncnn-vulkan binary nor Python package found")
         else:
-            # Check if it has enhance method
             try:
                 import realesrgan  # noqa: F401
             except ImportError:
@@ -309,44 +433,108 @@ def check_ai_cli_tools() -> List[str]:
     if shutil.which("inference_codeformer.py"):
         cf_ok = True
     else:
-        spec = importlib.util.find_spec("codeformer")
-        if spec is None:
-            # Also check basicSR
-            spec = importlib.util.find_spec("basicsr")
-        if spec is not None:
-            cf_ok = True  # Assume available if package exists
+        # Try importing codeformer through basicsr
+        try:
+            import basicsr.archs.codeformer_arch  # noqa: F401
+            cf_ok = True
+        except ImportError:
+            pass
     if not cf_ok:
-        missing.append("  - codeformer: neither inference_codeformer.py nor package available")
+        missing.append("  - codeformer: neither inference_codeformer.py nor basicsr.archs.codeformer importable")
 
     return missing
 
 
 def check_ai_models(models_dir: str = "./models") -> List[str]:
-    """Check AI model weights exist. Returns missing model descriptions."""
+    """Check AI model weights exist and validate MD5 checksums.
+    
+    Per v7.32 §3.6: Each model must have MD5 + download URL;
+    version mismatch rejects loading.
+    
+    Supports external MD5 manifest (md5_manifest.json) in models_dir
+    to enable checksum validation without modifying source code.
+    If no MD5 is configured (built-in or external), a warning is issued
+    to encourage configuration.
+    """
     models_path = Path(models_dir).resolve()
+    
+    # Load external MD5 manifest if present
+    external_md5 = {}
+    manifest_path = models_path / "md5_manifest.json"
+    if manifest_path.exists():
+        try:
+            import json
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                external_md5 = json.load(f)
+        except Exception:
+            pass
+    
     required_models = {
-        "RealESRGAN_x2plus.pth": "https://github.com/xinntao/Real-ESRGAN/releases",
-        "RealESRGAN_x4plus.pth": "https://github.com/xinntao/Real-ESRGAN/releases",
-        "GFPGANv1.4.pth": "https://github.com/TencentARC/GFPGAN/releases",
-        "DAT_x2.pth": "https://github.com/ckkelvinchan/DAT/releases",
-        "DAT_x4.pth": "https://github.com/ckkelvinchan/DAT/releases",
+        "RealESRGAN_x2plus.pth": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases",
+            "md5": None,  # Fill with actual MD5 or use external manifest
+        },
+        "RealESRGAN_x4plus.pth": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases",
+            "md5": None,
+        },
+        "GFPGANv1.4.pth": {
+            "url": "https://github.com/TencentARC/GFPGAN/releases",
+            "md5": None,
+        },
+        "DAT_x2.pth": {
+            "url": "https://github.com/ckkelvinchan/DAT/releases",
+            "md5": None,
+        },
+        "DAT_x4.pth": {
+            "url": "https://github.com/ckkelvinchan/DAT/releases",
+            "md5": None,
+        },
+        "CodeFormer.pth": {
+            "url": "https://github.com/sczhou/CodeFormer/releases",
+            "md5": None,
+        },
     }
     missing = []
-    for model_name, url in required_models.items():
+    for model_name, info in required_models.items():
         model_path = models_path / model_name
         if not model_path.exists():
-            missing.append(f"  - {model_name}: not found in {models_path} (download: {url})")
+            missing.append(f"  - {model_name}: not found in {models_path} (download: {info['url']})")
+            continue
+        
+        expected_md5 = info.get("md5") or external_md5.get(model_name)
+        if expected_md5:
+            import hashlib
+            h = hashlib.md5()
+            with open(model_path, "rb") as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
+            actual_md5 = h.hexdigest()
+            if actual_md5 != expected_md5:
+                missing.append(f"  - {model_name}: MD5 mismatch (expected {expected_md5}, got {actual_md5})")
+        else:
+            # No MD5 configured: warn but do not block execution
+            missing.append(
+                f"  - {model_name}: WARNING - MD5 checksum not configured. "
+                f"Create {manifest_path} with {{'{model_name}': '<md5_hash>'}} to enable verification"
+            )
     return missing
 
 
-def check_arnndn_models(config: Optional[Dict] = None) -> List[str]:
-    """Check arnndn model files for FFmpeg <4.4 fallback path."""
+def check_arnndn_models(config: Optional[Dict] = None, ffmpeg_version_ok: bool = True) -> List[str]:
+    """Check arnndn model files for FFmpeg <4.4 fallback path.
+    
+    Also checks when audio is disabled but FFmpeg <4.4 (bandreject unavailable).
+    """
     if config is None:
         config = {}
-    # Skip if audio not enabled or photo pipeline
-    audio_cfg = config.get("audio", {})
-    if audio_cfg.get("enabled", False) is False:
-        return []
+    
+    # Skip only if FFmpeg >=4.4 AND audio not enabled
+    if ffmpeg_version_ok:
+        audio_cfg = config.get("audio", {})
+        if audio_cfg.get("enabled", False) is False:
+            return []
+    
     models_dir = config.get("arnndn_model_dir", "./models")
     models_path = Path(models_dir)
     missing = []
@@ -360,21 +548,104 @@ def check_arnndn_models(config: Optional[Dict] = None) -> List[str]:
 
 
 def check_gmic_filters() -> List[str]:
-    """Check G'MIC supports required filters."""
-    required_filters = ["-repair", "-deblock", "-deband", "-film_grain"]
+    """Check G'MIC supports required filters.
+    
+    BUG-062 fix: Use per-filter exact query (gmic -h filtername) instead of
+    substring matching in the full help text to avoid false positives.
+    """
+    required_filters = ["repair", "deblock", "deband", "film_grain"]
     missing = []
-    try:
-        r = subprocess.run(["gmic", "-h"],
-                          capture_output=True, text=True, timeout=10, shell=False)
-        if r.returncode != 0:
-            return ["  - Cannot query G'MIC help"]
-        help_text = r.stdout.lower()
-        for f in required_filters:
-            if f.lower().lstrip("-") not in help_text:
-                missing.append(f"  - G'MIC filter '{f}' may not be available")
-    except Exception:
-        missing.append("  - Cannot verify G'MIC filters")
+    for f in required_filters:
+        try:
+            r = subprocess.run(["gmic", "-h", f],
+                              capture_output=True, text=True, timeout=10, shell=False)
+            # If returncode != 0 or stdout is empty/just error, filter is unavailable
+            if r.returncode != 0 or not r.stdout.strip() or "unknown command" in r.stdout.lower():
+                missing.append(f"  - G'MIC filter '{f}' not available")
+        except Exception:
+            missing.append(f"  - Cannot verify G'MIC filter '{f}'")
     return missing
+
+
+def check_gpu_backends() -> Tuple[bool, List[str]]:
+    """Check GPU backend availability: CUDA → ROCm → MPS → CPU.
+    
+    Returns (has_gpu, messages).
+    """
+    messages = []
+    try:
+        import torch
+        if torch.cuda.is_available():
+            messages.append(f"  - CUDA: available (device: {torch.cuda.get_device_name(0)})")
+            return True, messages
+        if getattr(torch.version, "hip", None) is not None:
+            messages.append("  - ROCm: available")
+            return True, messages
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            messages.append("  - MPS (Apple Silicon): available")
+            return True, messages
+        messages.append("  - No GPU backend found (CUDA/ROCm/MPS)")
+        return False, messages
+    except ImportError:
+        messages.append("  - PyTorch not installed, cannot detect GPU backends")
+        return False, messages
+
+
+def check_spawn_compliance(target_script: Optional[str] = None,
+                             related_modules: Optional[List[str]] = None) -> List[str]:
+    """Check PyTorch spawn compliance.
+    
+    Per v7.32 §3.10.18:
+    1. Main script all top-level executable code in if __name__ == '__main__':
+    2. Imported modules: only defs/classes/constants at top level
+    3. Target function must be module-level global function
+    
+    ISSUE-066 fix: also checks related_modules (e.g., main.py, stage scripts)
+    for top-level executable code.
+    """
+    issues = []
+    
+    def _check_single_file(path: str, label: str) -> None:
+        if not path or not Path(path).exists():
+            return
+        content = Path(path).read_text(encoding="utf-8")
+        lines = content.splitlines()
+        in_main = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("if __name__"):
+                in_main = True
+            elif in_main:
+                continue
+            elif stripped and not stripped.startswith(("#", "import", "from", "def ", "class ", 
+                                                        "__", "\"\"\"", "'''", " ", "\t")):
+                if i > 20:  # Skip header comments
+                    issues.append(f"  - {label}: potential top-level executable code at line {i+1}: {stripped[:60]}")
+                    break
+    
+    # Check main script
+    if target_script is None:
+        target_script = sys.argv[0] if sys.argv else None
+    if target_script:
+        _check_single_file(target_script, Path(target_script).name)
+    
+    # ISSUE-066 fix: check related modules
+    if related_modules:
+        for mod_path in related_modules:
+            _check_single_file(mod_path, Path(mod_path).name)
+    else:
+        # Default: discover project Python files adjacent to the main script
+        if target_script:
+            base_dir = Path(target_script).parent
+            for py_file in base_dir.rglob("*.py"):
+                # Skip __pycache__ and virtualenv paths
+                if "__pycache__" in str(py_file):
+                    continue
+                if py_file.resolve() == Path(target_script).resolve():
+                    continue
+                _check_single_file(str(py_file), py_file.name)
+    
+    return issues
 
 
 # Fix: Auto-detect pipeline type from config
@@ -386,17 +657,13 @@ def _detect_pipeline_type(config: Optional[Dict] = None) -> str:
     """
     if config is None:
         return "photo"
-    # Check for explicit pipeline type indicator
     if "pipeline_type" in config:
         return config["pipeline_type"]
-    # Heuristic: photo config has 'photo' top-level key
     if "photo" in config and "audio" not in config:
         return "photo"
-    # If has audio section with enabled=true, likely video
     audio_cfg = config.get("audio", {})
     if isinstance(audio_cfg, dict) and audio_cfg.get("enabled", False):
         return "video"
-    # Default: photo (safer - fewer dependencies to check)
     return "photo"
 
 
@@ -410,7 +677,6 @@ def run_all_checks(config: Optional[Dict] = None,
     """
     issues = []
     
-    # Fix: Auto-detect or use explicit pipeline_type
     if pipeline_type is None:
         pipeline_type = _detect_pipeline_type(config)
 
@@ -420,11 +686,21 @@ def run_all_checks(config: Optional[Dict] = None,
         issues.append("Missing external tools:")
         issues.extend(ext)
 
-    # 2. FFmpeg version (video only)
+    # 1a. avifenc version + --jobs compatibility (ISSUE-SHARED-DC-001)
+    if shutil.which("avifenc"):
+        avif_ok, avif_ver, avif_jobs = check_avifenc_version()
+        if not avif_ok:
+            issues.append(f"avifenc version check failed: {avif_ver}")
+        # Info message is not an issue; store for caller inspection if needed
+        # (callers can inspect config['photo']['avif_params']['jobs'])
+
+    # 2. FFmpeg version (video only, but also for photo metadata)
+    ffmpeg_ok = True
     if pipeline_type != "photo":
         ok, msg = check_ffmpeg_version()
         if not ok:
             issues.append(f"FFmpeg version check: {msg}")
+            ffmpeg_ok = False
         else:
             filt = check_ffmpeg_filters(pipeline_type)
             if filt:
@@ -476,18 +752,38 @@ def run_all_checks(config: Optional[Dict] = None,
             issues.append("Missing AI model weights:")
             issues.extend(models)
 
-    # 10. arnndn models (audio fallback, only if audio enabled)
-    arnndn = check_arnndn_models(config)
+    # 10. arnndn models (audio fallback, or FFmpeg <4.4)
+    arnndn = check_arnndn_models(config, ffmpeg_version_ok=ffmpeg_ok)
     if arnndn:
         issues.append("Missing arnndn models (audio fallback):")
         issues.extend(arnndn)
 
-    # 11. G'MIC filters (photo)
-    if pipeline_type == "photo":
-        gmic = check_gmic_filters()
-        if gmic:
-            issues.append("G'MIC filter warnings:")
-            issues.extend(gmic)
+    # 11. G'MIC filters (all pipelines)
+    gmic = check_gmic_filters()
+    if gmic:
+        issues.append("G'MIC filter warnings:")
+        issues.extend(gmic)
+
+    # 12. GPU backends
+    has_gpu, gpu_msgs = check_gpu_backends()
+    if not has_gpu:
+        issues.append("GPU backend check:")
+        issues.extend(gpu_msgs)
+
+    # 13. FFmpeg filter minimal calls (video only)
+    if pipeline_type != "photo":
+        ffmpeg_call_issues = check_ffmpeg_filters_minimal_calls(pipeline_type)
+        if ffmpeg_call_issues:
+            issues.append("FFmpeg filter test failures:")
+            issues.extend(ffmpeg_call_issues)
+
+    # 14. Spawn compliance (all pipelines, when multiprocessing used)
+    # ISSUE-SHARED-DC-002 fix: Removed pipeline_type != "photo" restriction.
+    # Photo pipeline also uses multiprocessing (--workers) and must comply.
+    spawn_issues = check_spawn_compliance()
+    if spawn_issues:
+        issues.append("Spawn compliance warnings:")
+        issues.extend(spawn_issues)
 
     return len(issues) == 0, issues
 
@@ -508,14 +804,12 @@ def main():
         with open(args.config, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
     else:
-        # Try default config paths
         for p in ["./config.yaml", "../config.yaml"]:
             if Path(p).exists():
                 with open(p, "r", encoding="utf-8") as f:
                     config = yaml.safe_load(f)
                 break
 
-    # Determine pipeline type
     pipeline_type = None if args.pipeline_type == "auto" else args.pipeline_type
 
     ok, issues = run_all_checks(config, pipeline_type=pipeline_type)

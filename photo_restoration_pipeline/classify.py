@@ -32,6 +32,53 @@ def run_exiftool(input_path: str) -> Dict[str, str]:
     return {}
 
 
+def _analyze_pixel_features(input_path: str) -> Dict[str, Any]:
+    """Analyze pixel-level features for better classification confidence.
+    
+    Detects:
+    - Blockiness (JPEG/DCT artifact strength)
+    - Blur amount (Laplacian variance)
+    - Noise level (median filter residual)
+    
+    Returns dict with features and adjusted confidence hints.
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+        from scipy.ndimage import laplace, median_filter
+        
+        with Image.open(input_path) as img:
+            arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+        
+        gray = arr.mean(axis=2)
+        h, w = gray.shape
+        
+        # Blockiness: detect 8x8 DCT grid artifacts via gradient variance
+        blockiness = 0.0
+        if h >= 16 and w >= 16:
+            dx = np.diff(gray, axis=1)
+            dy = np.diff(gray, axis=0)
+            # Measure periodicity at 8-pixel intervals
+            block_var_x = np.var(dx[:, ::8]) if w > 8 else 0.0
+            block_var_y = np.var(dy[::8, :]) if h > 8 else 0.0
+            blockiness = float((block_var_x + block_var_y) / 2.0)
+        
+        # Blur: Laplacian variance (lower = more blurred)
+        lap_var = float(np.var(laplace(gray)))
+        
+        # Noise: median filter residual std
+        med = median_filter(gray, size=3)
+        noise_std = float(np.std(gray - med))
+        
+        return {
+            "blockiness": blockiness,
+            "blur_laplacian_var": lap_var,
+            "noise_std": noise_std,
+        }
+    except Exception:
+        return {"blockiness": 0.0, "blur_laplacian_var": 0.0, "noise_std": 0.0}
+
+
 def classify_photo(input_path: str) -> Dict[str, Any]:
     """Classify photo and return metadata.
 
@@ -71,12 +118,24 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
         from PIL import Image
         with Image.open(input_path) as img:
             result["original_width"], result["original_height"] = img.size
-            result["native_width"], result["native_height"] = img.size
-            # Compute native DAR
+            # PHOTO-AUDIT-005: Try to read EXIF original dimensions for native_*
+            native_w, native_h = img.size
+            try:
+                exif_data = img._getexif()
+                if exif_data:
+                    # EXIF tag 0xA000 (ExifImageWidth) and 0xA001 (ExifImageHeight)
+                    if 0xA000 in exif_data and 0xA001 in exif_data:
+                        native_w = exif_data[0xA000]
+                        native_h = exif_data[0xA001]
+            except Exception:
+                pass
+            result["native_width"], result["native_height"] = native_w, native_h
+            # Compute native DAR as ratio string (v7.32 §3.4.1: "4:3", "16:9")
             w, h = img.size
             if h > 0:
-                dar = w / h
-                result["native_dar"] = f"{dar:.4f}"
+                from math import gcd
+                g = gcd(w, h)
+                result["native_dar"] = f"{w//g}:{h//g}"
             # Try to get DPI
             dpi_info = img.info.get("dpi")
             if dpi_info:
@@ -87,6 +146,9 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
     # ExifTool metadata
     exif = run_exiftool(input_path)
 
+    # Pixel-level feature analysis for enhanced classification
+    pixel_features = _analyze_pixel_features(input_path)
+    
     # Classification
     model = exif.get("Model", "")
     make = exif.get("Make", "")
@@ -105,7 +167,7 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
         result["detected_class"] = "DIGITAL_PHOTO"
         result["confidence"] = 0.90
     else:
-        # Default based on resolution
+        # Default based on resolution + pixel features
         w = result["original_width"]
         h = result["original_height"]
         if w > 0 and h > 0:
@@ -118,6 +180,16 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
         else:
             result["detected_class"] = "UNKNOWN"
             result["confidence"] = 0.0
+    
+    # Adjust confidence based on pixel features
+    # High blockiness suggests scanned/printed material (JPEG recompression)
+    # High noise + moderate blur suggests old photo scan
+    if pixel_features["blockiness"] > 0.01:
+        result["confidence"] = min(0.99, result["confidence"] + 0.05)
+    if pixel_features["noise_std"] > 0.02 and pixel_features["blur_laplacian_var"] < 0.01:
+        # Old scanned photo pattern: noisy but soft
+        if result["detected_class"] == "SCAN_PRINT":
+            result["confidence"] = min(0.99, result["confidence"] + 0.03)
 
     # AI upscale ban check (v6.3 §4.4)
     # Unified ban logic using config-driven thresholds:

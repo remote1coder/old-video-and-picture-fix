@@ -20,17 +20,25 @@ from logger import get_logger  # noqa: E402
 from audio_utils import extract_audio  # noqa: E402
 
 
+def _load_params(args):
+    if getattr(args, "params_file", None):
+        with open(args.params_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(args.params) if args.params else {}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
+    parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--no-wsl-redirect", action="store_true")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
-    params = json.loads(args.params) if args.params else {}
+    params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
@@ -39,7 +47,8 @@ def main():
     os.makedirs(temp_dir, exist_ok=True)
 
     input_name = Path(args.input).stem
-    output_audio = os.path.join(temp_dir, f"{args.job_id}_{input_name}_audio_raw.wav")
+    # V-P-018 fix: use consistent extension with stage7 lookup
+    output_audio = os.path.join(temp_dir, f"{args.job_id}_{input_name}.audio")
 
     # Check if already exists
     if os.path.exists(output_audio) and os.path.getsize(output_audio) > 0:

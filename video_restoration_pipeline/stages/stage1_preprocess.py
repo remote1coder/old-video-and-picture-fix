@@ -246,9 +246,8 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     if needs_ivtc and not is_psf:
         lines.append("# IVTC - must execute before QTGMC")
         if ivtc == "VIVTC":
-            lines.append("clip = core.vivtc.VFM(clip, mode=1, ovr=0)")
-            lines.append("# VDecimate must chain directly after VFM")
-            lines.append("clip = core.vivtc.VDecimate(clip, cycle=5)")
+            # V-P-019 fix: VFM and VDecimate on adjacent lines without intervening comments
+            lines.append("clip = core.vivtc.VFM(clip, mode=1, ovr=0).VDecimate(cycle=5)")
         elif ivtc == "sRestore":
             lines.append("clip = haf.srestore(clip, frate=23.976)")
         lines.append("")
@@ -279,14 +278,8 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     qtgmc_clear_fieldbased = params.get("qtgmc_clear_fieldbased", True)
     cm_str = "True" if qtgmc_chromamotion else "False"
 
-    # v6.3: InputType=1 for damaged field order detection
-    # We run a short InputType=1 QTGMC on sample frames to detect damage
-    if qtgmc_input_type == 0 and needs_ivtc and field_order in ("tt", "bb"):
-        lines.append("# InputType=1 damaged field order detection (v6.3)")
-        lines.append("_sample = core.std.Trim(clip, first=0, last=99) if clip.num_frames > 100 else clip")
-        lines.append(f"_deint_test = haf.QTGMC(_sample, Preset='Fast', InputType=1, TFF={tff_bool}, EZDenoise=0)")
-        lines.append("# Analysis would be done externally; proceeding with standard deinterlace")
-        lines.append("")
+    # V-P-025 fix: Remove InputType=1 test code from generated script
+    # (damaged field order detection should be done in classify.py, not in VS script)
 
     # Deinterlace (QTGMC)
     field_segments = params.get("field_segments", [])
@@ -492,17 +485,25 @@ def check_ivtc_quality(video_path: str, logger=None,
         return False, {}
 
 
+def _load_params(args):
+    if getattr(args, "params_file", None):
+        with open(args.params_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(args.params) if args.params else {}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
+    parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--no-wsl-redirect", action="store_true")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
-    params = json.loads(args.params) if args.params else {}
+    params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
@@ -528,14 +529,33 @@ def main():
     # Detect black borders
     crop_info = detect_black_borders(input_path, logger)
     if not validate_crop(crop_info, logger):
-        crop_info = None  # Use full frame if crop invalid
+        # v6.3 §7.19 / v7.32 §3.10.3: invalid crop must mark FAILED, not fallback to full frame
+        logger.error("STAGE1_CROP_FAILED", "Black border crop validation failed, aborting")
+        return 81
 
     # Generate VapourSynth script
     vs_script = generate_vs_script(input_path, params, args.job_id, crop_info)
+
+    # ISSUE-039 fix: hard validation of IVTC-before-QTGMC ordering in generated script
+    needs_ivtc = params.get("needs_ivtc", False)
+    if needs_ivtc:
+        ivtc_pos = vs_script.find("core.vivtc.VFM")
+        if ivtc_pos == -1:
+            ivtc_pos = vs_script.find("haf.srestore")
+        qtgmc_pos = vs_script.find("haf.QTGMC")
+        if qtgmc_pos != -1 and ivtc_pos != -1 and qtgmc_pos < ivtc_pos:
+            logger.error("STAGE1_ORDER_FAIL",
+                        "QTGMC appears before IVTC in generated script; violates v6.3 hard constraint")
+            return 81
+
     vs_path = os.path.join(temp_dir, f"{args.job_id}_{input_name}.vpy")
     with open(vs_path, "w", encoding="utf-8") as f:
         f.write(vs_script)
-    logger.info("STAGE1_VPY", f"VS script written: {vs_path}")
+
+    # V-P-020 fix: record SHA-256 hash of generated script
+    import hashlib
+    script_hash = hashlib.sha256(vs_script.encode("utf-8")).hexdigest()
+    logger.info("STAGE1_VPY", f"VS script written: {vs_path}", script_sha256=script_hash)
 
     # Render with vspipe -> ffmpeg
     try:
@@ -557,6 +577,93 @@ def main():
         _, stderr = ff.communicate(timeout=7200)
 
         if ff.returncode == 0 and os.path.exists(inter_path):
+            # V-P-022 fix: IVTC auto-fallback check
+            needs_ivtc = params.get("needs_ivtc", False)
+            ivtc = params.get("ivtc", "VIVTC")
+            ivtc_auto_fallback = params.get("ivtc_auto_fallback", True)
+            if needs_ivtc and ivtc == "VIVTC" and ivtc_auto_fallback:
+                ivtc_threshold = params.get("ivtc_fallback_threshold", {})
+                is_good, stats = check_ivtc_quality(inter_path, logger, ivtc_threshold)
+                if not is_good:
+                    logger.warning("STAGE1_IVTC_FALLBACK",
+                                  f"IVTC quality check failed (stats={stats}), regenerating with sRestore")
+                    # Regenerate with sRestore
+                    srestore_params = dict(params)
+                    srestore_params["ivtc"] = "sRestore"
+                    vs_script_srestore = generate_vs_script(input_path, srestore_params, args.job_id, crop_info)
+                    vs_path_srestore = os.path.join(temp_dir, f"{args.job_id}_{input_name}_srestore.vpy")
+                    with open(vs_path_srestore, "w", encoding="utf-8") as f:
+                        f.write(vs_script_srestore)
+                    script_hash_sr = hashlib.sha256(vs_script_srestore.encode("utf-8")).hexdigest()
+                    logger.info("STAGE1_VPY_SRESTORE", f"sRestore script written: {vs_path_srestore}", script_sha256=script_hash_sr)
+
+                    vp2 = subprocess.Popen(["vspipe", "--y4m", vs_path_srestore, "-"],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+                    ff2 = subprocess.Popen(ffmpeg_cmd, stdin=vp2.stdout,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+                    vp2.stdout.close()
+                    _, stderr2 = ff2.communicate(timeout=7200)
+                    if ff2.returncode == 0 and os.path.exists(inter_path):
+                        # V-P-022: verify sRestore frame rate
+                        try:
+                            fr_cmd = ["ffprobe", "-hide_banner", "-v", "error",
+                                      "-select_streams", "v:0",
+                                      "-show_entries", "stream=r_frame_rate",
+                                      "-of", "default=noprint_wrappers=1:nokey=1", inter_path]
+                            fr_r = subprocess.run(fr_cmd, capture_output=True, text=True, timeout=30, shell=False)
+                            if fr_r.returncode == 0:
+                                rate_str = fr_r.stdout.strip()
+                                if "/" in rate_str:
+                                    num, den = map(float, rate_str.split("/"))
+                                    detected_fps = num / den if den != 0 else 0
+                                else:
+                                    detected_fps = float(rate_str)
+                                expected_fps = 23.976
+                                if abs(detected_fps - expected_fps) / expected_fps > 0.01:
+                                    logger.error("STAGE1_IVTC_FRAMERATE",
+                                                f"sRestore output fps {detected_fps} deviates from expected {expected_fps}")
+                                    return 86
+                        except Exception as e:
+                            logger.warning("STAGE1_FRAMERATE_CHECK", f"Frame rate check failed: {e}")
+                        logger.info("STAGE1_SRESTORE_DONE", "sRestore IVTC fallback complete", output=inter_path)
+                    else:
+                        err_msg = stderr2.decode()[:300] if stderr2 else "Unknown error"
+                        logger.error("STAGE1_SRESTORE_FAIL", f"sRestore render error: {err_msg}")
+                        return 84
+
+            # V-P-023 fix: deinterlace quality check for segmented field order
+            field_segments = params.get("field_segments", [])
+            if field_segments:
+                is_good, prog_pct = check_deinterlace_quality(inter_path, logger)
+                if not is_good:
+                    logger.warning("STAGE1_DEINT_FALLBACK",
+                                  f"Deinterlace quality {prog_pct:.1f}% < 95%, progressive ratio too low")
+                    # Conservative fallback: result is usable but flagged
+
+            # V-P-024 fix: PSF frame rate verification
+            is_psf = params.get("is_psf", False)
+            if is_psf:
+                try:
+                    fr_cmd = ["ffprobe", "-hide_banner", "-v", "error",
+                              "-select_streams", "v:0",
+                              "-show_entries", "stream=r_frame_rate",
+                              "-of", "default=noprint_wrappers=1:nokey=1", inter_path]
+                    fr_r = subprocess.run(fr_cmd, capture_output=True, text=True, timeout=30, shell=False)
+                    if fr_r.returncode == 0:
+                        rate_str = fr_r.stdout.strip()
+                        if "/" in rate_str:
+                            num, den = map(float, rate_str.split("/"))
+                            detected_fps = num / den if den != 0 else 0
+                        else:
+                            detected_fps = float(rate_str)
+                        original_fps = params.get("original_fps", 0)
+                        if original_fps > 0 and abs(detected_fps - original_fps) > 0.5:
+                            logger.error("STAGE1_PSF_FRAMERATE",
+                                        f"PSF output fps {detected_fps} differs from original {original_fps}")
+                            return 86
+                except Exception as e:
+                    logger.warning("STAGE1_PSF_FRAMERATE_CHECK", f"PSF frame rate check failed: {e}")
+
             logger.info("STAGE1_DONE", "Preprocessing complete", output=inter_path)
             return 0
         else:

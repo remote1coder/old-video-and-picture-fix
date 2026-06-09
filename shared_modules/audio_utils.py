@@ -7,7 +7,7 @@ Shared audio processing for both video and photo pipelines.
 import sys
 from pathlib import Path
 import subprocess
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 import math
 
@@ -159,6 +159,45 @@ def get_audio_channel_layout(audio_path: str) -> str:
     return "stereo"
 
 
+def get_audio_info(audio_path: str) -> Dict[str, Any]:
+    """Get audio stream information using ffprobe.
+
+    Returns a dict with sample_rate, channels, channel_layout, codec.
+    Uses None for unknown values instead of hard-coded defaults.
+    """
+    info: Dict[str, Any] = {
+        "sample_rate": None,
+        "channels": None,
+        "channel_layout": None,
+        "codec": None,
+    }
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=sample_rate,channels,codec_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            lines = [line.strip() for line in r.stdout.strip().splitlines() if line.strip()]
+            if len(lines) >= 3:
+                # sample_rate
+                sr = lines[0]
+                if sr.isdigit():
+                    info["sample_rate"] = int(sr)
+                # channels
+                ch = lines[1]
+                if ch.isdigit():
+                    info["channels"] = int(ch)
+                # codec
+                info["codec"] = lines[2] if lines[2] else None
+        # channel_layout from separate probe (more reliable)
+        info["channel_layout"] = get_audio_channel_layout(audio_path)
+    except Exception:
+        pass
+    return info
+
+
 def build_hum_filters(freq: int, dual_hum: bool = False,
                       config: Dict[str, Any] = None) -> List[str]:
     """Build bandreject filter chain for hum removal.
@@ -184,15 +223,47 @@ def build_hum_filters(freq: int, dual_hum: bool = False,
     return filters
 
 
+def _get_ffmpeg_version() -> Tuple[bool, str]:
+    """Check if FFmpeg version >= 4.4. Returns (ok, version_str)."""
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
+                          timeout=10, shell=False)
+        if r.returncode == 0:
+            first = r.stdout.splitlines()[0]
+            import re
+            m = re.search(r'version\s+(\d+\.\d+)', first)
+            if m:
+                v = m.group(1)
+                parts = v.split(".")
+                major = int(parts[0])
+                minor = int(parts[1]) if len(parts) > 1 else 0
+                return (major > 4 or (major == 4 and minor >= 4)), v
+    except Exception:
+        pass
+    return False, "unknown"
+
+
+def _get_arnndn_model_path(config: Dict[str, Any], primary_freq: int) -> Optional[str]:
+    """Get arnndn model path based on detected primary frequency."""
+    models_dir = config.get("arnndn_model_dir", "./models")
+    model_name = f"arnndn_{primary_freq}Hz.pb"
+    model_path = Path(models_dir) / model_name
+    if model_path.exists():
+        return str(model_path)
+    return None
+
+
 def process_audio(audio_path: str, output_path: str,
                   config: Dict[str, Any], logger=None) -> bool:
     """Process audio for restoration.
 
     Steps:
-    1. Detect hum energy and frequency
-    2. If hum detected: bandreject filters (fundamental + second + third harmonic)
-    3. Noise reduction (afftdn or arnndn)
-    4. Preserve multi-channel layout
+    1. Detect FFmpeg version; if <4.4, force arnndn fallback
+    2. Detect hum energy and frequency
+    3. If hum detected: bandreject filters (fundamental + second + third harmonic)
+    4. Noise reduction (afftdn or arnndn)
+    5. Optional compand dynamic range compression
+    6. Preserve multi-channel layout
     
     Filter order is CRITICAL: bandreject FIRST, then afftdn/arnndn.
     """
@@ -205,24 +276,53 @@ def process_audio(audio_path: str, output_path: str,
         return True
 
     try:
-        # Parse audio settings
-        sample_rate = audio_config.get("sample_rate", 48000)
-        noise_reduction = audio_config.get("noise_reduction", True)
-        codec = audio_config.get("codec", "flac")
-        bitrate = audio_config.get("bitrate", "320k")
-        arnndn_model = audio_config.get("arnndn_model", "")
-        hum_dual_config = audio_config.get("hum_dual", False)
+        # ISSUE-SHARED-AU-001: Check if audio stream exists before processing
+        audio_info = get_audio_info(audio_path)
+        if audio_info.get("channels") is None:
+            logger.info("AUDIO_NO_STREAM",
+                       "Source file has no audio stream, skipping audio processing")
+            return True
 
-        # Get channel layout for multi-channel preservation
-        channel_layout = get_audio_channel_layout(audio_path)
-        num_channels = 2
-        if channel_layout in ("5.1", "6.1", "7.1"):
-            num_channels = 6 if channel_layout == "5.1" else (8 if channel_layout == "7.1" else 7)
+        # Parse audio settings
+        # Per v7.32 §3.10.9: sample_rate can be "auto" — detect from actual file
+        sample_rate_raw = audio_config.get("sample_rate", 48000)
+        if sample_rate_raw == "auto" or sample_rate_raw is None:
+            detected_sr = audio_info.get("sample_rate")
+            if detected_sr:
+                sample_rate = int(detected_sr)
+                logger.info("AUDIO_SAMPLE_RATE",
+                           f"Auto-detected sample rate: {sample_rate}Hz")
+            else:
+                sample_rate = 48000
+                logger.warning("AUDIO_SAMPLE_RATE_DEFAULT",
+                              "Could not detect sample rate, defaulting to 48000Hz")
+        else:
+            sample_rate = int(sample_rate_raw)
+        
+        # Unified key: 'denoise' per spec v7.32, fallback to 'noise_reduction'
+        denoise = audio_config.get("denoise", audio_config.get("noise_reduction", True))
+        codec = audio_config.get("codec", "aac")  # Default 'aac' per spec
+        bitrate = audio_config.get("bitrate", "320k")
+        hum_dual_config = audio_config.get("hum_dual", False)
+        use_compand = audio_config.get("compand", False)
+
+        # Check FFmpeg version for bandreject compatibility
+        ffmpeg_ok, ffmpeg_ver = _get_ffmpeg_version()
+        if not ffmpeg_ok:
+            logger.warning("AUDIO_FFMPEG_OLD",
+                          f"FFmpeg {ffmpeg_ver} < 4.4, bandreject unavailable. "
+                          "Will use arnndn fallback for hum removal.")
+
+        # BUG-059 fix: Use channel count instead of exact layout string matching
+        # to handle variants like "5.1(side)", "7.1(wide)", "5.1(back)", etc.
+        channel_layout = audio_info.get("channel_layout", "stereo") or "stereo"
+        num_channels = audio_info.get("channels", 2) or 2
+        if num_channels >= 6:
             # For multi-channel, use FLAC to preserve layout (AAC may downmix)
             if codec == "aac":
                 codec = "flac"
                 logger.info("AUDIO_MULTICHANNEL",
-                           f"Detected {channel_layout}, switching to FLAC to preserve layout")
+                           f"Detected {num_channels}ch ({channel_layout}), switching to FLAC to preserve layout")
 
         # Build filter chain
         # ORDER IS CRITICAL: bandreject FIRST (removes strong single-freq noise),
@@ -231,12 +331,12 @@ def process_audio(audio_path: str, output_path: str,
 
         # Step 1: Hum detection and removal (BEFORE noise reduction)
         hum_result = detect_hum_frequency(audio_path, sample_rate, audio_config)
+        primary_freq = hum_result["primary_freq"]
         
         if hum_result["skip_bandreject"]:
             logger.info("AUDIO_HUM_SKIP",
                        f"No significant hum detected (ratio={hum_result['hum_ratio']:.4f}), skipping bandreject")
         else:
-            primary_freq = hum_result["primary_freq"]
             is_dual = hum_result["is_dual_hum"]
             
             if is_dual and not hum_dual_config:
@@ -244,24 +344,52 @@ def process_audio(audio_path: str, output_path: str,
                               f"Dual hum detected (50Hz+60Hz). Processing primary frequency {primary_freq}Hz only. "
                               f"Set hum_dual=true to process both.")
             
-            hum_filters = build_hum_filters(primary_freq, is_dual and hum_dual_config, audio_config)
-            filters.extend(hum_filters)
-            logger.info("AUDIO_HUM_FILTERS",
-                       f"Applying bandreject for {primary_freq}Hz hum",
-                       filters=hum_filters,
-                       is_dual=is_dual)
+            if ffmpeg_ok:
+                hum_filters = build_hum_filters(primary_freq, is_dual and hum_dual_config, audio_config)
+                filters.extend(hum_filters)
+                logger.info("AUDIO_HUM_FILTERS",
+                           f"Applying bandreject for {primary_freq}Hz hum",
+                           filters=hum_filters,
+                           is_dual=is_dual)
+            else:
+                # FFmpeg <4.4: use arnndn for hum+noise instead of bandreject
+                logger.info("AUDIO_HUM_ARNNDN",
+                           f"FFmpeg <4.4, using arnndn instead of bandreject for {primary_freq}Hz hum")
 
         # Step 2: Noise reduction (AFTER bandreject)
-        if noise_reduction:
+        if denoise:
+            arnndn_model = _get_arnndn_model_path(audio_config, primary_freq)
+            if not arnndn_model:
+                # Fallback to config-provided path
+                arnndn_model = audio_config.get("arnndn_model", "")
+            
             if arnndn_model and Path(arnndn_model).exists():
+                # arnndn models are trained on mono 48kHz; convert to mono first to avoid stereo bug
+                if num_channels > 1:
+                    filters.append("aformat=channel_layouts=mono")
                 filters.append(f"arnndn=m='{arnndn_model}'")
+                # Restore original channel layout after arnndn
+                # Per v6.32 §3.10.9 / v7.32 §3.10.9: multi-channel must be preserved,严禁混缩为立体声
+                if num_channels > 1:
+                    filters.append(f"aformat=channel_layouts={channel_layout}")
                 logger.info("AUDIO_DENOISE", "Using arnndn noise reduction", model=arnndn_model)
             else:
                 # Fallback to afftdn
+                if not ffmpeg_ok:
+                    logger.warning("AUDIO_ARNNDN_MISSING",
+                                  f"arnndn model not found for {primary_freq}Hz, using afftdn fallback")
                 filters.append("afftdn=nr=10:nf=-20")
                 logger.info("AUDIO_DENOISE", "Using afftdn noise reduction")
 
-        # Step 3: Reset PTS to ensure A/V sync (v6.3 §3.10.9)
+        # Step 3: Optional compand dynamic range compression
+        if use_compand:
+            # Default gentle compand curve per v6.32 §7.27
+            compand_points = audio_config.get("compand_points",
+                                              "0.3:1:-90/-900|-70/-70|-30/-9|0/-3:6:0:0:0.5")
+            filters.append(f"compand={compand_points}")
+            logger.info("AUDIO_COMPAND", "Applying compand dynamic range compression")
+
+        # Step 4: Reset PTS to ensure A/V sync (v6.3 §3.10.9)
         filters.append("asetpts=PTS")
 
         # Build command
@@ -336,7 +464,7 @@ def extract_audio(video_path: str, output_path: str, codec: str = "copy",
                   logger=None) -> bool:
     """Extract audio stream from video file without processing.
     
-    Uses ffmpeg -vn -acodec copy to extract original audio unchanged.
+    Uses ffmpeg -vn -c:a copy to extract original audio unchanged.
     This is Stage 0 operation - audio processing happens in Stage 7.
     """
     if logger is None:
@@ -346,7 +474,7 @@ def extract_audio(video_path: str, output_path: str, codec: str = "copy",
         cmd = [
             "ffmpeg", "-y", "-i", video_path,
             "-vn",  # No video
-            "-acodec", codec,  # Copy audio codec (or "copy" for lossless)
+            "-c:a", codec,  # Copy audio codec
             output_path
         ]
         r = subprocess.run(cmd, capture_output=True, timeout=120, shell=False)

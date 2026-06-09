@@ -13,6 +13,7 @@ v6.3 Compliance:
 import sys
 import json
 import yaml  # type: ignore[import-untyped]
+import importlib.util
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
@@ -29,43 +30,104 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+# ISSUE-V-MGEN-001: module-level cache to avoid repeated importlib loading
+_CLASSIFY_CACHE: Dict[str, Any] = {}
+
+
 def classify_item(input_path: str, pipeline_type: str = "video") -> Dict[str, Any]:
-    """Classify a single file."""
+    """Classify a single file using importlib to avoid sys.path conflicts.
+
+    Caches the loaded module so large directories don't pay importlib overhead
+    per file.
+    """
+    cache_key = pipeline_type
+    if cache_key in _CLASSIFY_CACHE:
+        return _CLASSIFY_CACHE[cache_key](input_path)
+
     if pipeline_type == "video":
-        try:
-            sys.path.insert(0, str(Path(__file__).parent.parent / "video_restoration_pipeline"))
-            from classify import classify_video
-            return classify_video(input_path)
-        except Exception as e:
-            return {"detected_class": "UNKNOWN", "confidence": 0.0, "error": str(e)}
+        module_path = Path(__file__).parent.parent / "video_restoration_pipeline" / "classify.py"
+        func_name = "classify_video"
     else:
-        try:
-            sys.path.insert(0, str(Path(__file__).parent.parent / "photo_restoration_pipeline"))
-            from classify import classify_photo
-            return classify_photo(input_path)
-        except Exception as e:
-            return {"detected_class": "UNKNOWN", "confidence": 0.0, "error": str(e)}
+        module_path = Path(__file__).parent.parent / "photo_restoration_pipeline" / "classify.py"
+        func_name = "classify_photo"
+
+    try:
+        spec = importlib.util.spec_from_file_location(f"classify_module_{pipeline_type}", module_path)
+        if spec is None or spec.loader is None:
+            return {"detected_class": "UNKNOWN", "confidence": 0.0, "error": "Cannot load classify module"}
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        classify_func = getattr(module, func_name)
+        _CLASSIFY_CACHE[cache_key] = classify_func
+        return classify_func(input_path)
+    except Exception as e:
+        return {"detected_class": "UNKNOWN", "confidence": 0.0, "error": str(e)}
 
 
 def map_class_to_path_params(detected_class: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Map detected class to path-specific parameters."""
+    """Map detected class to path-specific parameters.
+    
+    For photo categories, merges config["photo"] settings into recommended_params.
+    Also merges audio_override if present.
+    """
     paths = config.get("paths", {})
+    result: Dict[str, Any] = {}
+    
     if detected_class == "ANALOG_TAPE":
-        return dict(paths.get("analog_tape", {}))
+        result = dict(paths.get("analog_tape", {}))
     elif detected_class == "DV_DIGITAL":
-        return dict(paths.get("dv_digital", {}))
+        result = dict(paths.get("dv_digital", {}))
     elif detected_class == "HDV_AVCHD":
-        return dict(paths.get("hdv_avchd", {}))
+        result = dict(paths.get("hdv_avchd", {}))
     elif detected_class == "SCAN_PRINT":
-        return dict(paths.get("scan_print", {}))
+        result = dict(paths.get("scan_print", {}))
+        # Merge photo-specific defaults if scan_print is empty
+        if not result:
+            result = dict(config.get("photo", {}))
     elif detected_class == "DIGITAL_PHOTO":
-        return dict(paths.get("digital_photo", {}))
-    return {}
+        result = dict(paths.get("digital_photo", {}))
+        if not result:
+            result = dict(config.get("photo", {}))
+    
+    # ISSUE-069 fix: filter out encoding-specific keys from photo params
+    # to keep recommended_params focused on processing parameters
+    encoding_keys = {"avif_params", "avif_rgb444_params"}
+    result = {k: v for k, v in result.items() if k not in encoding_keys}
+    
+    # Merge audio_override into recommended_params per spec priority
+    audio_override = config.get("audio_override", {})
+    if audio_override:
+        result["audio_override"] = dict(audio_override)
+    
+    return result
+
+
+def _get_duration(input_path: str, classification: Dict[str, Any]) -> float:
+    """Return duration in seconds from classify result or ffprobe fallback."""
+    if "duration" in classification and classification["duration"]:
+        try:
+            return float(classification["duration"])
+        except Exception:
+            pass
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            return float(r.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
 
 
 def generate_manifest(input_dirs: List[str], output_path: str,
                       config: Dict[str, Any],
-                      pipeline_type: str = "video") -> str:
+                      pipeline_type: str = "video",
+                      incremental: bool = False) -> str:
     """Generate manifest from input directories.
 
     Args:
@@ -77,6 +139,29 @@ def generate_manifest(input_dirs: List[str], output_path: str,
     Returns:
         Path to generated manifest
     """
+    # Deduplicate input_dirs
+    seen_dirs = set()
+    unique_dirs = []
+    for d in input_dirs:
+        resolved = str(Path(d).resolve())
+        if resolved not in seen_dirs:
+            seen_dirs.add(resolved)
+            unique_dirs.append(d)
+    input_dirs = unique_dirs
+
+    # ISSUE-V-MGEN-003: incremental scan preserves existing user edits
+    existing_jobs: Dict[str, Dict[str, Any]] = {}
+    if incremental and Path(output_path).exists():
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                old_manifest = yaml.safe_load(f)
+            for old_job in old_manifest.get("jobs", []):
+                key = old_job.get("input_path", "")
+                if key:
+                    existing_jobs[key] = old_job
+        except Exception:
+            pass
+
     manifest: Dict[str, Any] = {
         "meta": {
             "generated_at": now_iso(),
@@ -139,6 +224,9 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                     out_name += ".avif"
                 job_out_path = str(Path(output_dir) / out_name)
 
+                # ISSUE-V-MGEN-002 / BUG-045: ensure duration is populated
+                duration = _get_duration(input_str, classification)
+
                 job = {
                     "job_id": f"job_{job_id:03d}",
                     "input_path": input_str,
@@ -163,11 +251,25 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                     "native_width": classification.get("native_width", 0),
                     "native_height": classification.get("native_height", 0),
                     "native_dar": classification.get("native_dar", ""),
+                    "duration": duration,
                     "dpi": classification.get("dpi", None),
                     "file_size": classification.get("file_size", 0),
                     "file_mtime": classification.get("file_mtime", 0),
                     "file_hash_prefix": classification.get("file_hash_prefix", ""),
                 }
+
+                # ISSUE-V-MGEN-003: preserve user edits from existing manifest
+                old_job = existing_jobs.get(input_str)
+                if old_job:
+                    for preserve_key in ("user_overrides", "status", "priority", "error_message"):
+                        if preserve_key in old_job:
+                            job[preserve_key] = old_job[preserve_key]
+                    # If old status was DONE but file changed, reset to PENDING for safety
+                    old_hash = old_job.get("file_hash_prefix", "")
+                    new_hash = job.get("file_hash_prefix", "")
+                    if old_hash and new_hash and old_hash != new_hash:
+                        job["status"] = "PENDING"
+                        job["error_message"] = "File changed since last scan, reset to PENDING"
 
                 manifest["jobs"].append(job)
 
@@ -177,14 +279,24 @@ def generate_manifest(input_dirs: List[str], output_path: str,
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if output_path.endswith(".jsonl"):
-        with open(output_path, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(manifest["meta"], ensure_ascii=False) + "\n")
-            for job in manifest["jobs"]:
-                fh.write(json.dumps(job, ensure_ascii=False) + "\n")
-    else:
-        with open(output_path, "w", encoding="utf-8") as fh:
-            yaml.dump(manifest, fh, allow_unicode=True, sort_keys=False)
+    # BUG-011 fix: atomic write to avoid corruption during concurrent generation
+    out_path = Path(output_path)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        if output_path.endswith(".jsonl"):
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(manifest["meta"], ensure_ascii=False) + "\n")
+                for job in manifest["jobs"]:
+                    fh.write(json.dumps(job, ensure_ascii=False) + "\n")
+        else:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                yaml.dump(manifest, fh, allow_unicode=True, sort_keys=False)
+        # Atomic rename on same filesystem
+        tmp_path.replace(out_path)
+    except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Failed to write manifest atomically: {e}") from e
 
     return output_path
 
@@ -200,10 +312,13 @@ def main():
                         help="Config file path")
     parser.add_argument("--type", choices=["video", "photo"],
                         default="video", help="Pipeline type")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Preserve existing manifest user_overrides/status/priority")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    path = generate_manifest(args.input, args.output, config, args.type)
+    path = generate_manifest(args.input, args.output, config, args.type,
+                             incremental=args.incremental)
     print(f"Manifest generated: {path}")
     # Count jobs from the generated manifest
     try:

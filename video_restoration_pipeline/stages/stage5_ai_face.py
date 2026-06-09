@@ -116,24 +116,9 @@ def run_codeformer(input_dir: str, output_dir: str, model_path: str = "",
         except Exception:
             pass
 
-    # Fallback: try to import CodeFormer module
-    try:
-        cmd = [
-            sys.executable, "-c",
-            f"import sys; sys.path.insert(0, 'CodeFormer'); "
-            f"from codeformer.facelib.utils.face_restoration_helper import FaceRestoreHelper; "
-            f"import cv2; import os; import glob; "
-            f"os.makedirs('{output_dir}', exist_ok=True); "
-            f"# Best-effort fallback: copy frames (actual CodeFormer inference requires full setup); "
-            f"for f in sorted(glob.glob(os.path.join('{input_dir}', '*.png'))): "
-            f"    img = cv2.imread(f); "
-            f"    out_path = os.path.join('{output_dir}', os.path.basename(f)); "
-            f"    cv2.imwrite(out_path, img)"
-        ]
-        r = subprocess.run(cmd, capture_output=True, timeout=600, shell=False)
-        return r.returncode == 0
-    except Exception:
-        return False
+    # V-P-043 fix: CodeFormer fallback returns False instead of copying original frames
+    # True CodeFormer inference requires full setup; signal failure so caller can skip
+    return False
 
 
 def _get_frame_pts(video_path: str) -> List[float]:
@@ -350,6 +335,41 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> List[Tuple[int,
         shutil.rmtree(sample_dir, ignore_errors=True)
         return []
 
+    # V-P-042 fix: static frame detection via SSIM
+    # Check for contiguous segments where SSIM > 0.99 across 25+ frames
+    def _check_static_by_ssim(frame_paths, threshold=0.99, min_count=25):
+        if len(frame_paths) < min_count:
+            return False
+        try:
+            from PIL import Image
+            static_count = 0
+            prev = None
+            for fp in frame_paths:
+                img = Image.open(fp).convert("L")
+                arr = np.array(img, dtype=np.float32)
+                if prev is not None:
+                    if arr.shape != prev.shape:
+                        arr = np.array(img.resize((prev.shape[1], prev.shape[0]), Image.BILINEAR), dtype=np.float32)
+                    # Simple normalized cross-correlation as SSIM proxy
+                    mean_p, mean_c = prev.mean(), arr.mean()
+                    std_p, std_c = prev.std(), arr.std()
+                    if std_p < 1e-6 or std_c < 1e-6:
+                        ssim_val = 1.0 if abs(mean_p - mean_c) < 1 else 0.0
+                    else:
+                        cov = np.mean((prev - mean_p) * (arr - mean_c))
+                        ssim_val = (2 * mean_p * mean_c + 0.01) * (2 * cov + 0.03) / \
+                                   ((mean_p**2 + mean_c**2 + 0.01) * (std_p**2 + std_c**2 + 0.03))
+                    if ssim_val >= threshold:
+                        static_count += 1
+                    else:
+                        static_count = 0
+                    if static_count >= min_count - 1:
+                        return True
+                prev = arr
+        except Exception:
+            pass
+        return False
+
     # Filter segments by static criteria (v7.3 §3.10.5)
     face_segments = []
     for seg_start, seg_end in raw_segments:
@@ -363,14 +383,13 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> List[Tuple[int,
             cumulated = 0.0
             for f in range(start_frame, min(end_frame, len(all_pts) - 1)):
                 diff = all_pts[f + 1] - all_pts[f]
-                if diff <= 0:
-                    # PTS non-monotonic or duplicate frame
-                    # Use average interval for duplicate, skip backward
-                    if diff == 0:
-                        cumulated += avg_interval
-                    else:
-                        logger.warning("STAGE5_PTS_ANOMALY", f"PTS non-monotonic at frame {f}")
-                        break
+                if diff < 0:
+                    # PTS backward
+                    logger.warning("STAGE5_PTS_ANOMALY", f"PTS non-monotonic at frame {f}")
+                    break
+                elif diff == 0:
+                    # V-P-041 fix: duplicate frame, use avg_interval without breaking
+                    cumulated += avg_interval
                 elif diff > avg_interval * 2:
                     # Gap > 2× normal interval: break segment
                     logger.info("STAGE5_PTS_GAP", f"PTS gap {diff:.3f}s > 2×avg at frame {f}, breaking segment")
@@ -395,6 +414,36 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> List[Tuple[int,
                        f"Segment frames {start_frame}-{end_frame} motion {motion:.4f} > 0.03, skipping (dynamic scene)")
             continue
 
+        # V-P-040 fix: face spatial stability check
+        # Center point displacement < 5% of face box size AND absolute < max(10px, min(50px, 5%))
+        valid_stability = True
+        if len(seg_frame_paths) >= 2 and seg_start < len(face_boxes):
+            prev_box = None
+            for idx in range(seg_start, min(seg_end + 1, len(face_boxes))):
+                boxes = face_boxes[idx]
+                if not boxes:
+                    valid_stability = False
+                    break
+                # Use largest face
+                boxes_sorted = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+                fx, fy, fw, fh, _ = boxes_sorted[0]
+                cx, cy = fx + fw / 2, fy + fh / 2
+                if prev_box is not None:
+                    pcx, pcy, pw, ph = prev_box
+                    rel_dx = abs(cx - pcx) / max(fw, 1)
+                    rel_dy = abs(cy - pcy) / max(fh, 1)
+                    abs_dx = abs(cx - pcx)
+                    abs_dy = abs(cy - pcy)
+                    limit_abs = max(10, min(50, max(fw, fh) * 0.05))
+                    if rel_dx > 0.05 or rel_dy > 0.05 or abs_dx > limit_abs or abs_dy > limit_abs:
+                        valid_stability = False
+                        break
+                prev_box = (cx, cy, fw, fh)
+            if not valid_stability:
+                logger.info("STAGE5_UNSTABLE_FACE",
+                           f"Segment frames {start_frame}-{end_frame}: face movement exceeds stability threshold")
+                continue
+
         # Face area check: at least one face must cover >15% of frame area
         valid_area = False
         for i in range(seg_start, seg_end + 1):
@@ -411,6 +460,12 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> List[Tuple[int,
                        f"Segment frames {start_frame}-{end_frame}: no face >15% area, skipping")
             continue
 
+        # V-P-042: SSIM-based static frame detection
+        is_static_by_ssim = _check_static_by_ssim(seg_frame_paths)
+        if is_static_by_ssim:
+            logger.info("STAGE5_STATIC_SSIM",
+                       f"Segment frames {start_frame}-{end_frame} classified as static by SSIM >=0.99")
+
         face_segments.append((start_frame, duration_sec))
         logger.info("STAGE5_STATIC_SEGMENT",
                    f"Accepted static segment: frames {start_frame}-{end_frame}, duration={duration_sec:.2f}s, motion={motion:.4f}")
@@ -421,16 +476,24 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> List[Tuple[int,
     return face_segments
 
 
+def _load_params(args):
+    if getattr(args, "params_file", None):
+        with open(args.params_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(args.params) if args.params else {}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
+    parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
-    params = json.loads(args.params) if args.params else {}
+    params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
@@ -468,6 +531,31 @@ def main():
 
     logger.info("STAGE5_FACE_SEGMENTS", f"Found {len(face_segments)} face segments")
 
+    # BUG-038 fix: detect actual frame rate instead of hardcoding 25fps
+    fps_str = "25"
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             input_source],
+            capture_output=True, text=True, timeout=10, shell=False
+        )
+        if r.returncode == 0:
+            fps_str = r.stdout.strip()
+    except Exception:
+        pass
+    fps_val = 25.0
+    try:
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            fps_val = float(num) / float(den)
+        else:
+            fps_val = float(fps_str)
+    except Exception:
+        fps_val = 25.0
+
     # Extract face segments
     static_segment_duration = params.get("static_segment_duration", 2.0)
     face_frames_dir = os.path.join(temp_dir, f"{job_id}_face_frames")
@@ -477,7 +565,7 @@ def main():
         cmd = [
             "ffmpeg", "-hide_banner", "-v", "error", "-y",
             "-i", input_source,
-            "-ss", str(start_frame / 25.0),
+            "-ss", str(start_frame / fps_val),
             "-t", str(static_segment_duration),
             os.path.join(face_frames_dir, f"face_{start_frame:06d}_%04d.png")
         ]
@@ -528,34 +616,57 @@ def main():
         logger.warning("STAGE5_EXTRACT_FAIL", f"Full frame extraction failed: {e}")
     
     # Step 2: Replace restored face frames into the full frame sequence
-    # Face output frames are named: face_{start_frame:06d}_%04d.png
-    # We glob the restored output and map by basename to replace in all_frames_dir
+    # V-P-044 fix: feathered blending instead of hard copy
+    # Use Gaussian blur on mask edge for >=8px transition
     restored_frames = sorted(Path(face_output_dir).glob("*.png"))
     replaced_count = 0
     for rf in restored_frames:
         target = Path(all_frames_dir) / rf.name
-        if target.exists():
-            shutil.copy2(str(rf), str(target))
-            replaced_count += 1
-        else:
-            # Try to find matching frame by index pattern
-            # face_001234_0001.png -> look for frame_001234.png in all_frames
+        fallback_target = None
+        if not target.exists():
             import re
             m = re.match(r"face_(\d+)_\d+\.png", rf.name)
             if m:
                 frame_idx = int(m.group(1))
-                # Approximate: use frame index directly
-                target_approx = Path(all_frames_dir) / f"frame_{frame_idx:08d}.png"
-                if target_approx.exists():
-                    shutil.copy2(str(rf), str(target_approx))
+                fallback_target = Path(all_frames_dir) / f"frame_{frame_idx:08d}.png"
+                target = fallback_target
+        if target.exists():
+            try:
+                import cv2
+                orig = cv2.imread(str(target))
+                restored = cv2.imread(str(rf))
+                if orig is not None and restored is not None:
+                    # Resize restored to match original if needed
+                    if orig.shape != restored.shape:
+                        restored = cv2.resize(restored, (orig.shape[1], orig.shape[0]))
+                    # Create mask: center region bright, edges dark
+                    h, w = orig.shape[:2]
+                    mask = np.zeros((h, w), dtype=np.float32)
+                    # Margin for feathering (min 8px, max 5% of min dimension)
+                    margin = max(8, min(h, w) // 20)
+                    mask[margin:h-margin, margin:w-margin] = 1.0
+                    # Gaussian blur for feathering
+                    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=margin)
+                    # Expand mask to 3 channels
+                    mask_3c = np.stack([mask] * 3, axis=2)
+                    # Alpha blend
+                    blended = (restored * mask_3c + orig * (1 - mask_3c)).astype(np.uint8)
+                    cv2.imwrite(str(target), blended)
                     replaced_count += 1
+                else:
+                    shutil.copy2(str(rf), str(target))
+                    replaced_count += 1
+            except Exception:
+                shutil.copy2(str(rf), str(target))
+                replaced_count += 1
     
-    logger.info("STAGE5_BLEND", f"Replaced {replaced_count} face-restored frames")
+    logger.info("STAGE5_BLEND", f"Feather-blended {replaced_count} face-restored frames")
     
-    # Step 3: Encode the complete frame sequence to output video
+    # BUG-039 fix: use param_hash in output filename for deterministic intermediate matching
+    param_hash = params.get("param_hash", job_id)
     output_path = os.path.join(
         temp_dir,
-        f"{job_id}_{Path(args.input).stem}_step5_face_p{job_id}.mkv"
+        f"{job_id}_{Path(args.input).stem}_step5_face_p{param_hash}.mkv"
     )
     
     # Detect original frame rate for accurate re-encoding
@@ -573,19 +684,20 @@ def main():
     except Exception:
         pass
     
-    # Read encoding parameters from config (not hardcoded)
-    encoder = params.get("encoder", "libsvtav1")
-    crf = str(params.get("crf", 24))
-    preset = str(params.get("preset", 4))
-    pix_fmt = params.get("pix_fmt", "yuv420p10le")
+    # V-P-045 fix: use lossless FFV1 intermediate instead of lossy SVT-AV1
+    vs_bit_depth = params.get("vs_bit_depth", 16)
+    if vs_bit_depth == 16:
+        pix_fmt = "yuv420p16le"
+    elif vs_bit_depth == 10:
+        pix_fmt = "yuv420p10le"
+    else:
+        pix_fmt = "yuv420p"
 
     encode_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-framerate", fps_str,
         "-i", os.path.join(all_frames_dir, "frame_%08d.png"),
-        "-c:v", encoder,
-        "-crf", crf,
-        "-preset", preset,
+        "-c:v", "ffv1",
         "-pix_fmt", pix_fmt,
         "-color_primaries", "bt709",
         "-color_trc", "bt709",

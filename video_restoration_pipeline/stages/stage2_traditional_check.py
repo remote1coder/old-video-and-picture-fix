@@ -21,16 +21,24 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 
 
+def _load_params(args):
+    if getattr(args, "params_file", None):
+        with open(args.params_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(args.params) if args.params else {}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
+    parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
-    params = json.loads(args.params) if args.params else {}
+    params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
@@ -96,12 +104,41 @@ def main():
                 prog_pct = stats.get("progressive", 0) / total * 100
                 if prog_pct >= threshold:
                     logger.info("STAGE2_DONE", f"Verification passed: {prog_pct:.1f}% progressive")
-                    return 0
                 else:
-                    logger.warning("STAGE2_LOW_PROGRESSIVE",
-                                  f"Progressive={prog_pct:.1f}% < threshold={threshold}%")
-                    # Not a fatal error, just a warning
-                    return 0
+                    logger.error("STAGE2_LOW_PROGRESSIVE",
+                                f"Progressive={prog_pct:.1f}% < threshold={threshold}%")
+                    return 86
+
+                # Frame rate validation
+                try:
+                    fr_cmd = ["ffprobe", "-hide_banner", "-v", "error",
+                              "-select_streams", "v:0",
+                              "-show_entries", "stream=r_frame_rate",
+                              "-of", "default=noprint_wrappers=1:nokey=1", stage1_output]
+                    fr = subprocess.run(fr_cmd, capture_output=True, text=True,
+                                        timeout=60, shell=False)
+                    if fr.returncode == 0:
+                        rate_str = fr.stdout.strip()
+                        if "/" in rate_str:
+                            num, den = map(float, rate_str.split("/"))
+                            detected_fps = num / den if den != 0 else 0
+                        else:
+                            detected_fps = float(rate_str)
+                        expected_fps = params.get("expected_fps", params.get("original_fps", 0))
+                        if expected_fps > 0:
+                            deviation = abs(detected_fps - expected_fps) / expected_fps
+                            if deviation > 0.02:
+                                logger.error("STAGE2_FRAMERATE",
+                                            f"FPS {detected_fps} deviates {deviation*100:.1f}% from expected {expected_fps}")
+                                return 86
+                            else:
+                                logger.info("STAGE2_FRAMERATE",
+                                           f"FPS {detected_fps} matches expected {expected_fps}")
+                except Exception as e:
+                    logger.warning("STAGE2_FRAMERATE_CHECK", f"Frame rate check failed: {e}")
+
+                logger.info("TRADITIONAL_GATE", "Traditional restoration completed, proceeding to AI stages")
+                return 0
     except Exception as e:
         logger.warning("STAGE2_CHECK_FAIL", f"Quality check failed: {e}")
 
