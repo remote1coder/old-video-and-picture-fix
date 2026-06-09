@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--config", "-c", default=str(SCRIPT_DIR / "config.yaml"),
                         help="Config file path")
     parser.add_argument("--manifest", "-m", help="Use existing manifest")
+    parser.add_argument("--output-manifest", help="Output manifest path for --scan")
     parser.add_argument("--preview", action="store_true", help="Preview mode")
     parser.add_argument("--keep-intermediates", action="store_true",
                         help="Keep intermediate files")
@@ -47,6 +48,28 @@ def parse_args():
                         help="GPU backend (auto/cuda/rocm/mps/cpu)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel workers (default: 1)")
+    # V-P-001~004 fix: mode parameters
+    parser.add_argument("--mode", choices=["scan", "edit", "batch", "quick", "interactive", "preview"],
+                        help="Execution mode (v7.3 §3.3)")
+    parser.add_argument("--scan", action="store_true",
+                        help="Step 1: Scan input dirs and generate manifest")
+    parser.add_argument("--edit-manifest", action="store_true",
+                        help="Step 2: Interactive manifest review")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing manifest (skip DONE)")
+    # ISSUE-V-MAIN-001 / BUG-047: AI CLI overrides (highest priority per v7.3 §3.10.12)
+    parser.add_argument("--ai-enabled", action="store_true",
+                        help="Enable AI upscale (overrides config.ai.enabled)")
+    parser.add_argument("--ai-upscale-factor", type=int, choices=[2, 4], default=None,
+                        help="AI upscale factor 2x or 4x (overrides config.ai.upscale_scale)")
+    parser.add_argument("--face-restore", choices=["GFPGAN", "CodeFormer", ""], default=None,
+                        help="Face restore model (overrides config.ai.face_restore)")
+    parser.add_argument("--ai-model", choices=["RealESRGAN_x2plus", "RealESRGAN_x4plus",
+                                                "DAT_x2", "DAT_x4"], default=None,
+                        help="AI upscale model (overrides config.ai.upscale_model)")
+    # ISSUE-V-MGEN-003: incremental manifest scan
+    parser.add_argument("--incremental", action="store_true",
+                        help="Incremental scan: preserve existing manifest user_overrides/status")
     return parser.parse_args()
 
 
@@ -69,66 +92,92 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 def merge_params(job: Dict[str, Any], config: Dict[str, Any],
-                 cli_overrides: Dict[str, Any]) -> Dict[str, Any]:
+                 cli_overrides: Dict[str, Any], logger=None) -> Dict[str, Any]:
     """Merge parameters with priority:
     CLI > user_overrides > paths > global > defaults
     Uses deep merge for nested dicts.
+    Records PARAM_OVERRIDE events per v7.3 §3.10.12.
     """
     params: Dict[str, Any] = {}
+    overrides_log = []
+
+    def _log_override(key: str, old_val: Any, new_val: Any, source: str):
+        if old_val != new_val:
+            overrides_log.append({"key": key, "old": old_val, "new": new_val, "source": source})
 
     # Start with global
-    params = _deep_merge(params, config.get("global", {}))
+    base = config.get("global", {})
+    params = _deep_merge(params, base)
 
     # Override with path-specific params
     detected_class = job.get("detected_class", "")
     path_key = detected_class.lower()
     paths = config.get("paths", {})
     if path_key in paths:
-        params = _deep_merge(params, paths[path_key])
+        path_params = paths[path_key]
+        for k, v in path_params.items():
+            if k != "audio_override":
+                old = params.get(k)
+                params[k] = v
+                _log_override(k, old, v, "paths")
 
     # Apply audio_override for the detected material type (v7.3 §3.1)
-    # Priority: CLI > user_overrides > recommended_params > paths.audio_override > paths > global > defaults
-    audio_override = paths.get("audio_override", {})
+    # Priority: CLI > user_overrides > recommended_params > audio_override > global.audio > defaults
+    # V-P-005 fix: read audio_override from config root (not paths sub-key)
+    audio_override = config.get("audio_override", {})
     if path_key in audio_override:
-        # Flat-inject audio override params so stage scripts can read them directly
         for k, v in audio_override[path_key].items():
+            old = params.get(k)
             params[k] = v
+            _log_override(k, old, v, "audio_override")
 
     # Override with job recommended_params
     rec_params = job.get("recommended_params", {})
     if rec_params:
-        params = _deep_merge(params, rec_params)
+        for k, v in rec_params.items():
+            old = params.get(k)
+            if isinstance(v, dict) and isinstance(params.get(k), dict):
+                params[k] = _deep_merge(params.get(k, {}), v)
+            else:
+                params[k] = v
+            _log_override(k, old, v, "recommended_params")
 
     # Override with user_overrides
     user_ov = job.get("user_overrides", {})
     if user_ov:
-        params = _deep_merge(params, user_ov)
+        for k, v in user_ov.items():
+            old = params.get(k)
+            if isinstance(v, dict) and isinstance(params.get(k), dict):
+                params[k] = _deep_merge(params.get(k, {}), v)
+            else:
+                params[k] = v
+            _log_override(k, old, v, "user_overrides")
 
     # Override with CLI
     if cli_overrides:
-        params = _deep_merge(params, cli_overrides)
+        for k, v in cli_overrides.items():
+            old = params.get(k)
+            params[k] = v
+            _log_override(k, old, v, "cli")
 
     # Merge nested config sections (audio, ai) as flat keys for stage script compatibility
-    # Stage scripts read audio params as flat keys: params.get("hum_freq", 50)
     audio_config = config.get("audio", {})
     for k, v in audio_config.items():
-        # Only inject if not already set by higher priority sources
         if k not in params:
             params[k] = v
-        # Also inject with "audio_" prefix for backward compatibility in stage7
         params[f"audio_{k}"] = v
 
     ai_config = config.get("ai", {})
     for k, v in ai_config.items():
         if k not in params:
             params[k] = v
+        params[f"ai_{k}"] = v
 
     # grain_factory3 is accessed as nested dict by stage6: params.get("grain_factory3", {})
     if "grain_factory3" in config:
         if "grain_factory3" not in params:
             params["grain_factory3"] = config["grain_factory3"]
         else:
-            # Deep merge grain_factory3 to preserve per-class sub-keys
             params["grain_factory3"] = _deep_merge(
                 config["grain_factory3"], params["grain_factory3"]
             )
@@ -145,6 +194,12 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     params["input_path"] = job.get("input_path", "")
     params["field_segments"] = job.get("field_segments", [])
     params["duration"] = job.get("duration", 0)
+
+    # V-P-006 fix: log PARAM_OVERRIDE events
+    if logger and overrides_log:
+        for entry in overrides_log:
+            logger.info("PARAM_OVERRIDE",
+                       f"{entry['key']}: {entry['old']} -> {entry['new']} (source={entry['source']})")
 
     return params
 
@@ -179,10 +234,23 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     cmd.extend(["--input", job["input_path"]])
     cmd.extend(["--job-id", job["job_id"]])
 
-    # Add params as JSON
+    # ISSUE-V-MAIN-003: avoid command-line length limits by using params file when long
     import json
+    import tempfile
     params_json = json.dumps(params, default=str)
-    cmd.extend(["--params", params_json])
+    params_file = None
+    # Windows cmd limit is 32767; leave safety margin. Also use file for any long dict.
+    if len(params_json) > 30000:
+        try:
+            fd, params_file = tempfile.mkstemp(suffix=".json", prefix="vparams_")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(params_json)
+            cmd.extend(["--params-file", params_file])
+        except Exception:
+            # Fallback to inline JSON if temp file fails
+            cmd.extend(["--params", params_json])
+    else:
+        cmd.extend(["--params", params_json])
 
     # Add config path (FIXED: use passed config_path, not hardcoded)
     cmd.extend(["--config", config_path])
@@ -211,6 +279,13 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
         return 87, f"Stage timed out after {timeout}s"  # Resource不足 (timeout)
     except Exception as e:
         return 82, str(e)  # IO error
+    finally:
+        # Clean up temporary params file
+        if params_file and os.path.exists(params_file):
+            try:
+                os.unlink(params_file)
+            except Exception:
+                pass
 
 
 def _get_video_duration(video_path: str) -> float:
@@ -271,20 +346,67 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     logger.info("JOB_START", f"Starting job {job_id}",
                 job_id=job_id, input_path=input_path)
 
+    # BUG-042 fix: normalize args to dict early so all downstream code uses dict API
+    if not isinstance(args, dict):
+        args = vars(args)
+
     # Build CLI overrides
     cli_overrides = {}
-    if args.output:
-        cli_overrides["output_dir"] = args.output
-    if args.no_wsl_redirect:
+    _output = args.get("output")
+    _no_wsl = args.get("no_wsl_redirect", False)
+    _keep = args.get("keep_intermediates", False)
+    _gpu = args.get("gpu")
+    _ai_enabled = args.get("ai_enabled")
+    _ai_scale = args.get("ai_upscale_factor")
+    _face_restore = args.get("face_restore")
+    _ai_model = args.get("ai_model")
+    if _output:
+        cli_overrides["output_dir"] = _output
+    if _no_wsl:
         cli_overrides["no_wsl_redirect"] = True
-    if args.keep_intermediates:
+    if _keep:
         cli_overrides["cleanup_intermediates"] = False
-    if args.gpu:
-        cli_overrides["gpu_backend"] = args.gpu
+    if _gpu:
+        cli_overrides["gpu_backend"] = _gpu
+    # ISSUE-V-MAIN-001 / BUG-047: propagate AI CLI overrides into params
+    if _ai_enabled is True:
+        cli_overrides["enabled"] = True
+    if _ai_scale is not None:
+        cli_overrides["upscale_scale"] = _ai_scale
+    if _face_restore is not None:
+        cli_overrides["face_restore"] = _face_restore
+    if _ai_model is not None:
+        cli_overrides["upscale_model"] = _ai_model
 
     # Merge params
-    params = merge_params(job, config, cli_overrides)
+    params = merge_params(job, config, cli_overrides, logger)
     params["output_path"] = job.get("output_path", "")
+
+    # V-P-008 fix: WSL2 path redirect for temp_dir and output_dir
+    try:
+        from checkpoint import wsl_redirect_path
+        no_wsl_redirect = params.get("no_wsl_redirect", False)
+        platform_val = params.get("platform", "auto")
+        temp_dir = params.get("temp_dir", "./temp")
+        output_dir = params.get("output_dir", "./output")
+        redirected_temp, original_temp, _, _ = wsl_redirect_path(
+            temp_dir, no_wsl_redirect=no_wsl_redirect, platform=platform_val
+        )
+        redirected_output, original_output, _, _ = wsl_redirect_path(
+            output_dir, no_wsl_redirect=no_wsl_redirect, platform=platform_val
+        )
+        if original_temp:
+            logger.info("WSL_REDIRECT", f"temp_dir: {temp_dir} -> {redirected_temp}",
+                       original_path=temp_dir, redirected_path=redirected_temp)
+            params["temp_dir"] = redirected_temp
+            params["original_temp_dir"] = original_temp
+        if original_output:
+            logger.info("WSL_REDIRECT", f"output_dir: {output_dir} -> {redirected_output}",
+                       original_path=output_dir, redirected_path=redirected_output)
+            params["output_dir"] = redirected_output
+            params["original_output_dir"] = original_output
+    except Exception as e:
+        logger.warning("WSL_REDIRECT_SKIP", f"WSL redirect check failed: {e}")
 
     # Disk space check
     if not _check_disk_space(job, config, logger):
@@ -304,6 +426,8 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     ai_banned = job.get("ai_upscale_banned", False)
     force_allow = params.get("force_allow_banned_upscale", False)
 
+    # V-P-007 fix: force_traditional_first gate
+    # AI stages are appended conditionally; main loop will gate them
     if ai_enabled and not (ai_banned and not force_allow):
         stages.append((3, "stage3_ai_upscale.py"))
         stages.append((4, "stage4_postprocess.py"))
@@ -315,30 +439,62 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     stages.append((6, "stage6_grain_synthesis.py"))
     stages.append((7, "stage7_encode.py"))
 
-    if args.stage is not None:
+    _stage = args.get("stage")
+    if _stage is not None:
         stage_map = {s[0]: s[1] for s in stages}
-        if args.stage in stage_map:
-            stages = [(args.stage, stage_map[args.stage])]
+        if _stage in stage_map:
+            stages = [(_stage, stage_map[_stage])]
         else:
             return 81, "Invalid stage number"
+    else:
+        # BUG-044 fix: resume from last completed stage + 1 when available
+        resume_from = job.get("resume_from_stage")
+        if resume_from is not None:
+            stages = [(n, s) for n, s in stages if n >= resume_from]
+            job_logger.info("RESUME_STAGE", f"Resuming job from stage {resume_from}")
+            # Clear one-shot resume marker so re-runs don't keep skipping
+            job.pop("resume_from_stage", None)
 
     # Run stages
+    traditional_stage_completed = False
     for stage_num, script_name in stages:
         job_logger.info("STAGE_START", f"Stage {stage_num}: {script_name}")
-        exit_code, stderr = run_stage(script_name, job, params, args.config)
+        exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
+            if stage_num == 2:
+                traditional_stage_completed = True
+                job_logger.info("TRADITIONAL_GATE",
+                               "Traditional restoration completed, proceeding to AI stages")
         elif exit_code == 3:
             job_logger.info("STAGE_SKIP", f"Stage {stage_num} skipped")
+            if stage_num == 2:
+                traditional_stage_completed = True
+                job_logger.info("TRADITIONAL_GATE",
+                               "Traditional restoration skipped (already done), proceeding to AI stages")
         else:
             job_logger.error("STAGE_FAILED", f"Stage {stage_num} failed: {exit_code}")
+            # V-P-007/V-P-028 fix: force_traditional_first gate
+            force_traditional_first = params.get("force_traditional_first", True)
+            if force_traditional_first and stage_num == 2:
+                job_logger.error("TRADITIONAL_GATE_BLOCK",
+                                "Traditional restoration failed, blocking AI stages per force_traditional_first")
+                return 86, stderr
             return exit_code, stderr
+
+        # V-P-007 fix: block AI stages if traditional check failed
+        force_traditional_first = params.get("force_traditional_first", True)
+        if force_traditional_first and stage_num == 2 and not traditional_stage_completed:
+            job_logger.error("TRADITIONAL_GATE_BLOCK",
+                            "Traditional restoration not verified, blocking AI stages")
+            return 86, "Traditional restoration verification failed"
 
         # Cleanup old intermediates after successful stage
         if params.get("cleanup_intermediates", True):
             temp_dir = params.get("temp_dir", "./temp")
+            input_name = Path(input_path).name
             keep_steps = params.get("keep_steps", 2)
-            cleanup_old_intermediates(temp_dir, job_id, keep_steps)
+            cleanup_old_intermediates(temp_dir, job_id, input_name, keep_steps)
 
     logger.info("JOB_DONE", f"Job {job_id} complete")
     return 0, ""
@@ -407,6 +563,100 @@ def main():
     except Exception as e:
         logger.warning("DEP_CHECK", f"Check skipped: {e}")
 
+    # V-P-001~004 fix: mode-aware manifest handling
+    mode = args.mode
+    if args.scan or (mode == "scan"):
+        if not args.input:
+            print("Error: --scan requires --input directories")
+            sys.exit(81)
+        manifest_path = args.manifest or str(SCRIPT_DIR / "batch_manifest.yaml")
+        from manifest_generate import generate_manifest
+        generate_manifest(args.input, manifest_path, config, "video")
+        logger.info("SCAN_DONE", f"Manifest saved to {manifest_path}")
+        print(f"Scan complete. Manifest saved to {manifest_path}")
+        print("Next: Review with --edit-manifest, then execute with --mode batch")
+        return
+    elif args.edit_manifest or (mode == "edit"):
+        manifest_path = args.manifest or str(SCRIPT_DIR / "batch_manifest.yaml")
+        if not Path(manifest_path).exists():
+            print(f"Error: Manifest not found: {manifest_path}")
+            sys.exit(81)
+        from manifest_editor import edit_manifest_interactive
+        edit_manifest_interactive(manifest_path)
+        logger.info("EDIT_DONE", f"Manifest edited: {manifest_path}")
+        print(f"Manifest editing complete: {manifest_path}")
+        print("Next: Execute with --mode batch")
+        return
+    elif mode == "quick":
+        # V-P-001~004 fix: quick mode (scan + execute, no persistent manifest)
+        if not args.input:
+            print("Error: --mode quick requires --input directories")
+            sys.exit(81)
+        manifest_path = str(SCRIPT_DIR / "batch_manifest_quick.yaml")
+        from manifest_generate import generate_manifest
+        generate_manifest(args.input, manifest_path, config, "video")
+        manifest = load_manifest(manifest_path)
+        jobs = filter_jobs(manifest, ["PENDING"])
+        logger.info("QUICK_START", f"Quick mode: {len(jobs)} jobs")
+        print(f"Quick mode: scanning done, executing {len(jobs)} jobs...")
+        for job in jobs:
+            _run_single_job(job, config, args, logger, manifest, manifest_path)
+        # Clean up temporary manifest
+        try:
+            Path(manifest_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        logger.info("PIPELINE_DONE", "Video pipeline complete (quick mode)")
+        print("Done.")
+        return
+    elif mode == "interactive":
+        # V-P-001~004 fix: interactive mode (single file, step-by-step)
+        if not args.input or len(args.input) != 1:
+            print("Error: --mode interactive requires exactly one --input file")
+            sys.exit(81)
+        input_file = args.input[0]
+        if not Path(input_file).is_file():
+            print(f"Error: Input file not found: {input_file}")
+            sys.exit(81)
+        # Create a single-job manifest
+        manifest_path = str(SCRIPT_DIR / "batch_manifest_interactive.yaml")
+        from manifest_generate import generate_manifest
+        generate_manifest([str(Path(input_file).parent)], manifest_path, config, "video")
+        manifest = load_manifest(manifest_path)
+        jobs = [j for j in manifest.get("jobs", []) if j.get("input_path") == input_file]
+        if not jobs:
+            print(f"Error: File not found in scanned manifest: {input_file}")
+            sys.exit(81)
+        job = jobs[0]
+        print(f"\nInteractive mode: {input_file}")
+        print(f"  Detected class: {job.get('detected_class', 'unknown')}")
+        print(f"  Field order: {job.get('field_order', 'unknown')}")
+        print(f"  Recommended params: {job.get('recommended_params', {})}")
+        confirm = input("Proceed with recommended parameters? [Y/n/edit]: ").strip().lower()
+        if confirm in ("n", "no", "skip"):
+            print("Skipped.")
+            return
+        if confirm in ("e", "edit"):
+            # Allow simple key=value overrides
+            print("Enter parameter overrides (key=value), empty line to finish:")
+            while True:
+                line = input("> ").strip()
+                if not line:
+                    break
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    job.setdefault("user_overrides", {})[k.strip()] = v.strip()
+                    print(f"  Set {k.strip()} = {v.strip()}")
+        # Run single job
+        _run_single_job(job, config, args, logger, manifest, manifest_path)
+        try:
+            Path(manifest_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        logger.info("PIPELINE_DONE", "Video pipeline complete (interactive mode)")
+        print("Done.")
+        return
+
     # Generate or load manifest
     if args.manifest:
         manifest_path = args.manifest
@@ -419,21 +669,147 @@ def main():
         sys.exit(81)
 
     manifest = load_manifest(manifest_path)
-    jobs = filter_jobs(manifest, ["PENDING", "FAILED"])
+
+    # V-P-010 / BUG-044 fix: FAILED job downgrade logic with stage-aware retry
+    # Verify intermediate file integrity for FAILED jobs and resume from last_completed_stage+1
+    try:
+        from checkpoint import verify_ffprobe_decodeable
+        temp_dir = config.get("global", {}).get("temp_dir", "./temp")
+        for job in manifest.get("jobs", []):
+            if job.get("status") != "FAILED":
+                continue
+            job_id = job.get("job_id", "")
+            input_name = Path(job.get("input_path", "")).name
+            last_completed = -1
+            # Scan step0..step7 to find highest valid intermediate
+            for stage_num in range(7, -1, -1):
+                import glob
+                pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
+                candidates = glob.glob(pattern)
+                if candidates:
+                    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    if verify_ffprobe_decodeable(candidates[0]):
+                        last_completed = stage_num
+                        break
+            job["last_completed_stage"] = last_completed
+            if last_completed >= 0:
+                logger.info("FAILED_DOWNGRADE",
+                           f"Job {job_id} has valid step{last_completed}, downgrading to PENDING "
+                           f"(will resume from stage {last_completed + 1})")
+                job["status"] = "PENDING"
+                job["resume_from_stage"] = last_completed + 1
+            else:
+                logger.info("FAILED_KEEP",
+                           f"Job {job_id} no valid intermediates, keeping FAILED")
+        save_manifest(manifest, manifest_path)
+    except Exception as e:
+        logger.warning("FAILED_CHECK", f"FAILED job check skipped: {e}")
+
+    # BUG-043 / V-P-004 fix: resume mode must check step7 first; only DONE if final output valid
+    target_statuses = ["PENDING", "FAILED"]
+    if args.resume:
+        try:
+            from checkpoint import verify_ffprobe_decodeable
+            temp_dir = config.get("global", {}).get("temp_dir", "./temp")
+            for job in manifest.get("jobs", []):
+                if job.get("status") != "PENDING":
+                    continue
+                job_id = job.get("job_id", "")
+                input_name = Path(job.get("input_path", "")).name
+                # Only mark DONE if step7 output exists and is valid
+                step7_done = False
+                import glob
+                pattern = f"{temp_dir}/{job_id}_{input_name}_step7*"
+                candidates = glob.glob(pattern)
+                if candidates:
+                    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    if verify_ffprobe_decodeable(candidates[0]):
+                        step7_done = True
+                        logger.info("RESUME_DONE",
+                                   f"Job {job_id} has valid step7 output, marking DONE")
+                        job["status"] = "DONE"
+                if not step7_done:
+                    # Determine highest valid completed stage for partial resume
+                    last_completed = -1
+                    for stage_num in range(6, -1, -1):
+                        pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
+                        candidates = glob.glob(pattern)
+                        if candidates:
+                            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                            if verify_ffprobe_decodeable(candidates[0]):
+                                last_completed = stage_num
+                                break
+                    job["last_completed_stage"] = last_completed
+                    if last_completed >= 0:
+                        job["resume_from_stage"] = last_completed + 1
+                        logger.info("RESUME_PARTIAL",
+                                   f"Job {job_id} resuming from stage {last_completed + 1}")
+            save_manifest(manifest, manifest_path)
+        except Exception as e:
+            logger.warning("RESUME_CHECK", f"Resume check skipped: {e}")
+
+    jobs = filter_jobs(manifest, target_statuses)
     if args.job_id:
         jobs = [j for j in jobs if j.get("job_id") == args.job_id]
 
     logger.info("BATCH_START", f"Processing {len(jobs)} video jobs")
     print(f"Processing {len(jobs)} video jobs...")
 
-    # Preview mode
-    if args.preview:
-        from preview import extract_preview_frames
+    # V-P-009 fix: enhanced preview mode with motion segments
+    # Also handle mode == "preview"
+    if args.preview or (mode == "preview"):
+        from preview import extract_preview_frames, generate_preview_clip, generate_comparison_frames
         for job in jobs[:3]:
             try:
                 preview_dir = Path(gcfg.get("temp_dir", "./temp")) / "preview"
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                # Static frames
                 frames = extract_preview_frames(job["input_path"], str(preview_dir), num_frames=3)
                 logger.info("PREVIEW", f"Preview frames for {job['job_id']}: {frames}")
+                # Motion segments (0.5s WebP animation)
+                for seg_idx, start_pct in enumerate([0.3, 0.6]):
+                    try:
+                        dur = job.get("duration", 0)
+                        start_sec = dur * start_pct if dur > 0 else start_pct * 30
+                        webp_path = str(preview_dir / f"{job['job_id']}_motion_{seg_idx}.webp")
+                        if generate_preview_clip(job["input_path"], webp_path,
+                                                 start_sec=start_sec, duration_sec=0.5):
+                            logger.info("PREVIEW_MOTION",
+                                       f"Motion preview for {job['job_id']}: {webp_path}")
+                    except Exception as e:
+                        logger.warning("PREVIEW_MOTION_FAIL",
+                                      f"Motion preview failed for {job['job_id']}: {e}")
+
+                # ISSUE-V-MAIN-002: generate AI before/after comparison frames in preview
+                job_params = merge_params(job, config, {}, logger)
+                if job_params.get("ai_enabled") or job_params.get("force_allow_banned_upscale"):
+                    try:
+                        sim_path = str(preview_dir / f"{job['job_id']}_sim_upscale.mkv")
+                        # Lightweight Lanczos simulation for quick preview
+                        # Real AI comparison is generated when force_allow_banned_upscale=True
+                        sim_cmd = [
+                            "ffmpeg", "-hide_banner", "-v", "error", "-y",
+                            "-i", job["input_path"],
+                            "-vf",
+                            "scale=iw*2:ih*2:flags=lanczos,unsharp=luma_msize_x=3:luma_msize_y=3:luma_amount=0.5",
+                            "-t", "2", "-c:v", "libx264", "-crf", "28",
+                            "-pix_fmt", "yuv420p", sim_path,
+                        ]
+                        sim_r = subprocess.run(sim_cmd, capture_output=True, timeout=60, shell=False)
+                        if sim_r.returncode == 0 and os.path.exists(sim_path):
+                            comp_frames = generate_comparison_frames(
+                                job["input_path"], sim_path, str(preview_dir), num_pairs=2
+                            )
+                            logger.info("PREVIEW_COMPARE",
+                                       f"Comparison frames for {job['job_id']}: {comp_frames}")
+                            # If force-allowed, additionally attempt real AI preview on 1s clip
+                            if job_params.get("force_allow_banned_upscale"):
+                                logger.info("PREVIEW_FORCE",
+                                           f"force_allow_banned_upscale active for {job['job_id']}; "
+                                           f"run full pipeline to obtain true AI comparison")
+                    except Exception as e:
+                        logger.warning("PREVIEW_COMPARE_FAIL",
+                                      f"Comparison preview failed for {job['job_id']}: {e}")
             except Exception as e:
                 logger.warning("PREVIEW_FAIL", f"Preview failed for {job['job_id']}: {e}")
         print("Preview mode complete. Inspect frames and re-run without --preview.")
@@ -447,14 +823,27 @@ def main():
         multiprocessing.set_start_method("spawn", force=True)
 
         # Build task contexts for picklable worker submission
+        # BUG-040 fix: convert argparse.Namespace to plain dict for spawn safety
         task_contexts = []
         for job in jobs:
             task_contexts.append({
                 "job": job,
-                "config_path": args.config,
+                "config_path": getattr(args, "config"),
                 "log_dir": log_dir,
                 "manifest_path": manifest_path,
-                "args": args,
+                "args": {
+                    "config": getattr(args, "config"),
+                    "output": getattr(args, "output", None),
+                    "no_wsl_redirect": getattr(args, "no_wsl_redirect", False),
+                    "keep_intermediates": getattr(args, "keep_intermediates", False),
+                    "gpu": getattr(args, "gpu", None),
+                    "stage": getattr(args, "stage", None),
+                    # ISSUE-V-MAIN-001 / BUG-047: AI CLI args must propagate to workers
+                    "ai_enabled": getattr(args, "ai_enabled", None),
+                    "ai_upscale_factor": getattr(args, "ai_upscale_factor", None),
+                    "face_restore": getattr(args, "face_restore", None),
+                    "ai_model": getattr(args, "ai_model", None),
+                },
             })
 
         with ProcessPoolExecutor(max_workers=workers) as executor:

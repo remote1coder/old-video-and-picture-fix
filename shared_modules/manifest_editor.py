@@ -2,20 +2,39 @@
 """
 Manifest Editor (Optional)
 Interactive or command-line tool to edit manifest jobs.
+
+v7.32 Compliance:
+- CLI subcommands for batch operations
+- Interactive TUI using rich for visual job review
+- Nested dict override support (key.subkey syntax)
+- PRIORITY setting support
 """
 
+import sys
 from pathlib import Path
 from typing import Optional
 
-from manifest_loader import load_manifest, save_manifest, update_job_status
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from manifest_loader import load_manifest, save_manifest, update_job_status  # noqa: E402
 
 
-def list_jobs(manifest_path: str, status_filter: Optional[str] = None):
+def _set_nested(d: dict, key_path: str, value):
+    """Set nested dict value by dot-separated key path."""
+    keys = key_path.split(".")
+    for k in keys[:-1]:
+        d = d.setdefault(k, {})
+    d[keys[-1]] = value
+
+
+def list_jobs(manifest_path: str, status_filter: Optional[str] = None,
+              show_params: bool = False):
     """List jobs in manifest."""
     manifest = load_manifest(manifest_path)
     jobs = manifest.get("jobs", [])
 
-    print(f"{'Job ID':<12} {'Status':<10} {'Class':<14} {'Confidence':<10} {'Path'}")
+    print(f"{'Job ID':<12} {'Status':<10} {'Class':<14} {'Priority':<8} {'Confidence':<10} {'Path'}")
     print("-" * 100)
 
     for job in jobs:
@@ -24,8 +43,16 @@ def list_jobs(manifest_path: str, status_filter: Optional[str] = None):
         print(f"{job.get('job_id', ''):<12} "
               f"{job.get('status', ''):<10} "
               f"{job.get('detected_class', ''):<14} "
+              f"{job.get('priority', 0):<8} "
               f"{job.get('confidence', 0):.2f}       "
               f"{Path(job.get('input_path', '')).name}")
+        if show_params:
+            rec = job.get("recommended_params", {})
+            over = job.get("user_overrides", {})
+            if rec:
+                print(f"    recommended: {rec}")
+            if over:
+                print(f"    overrides: {over}")
 
 
 def set_job_status(manifest_path: str, job_id: str, status: str):
@@ -38,14 +65,166 @@ def set_job_status(manifest_path: str, job_id: str, status: str):
 
 def set_user_override(manifest_path: str, job_id: str,
                       key: str, value: str):
-    """Set user override parameter for a job."""
+    """Set user override parameter for a job.
+    
+    Supports nested keys via dot notation (e.g., 'avif_params.speed').
+    Values are parsed as int, float, bool, or string.
+    """
     manifest = load_manifest(manifest_path)
     for job in manifest.get("jobs", []):
         if job.get("job_id") == job_id:
-            job.setdefault("user_overrides", {})[key] = value
-            print(f"Set {key}={value} for job {job_id}")
+            overrides = job.setdefault("user_overrides", {})
+            
+            # Auto-detect type
+            parsed_value = value
+            if value.lower() == "true":
+                parsed_value = True
+            elif value.lower() == "false":
+                parsed_value = False
+            elif value.lower() == "none":
+                parsed_value = None
+            else:
+                try:
+                    if "." in value:
+                        parsed_value = float(value)
+                    else:
+                        parsed_value = int(value)
+                except ValueError:
+                    pass
+            
+            _set_nested(overrides, key, parsed_value)
+            print(f"Set {key}={parsed_value} for job {job_id}")
             break
     save_manifest(manifest, manifest_path)
+
+
+def set_priority(manifest_path: str, job_id: str, priority: int):
+    """Set job priority."""
+    manifest = load_manifest(manifest_path)
+    for job in manifest.get("jobs", []):
+        if job.get("job_id") == job_id:
+            job["priority"] = priority
+            print(f"Set priority={priority} for job {job_id}")
+            break
+    save_manifest(manifest, manifest_path)
+
+
+def interactive_tui(manifest_path: str):
+    """Interactive TUI for manifest review using rich.
+    
+    Workflow: y (accept) / e (edit) / s (skip) / p (priority) / q (quit)
+    """
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+    except ImportError:
+        print("rich library not installed. Falling back to basic interactive mode.")
+        _interactive_basic(manifest_path)
+        return
+
+    manifest = load_manifest(manifest_path)
+    jobs = manifest.get("jobs", [])
+    console = Console()
+    
+    console.print(Panel(f"Manifest Editor: {manifest_path}\n"
+                        f"Total jobs: {len(jobs)}\n"
+                        f"Commands: [y]=accept [e]=edit [s]=skip [p]=priority [q]=quit",
+                        title="Interactive Review"))
+    
+    for i, job in enumerate(jobs):
+        if job.get("status") not in ("PENDING", "FAILED"):
+            continue
+        
+        table = Table(title=f"Job {i+1}/{len(jobs)}: {job.get('job_id')}")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value", style="magenta")
+        table.add_row("Input", str(job.get("input_path")))
+        table.add_row("Class", str(job.get("detected_class")))
+        table.add_row("Confidence", f"{job.get('confidence', 0):.2f}")
+        table.add_row("Status", str(job.get("status")))
+        table.add_row("Priority", str(job.get("priority", 0)))
+        table.add_row("AI Banned", str(job.get("ai_upscale_banned", False)))
+        
+        rec = job.get("recommended_params", {})
+        if rec:
+            table.add_row("Params", str(rec)[:80])
+        
+        console.print(table)
+        
+        while True:
+            choice = console.input("[y/e/s/p/q] ? ").strip().lower()
+            if choice == "y":
+                job["status"] = "PENDING"
+                break
+            elif choice == "e":
+                key = console.input("Parameter key (dot notation supported): ").strip()
+                val = console.input("Value: ").strip()
+                set_user_override(manifest_path, job["job_id"], key, val)
+                break
+            elif choice == "s":
+                job["status"] = "SKIP"
+                break
+            elif choice == "p":
+                try:
+                    p = int(console.input("Priority (int): ").strip())
+                    job["priority"] = p
+                except ValueError:
+                    console.print("Invalid priority")
+                break
+            elif choice == "q":
+                save_manifest(manifest, manifest_path)
+                console.print("Manifest saved. Quitting.")
+                return
+    
+    save_manifest(manifest, manifest_path)
+    console.print("All jobs reviewed. Manifest saved.")
+
+
+def _interactive_basic(manifest_path: str):
+    """Basic interactive mode without rich."""
+    manifest = load_manifest(manifest_path)
+    jobs = manifest.get("jobs", [])
+    
+    print(f"Manifest Editor: {manifest_path}")
+    print(f"Total jobs: {len(jobs)}")
+    print("Commands: y=accept e=edit s=skip p=priority q=quit")
+    
+    for i, job in enumerate(jobs):
+        if job.get("status") not in ("PENDING", "FAILED"):
+            continue
+        
+        print(f"\n--- Job {i+1}/{len(jobs)}: {job.get('job_id')} ---")
+        print(f"  Input: {job.get('input_path')}")
+        print(f"  Class: {job.get('detected_class')} (confidence: {job.get('confidence', 0):.2f})")
+        print(f"  Status: {job.get('status')} | Priority: {job.get('priority', 0)}")
+        
+        while True:
+            choice = input("[y/e/s/p/q] ? ").strip().lower()
+            if choice == "y":
+                job["status"] = "PENDING"
+                break
+            elif choice == "e":
+                key = input("Parameter key: ").strip()
+                val = input("Value: ").strip()
+                set_user_override(manifest_path, job["job_id"], key, val)
+                break
+            elif choice == "s":
+                job["status"] = "SKIP"
+                break
+            elif choice == "p":
+                try:
+                    job["priority"] = int(input("Priority: ").strip())
+                except ValueError:
+                    print("Invalid priority")
+                break
+            elif choice == "q":
+                save_manifest(manifest, manifest_path)
+                print("Saved. Quitting.")
+                return
+    
+    save_manifest(manifest, manifest_path)
+    print("All jobs reviewed. Manifest saved.")
 
 
 def main():
@@ -57,6 +236,7 @@ def main():
     # List command
     list_parser = subparsers.add_parser("list", help="List jobs")
     list_parser.add_argument("--status", help="Filter by status")
+    list_parser.add_argument("--params", action="store_true", help="Show parameters")
 
     # Set-status command
     status_parser = subparsers.add_parser("set-status", help="Set job status")
@@ -66,17 +246,29 @@ def main():
     # Set-override command
     override_parser = subparsers.add_parser("set-override", help="Set parameter override")
     override_parser.add_argument("job_id", help="Job ID")
-    override_parser.add_argument("key", help="Parameter name")
+    override_parser.add_argument("key", help="Parameter name (dot notation supported)")
     override_parser.add_argument("value", help="Parameter value")
+
+    # Set-priority command
+    priority_parser = subparsers.add_parser("set-priority", help="Set job priority")
+    priority_parser.add_argument("job_id", help="Job ID")
+    priority_parser.add_argument("priority", type=int, help="Priority value")
+
+    # Interactive TUI command
+    tui_parser = subparsers.add_parser("interactive", help="Interactive TUI review")
 
     args = parser.parse_args()
 
     if args.command == "list":
-        list_jobs(args.manifest, args.status)
+        list_jobs(args.manifest, args.status, show_params=getattr(args, "params", False))
     elif args.command == "set-status":
         set_job_status(args.manifest, args.job_id, args.status)
     elif args.command == "set-override":
         set_user_override(args.manifest, args.job_id, args.key, args.value)
+    elif args.command == "set-priority":
+        set_priority(args.manifest, args.job_id, args.priority)
+    elif args.command == "interactive":
+        interactive_tui(args.manifest)
     else:
         parser.print_help()
 

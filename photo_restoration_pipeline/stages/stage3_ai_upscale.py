@@ -69,48 +69,55 @@ def _resolve_input_source(temp_dir: str, job_id: str, input_name: str,
     return None, ""
 
 
-def run_realesrgan(input_path: str, output_path: str, model: str,
-                   scale: int, model_dir: str = "", use_gpu: bool = True) -> bool:
-    """Run Real-ESRGAN on a single image via realesrgan-ncnn-vulkan or Python API fallback."""
-    if not model_dir:
-        project_root = SCRIPT_DIR.parent.resolve()
-        model_dir = str(project_root / "models")
+def _run_realesrgan_vulkan(input_path: str, output_path: str, model: str,
+                             scale: int, model_dir: str, use_gpu: bool) -> bool:
+    """Run Real-ESRGAN via ncnn-vulkan CLI."""
     model_path = os.path.join(model_dir, f"{model}.pth")
     if not os.path.exists(model_path):
         return False
-
-    # Try realesrgan-ncnn-vulkan CLI first (preferred)
     vulkan_bin = shutil.which("realesrgan-ncnn-vulkan")
-    if vulkan_bin:
-        cmd = [
-            vulkan_bin,
-            "-i", input_path,
-            "-o", output_path,
-            "-n", model,
-            "-s", str(scale),
-        ]
-        if not use_gpu:
-            cmd.extend(["-g", "-1"])
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=1800, shell=False)
-            return r.returncode == 0
-        except Exception:
-            pass
-
-    # Fallback: Python API via realesrgan package
+    if not vulkan_bin:
+        return False
+    cmd = [
+        vulkan_bin,
+        "-i", input_path,
+        "-o", output_path,
+        "-n", model,
+        "-s", str(scale),
+    ]
+    if not use_gpu:
+        cmd.extend(["-g", "-1"])
     try:
+        r = subprocess.run(cmd, capture_output=True, timeout=1800, shell=False)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _run_realesrgan_python(input_path: str, output_path: str, model: str,
+                           scale: int, model_dir: str, use_gpu: bool) -> bool:
+    """Run Real-ESRGAN via Python API fallback."""
+    model_path = os.path.join(model_dir, f"{model}.pth")
+    if not os.path.exists(model_path):
+        return False
+    try:
+        import json
+        # PHOTO-AUDIT-012: Use json.dumps for safe string quoting
+        safe_model_path = json.dumps(model_path)
+        safe_input_path = json.dumps(input_path)
+        safe_output_path = json.dumps(output_path)
         cmd = [
             sys.executable, "-c",
             f"from realesrgan import RealESRGANer; "
             f"from basicsr.utils.download_util import load_file_from_url; "
             f"import torch; "
-            f"model = RealESRGANer(scale={scale}, model_path='{model_path}', "
+            f"model = RealESRGANer(scale={scale}, model_path={safe_model_path}, "
             f"prepad=10, half={'False' if not use_gpu else 'not torch.cuda.is_available()'}); "
             f"from PIL import Image; "
-            f"img = Image.open('{input_path}').convert('RGB'); "
+            f"img = Image.open({safe_input_path}).convert('RGB'); "
             f"import numpy as np; "
             f"output, _ = model.enhance(np.array(img)); "
-            f"Image.fromarray(output).save('{output_path}')",
+            f"Image.fromarray(output).save({safe_output_path})",
         ]
         r = subprocess.run(cmd, capture_output=True, timeout=1800, shell=False)
         return r.returncode == 0
@@ -118,16 +125,132 @@ def run_realesrgan(input_path: str, output_path: str, model: str,
         return False
 
 
+# BUG-052 fix: DAT model architecture config mapping
+# Different DAT variants may require different architecture parameters.
+# This map allows per-model architecture configuration.
+_DAT_MODEL_CONFIGS = {
+    # Default DAT configuration (DAT_x2 / DAT_x4 share same architecture in official release)
+    "default": {
+        "depth": [6, 6, 6, 6],
+        "embed_dim": 180,
+        "num_heads": [6, 6, 6, 6],
+        "expansion_factor": 4,
+        "resi_connection": "1conv",
+        "img_size": 64,
+        "img_range": 1.0,
+    },
+    # Lightweight variant (if available)
+    "DAT_light": {
+        "depth": [4, 4, 4, 4],
+        "embed_dim": 120,
+        "num_heads": [4, 4, 4, 4],
+        "expansion_factor": 4,
+        "resi_connection": "1conv",
+        "img_size": 64,
+        "img_range": 1.0,
+    },
+}
+
+
+def _get_dat_config(model_name: str) -> dict:
+    """Get DAT architecture config by model name. Falls back to default."""
+    for key in _DAT_MODEL_CONFIGS:
+        if key != "default" and key.lower() in model_name.lower():
+            return _DAT_MODEL_CONFIGS[key]
+    return _DAT_MODEL_CONFIGS["default"]
+
+
+def _run_dat_pytorch(input_path: str, output_path: str, model: str,
+                     scale: int, model_dir: str, use_gpu: bool) -> bool:
+    """Run DAT model via PyTorch backend (v7.32 §3.1: DAT uses official PyTorch scripts)."""
+    model_path = os.path.join(model_dir, f"{model}.pth")
+    if not os.path.exists(model_path):
+        return False
+    try:
+        import torch
+        from PIL import Image
+        import numpy as np
+
+        device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+        state_dict = torch.load(model_path, map_location=device, weights_only=False)
+
+        # BUG-052 fix: Load architecture config from mapping table instead of hardcoding
+        cfg = _get_dat_config(model)
+        dat_model = None
+        try:
+            from basicsr.archs.dat_arch import DAT
+            dat_model = DAT(
+                upscale=scale, in_chans=3,
+                img_size=cfg["img_size"], img_range=cfg["img_range"],
+                depth=cfg["depth"], embed_dim=cfg["embed_dim"],
+                num_heads=cfg["num_heads"],
+                expansion_factor=cfg["expansion_factor"],
+                resi_connection=cfg["resi_connection"],
+            )
+            sd = state_dict['params'] if 'params' in state_dict else state_dict
+            dat_model.load_state_dict(sd, strict=False)
+            dat_model.eval().to(device)
+        except Exception as e:
+            # Log architecture mismatch for debugging
+            import sys
+            print(f"DAT architecture load failed for {model}: {e}", file=sys.stderr)
+            # Fallback: try loading as a generic nn.Module if state dict keys suggest DAT
+            pass
+
+        if dat_model is None:
+            return False
+
+        img = Image.open(input_path).convert("RGB")
+        img_np = np.array(img).astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
+        with torch.no_grad():
+            output = dat_model(img_tensor)
+        output = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
+        Image.fromarray(output).save(output_path)
+        return True
+    except Exception:
+        return False
+
+
+def run_realesrgan(input_path: str, output_path: str, model: str,
+                   scale: int, model_dir: str = "", use_gpu: bool = True) -> bool:
+    """Run AI upscale on a single image.
+
+    Supports Real-ESRGAN (ncnn-vulkan + Python fallback) and DAT (PyTorch only).
+    PHOTO-AUDIT-011: Added DAT PyTorch backend per v7.32 §3.1.
+    """
+    if not model_dir:
+        project_root = SCRIPT_DIR.parent.resolve()
+        model_dir = str(project_root / "models")
+
+    family = _get_model_basename(model)
+    if family == "DAT":
+        # DAT only supports PyTorch backend (ncnn-vulkan may not support DAT weights)
+        return _run_dat_pytorch(input_path, output_path, model, scale, model_dir, use_gpu)
+
+    # RealESRGAN: try ncnn-vulkan first, then Python fallback
+    if _run_realesrgan_vulkan(input_path, output_path, model, scale, model_dir, use_gpu):
+        return True
+    return _run_realesrgan_python(input_path, output_path, model, scale, model_dir, use_gpu)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
+    parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
-    params = json.loads(args.params) if args.params else {}
+    # BUG-057 support: --params-file fallback for long JSON
+    if getattr(args, "params_file", None):
+        with open(args.params_file, "r", encoding="utf-8") as f:
+            params = json.load(f)
+    else:
+        params = json.loads(args.params) if args.params else {}
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
@@ -164,14 +287,27 @@ def main():
     # v6.3 §5.3: Target resolution check - AI upscale only available when target <= 1080p
     original_width = params.get("original_width", 0)
     original_height = params.get("original_height", 0)
+    # Fallback: read from input file if job metadata missing
+    if original_width == 0 or original_height == 0:
+        try:
+            from PIL import Image
+            with Image.open(args.input) as img:
+                original_width, original_height = img.size
+        except Exception:
+            original_width, original_height = 1920, 1080
+
     target_w = original_width * scale
     target_h = original_height * scale
     # 1080p threshold: 1920x1080
     if target_w > 1920 or target_h > 1080:
-        logger.warning("STAGE3_RES_LIMIT",
-                       f"Target resolution {target_w}x{target_h} exceeds 1080p, "
-                       "skipping AI upscale per v6.3 §5.3")
-        return 3
+        if force_allow:
+            logger.critical("STAGE3_FORCE_ALLOW",
+                           f"FORCE ALLOW: target {target_w}x{target_h} exceeds 1080p but force_allow=true")
+        else:
+            logger.warning("STAGE3_RES_LIMIT",
+                           f"Target resolution {target_w}x{target_h} exceeds 1080p, "
+                           "skipping AI upscale per v6.3 §5.3")
+            return 3
 
     # v6.3 §5.3: Enforce traditional-first if configured
     force_traditional_first = params.get("force_traditional_first", True)
@@ -212,9 +348,11 @@ def main():
                        "lanczos_target is set but v6.3 §5.3 prohibits Lanczos pre-processing to AI")
 
     # Output path
+    # Bug 11.14 fix: add _forced_upscale suffix when force_allow is true
+    suffix = "_forced_upscale" if force_allow else ""
     param_hash = compute_param_hash(args.input, params)
     inter_name = build_intermediate_name(
-        args.job_id, input_name, 3, "upscale", param_hash, "png"
+        args.job_id, input_name, 3, f"upscale{suffix}", param_hash, "png"
     )
     output_path = os.path.join(temp_dir, inter_name)
 
@@ -239,8 +377,17 @@ def main():
     except Exception:
         img_w, img_h = 1920, 1080  # fallback conservative estimate
 
-    # Estimated VRAM: width * height * channels * 4 bytes * (2 + scale^2)
-    vram_required = int(img_w * img_h * 3 * 4 * (2 + scale * scale))
+    # BUG-056 fix: Include model weight bytes in VRAM estimation
+    # Estimated VRAM: width * height * channels * 4 bytes * (2 + scale^2) + model_weight_bytes
+    base_vram = img_w * img_h * 3 * 4 * (2 + scale * scale)
+    model_weight_bytes = 0
+    try:
+        model_path = os.path.join(model_dir, f"{model}.pth")
+        if os.path.exists(model_path):
+            model_weight_bytes = os.path.getsize(model_path)
+    except Exception:
+        pass
+    vram_required = int(base_vram + model_weight_bytes)
     sufficient, backend = gpu_memory_check(vram_required)
 
     use_gpu = True
@@ -276,6 +423,22 @@ def main():
         logger.info("STAGE3_DONE", "Upscale complete",
                     output=output_path, scale=actual_scale,
                     backend=backend if use_gpu else "cpu")
+
+        # Bug 11.15 fix: generate preview comparison frames for forced upscale
+        if force_allow:
+            try:
+                sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+                from preview import extract_preview_frames
+                preview_dir = os.path.join(temp_dir, "previews")
+                os.makedirs(preview_dir, exist_ok=True)
+                preview_frames = extract_preview_frames(
+                    stage1_output, preview_dir,
+                    num_frames=2, force_compare_frames=True
+                )
+                if preview_frames:
+                    logger.info("STAGE3_PREVIEW", f"Generated comparison preview: {preview_frames}")
+            except Exception as e:
+                logger.warning("STAGE3_PREVIEW_FAIL", f"Preview generation failed: {e}")
         return 0
 
     logger.error("STAGE3_FAILED", "AI upscaling failed")

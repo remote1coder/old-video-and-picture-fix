@@ -28,6 +28,30 @@ def run_ffprobe(input_path: str) -> Dict[str, Any]:
     return {}
 
 
+def _check_psf_mediainfo(input_path: str) -> bool:
+    """Check if MediaInfo indicates PSF (Progressive Frame / InterleavedFields).
+
+    Per v6.32 §3.9 / v7.32 §3.9 (Method B):
+    Reads ScanType_StoreMethod field. Returns True if 'InterleavedFields',
+    'PF', or 'Progressive Frame'.
+    """
+    try:
+        r = subprocess.run(
+            ["mediainfo", "--Inform=Video;%ScanType_StoreMethod%", input_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            method = r.stdout.strip().lower()
+            if method in ("interleavedfields", "pf", "progressive frame"):
+                return True
+    except FileNotFoundError:
+        # MediaInfo not installed; silently skip
+        pass
+    except Exception:
+        pass
+    return False
+
+
 def _parse_idet_counts(idet_output: str) -> Tuple[int, int, int, int]:
     """Parse ffmpeg idet stderr for TFF/BFF/Progressive/Undetermined counts."""
     tff_count = 0
@@ -120,6 +144,11 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
 
     # PSF check
     if gprog_ratio > 0.90 and fo_meta in ("tt", "bb", "tff", "bff"):
+        # Method B: MediaInfo auxiliary check (v6.32 §3.9 / v7.32 §3.9)
+        # If MediaInfo explicitly indicates PSF, skip expensive SSIM test
+        if _check_psf_mediainfo(input_path):
+            return "psf", gprog_ratio, []
+        # Method C: SSIM field similarity check
         if _check_psf_ssim(input_path):
             return "psf", gprog_ratio, []
 
@@ -435,6 +464,95 @@ def _check_psf_ssim(input_path: str) -> bool:
         return False
 
 
+def _detect_blockiness_and_blur(input_path: str) -> Dict[str, float]:
+    """Detect pixel-level features: blockiness (DCT artifacts) and blur/sharpness.
+
+    Returns dict with:
+    - blockiness_score: 0-1 (higher = more blocky, e.g. heavy DCT compression)
+    - blur_score: 0-1 (higher = more blurred / out of focus)
+    - noise_score: 0-1 (higher = more grain/noise)
+    """
+    import tempfile
+    from PIL import Image
+
+    scores = {"blockiness_score": 0.0, "blur_score": 0.0, "noise_score": 0.0}
+    try:
+        # Extract one frame from middle of video
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-v", "error",
+             "-ss", "00:00:02", "-i", input_path,
+             "-frames:v", "1", "-f", "image2", "-y", tmp.name],
+            capture_output=True, timeout=30, shell=False
+        )
+        if r.returncode != 0:
+            return scores
+
+        img = Image.open(tmp.name).convert("L")
+        arr = np.array(img, dtype=np.float64)
+
+        # Blockiness: compare pixel difference at 8-pixel boundaries vs interior
+        h, w = arr.shape
+        # Horizontal block boundaries (rows at multiples of 8)
+        h_diff_boundary = []
+        h_diff_interior = []
+        for y in range(1, h):
+            row_diff = np.abs(arr[y, :] - arr[y - 1, :]).mean()
+            if y % 8 == 0:
+                h_diff_boundary.append(row_diff)
+            else:
+                h_diff_interior.append(row_diff)
+
+        # Vertical block boundaries (cols at multiples of 8)
+        v_diff_boundary = []
+        v_diff_interior = []
+        for x in range(1, w):
+            col_diff = np.abs(arr[:, x] - arr[:, x - 1]).mean()
+            if x % 8 == 0:
+                v_diff_boundary.append(col_diff)
+            else:
+                v_diff_interior.append(col_diff)
+
+        if h_diff_interior and v_diff_interior and h_diff_boundary and v_diff_boundary:
+            avg_interior = (np.mean(h_diff_interior) + np.mean(v_diff_interior)) / 2 + 1e-6
+            avg_boundary = (np.mean(h_diff_boundary) + np.mean(v_diff_boundary)) / 2
+            blockiness = avg_boundary / avg_interior
+            # Normalize to 0-1 range (typical blockiness 1.0-5.0)
+            scores["blockiness_score"] = min(1.0, max(0.0, (blockiness - 1.0) / 3.0))
+
+        # Blur: Laplacian variance (lower = more blurred)
+        try:
+            import cv2
+            lap = cv2.Laplacian(arr.astype(np.float32), cv2.CV_32F)
+            lap_var = lap.var()
+            # Typical lap_var: sharp ~1000+, blurred ~50-200
+            scores["blur_score"] = min(1.0, max(0.0, 1.0 - (lap_var / 800.0)))
+
+            # Noise: residual mean after 3x3 median filter
+            median_img = cv2.medianBlur(arr.astype(np.uint8), 3).astype(np.float64)
+            noise = np.abs(arr - median_img).mean()
+            # Normalize: typical noise 2-20
+            scores["noise_score"] = min(1.0, max(0.0, noise / 15.0))
+        except Exception:
+            # Fallback without cv2: simple gradient variance
+            gx = np.diff(arr, axis=1)
+            gy = np.diff(arr, axis=0)
+            grad_var = (gx.var() + gy.var()) / 2
+            scores["blur_score"] = min(1.0, max(0.0, 1.0 - (grad_var / 500.0)))
+            # Simple noise estimate from high-frequency residual
+            noise = np.abs(arr[1:, 1:] - arr[:-1, :-1]).mean()
+            scores["noise_score"] = min(1.0, max(0.0, noise / 15.0))
+
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return scores
+
+
 def classify_video(input_path: str) -> Dict[str, Any]:
     """Classify video and return full metadata.
 
@@ -446,6 +564,7 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     - is_psf: bool
     - original_width, original_height
     - native_width, native_height, native_dar
+    - duration: float (seconds)
     """
     result: Dict[str, Any] = {
         "detected_class": "UNKNOWN",
@@ -458,6 +577,7 @@ def classify_video(input_path: str) -> Dict[str, Any]:
         "native_width": 0,
         "native_height": 0,
         "native_dar": "",
+        "duration": 0.0,
         "file_size": 0,
         "file_mtime": 0,
         "file_hash_prefix": "",
@@ -488,6 +608,15 @@ def classify_video(input_path: str) -> Dict[str, Any]:
         if s.get("codec_type") == "video":
             video_stream = s
             break
+
+    # BUG-045 fix: populate duration from ffprobe format
+    try:
+        format_info = info.get("format", {})
+        duration_raw = format_info.get("duration")
+        if duration_raw:
+            result["duration"] = float(duration_raw)
+    except Exception:
+        pass
 
     if not video_stream:
         return result
@@ -550,6 +679,39 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     elif result["detected_class"] == "DV_DIGITAL" and field_order in interlaced_orders:
         # DV may need IVTC if it has pulldown
         result["needs_ivtc"] = True  # Auto-detect will verify
+
+    # V-P-014 fix: pixel feature analysis enhancement
+    pixel_features = _detect_blockiness_and_blur(input_path)
+    result["blockiness_score"] = pixel_features.get("blockiness_score", 0.0)
+    result["blur_score"] = pixel_features.get("blur_score", 0.0)
+    result["noise_score"] = pixel_features.get("noise_score", 0.0)
+
+    # Refine classification with pixel features
+    # High blur + high noise strongly suggests analog tape (VHS etc.)
+    # Low blur + low noise suggests digital source (DV/HDV)
+    # High blockiness with H.264 suggests low-bitrate AVCHD
+    blur = result["blur_score"]
+    noise = result["noise_score"]
+    blockiness = result["blockiness_score"]
+
+    if result["detected_class"] == "ANALOG_TAPE":
+        # Boost confidence if pixel features match analog tape profile
+        if blur > 0.4 and noise > 0.3:
+            result["confidence"] = min(0.98, result["confidence"] + 0.1)
+        elif blur < 0.2 and noise < 0.2:
+            # Suspect misclassification: very clean/sharp for analog
+            result["confidence"] = max(0.50, result["confidence"] - 0.15)
+    elif result["detected_class"] == "HDV_AVCHD":
+        # High blockiness with HD resolution suggests low-bitrate AVCHD
+        if blockiness > 0.5:
+            result["confidence"] = min(0.95, result["confidence"] + 0.05)
+        # Very low blur/noise confirms digital source
+        if blur < 0.2 and noise < 0.15:
+            result["confidence"] = min(0.98, result["confidence"] + 0.05)
+    elif result["detected_class"] == "DV_DIGITAL":
+        # DV usually has moderate noise but low blur
+        if noise > 0.2 and blur < 0.3:
+            result["confidence"] = min(0.98, result["confidence"] + 0.05)
 
     # AI upscale banned: HDV/AVCHD 1080p or any video >=1080p height
     # v6.3: base ban on original input pixel dimensions

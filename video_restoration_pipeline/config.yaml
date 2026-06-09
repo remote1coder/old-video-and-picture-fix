@@ -99,45 +99,45 @@ paths:
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true
 
-  audio_override:
-    # v7.3：各素材类型可独立覆盖全局音频参数
-    # 优先级：命令行 > user_overrides > paths.audio_override > global.audio > 内置默认值
-    analog_tape:
-      hum_freq: 50
-      hum_harmonics: 3
-      hum_bandwidth: 2
-      hum_width_type: "h"
-      hum_dual: false
-      hum_dual_ratio_threshold: 3.0
-      hum_lowfreq_energy_threshold: 0.3
-      hum_fft_window: "adaptive"
-      hum_fft_overlap: 0.5
-      hum_fft_window_func: "hann"
-      denoise: "afftdn"
-    dv_digital:
-      hum_freq: 50
-      hum_harmonics: 3
-      hum_bandwidth: 2
-      hum_width_type: "h"
-      hum_dual: false
-      hum_dual_ratio_threshold: 3.0
-      hum_lowfreq_energy_threshold: 0.3
-      hum_fft_window: "adaptive"
-      hum_fft_overlap: 0.5
-      hum_fft_window_func: "hann"
-      denoise: "afftdn"
-    hdv_avchd:
-      hum_freq: 50
-      hum_harmonics: 3
-      hum_bandwidth: 2
-      hum_width_type: "h"
-      hum_dual: false
-      hum_dual_ratio_threshold: 3.0
-      hum_lowfreq_energy_threshold: 0.3
-      hum_fft_window: "adaptive"
-      hum_fft_overlap: 0.5
-      hum_fft_window_func: "hann"
-      denoise: "afftdn"
+audio_override:
+  # v7.3：各素材类型可独立覆盖全局音频参数
+  # 优先级：命令行 > user_overrides > paths.audio_override > global.audio > 内置默认值
+  analog_tape:
+    hum_freq: 50
+    hum_harmonics: 3
+    hum_bandwidth: 2
+    hum_width_type: "h"
+    hum_dual: false
+    hum_dual_ratio_threshold: 3.0
+    hum_lowfreq_energy_threshold: 0.3
+    hum_fft_window: "adaptive"
+    hum_fft_overlap: 0.5
+    hum_fft_window_func: "hann"
+    denoise: "afftdn"
+  dv_digital:
+    hum_freq: 50
+    hum_harmonics: 3
+    hum_bandwidth: 2
+    hum_width_type: "h"
+    hum_dual: false
+    hum_dual_ratio_threshold: 3.0
+    hum_lowfreq_energy_threshold: 0.3
+    hum_fft_window: "adaptive"
+    hum_fft_overlap: 0.5
+    hum_fft_window_func: "hann"
+    denoise: "afftdn"
+  hdv_avchd:
+    hum_freq: 50
+    hum_harmonics: 3
+    hum_bandwidth: 2
+    hum_width_type: "h"
+    hum_dual: false
+    hum_dual_ratio_threshold: 3.0
+    hum_lowfreq_energy_threshold: 0.3
+    hum_fft_window: "adaptive"
+    hum_fft_overlap: 0.5
+    hum_fft_window_func: "hann"
+    denoise: "afftdn"
 
 grain_factory3:
   enabled: true
@@ -145,14 +145,17 @@ grain_factory3:
     g1str: 1.0
     g2str: 0.2
     g3str: 0.2
+    temp_avg: 0  # V-P-012 fix: temporal averaging for grain continuity
   dv_digital:
     g1str: 1.0
     g2str: 0.2
     g3str: 0.2
+    temp_avg: 0
   hdv_avchd:
     g1str: 0.8
     g2str: 0.2
     g3str: 0.2
+    temp_avg: 0
   addgrainc_enabled: false
   addgrainc_ratio: 0.2
 
@@ -171,6 +174,7 @@ ai:
   face_detect_threshold: 0.8
   face_detect_threshold_lowres: 0.6
   face_detect_lowres_max_dimension: 720
+  static_segment_duration: 2.0  # V-P-013 fix: minimum static segment duration in seconds
   ban_original_input_pixels: true
   ban_intermediate_pixels: true
 
