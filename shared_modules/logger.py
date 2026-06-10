@@ -90,15 +90,46 @@ class StructuredLogger:
             except OSError:
                 pass
 
+    def _rotate_locked(self, f):
+        """Rotate log file when holding a cross-process lock.
+        
+        FIX-P1-4: Uses file size estimate instead of line count to avoid
+        re-reading the entire file under lock. Per v7.32 §3.10.12 / v6.32 §7.4.
+        """
+        f.seek(0, 2)  # EOF
+        size = f.tell()
+        # Rough estimate: assume average 200 bytes per line
+        estimated_lines = size // 200
+        if estimated_lines >= self.log_max_lines:
+            ts = int(time.time() * 1000)
+            backup = self.log_file.parent / f"{self.log_file.name}.{ts}"
+            try:
+                f.flush()
+                import os
+                os.rename(str(self.log_file), str(backup))
+                open(self.log_file, 'a').close()
+                # Clean up old backups if exceeding log_backup_count
+                backups = sorted(
+                    self.log_file.parent.glob(f"{self.log_file.name}.*"),
+                    key=lambda p: p.stat().st_mtime
+                )
+                while len(backups) > self.log_backup_count:
+                    try:
+                        backups.pop(0).unlink()
+                    except OSError:
+                        pass
+            except OSError:
+                pass  # Another process already rotated
+
     def log(self, level: str, event: str, message: str, **kwargs):
         """Write a structured log entry."""
-        # Truncate large fields per v7.3 §3.10.12
+        # FIX-P1-3: Truncate large fields by byte length per v7.32 §3.10.12
         for key, value in kwargs.items():
-            vstr = str(value)
-            if len(vstr) > self.log_max_line_bytes:
+            vbytes = str(value).encode("utf-8")
+            if len(vbytes) > self.log_max_line_bytes:
                 import hashlib
-                h = hashlib.sha256(vstr.encode()).hexdigest()[:8]
-                kwargs[key] = f"<truncated_field name={key} len={len(vstr)} sha={h}>"
+                h = hashlib.sha256(vbytes).hexdigest()[:8]
+                kwargs[key] = f"<truncated_field name={key} len={len(vbytes)} sha={h}>"
 
         # Use local timezone with offset per v7.3 §3.10.12
         entry = {
@@ -114,20 +145,38 @@ class StructuredLogger:
         line = json.dumps(entry, ensure_ascii=False) + "\n"
         line_bytes = line.encode("utf-8")
 
+        # FIX-P1-3: Final safety net — if entire line exceeds 1MB, replace with safe stub
+        if len(line_bytes) > self.log_max_line_bytes:
+            safe = {
+                "timestamp": entry["timestamp"],
+                "level": level,
+                "event": "LOG_TRUNCATED",
+                "message": f"Original line {len(line_bytes)} bytes exceeds 1MB",
+                "original_event": event,
+                "truncated_fields": list(kwargs.keys()),
+            }
+            line_bytes = (json.dumps(safe, ensure_ascii=False) + "\n").encode("utf-8")
+
         with self.lock:
             self._rotate_if_needed()
             with open(self.log_file, "a+b") as f:
                 if _HAS_FCNTL:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    # FIX-P1-5: flock → lockf per v6.32 §7.4
+                    # FIX-P1-4: Rotate under cross-process lock per v7.32 §3.10.12
+                    fcntl.lockf(f.fileno(), fcntl.LOCK_EX)
+                    self._rotate_locked(f)
                     f.write(line_bytes)
                     f.flush()
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    fcntl.lockf(f.fileno(), fcntl.LOCK_UN)
                 elif _HAS_MSVCRT:
                     # Windows: use LK_LOCK (blocking) instead of LK_NBLCK
                     f.seek(0, 2)  # EOF
+                    lock_start = f.tell()
                     msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, len(line_bytes))
                     f.write(line_bytes)
                     f.flush()
+                    # msvcrt.locking requires file pointer at lock start to unlock
+                    f.seek(lock_start)
                     msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, len(line_bytes))
                 else:
                     # Fallback: no locking (single-process only)
@@ -145,6 +194,10 @@ class StructuredLogger:
 
     def error(self, event: str, message: str, **kwargs):
         self.log("ERROR", event, message, **kwargs)
+
+    def critical(self, event: str, message: str, **kwargs):
+        """FIX-P1-2: Added critical() per v7.32 §3.10.2/§3.10.5/§3.10.9."""
+        self.log("CRITICAL", event, message, **kwargs)
 
     def debug(self, event: str, message: str, **kwargs):
         self.log("DEBUG", event, message, **kwargs)

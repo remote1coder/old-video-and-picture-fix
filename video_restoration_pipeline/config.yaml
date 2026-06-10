@@ -50,10 +50,11 @@ paths:
     qtgmc_chromamotion: true
     qtgmc_sourcematch: 3
     qtgmc_input_type: 0
-    qtgmc_fps_divisor: 2
+    qtgmc_fps_divisor: 1
     qtgmc_input_type_rule: "field_order"
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true
+    psf_use_input_type1: false
     stabilize: "DepanStabilize"
     stabilize_params:
       dxmax: 10
@@ -75,7 +76,7 @@ paths:
     qtgmc_chromamotion: true
     qtgmc_sourcematch: 3
     qtgmc_input_type: 0
-    qtgmc_fps_divisor: 2
+    qtgmc_fps_divisor: 1
     qtgmc_input_type_rule: "field_order"
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true
@@ -94,7 +95,7 @@ paths:
     qtgmc_chromamotion: true
     qtgmc_sourcematch: 3
     qtgmc_input_type: 0
-    qtgmc_fps_divisor: 2
+    qtgmc_fps_divisor: 1
     qtgmc_input_type_rule: "field_order"
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true

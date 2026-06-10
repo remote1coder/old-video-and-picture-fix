@@ -94,10 +94,20 @@ def map_class_to_path_params(detected_class: str, config: Dict[str, Any]) -> Dic
     encoding_keys = {"avif_params", "avif_rgb444_params"}
     result = {k: v for k, v in result.items() if k not in encoding_keys}
     
-    # Merge audio_override into recommended_params per spec priority
+    # FIX-P4-1: Merge audio_override per detected_class, not entire dict
     audio_override = config.get("audio_override", {})
     if audio_override:
-        result["audio_override"] = dict(audio_override)
+        type_key = None
+        if detected_class == "ANALOG_TAPE":
+            type_key = "analog_tape"
+        elif detected_class == "DV_DIGITAL":
+            type_key = "dv_digital"
+        elif detected_class == "HDV_AVCHD":
+            type_key = "hdv_avchd"
+        if type_key and type_key in audio_override:
+            result["audio_override"] = dict(audio_override[type_key])
+        elif "default" in audio_override:
+            result["audio_override"] = dict(audio_override["default"])
     
     return result
 
@@ -127,7 +137,8 @@ def _get_duration(input_path: str, classification: Dict[str, Any]) -> float:
 def generate_manifest(input_dirs: List[str], output_path: str,
                       config: Dict[str, Any],
                       pipeline_type: str = "video",
-                      incremental: bool = False) -> str:
+                      incremental: bool = False,
+                      config_path: str = "") -> str:
     """Generate manifest from input directories.
 
     Args:
@@ -166,6 +177,7 @@ def generate_manifest(input_dirs: List[str], output_path: str,
         "meta": {
             "generated_at": now_iso(),
             "source_dirs": input_dirs,
+            "config_path": config_path,  # FIX-P4-6: record config path for editor
             "total_files": 0,
             "pending": 0,
             "done": 0,
@@ -213,8 +225,21 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                 # Map to path params
                 path_params = map_class_to_path_params(detected_class, config)
 
-                # AI upscale banned
+                # FIX-P4-4: AI upscale banned: compute directly in generate.py per spec
+                orig_w = classification.get("original_width", 0) or 0
+                orig_h = classification.get("original_height", 0) or 0
                 ai_banned = classification.get("ai_upscale_banned", False)
+                
+                # Hard recalculation based on original pixel dimensions
+                if detected_class in ("SCAN_PRINT", "DIGITAL_PHOTO"):
+                    if orig_w > 3840 or orig_h > 2160:
+                        ai_banned = True
+                elif detected_class == "HDV_AVCHD":
+                    if orig_h >= 1080 or orig_w >= 1920:
+                        ai_banned = True
+                elif detected_class == "ANALOG_TAPE":
+                    if orig_h > 1080 or orig_w > 1920:
+                        ai_banned = True
 
                 # Determine output path
                 out_name = f.stem + "_restored"
@@ -284,8 +309,11 @@ def generate_manifest(input_dirs: List[str], output_path: str,
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     try:
         if output_path.endswith(".jsonl"):
+            # FIX-P4-7: JSONL stores only job lines; meta goes to separate .meta.json
+            meta_path = str(out_path.with_suffix(".meta.json"))
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump(manifest["meta"], fh, ensure_ascii=False, indent=2)
             with open(tmp_path, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(manifest["meta"], ensure_ascii=False) + "\n")
                 for job in manifest["jobs"]:
                     fh.write(json.dumps(job, ensure_ascii=False) + "\n")
         else:
@@ -318,7 +346,8 @@ def main():
 
     config = load_config(args.config)
     path = generate_manifest(args.input, args.output, config, args.type,
-                             incremental=args.incremental)
+                             incremental=args.incremental,
+                             config_path=args.config)
     print(f"Manifest generated: {path}")
     # Count jobs from the generated manifest
     try:

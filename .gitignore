@@ -16,3 +16,6 @@ build/
 bugs.md
 shixian.md
 .ruff_cache/
+.claude/
+agents.md
+CLAUDE.md

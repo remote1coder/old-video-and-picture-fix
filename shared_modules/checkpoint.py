@@ -83,7 +83,7 @@ CORE_QUALITY_PARAMS = frozenset([
     # Deblocking
     "deblock_quant", "deblock_strength",
     # QTGMC
-    "qtgmc_preset", "qtgmc_ezdenoise", "qtgmc_sharpness",
+    "qtgmc_preset", "qtgmc_ezdenoise", "EZDenoise", "qtgmc_sharpness",
     "qtgmc_chromamotion", "qtgmc_sourcematch", "qtgmc_fps_divisor",
     # IVTC
     "ivtc",
@@ -158,12 +158,19 @@ def compute_param_hash(input_path: str, params: Dict[str, Any]) -> str:
     }
 
     # Extract only quality-related params (recursive nested traversal)
+    # FIX-P2-1: Normalize path-like values to filename+suffix for cross-platform hash consistency (v7.32 §3.10.19)
+    def _normalize_value(k: str, v: Any) -> Any:
+        """Strip platform-specific path prefixes for cross-platform hash consistency."""
+        if isinstance(v, str) and ("/" in v or "\\" in v or v.endswith((".pth", ".pb", ".pt", ".onnx"))):
+            return Path(v).name
+        return v
+
     def _extract_quality(obj: Any) -> Any:
         if isinstance(obj, dict):
             result: Dict[str, Any] = {}
             for k, v in obj.items():
                 if k in CORE_QUALITY_PARAMS:
-                    result[k] = v
+                    result[k] = _normalize_value(k, v)
                 else:
                     nested = _extract_quality(v)
                     if nested is not None and nested != {}:
@@ -276,12 +283,13 @@ def _read_frame_info(filepath: str, position: float) -> Optional[Dict[str, Any]]
             return None
 
         target_time = duration * position
+        # FIX-P2-4: Use yuv420p and extract Y plane for luminance mean per v7.32 §3.10.19
         r2 = subprocess.run(
             ["ffmpeg", "-hide_banner", "-v", "error",
              "-ss", str(target_time),
              "-i", filepath,
              "-frames:v", "1",
-             "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "-f", "rawvideo", "-pix_fmt", "yuv420p",
              "-"],
             capture_output=True, timeout=30, shell=False
         )
@@ -293,14 +301,15 @@ def _read_frame_info(filepath: str, position: float) -> Optional[Dict[str, Any]]
             return None
 
         data = r2.stdout
-        expected = w * h * 3
-        if len(data) < expected:
+        # Y plane is the first w*h bytes in yuv420p
+        if len(data) < w * h:
             return None
 
-        arr = np.frombuffer(data[:expected], dtype=np.uint8).reshape((h, w, 3))
+        y_plane = np.frombuffer(data[:w*h], dtype=np.uint8)
+        mean_y = float(np.mean(y_plane))
         return {
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
+            "mean": mean_y,
+            "std": float(np.std(y_plane)),
             "height": h,
             "width": w,
         }
@@ -400,6 +409,11 @@ def verify_frame_integrity(filepath: str,
                 return True
             return False
         except Exception:
+            return False
+
+    # FIX-P2-7: Fast ffprobe pre-screen before expensive per-frame decode (v7.32 §3.10.19)
+    if not is_photo:
+        if not verify_ffprobe_decodeable(filepath):
             return False
 
     # Determine duration for per-10min sampling
@@ -660,7 +674,7 @@ def is_wsl() -> bool:
 
 def wsl_redirect_path(output_path: str, temp_dir: Optional[str] = None,
                          no_wsl_redirect: bool = False,
-                         platform: str = "auto") -> Tuple[str, Optional[str], str, Optional[str]]:
+                         target_platform: str = "auto") -> Tuple[str, Optional[str], str, Optional[str]]:
     """Redirect output/temp paths for WSL2 compatibility.
     
     Per v6.32 §7.3 / v7.32 §3.10.10: When output_path OR temp_dir is under /mnt/
@@ -674,7 +688,7 @@ def wsl_redirect_path(output_path: str, temp_dir: Optional[str] = None,
     """
     if no_wsl_redirect:
         return output_path, None, temp_dir or "", None
-    if platform not in ("wsl2", "auto"):
+    if target_platform not in ("wsl2", "auto"):
         return output_path, None, temp_dir or "", None
     if not is_wsl():
         return output_path, None, temp_dir or "", None
@@ -746,7 +760,33 @@ def wsl_copy_back(redirected_path: str, original_path: str,
             return False
     
     tmp_path = original_path + ".tmp"
-    
+
+    # FIX-P2-3: rsync-style incremental check per v7.32 §3.10.10
+    if os.path.exists(original_path):
+        try:
+            if (os.path.getsize(redirected_path) == os.path.getsize(original_path) and
+                _md5(redirected_path) == _md5(original_path)):
+                logger.info("WSL_COPY_BACK_SKIP",
+                           "Destination already exists with matching hash, skipping copy",
+                           original=original_path)
+                return True
+        except OSError:
+            pass
+
+    # FIX-P2-2: Disk space pre-check per v7.32 §3.10.10
+    try:
+        target_dir = os.path.dirname(original_path) or "."
+        stat = os.statvfs(target_dir)
+        required_bytes = int(os.path.getsize(redirected_path) * 1.2)
+        available_bytes = stat.f_frsize * stat.f_bavail
+        if available_bytes < required_bytes:
+            logger.error("WSL_COPY_NO_SPACE",
+                        f"Target filesystem has {available_bytes/1024/1024:.1f} MB free, "
+                        f"needs {required_bytes/1024/1024:.1f} MB. Aborting copy-back.")
+            return False
+    except (OSError, AttributeError):
+        pass  # statvfs may fail on some paths; continue at risk
+
     for attempt in range(1, 4):
         try:
             os.makedirs(os.path.dirname(original_path) or ".", exist_ok=True)
@@ -766,6 +806,10 @@ def wsl_copy_back(redirected_path: str, original_path: str,
                 os.replace(tmp_path, original_path)
             else:
                 # Cross filesystem: copyfile directly (rename would fail)
+                # FIX-P2-6: Record WARNING for cross-filesystem copy per v7.32 §3.10.10
+                logger.warning("WSL_COPY_BACK_CROSSFS",
+                              "Cross-filesystem copy: atomic rename disabled, using copyfile with .bak backup",
+                              original=original_path)
                 # Per v6.32 §7.3: backup old file as .bak before overwriting
                 if os.path.exists(original_path):
                     bak_path = original_path + ".bak"

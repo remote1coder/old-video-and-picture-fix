@@ -18,6 +18,8 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from logger import get_logger
+
 
 def _is_photo(path: str) -> bool:
     """Check if path is a photo file (by extension)."""
@@ -79,6 +81,39 @@ def _is_vfr(input_path: str) -> bool:
     return False
 
 
+def _check_pts_monotonic(input_path: str, max_frames: int = 200) -> bool:
+    """Check if video PTS is monotonically increasing.
+
+    Per v7.32 §3.8(注): Validate PTS monotonicity before frame-number extraction.
+    FIX-P3-7
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "frame=pkt_pts_time",
+             "-of", "csv=p=0", input_path],
+            capture_output=True, text=True, timeout=60, shell=False
+        )
+        if r.returncode != 0:
+            return False
+        pts_list = []
+        for line in r.stdout.strip().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    pts_list.append(float(line))
+                except ValueError:
+                    continue
+            if len(pts_list) >= max_frames:
+                break
+        for i in range(1, len(pts_list)):
+            if pts_list[i] < pts_list[i - 1]:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _get_total_frames(input_path: str) -> int:
     """Estimate total frame count for VFR frame-number-based extraction."""
     # First try nb_frames from stream metadata
@@ -137,7 +172,7 @@ def extract_preview_frames(input_path: str, output_dir: str,
     Returns:
         List of extracted frame file paths
     """
-    out_path = Path(output_dir)
+    out_path = Path(output_dir) / "preview"
     out_path.mkdir(parents=True, exist_ok=True)
 
     stem = Path(input_path).stem
@@ -206,6 +241,11 @@ def extract_preview_frames(input_path: str, output_dir: str,
     vfr = _is_vfr(input_path)
     total_frames = 0
     if vfr:
+        pts_ok = _check_pts_monotonic(input_path)
+        if not pts_ok:
+            logger = get_logger()
+            logger.warning("PREVIEW_VFR_PTS_BAD",
+                          "VFR detected with non-monotonic PTS, falling back to PTS-based extraction")
         total_frames = _get_total_frames(input_path)
 
     for pos in positions:
@@ -221,6 +261,8 @@ def extract_preview_frames(input_path: str, output_dir: str,
                      "-vf", f"select=eq(n\\,{target_frame})",
                      "-vsync", "vfr",
                      "-frames:v", "1",
+                     "-pix_fmt", "rgb48be",  # FIX-P3-1: 10bit/16bit PNG per v7.32 §3.8
+                     "-compression_level", "9",
                      "-f", "image2",
                      "-y", str(out_file)],
                     capture_output=True, timeout=30, shell=False
@@ -233,6 +275,8 @@ def extract_preview_frames(input_path: str, output_dir: str,
                      "-i", input_path,
                      "-ss", str(target_time),
                      "-frames:v", "1",
+                     "-pix_fmt", "rgb48be",  # FIX-P3-1: 10bit/16bit PNG per v7.32 §3.8
+                     "-compression_level", "9",
                      "-f", "image2",
                      "-y", str(out_file)],
                     capture_output=True, timeout=30, shell=False
@@ -265,16 +309,19 @@ def generate_preview_clip(input_path: str, output_path: str,
     """
     try:
         fps = _get_video_fps(input_path)
+        frame_count = max(1, int(fps * duration_sec))
         
         # ISSUE-SHARED-PV-001 fix: Single-stage ffmpeg directly to animated WebP.
         # Uses input seeking (-ss before -i) for fast seek, limits duration with -t.
         # Falls back to two-stage PNG extraction if single-stage fails.
+        # FIX-P3-6: Dynamic frame count by fps per v7.32 §3.10.21
+        vf = f"fps={fps},scale={target_width}:-2"
         r = subprocess.run(
             ["ffmpeg", "-hide_banner", "-v", "error",
              "-ss", str(start_sec),
              "-i", input_path,
              "-t", str(duration_sec),
-             "-vf", f"scale={target_width}:-2",
+             "-vf", vf,
              "-c:v", "libwebp",
              "-lossless", "0", "-q:v", "80",
              "-loop", "0",
@@ -337,7 +384,7 @@ def generate_comparison_frames(original_path: str, processed_path: str,
     Returns:
         List of comparison frame paths
     """
-    out_path = Path(output_dir)
+    out_path = Path(output_dir) / "preview"
     out_path.mkdir(parents=True, exist_ok=True)
     stem = Path(original_path).stem
     results = []
@@ -537,7 +584,7 @@ def generate_motion_preview_clips(input_path: str, output_dir: str,
     Returns:
         List of generated WebP clip paths
     """
-    out_path = Path(output_dir)
+    out_path = Path(output_dir) / "preview"
     out_path.mkdir(parents=True, exist_ok=True)
     stem = Path(input_path).stem
     

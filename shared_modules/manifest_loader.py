@@ -24,16 +24,21 @@ def load_manifest(path: str) -> Dict[str, Any]:
 
 
 def _load_jsonl(path: str) -> Dict[str, Any]:
-    """Load JSON Lines format manifest."""
+    """Load JSON Lines format manifest.
+    
+    FIX-P4-7: meta is stored in a separate .meta.json file.
+    """
     manifest: Dict[str, Any] = {"meta": {}, "jobs": []}
+    p = Path(path)
+    meta_path = p.with_suffix(".meta.json")
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as f:
+            manifest["meta"] = json.load(f)
     with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-        if lines:
-            manifest["meta"] = json.loads(lines[0])
-            for line in lines[1:]:
-                line = line.strip()
-                if line:
-                    manifest["jobs"].append(json.loads(line))
+        for line in f:
+            line = line.strip()
+            if line:
+                manifest["jobs"].append(json.loads(line))
     return manifest
 
 
@@ -46,61 +51,89 @@ def validate_job(job: Dict[str, Any]) -> bool:
     return True
 
 
-def _verify_photo_integrity(path: str) -> bool:
-    """Verify photo file integrity using PIL.
+def _verify_photo_integrity(path: str, bit_depth: int = 8) -> bool:
+    """Verify photo intermediate file integrity.
     
-    Per v6.32: Only mark as corrupted if PIL verify/load fails.
-    Solid colors and all-black frames are legitimate content.
+    FIX-P4-5: Use statistical features + three-region check instead of
+    all-zero/all-max spot checks to avoid false positives on legitimate
+    black-bordered scans.
     
-    ISSUE-SHARED-ML-001: Added multi-position spot checks (top-left, center,
-    bottom-right) to detect partial writes or corruption that PIL load might miss.
+    Strategy:
+    1. Load image (PIL)
+    2. Check three vertical regions (top/middle/bottom) for corruption
+    3. Use statistical features (mean/std) instead of all-zero/all-max
+    4. Allow legitimate black borders (detected via edge analysis)
     """
     try:
         from PIL import Image
         import numpy as np
-        with Image.open(path) as img:
-            # Ensure image can be loaded
-            img.load()
-            # Check non-trivial size
-            if img.width <= 0 or img.height <= 0:
-                return False
-            # For 16-bit images, preserve precision
-            if img.mode == "I;16":
-                arr = np.array(img, dtype=np.uint16)
-            else:
-                arr = np.array(img)
-            # Only reject if array is empty (not based on content)
-            if arr.size == 0:
-                return False
+        
+        img = Image.open(path)
+        arr = np.array(img)
+        
+        # Handle various modes
+        if len(arr.shape) == 2:
+            arr = arr[:, :, np.newaxis]  # Grayscale -> H,W,1
+        h, w, c = arr.shape
+        
+        # Determine max value based on bit_depth
+        if arr.dtype == np.uint16:
+            max_val = 65535
+            effective_depth = 16
+        elif arr.dtype == np.uint8:
+            max_val = 255
+            effective_depth = 8
+        else:
+            max_val = 255
+            effective_depth = 8
+        
+        # --- Step 1: Detect globally corrupt image ---
+        global_mean = float(np.mean(arr))
+        global_std = float(np.std(arr))
+        
+        # All-zero detection
+        if global_mean < 1.0 and global_std < 1.0:
+            return False  # Entire image almost black
+        
+        # All-max detection
+        if global_mean > max_val - 1.0 and global_std < 1.0:
+            return False  # Entire image almost white/max
+        
+        # --- Step 2: Three-region validation ---
+        region_h = h // 3
+        regions = {
+            "top": arr[0:region_h, :, :],
+            "middle": arr[region_h:2*region_h, :, :],
+            "bottom": arr[2*region_h:h, :, :]
+        }
+        
+        for region_name, region in regions.items():
+            r_mean = float(np.mean(region))
+            r_std = float(np.std(region))
             
-            # ISSUE-SHARED-ML-001 fix: Multi-position spot checks
-            # Extract top-left, center, bottom-right regions and verify
-            # they are not all-zero (indicates partial write / corruption)
-            h, w = arr.shape[:2]
-            region_h = max(1, h // 10)
-            region_w = max(1, w // 10)
-            
-            # Top-left region
-            top_left = arr[0:region_h, 0:region_w]
-            # Center region
-            cy, cx = h // 2, w // 2
-            center = arr[cy:cy+region_h, cx:cx+region_w]
-            # Bottom-right region
-            br = arr[h-region_h:h, w-region_w:w]
-            
-            for region_name, region in [("top-left", top_left),
-                                         ("center", center),
-                                         ("bottom-right", br)]:
-                if region.size == 0:
-                    continue
-                # Check if region is all zeros (indicates corruption/partial write)
-                if np.all(region == 0):
+            if r_std < 1.0:
+                # Region is nearly solid color
+                if r_mean < 1.0 or r_mean > max_val - 1.0:
+                    # Allow legitimate black/white borders on edges
+                    is_edge_region = (region_name in ("top", "bottom"))
+                    if is_edge_region and global_std > 10.0:
+                        continue
                     return False
-                # Check if region is all max value (also suspicious for corruption)
-                max_val = 65535 if arr.dtype == np.uint16 else 255
-                if np.all(region == max_val):
-                    return False
+        
+        # --- Step 3: Luminance mean range check (v6.32 §7.9) ---
+        if effective_depth == 8:
+            low, high = 10, 245
+        elif effective_depth == 10:
+            low, high = 40, 980
+        else:  # 16bit
+            low, high = 4096, 60160
+        
+        if not (low <= global_mean <= high):
+            if global_mean < 5 or global_mean > max_val - 5:
+                return False
+        
         return True
+        
     except Exception:
         return False
 
@@ -164,27 +197,35 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
         intermediates.sort(key=_step_key)
 
-        # Verify latest intermediate
-        latest = intermediates[-1]
-        # Photo intermediates are TIFF/PNG, video are MKV
-        is_photo = Path(latest).suffix.lower() in (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".avif")
-
-        valid = False
-        if is_photo:
-            valid = _verify_photo_integrity(latest)
+        # FIX-P4-5: Verify from latest backwards, keep up to 2 most recent valid stages
+        valid_stage_path = None
+        for cand in reversed(intermediates):
+            is_photo = Path(cand).suffix.lower() in (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".avif")
+            if is_photo:
+                valid = _verify_photo_integrity(cand)
+            else:
+                valid = verify_ffprobe_decodeable(cand) and verify_frame_integrity(cand)
+            if valid:
+                valid_stage_path = cand
+                break
+            else:
+                Path(cand).unlink(missing_ok=True)
+        
+        job["status"] = "PENDING"
+        
+        # Keep only up to 2 most recent valid stages
+        if valid_stage_path:
+            keep_paths = {valid_stage_path}
+            valid_idx = intermediates.index(valid_stage_path)
+            if valid_idx > 0:
+                keep_paths.add(intermediates[valid_idx - 1])
+            for p in intermediates:
+                if p not in keep_paths:
+                    Path(p).unlink(missing_ok=True)
         else:
-            valid = verify_ffprobe_decodeable(latest) and verify_frame_integrity(latest)
-
-        if valid:
-            job["status"] = "PENDING"
-        else:
-            Path(latest).unlink(missing_ok=True)
-            job["status"] = "PENDING"
-
-        # Keep recent 2 stages, delete older ones
-        if len(intermediates) > 2:
-            for old_path in intermediates[:-2]:
-                Path(old_path).unlink(missing_ok=True)
+            # None valid, clean up all
+            for p in intermediates:
+                Path(p).unlink(missing_ok=True)
 
     except Exception:
         # If we can't verify, just allow retry
@@ -199,8 +240,11 @@ def save_manifest(manifest: Dict[str, Any], path: str):
     p.parent.mkdir(parents=True, exist_ok=True)
 
     if path.endswith(".jsonl"):
+        # FIX-P4-7: write meta to separate .meta.json file
+        meta_path = p.with_suffix(".meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(manifest["meta"], f, ensure_ascii=False, indent=2)
         with open(path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(manifest["meta"], ensure_ascii=False) + "\n")
             for job in manifest["jobs"]:
                 f.write(json.dumps(job, ensure_ascii=False) + "\n")
     else:

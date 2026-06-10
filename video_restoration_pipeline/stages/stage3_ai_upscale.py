@@ -14,6 +14,7 @@ v6.3 Compliance:
 import os
 import sys
 import json
+import hashlib
 import argparse
 import subprocess
 import re
@@ -42,7 +43,7 @@ def estimate_gpu_memory(width: int, height: int, scale: int,
     return base + weight
 
 
-def check_gpu_memory(required_bytes: int) -> tuple:
+def check_gpu_memory(required_bytes: int, logger=None) -> tuple:
     """Check GPU availability. Returns (sufficient: bool, backend: str).
 
     Backend priority: cuda > rocm > mps > cpu.
@@ -68,23 +69,35 @@ def check_gpu_memory(required_bytes: int) -> tuple:
         import torch
         torch_ver = torch.__version__
 
+        # Parse version for >=1.10 check (P8-4)
+        ver_parts = torch_ver.split("+")[0].split(".")
+        ver_major = int(ver_parts[0])
+        ver_minor = int(ver_parts[1]) if len(ver_parts) > 1 else 0
+        has_mem_get_info = (ver_major > 1) or (ver_major == 1 and ver_minor >= 10)
+
         # CUDA
         if torch.cuda.is_available():
-            try:
-                free, total = torch.cuda.mem_get_info()
-                if free >= required_bytes * 1.2:
-                    return True, "cuda"
-            except Exception:
-                pass
+            if has_mem_get_info:
+                try:
+                    free, total = torch.cuda.mem_get_info()
+                    if free >= required_bytes * 1.2:
+                        return True, "cuda"
+                except Exception:
+                    pass
+            else:
+                if logger:
+                    logger.warning("STAGE3_PYTORCH_OLD",
+                                   f"PyTorch {torch_ver} < 1.10, skipping torch.cuda.mem_get_info()")
 
         # ROCm (AMD GPU)
         if hasattr(torch.version, "hip") and torch.version.hip is not None:
-            try:
-                free, total = torch.cuda.mem_get_info()
-                if free >= required_bytes * 1.2:
-                    return True, "rocm"
-            except Exception:
-                pass
+            if has_mem_get_info:
+                try:
+                    free, total = torch.cuda.mem_get_info()
+                    if free >= required_bytes * 1.2:
+                        return True, "rocm"
+                except Exception:
+                    pass
 
         # Apple Metal (MPS)
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -109,11 +122,11 @@ def _get_model_for_scale(model: str, scale: int) -> str:
     return f"RealESRGAN_x{scale}plus"
 
 
-def run_realesrgan(input_path: str, output_dir: str, model_name: str,
+def run_realesrgan(input_path: str, output_dir: str, model: str,
                    scale: int, gpu_id: int = 0) -> bool:
     """Run Real-ESRGAN upscaling via ncnn-vulkan or Python API."""
     model_dir = SCRIPT_DIR.parent.resolve() / "models"
-    model_path = str(model_dir / f"{model_name}.pth")
+    model_path = str(model_dir / f"{model}.pth")
     if not os.path.exists(model_path):
         return False
 
@@ -124,7 +137,7 @@ def run_realesrgan(input_path: str, output_dir: str, model_name: str,
             vulkan_bin,
             "-i", input_path,
             "-o", output_dir,
-            "-n", model_name,
+            "-n", model,
             "-s", str(scale),
             "-g", str(gpu_id),
         ]
@@ -161,6 +174,11 @@ def run_realesrgan(input_path: str, output_dir: str, model_name: str,
                 "    img = Image.open(fp).convert('RGB')\n"
                 "    output, _ = model.enhance(np.array(img))\n"
                 "    Image.fromarray(output).save(os.path.join(output_dir, os.path.basename(fp)))\n"
+                "del model\n"
+                "import gc\n"
+                "gc.collect()\n"
+                "import torch\n"
+                "torch.cuda.empty_cache()\n"
             )
         cmd = [sys.executable, script_path]
         r = subprocess.run(cmd, capture_output=True, text=True,
@@ -172,11 +190,21 @@ def run_realesrgan(input_path: str, output_dir: str, model_name: str,
         return r.returncode == 0
     except Exception:
         return False
+    finally:
+        # P8-3: Explicitly release model in Python API path
+        try:
+            del model
+            import gc
+            gc.collect()
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def extract_frames_with_pts(video_path: str, output_dir: str,
                               win_start: int = 0, win_size: int = 256,
-                              logger=None) -> List[Tuple[str, float]]:
+                              logger=None, fps: float = 30.0) -> List[Tuple[str, float]]:
     """Extract frames in a sliding window with PTS support for VFR.
 
     Returns list of (frame_path, pts_seconds) ordered by PTS.
@@ -191,7 +219,7 @@ def extract_frames_with_pts(video_path: str, output_dir: str,
         "-i", video_path,
     ]
     if win_start > 0:
-        cmd.extend(["-ss", str(win_start / 30.0)])  # approximate frame to time
+        cmd.extend(["-ss", str(win_start / fps)])  # v6.32 §4B: use actual fps
     if win_size > 0:
         cmd.extend(["-frames:v", str(win_size)])
     cmd.extend([
@@ -363,24 +391,40 @@ def main():
     temp_dir = params.get("temp_dir", "./temp")
     os.makedirs(temp_dir, exist_ok=True)
 
-    # Find stage1 output - deterministic by mtime
+    # Find stage2 output - deterministic by mtime (v6.32 §7.1)
     job_id = args.job_id
     input_name = Path(args.input).name
-    pattern = f"{job_id}_{Path(input_name).stem}_step1_preprocess*"
+    pattern = f"{job_id}_{Path(input_name).stem}_step2_traditional*"
     candidates = glob.glob(os.path.join(temp_dir, pattern))
     if not candidates:
-        logger.error("STAGE3_NO_INPUT", "Stage 1 output not found")
+        logger.error("STAGE3_NO_INPUT", "Stage 2 traditional output not found")
         return 82
 
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    stage1_output = candidates[0]
+    stage2_output = candidates[0]
+
+    # Validate stage2 output (v6.32 §7.1 mandatory)
+    if os.path.getsize(stage2_output) == 0:
+        logger.error("STAGE3_STAGE2_EMPTY", "Stage 2 output is empty")
+        return 82
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error", stage2_output],
+            capture_output=True, timeout=30, shell=False
+        )
+        if r.returncode != 0:
+            logger.error("STAGE3_STAGE2_UNDECODABLE", "Stage 2 output undecodable")
+            return 82
+    except Exception as e:
+        logger.error("STAGE3_STAGE2_CHECK_FAIL", str(e))
+        return 82
 
     # Get dimensions
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
-             "-of", "json", stage1_output],
+             "-of", "json", stage2_output],
             capture_output=True, text=True, timeout=30, shell=False
         )
         info = json.loads(r.stdout)
@@ -401,7 +445,7 @@ def main():
 
     # GPU memory check
     mem_required = estimate_gpu_memory(width, height, scale, model)
-    sufficient, backend = check_gpu_memory(mem_required)
+    sufficient, backend = check_gpu_memory(mem_required, logger)
 
     if not sufficient and backend == "cpu":
         # Try 2x if requested 4x, preserving model family
@@ -410,11 +454,30 @@ def main():
             scale = 2
             mem_required = estimate_gpu_memory(width, height, scale, model)
             model = _get_model_for_scale(model, 2)
-            sufficient, backend = check_gpu_memory(mem_required)
+            sufficient, backend = check_gpu_memory(mem_required, logger)
 
         if not sufficient:
             logger.warning("STAGE3_CPU", "GPU unavailable, using CPU (very slow)")
             backend = "cpu"
+
+    # P8-6: Compute param_hash for intermediate filename
+    try:
+        from checkpoint import compute_param_hash
+    except Exception:
+        # Fallback if checkpoint not available
+        def compute_param_hash(input_path, params):
+            import hashlib
+            param_str = json.dumps(params, sort_keys=True, ensure_ascii=False)
+            file_id = str(os.path.getsize(input_path)) + str(int(os.path.getmtime(input_path)))
+            return hashlib.sha256((param_str + file_id).encode()).hexdigest()[:16]
+
+    core_params = {
+        "upscale_scale": scale,
+        "upscale_model": model,
+        "lanczos_target": params.get("lanczos_target", "auto"),
+        "ai_enabled": ai_enabled,
+    }
+    param_hash = compute_param_hash(stage2_output, core_params)
 
     logger.info("STAGE3_START", "AI upscaling",
                 model=model, scale=scale, backend=backend,
@@ -422,12 +485,33 @@ def main():
 
     # 256-frame sliding window processing
     win_size = params.get("ai_window_size", 256)
-    total_frames = _count_video_frames(stage1_output)
+    total_frames = _count_video_frames(stage2_output)
     if total_frames == 0:
         total_frames = 30000  # fallback: ~20min @ 25fps
 
     output_dir = os.path.join(temp_dir, f"{job_id}_upscaled")
     os.makedirs(output_dir, exist_ok=True)
+
+    # Get actual fps for frame extraction (v6.32 §4B)
+    fps_cmd = [
+        "ffprobe", "-hide_banner", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        stage2_output,
+    ]
+    actual_fps = 30.0
+    try:
+        r = subprocess.run(fps_cmd, capture_output=True, text=True, timeout=10, shell=False)
+        if r.returncode == 0:
+            fps_str = r.stdout.strip()
+            if "/" in fps_str:
+                num, den = fps_str.split("/")
+                actual_fps = int(num) / int(den)
+            else:
+                actual_fps = float(fps_str)
+    except Exception:
+        pass
 
     all_success = True
     gpu_oom_retry_done = False  # v6.3 §7.14: max 1 OOM retry per job
@@ -439,8 +523,8 @@ def main():
 
         # Extract window frames
         frames_dir = os.path.join(temp_dir, f"{job_id}_frames_{win_start}")
-        frames = extract_frames_with_pts(stage1_output, frames_dir,
-                                         win_start, actual_win_size, logger)
+        frames = extract_frames_with_pts(stage2_output, frames_dir,
+                                         win_start, actual_win_size, logger, actual_fps)
         if not frames:
             logger.warning("STAGE3_WINDOW_EMPTY", f"No frames in window {win_start}")
             continue
@@ -458,9 +542,16 @@ def main():
                 logger.warning("STAGE3_OOM_DOWNSCALE", "GPU OOM detected, downgrading 4x->2x")
                 try:
                     import torch
+                    _saved_model = model
+                    del model
+                    import gc
+                    gc.collect()
                     torch.cuda.empty_cache()
+                    model = _saved_model
                 except Exception:
                     pass
+                import time
+                time.sleep(0.1)  # v6.32 §7.14 mandatory 100ms wait
                 scale = 2
                 model = _get_model_for_scale(model, 2)
                 success = run_realesrgan(frames_dir, win_output_dir, model, scale)
@@ -470,7 +561,12 @@ def main():
                 logger.warning("STAGE3_OOM_CPU", "GPU still failing, downgrading to CPU")
                 try:
                     import torch
+                    _saved_model = model
+                    del model
+                    import gc
+                    gc.collect()
                     torch.cuda.empty_cache()
+                    model = _saved_model
                 except Exception:
                     pass
                 import time
@@ -493,7 +589,12 @@ def main():
             # Map to global frame numbering
             global_idx = win_start + int(re.search(r'\d+', src.name).group()) - 1
             dst = Path(output_dir) / f"frame_{global_idx:08d}.png"
-            shutil.copy2(str(src), str(dst))
+            shutil.copyfile(str(src), str(dst))
+            try:
+                st = os.stat(str(src))
+                os.utime(str(dst), (st.st_atime, st.st_mtime))
+            except Exception:
+                pass
 
         # Cleanup window frames to save disk space
         if params.get("cleanup_intermediates", True):
@@ -543,7 +644,7 @@ def main():
         "-select_streams", "v:0",
         "-show_entries", "stream=r_frame_rate",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        stage1_output,
+        stage2_output,
     ]
     fps_str = "25"
     try:
@@ -553,10 +654,10 @@ def main():
     except Exception:
         pass
 
-    # V-P-031 fix: force_allow suffix
-    inter_name = f"{job_id}_{Path(input_name).stem}_step3_upscale"
+    # V-P-031 fix: force_allow suffix (P8-2 corrected)
+    inter_name = f"{job_id}_{Path(input_name).stem}_step3_upscale_p{param_hash}"
     if ai_banned and force_allow:
-        inter_name = inter_name.replace("_upscale_", "_forced_upscale_")
+        inter_name = f"{job_id}_{Path(input_name).stem}_step3_forced_upscale_p{param_hash}"
 
     # Encode PNG frames to intermediate MKV for stage4 consumption
     output_path = os.path.join(temp_dir, f"{inter_name}.mkv")
@@ -578,6 +679,20 @@ def main():
     except Exception as e:
         logger.error("STAGE3_ENCODE_ERROR", str(e))
         return 82
+
+    # P8-9: Generate forced upscale comparison preview
+    if ai_banned and force_allow:
+        preview_dir = params.get("preview_dir", "./preview")
+        os.makedirs(preview_dir, exist_ok=True)
+        try:
+            from preview import generate_before_after_comparison
+            generate_before_after_comparison(
+                stage2_output, output_path,
+                os.path.join(preview_dir, f"{job_id}_forced_upscale_comparison.png")
+            )
+            logger.info("STAGE3_PREVIEW", "Generated forced upscale comparison frames")
+        except Exception as e:
+            logger.warning("STAGE3_PREVIEW_FAIL", f"Failed to generate preview: {e}")
 
     logger.info("STAGE3_DONE", "AI upscaling complete",
                 total_frames=len(output_frames), output_path=output_path)

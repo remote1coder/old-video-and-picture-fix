@@ -317,6 +317,16 @@ def check_vs_minimal_calls() -> List[str]:
         except Exception as e:
             errors.append(f"  - TemporalDegrain2 test failed: {e}")
 
+        # FIX-P1-1: DepanStabilize minimal call test per v7.32 §3.6
+        try:
+            clip3b = core.std.BlankClip(format=vs.YUV420P16, width=720, height=480, length=60)
+            # mvtools2 registers as core.mv namespace in VS
+            result3b = core.mv.DepanStabilize(clip3b, dxmax=10, dymax=10)
+            if result3b is None:
+                errors.append("  - DepanStabilize returned None")
+        except Exception as e:
+            errors.append(f"  - DepanStabilize test failed: {e}")
+
         # Test 4: GrainFactory3
         try:
             clip4 = core.std.BlankClip(format=vs.YUV420P16, width=720, height=480, length=30)
@@ -445,7 +455,7 @@ def check_ai_cli_tools() -> List[str]:
     return missing
 
 
-def check_ai_models(models_dir: str = "./models") -> List[str]:
+def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) -> List[str]:
     """Check AI model weights exist and validate MD5 checksums.
     
     Per v7.32 §3.6: Each model must have MD5 + download URL;
@@ -453,8 +463,8 @@ def check_ai_models(models_dir: str = "./models") -> List[str]:
     
     Supports external MD5 manifest (md5_manifest.json) in models_dir
     to enable checksum validation without modifying source code.
-    If no MD5 is configured (built-in or external), a warning is issued
-    to encourage configuration.
+    If no MD5 is configured (built-in or external), an ERROR is issued
+    unless --skip-md5-check is used.
     """
     models_path = Path(models_dir).resolve()
     
@@ -513,11 +523,17 @@ def check_ai_models(models_dir: str = "./models") -> List[str]:
             if actual_md5 != expected_md5:
                 missing.append(f"  - {model_name}: MD5 mismatch (expected {expected_md5}, got {actual_md5})")
         else:
-            # No MD5 configured: warn but do not block execution
-            missing.append(
-                f"  - {model_name}: WARNING - MD5 checksum not configured. "
-                f"Create {manifest_path} with {{'{model_name}': '<md5_hash>'}} to enable verification"
-            )
+            # FIX-P1-6: No MD5 configured → ERROR per v7.32 §3.6
+            if skip_md5_check:
+                missing.append(
+                    f"  - {model_name}: WARNING - MD5 checksum not configured. "
+                    f"Create {manifest_path} with {{'{model_name}': '<md5_hash>'}} to enable verification"
+                )
+            else:
+                missing.append(
+                    f"  - {model_name}: ERROR - MD5 verification not configured. "
+                    f"Create {manifest_path} or use --skip-md5-check to bypass"
+                )
     return missing
 
 
@@ -668,7 +684,8 @@ def _detect_pipeline_type(config: Optional[Dict] = None) -> str:
 
 
 def run_all_checks(config: Optional[Dict] = None,
-                   pipeline_type: Optional[str] = None) -> Tuple[bool, List[str]]:
+                   pipeline_type: Optional[str] = None,
+                   skip_md5_check: bool = False) -> Tuple[bool, List[str]]:
     """Run all dependency checks. Returns (all_ok, list_of_issues).
     
     Args:
@@ -747,7 +764,7 @@ def run_all_checks(config: Optional[Dict] = None,
 
     # 9. AI models (if AI enabled)
     if config and config.get("ai", {}).get("enabled", False):
-        models = check_ai_models(config.get("model_dir", "./models"))
+        models = check_ai_models(config.get("model_dir", "./models"), skip_md5_check=skip_md5_check)
         if models:
             issues.append("Missing AI model weights:")
             issues.extend(models)
@@ -797,6 +814,8 @@ def main():
     parser.add_argument("--config", "-c", help="Config file path")
     parser.add_argument("--pipeline-type", choices=["photo", "video", "auto"],
                        default="auto", help="Pipeline type (auto-detect by default)")
+    parser.add_argument("--skip-md5-check", action="store_true",
+                        help="Skip AI model MD5 verification (not recommended)")
     args = parser.parse_args()
 
     config = None
@@ -812,7 +831,7 @@ def main():
 
     pipeline_type = None if args.pipeline_type == "auto" else args.pipeline_type
 
-    ok, issues = run_all_checks(config, pipeline_type=pipeline_type)
+    ok, issues = run_all_checks(config, pipeline_type=pipeline_type, skip_md5_check=args.skip_md5_check)
 
     print("=" * 60)
     print("Dependency Check Results")

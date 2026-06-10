@@ -52,7 +52,8 @@ def _get_audio_layout(audio_path: str) -> dict:
 
 
 def _build_audio_filter(audio_path: str, params: dict, logger=None,
-                          tempo_ratio: float = 1.0) -> str:
+                          tempo_ratio: float = 1.0,
+                          audio_layout: dict = None) -> str:
     """Build audio filter chain with hum removal and denoising.
     
     CRITICAL: bandreject filters must come BEFORE afftdn/arnndn.
@@ -119,12 +120,16 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
     noise_reduction = params.get("noise_reduction", True)
     if noise_reduction:
         arnndn_model = params.get("arnndn_model", "")
-        # V-P-052 fix: arnndn requires mono input for some CPUs
-        # Convert to mono before arnndn, then back to original layout
+        # FIX-P7-2: arnndn requires mono input for some CPUs
+        # Convert to mono before arnndn, then explicitly restore original layout
         if arnndn_model and Path(arnndn_model).exists():
             audio_filters.append("aformat=channel_layouts=mono")
             audio_filters.append(f"arnndn=m='{arnndn_model}'")
-            # Restore original layout will be done by -ac after -af
+            # Explicitly restore original channel layout inside filter chain
+            if audio_layout is None:
+                audio_layout = _get_audio_layout(audio_path)
+            layout = audio_layout.get("layout", "stereo")
+            audio_filters.append(f"aformat=channel_layouts={layout}")
         else:
             audio_filters.append("afftdn=nr=10:nf=-20")
 
@@ -180,25 +185,59 @@ def _get_stream_duration(path: str, stream_type: str = "v") -> float:
     return 0.0
 
 
-def _validate_av_sync(video_path: str, audio_path: str, logger) -> int:
-    """Validate audio/video sync duration difference.
-    
-    Per v6.3 §3.10.9:
+def _get_source_color_info(video_path: str) -> tuple:
+    """Probe source color_range and color_primaries via ffprobe.
+
+    Returns (source_color_range, color_standard) where:
+    - source_color_range: 'limited' or 'full'
+    - color_standard: 'PAL' or 'NTSC'
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=color_range,color_primaries",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            data = json.loads(r.stdout)
+            streams = data.get("streams", [])
+            if streams:
+                cr = streams[0].get("color_range", "")
+                cp = streams[0].get("color_primaries", "")
+                source_range = "full" if cr == "pc" else "limited"
+                # Map color_primaries to PAL/NTSC standard
+                if cp in ("bt470bg", "5"):
+                    color_std = "PAL"
+                elif cp in ("smpte170m", "bt470m", "6", "4"):
+                    color_std = "NTSC"
+                else:
+                    color_std = "NTSC"  # Default fallback for old footage
+                return source_range, color_std
+    except Exception:
+        pass
+    return "limited", "NTSC"
+
+
+def _validate_av_sync(muxed_path: str, logger) -> int:
+    """Validate A/V sync on the final muxed output file.
+
+    Per v6.3 §3.10.9 / v7.32 §3.10.9:
     - diff > 100ms: WARNING
     - diff > 300ms: sync processing needed
     - diff > 500ms: ERROR/FAILED (return 86)
     """
-    video_dur = _get_stream_duration(video_path, "v")
-    audio_dur = _get_stream_duration(audio_path, "a")
-    
+    video_dur = _get_stream_duration(muxed_path, "v")
+    audio_dur = _get_stream_duration(muxed_path, "a")
+
     if video_dur == 0 or audio_dur == 0:
         logger.warning("STAGE7_SYNC_SKIP", "Cannot determine durations for sync check")
         return 0  # Continue anyway
-    
+
     diff_ms = abs(video_dur - audio_dur) * 1000
-    
+
     if diff_ms > 500:
-        logger.error("STAGE7_SYNC_FAIL", 
+        logger.error("STAGE7_SYNC_FAIL",
                     f"AV sync difference {diff_ms:.0f}ms exceeds 500ms threshold",
                     video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
         return 86
@@ -212,7 +251,7 @@ def _validate_av_sync(video_path: str, audio_path: str, logger) -> int:
                    f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
                    video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
         return 0  # Continue
-    
+
     return 0
 
 
@@ -235,7 +274,7 @@ def main():
 
     # Find input - deterministic by mtime
     input_source = None
-    for pat in ["step6_grain*", "step5_face*", "step4_postprocess*", "step3_upscale*", "step1_preprocess*"]:
+    for pat in ["step6_grain*", "step5_face*", "step4_postprocess*", "step3_upscale*", "step2_traditional*", "step1_preprocess*"]:
         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
         if candidates:
@@ -258,7 +297,7 @@ def main():
     no_wsl_redirect = params.get("no_wsl_redirect", False)
     platform = params.get("platform", "auto")
     redirected_path, original_output_path, _, _ = wsl_redirect_path(
-        output_path, no_wsl_redirect=no_wsl_redirect, platform=platform
+        output_path, no_wsl_redirect=no_wsl_redirect, target_platform=platform
     )
     if original_output_path:
         logger.info("STAGE7_WSL_REDIRECT",
@@ -274,9 +313,7 @@ def main():
     pix_fmt = params.get("pix_fmt", "yuv420p10le")
     color_range = params.get("color_range", "limited")
 
-    # V-P-054/V-P-055 fix: adaptive preset/CRF based on resolution and scene type
-    # v6.32 §7.4.1: >1080p -> p6/crf26; <=720p -> p3/crf22; else -> p4/crf24
-    # Animation: +2 CRF
+    # FIX-P7-6: CRF adaptive logic per v6.32 §7.10 / v7.32 §3.10.20
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -289,15 +326,25 @@ def main():
             stream = info["streams"][0]
             vid_w = stream.get("width", 1920)
             vid_h = stream.get("height", 1080)
+
+            # Base CRF by resolution
             if vid_w > 1920 or vid_h > 1080:
-                preset = 6
                 crf = 26
-            elif vid_w <= 1280 and vid_h <= 720:
-                preset = 3
-                crf = 22
             else:
-                preset = 4
-                crf = 24
+                crf = 24  # 480p/576p/720p unified default
+
+            # Grain adaptive (if upstream stages passed grain info)
+            grain_strength = params.get("detected_grain_strength", None)
+            if grain_strength is None and "noise_score" in params:
+                grain_strength = params["noise_score"] * 10
+            if grain_strength is not None:
+                if grain_strength > 5.0:
+                    crf -= 1
+                    logger.info("STAGE7_CRF_GRAIN", f"High grain {grain_strength:.2f}, CRF -> {crf}")
+                elif grain_strength < 1.0:
+                    crf += 1
+                    logger.info("STAGE7_CRF_CLEAN", f"Low grain {grain_strength:.2f}, CRF -> {crf}")
+
             detected_class = params.get("detected_class", "").lower()
             if "animation" in detected_class or "anime" in detected_class:
                 crf += 2
@@ -322,6 +369,25 @@ def main():
         "-preset", str(preset),
         "-pix_fmt", pix_fmt,
     ]
+
+    # FIX-P7-1: BT.601→BT.709 color space conversion with range handling
+    source_color_range, color_standard = _get_source_color_info(args.input)
+    matrix_in = "bt470bg" if color_standard == "PAL" else "smpte170m"
+    rangein = "full" if source_color_range == "full" else "limited"
+    vf_parts = []
+    if not params.get("colorspace_converted", False):
+        vf_parts.append(f"zscale=matrixin={matrix_in}:matrix=bt709:rangein={rangein}:range=limited")
+        logger.info("STAGE7_COLORSPACE",
+                   f"BT.601({color_standard})->BT.709 zscale: matrixin={matrix_in}, rangein={rangein}")
+
+    # FIX-P7-7: 16bit→10bit error diffusion dithering before final encode
+    input_depth = params.get("input_bit_depth", 16)
+    if input_depth > 10:
+        vf_parts.append("format=yuv444p16,scale=out_range=limited:out_format=yuv444p10,format=yuv420p10le")
+        logger.info("STAGE7_DITHER", "Applying 16bit->10bit error diffusion dithering via YUV444")
+
+    if vf_parts:
+        video_cmd.extend(["-vf", ",".join(vf_parts)])
 
     # Scene detection for audio handling (v6.3 §3.10.9)
     # Scene 1: duration unchanged -> asetpts=PTS only
@@ -351,15 +417,17 @@ def main():
             audio_path = audio_path_fallback
     has_audio = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
     if has_audio:
-        audio_filter = _build_audio_filter(audio_path, params, logger, tempo_ratio=tempo_ratio)
+        # FIX-P7-2: multichannel preserve + explicit layout restore in filter chain
+        audio_layout = _get_audio_layout(audio_path)
+        channels = audio_layout.get("channels", 2)
+        audio_filter = _build_audio_filter(audio_path, params, logger,
+                                             tempo_ratio=tempo_ratio,
+                                             audio_layout=audio_layout)
         # Invalid tempo check
         if audio_filter == "__INVALID_TEMPO__":
             logger.error("STAGE7_AUDIO_FAIL", "Invalid tempo ratio, cannot process audio")
             return 86
 
-        # V-P-050 fix: multichannel preserve
-        audio_layout = _get_audio_layout(audio_path)
-        channels = audio_layout.get("channels", 2)
         multichannel_preserve = params.get("multichannel_preserve", True)
         if multichannel_preserve and channels > 2:
             audio_codec = "flac"
@@ -376,9 +444,8 @@ def main():
             "-map", "0:v:0",  # Map video from first input
             "-map", "1:a:0",  # Map audio from second input
         ])
-        # V-P-052 fix: restore channels after arnndn mono conversion
-        if "arnndn" in audio_filter:
-            video_cmd.extend(["-ac", str(channels)])
+        # FIX-P7-2: Layout restored inside audio filter chain via aformat;
+        # -ac fallback removed to avoid overriding explicit layout
 
         # Select codec per config (v6.3 §3.10.9)
         if audio_codec == "aac":
@@ -390,6 +457,8 @@ def main():
             if audio_bitrate:
                 video_cmd.extend(["-b:a", audio_bitrate])
     else:
+        # FIX-P7-8: Log when source has no audio stream
+        logger.info("STAGE7_NO_AUDIO", "Source has no audio stream, outputting video only")
         video_cmd.append("-an")
 
     # Color metadata (v6.3: double marking)
@@ -397,7 +466,10 @@ def main():
     color_primaries = params.get("color_primaries", "bt709")
     color_trc = params.get("color_trc", "bt709")
     colorspace = params.get("colorspace", "bt709")
-    
+
+    # FIX-P7-9: FFmpeg -color_range uses 'tv'/'pc', not 'limited'/'full'
+    ffmpeg_range = "tv" if color_range == "limited" else "pc"
+
     # Map color names to SVT-AV1 numeric values
     color_map = {
         "bt709": "1", "bt2020": "9", "bt470bg": "5", "smpte170m": "6",
@@ -407,13 +479,13 @@ def main():
     svt_trc = color_map.get(color_trc, "1")
     svt_matrix = color_map.get(colorspace, "1")
     svt_range = "0" if color_range == "limited" else "1"
-    
+
     # FFmpeg global color metadata (string names)
     video_cmd.extend([
         "-color_primaries", color_primaries,
         "-color_trc", color_trc,
         "-colorspace", colorspace,
-        "-color_range", color_range,
+        "-color_range", ffmpeg_range,
     ])
     
     # BUG-041 fix: build svtav1-params once after all parameters are known
@@ -433,9 +505,9 @@ def main():
         r = subprocess.run(video_cmd, capture_output=True, text=True,
                           timeout=3600*2, shell=False)
         if r.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            # v6.3: Validate audio/video sync duration
+            # FIX-P7-4: Validate A/V sync on final muxed output (not separate files)
             if has_audio:
-                sync_result = _validate_av_sync(output_path, audio_path, logger)
+                sync_result = _validate_av_sync(output_path, logger)
                 if sync_result != 0:
                     return sync_result
             

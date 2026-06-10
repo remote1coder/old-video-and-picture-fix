@@ -93,6 +93,10 @@ def detect_hum_frequency(audio_path: str, sample_rate: int = 48000,
         
         total_power = np.sum(power_spectrum)
         if total_power < 1e-12:
+            # FIX-P3-4: Default to 50Hz when no low-frequency content per v7.32 §3.10.22
+            result["primary_freq"] = 50
+            result["has_hum"] = False
+            result["skip_bandreject"] = True
             return result
         
         # 45-65Hz band power
@@ -332,6 +336,10 @@ def process_audio(audio_path: str, output_path: str,
         # Step 1: Hum detection and removal (BEFORE noise reduction)
         hum_result = detect_hum_frequency(audio_path, sample_rate, audio_config)
         primary_freq = hum_result["primary_freq"]
+        # FIX-P3-4: Log warning when no low-frequency content detected
+        if hum_result.get("primary_freq") == 50 and hum_result.get("hum_ratio", 0) == 0.0:
+            logger.warning("AUDIO_HUM_DEFAULT",
+                          "No low-frequency content detected, defaulting hum_freq to 50Hz")
         
         if hum_result["skip_bandreject"]:
             logger.info("AUDIO_HUM_SKIP",
@@ -352,11 +360,27 @@ def process_audio(audio_path: str, output_path: str,
                            filters=hum_filters,
                            is_dual=is_dual)
             else:
-                # FFmpeg <4.4: use arnndn for hum+noise instead of bandreject
-                logger.info("AUDIO_HUM_ARNNDN",
-                           f"FFmpeg <4.4, using arnndn instead of bandreject for {primary_freq}Hz hum")
+                # FIX-P3-2: FFmpeg <4.4, use arnndn for hum removal per v7.32 §3.10.22 / v6.32 §7.12
+                arnndn_model = _get_arnndn_model_path(audio_config, primary_freq)
+                if not arnndn_model:
+                    arnndn_model = audio_config.get("arnndn_model", "")
+                if arnndn_model and Path(arnndn_model).exists():
+                    # arnndn models trained on mono 48kHz
+                    if num_channels > 1:
+                        filters.append("aformat=channel_layouts=mono")
+                    filters.append(f"arnndn=m='{arnndn_model}'")
+                    if num_channels > 1:
+                        filters.append(f"aformat=channel_layouts={channel_layout}")
+                    logger.info("AUDIO_HUM_ARNNDN",
+                               f"FFmpeg <4.4, using arnndn for {primary_freq}Hz hum removal",
+                               model=arnndn_model)
+                else:
+                    logger.warning("AUDIO_HUM_ARNNDN_MISSING",
+                                  f"arnndn model not found for {primary_freq}Hz, "
+                                  "skipping hum removal (FFmpeg <4.4)")
 
         # Step 2: Noise reduction (AFTER bandreject)
+        filter_complex = None
         if denoise:
             arnndn_model = _get_arnndn_model_path(audio_config, primary_freq)
             if not arnndn_model:
@@ -364,15 +388,41 @@ def process_audio(audio_path: str, output_path: str,
                 arnndn_model = audio_config.get("arnndn_model", "")
             
             if arnndn_model and Path(arnndn_model).exists():
-                # arnndn models are trained on mono 48kHz; convert to mono first to avoid stereo bug
+                # FIX-P3-3: Per-channel arnndn to preserve multi-channel layout per v7.32 §3.10.9
                 if num_channels > 1:
-                    filters.append("aformat=channel_layouts=mono")
-                filters.append(f"arnndn=m='{arnndn_model}'")
-                # Restore original channel layout after arnndn
-                # Per v6.32 §3.10.9 / v7.32 §3.10.9: multi-channel must be preserved,严禁混缩为立体声
-                if num_channels > 1:
-                    filters.append(f"aformat=channel_layouts={channel_layout}")
-                logger.info("AUDIO_DENOISE", "Using arnndn noise reduction", model=arnndn_model)
+                    channel_map = {
+                        2: ["FL", "FR"],
+                        6: ["FL", "FR", "FC", "LFE", "BL", "BR"],
+                        8: ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+                    }
+                    ch_names = channel_map.get(num_channels, ["FL", "FR"])
+                    
+                    # Extract bandreject filters to preserve order (bandreject before arnndn)
+                    bandreject_filters = [f for f in filters if f.startswith("bandreject")]
+                    for br in bandreject_filters:
+                        filters.remove(br)
+                    # Also remove any aformat/arnndn from Step 1 (FFmpeg < 4.4 fallback)
+                    step1_audio_filters = [f for f in filters if f.startswith("aformat") or f.startswith("arnndn")]
+                    for sf in step1_audio_filters:
+                        filters.remove(sf)
+                    
+                    filter_complex = ""
+                    for i, ch in enumerate(ch_names):
+                        filter_complex += f"[0:a]pan=mono|c0={ch}[ch{i}];"
+                        if bandreject_filters:
+                            br_chain = "|".join(bandreject_filters)
+                            filter_complex += f"[ch{i}]{br_chain}[ch{i}_br];"
+                            filter_complex += f"[ch{i}_br]arnndn=m='{arnndn_model}'[ch{i}_d];"
+                        else:
+                            filter_complex += f"[ch{i}]arnndn=m='{arnndn_model}'[ch{i}_d];"
+                    
+                    merge_inputs = "".join(f"[ch{i}_d]" for i in range(len(ch_names)))
+                    filter_complex += f"{merge_inputs}amerge=inputs={len(ch_names)}[aout]"
+                    logger.info("AUDIO_ARNNDN_MULTICHANNEL", 
+                               f"Per-channel arnndn processing for {num_channels}ch layout")
+                else:
+                    filters.append(f"arnndn=m='{arnndn_model}'")
+                    logger.info("AUDIO_DENOISE", "Using arnndn noise reduction", model=arnndn_model)
             else:
                 # Fallback to afftdn
                 if not ffmpeg_ok:
@@ -393,12 +443,28 @@ def process_audio(audio_path: str, output_path: str,
         filters.append("asetpts=PTS")
 
         # Build command
-        cmd = [
-            "ffmpeg", "-y", "-i", audio_path,
-            "-vn",
-            "-af", ",".join(filters) if filters else "anull",
-            "-ar", str(sample_rate),
-        ]
+        if filter_complex:
+            # FIX-P3-3: Append remaining filters (compand, asetpts) to filter_complex
+            post_filters = [f for f in filters if not f.startswith("bandreject") and not f.startswith("arnndn") and not f.startswith("aformat")]
+            if post_filters:
+                filter_complex += f";[aout]{','.join(post_filters)}[aout2]"
+                map_label = "[aout2]"
+            else:
+                map_label = "[aout]"
+            cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-vn",
+                "-filter_complex", filter_complex,
+                "-map", map_label,
+                "-ar", str(sample_rate),
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-vn",
+                "-af", ",".join(filters) if filters else "anull",
+                "-ar", str(sample_rate),
+            ]
 
         # Audio codec selection
         if codec == "aac":
@@ -503,3 +569,52 @@ def get_ffmpeg_audio_filter(preset: str, custom_filters: List[str] = None) -> st
     if custom_filters:
         filters.extend(custom_filters)
     return ",".join(filters)
+
+
+def check_av_sync(video_path: str, audio_path: str,
+                  logger=None) -> Tuple[bool, float, str]:
+    """Check A/V sync by comparing processed video and audio durations.
+
+    Returns:
+        (is_acceptable, diff_ms, action)
+        is_acceptable: True if diff <= 300ms (stage7 should proceed)
+        diff_ms: absolute difference in milliseconds
+        action: "ok" / "warning" / "sync_required" / "failed"
+    FIX-P3-5 per v7.32 §3.10.9
+    """
+    if logger is None:
+        logger = get_logger()
+
+    def _get_duration(path: str) -> float:
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=30, shell=False
+            )
+            if r.returncode == 0:
+                return float(r.stdout.strip())
+        except Exception:
+            pass
+        return 0.0
+
+    v_dur = _get_duration(video_path)
+    a_dur = _get_duration(audio_path)
+
+    if v_dur <= 0 or a_dur <= 0:
+        logger.error("AV_SYNC_FAIL", "Cannot determine video or audio duration")
+        return False, 0.0, "failed"
+
+    diff_ms = abs((v_dur - a_dur) * 1000)
+    action = "ok"
+    if diff_ms > 500:
+        action = "failed"
+    elif diff_ms > 300:
+        action = "sync_required"
+    elif diff_ms > 100:
+        action = "warning"
+
+    logger.info("AV_SYNC_CHECK",
+               f"Video={v_dur:.3f}s, Audio={a_dur:.3f}s, Diff={diff_ms:.1f}ms",
+               action=action)
+    return action in ("ok", "warning"), diff_ms, action

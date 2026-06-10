@@ -40,7 +40,7 @@ def _get_video_color_metadata(video_path: str) -> dict:
         r = subprocess.run(
             ["ffprobe", "-hide_banner", "-v", "error",
              "-select_streams", "v:0",
-             "-show_entries", "stream=color_primaries,color_trc,colorspace",
+             "-show_entries", "stream=color_primaries,color_trc,colorspace,color_range",
              "-of", "json", video_path],
             capture_output=True, text=True, timeout=30, shell=False
         )
@@ -190,8 +190,15 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     else:
         vs_format = "vs.YUV420P8"
 
-    # Determine range
-    color_range = params.get("color_range", "limited")
+    # Determine range from ffprobe metadata (FIX-P6-2)
+    color_meta = _get_video_color_metadata(input_path)
+    detected_range = color_meta.get("color_range", "")
+    if detected_range == "tv":
+        color_range = "limited"
+    elif detected_range == "pc":
+        color_range = "full"
+    else:
+        color_range = params.get("color_range", "limited")
     range_in_str = "vs.RANGE_FULL" if color_range == "full" else "vs.RANGE_LIMITED"
     range_out_str = "vs.RANGE_LIMITED"
 
@@ -235,11 +242,38 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     # Default tff_bool for use throughout script
     tff_bool = "True" if field_order == "tt" else "False"
 
+    # QTGMC parameters (moved here so PSF path can use them) FIX-P6-3/P6-11
+    qtgmc_preset = params.get("qtgmc_preset", "Slow")
+    # Validate preset
+    valid_presets = {"Placebo", "Very Slow", "Slower", "Slow", "Medium", "Fast", "Faster",
+                     "Very Fast", "Super Fast", "Ultra Fast", "Draft"}
+    if qtgmc_preset not in valid_presets:
+        qtgmc_preset = "Slow"
+
+    fps_divisor = params.get("qtgmc_fps_divisor", 1)  # FIX-P6-3: default keep double frame rate
+    qtgmc_ezdenoise = params.get("qtgmc_ezdenoise", 2)
+    # Validate EZDenoise range
+    qtgmc_ezdenoise = max(0, min(qtgmc_ezdenoise, 10))
+
+    qtgmc_sharpness = params.get("qtgmc_sharpness", 0.5)
+    qtgmc_chromamotion = params.get("qtgmc_chromamotion", True)
+    qtgmc_sourcematch = params.get("qtgmc_sourcematch", 3)
+    qtgmc_input_type = params.get("qtgmc_input_type", 0)
+    qtgmc_clear_fieldbased = params.get("qtgmc_clear_fieldbased", True)
+    cm_str = "True" if qtgmc_chromamotion else "False"
+
     # PSF handling
     if is_psf:
         lines.append("# PSF handling: SeparateFields + Weave")
         lines.append(f"clip = core.std.SeparateFields(clip, tff={tff_bool})")
         lines.append("clip = core.std.Weave(clip)")
+        # FIX-P6-11: Optional progressive repair for PSF
+        if params.get("psf_use_input_type1", False):
+            lines.append("# Optional progressive repair for PSF")
+            lines.append(f"clip = haf.QTGMC(clip, Preset='{qtgmc_preset}', "
+                        f"EZDenoise={qtgmc_ezdenoise}, Sharpness={qtgmc_sharpness}, "
+                        f"ChromaMotion={cm_str}, SourceMatch={qtgmc_sourcematch}, "
+                        f"InputType=1, FpsDivisor={fps_divisor})")
         lines.append("")
 
     # IVTC (must be before deinterlace)
@@ -257,26 +291,6 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("# Auto-crop black borders")
         lines.append(f"clip = core.std.CropRel(clip, left={crop_left}, right={crop_right}, top={crop_top}, bottom={crop_bottom})")
         lines.append("")
-
-    # QTGMC parameters
-    qtgmc_preset = params.get("qtgmc_preset", "Slow")
-    # Validate preset
-    valid_presets = {"Placebo", "Very Slow", "Slower", "Slow", "Medium", "Fast", "Faster",
-                     "Very Fast", "Super Fast", "Ultra Fast", "Draft"}
-    if qtgmc_preset not in valid_presets:
-        qtgmc_preset = "Slow"
-
-    fps_divisor = params.get("qtgmc_fps_divisor", 2)
-    qtgmc_ezdenoise = params.get("qtgmc_ezdenoise", 2)
-    # Validate EZDenoise range
-    qtgmc_ezdenoise = max(0, min(qtgmc_ezdenoise, 10))
-
-    qtgmc_sharpness = params.get("qtgmc_sharpness", 0.5)
-    qtgmc_chromamotion = params.get("qtgmc_chromamotion", True)
-    qtgmc_sourcematch = params.get("qtgmc_sourcematch", 3)
-    qtgmc_input_type = params.get("qtgmc_input_type", 0)
-    qtgmc_clear_fieldbased = params.get("qtgmc_clear_fieldbased", True)
-    cm_str = "True" if qtgmc_chromamotion else "False"
 
     # V-P-025 fix: Remove InputType=1 test code from generated script
     # (damaged field order detection should be done in classify.py, not in VS script)
@@ -312,6 +326,7 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         if segment_vars:
             splice_args = ", ".join(segment_vars)
             lines.append(f"clip = core.std.Splice([{splice_args}], mismatch=False)")
+            lines.append("clip = core.std.SetFieldBased(clip, 0)")  # FIX-P6-6
             lines.append("")
         else:
             use_segmented = False
@@ -364,8 +379,8 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
 
     # Stabilization
     if stabilize == "DepanStabilize":
-        dxmax = stabilize_params.get("dxmax", 10)
-        dymax = stabilize_params.get("dymax", 10)
+        dxmax = max(0, min(stabilize_params.get("dxmax", 10), 20))  # FIX-P6-9
+        dymax = max(0, min(stabilize_params.get("dymax", 10), 20))  # FIX-P6-9
         lines.append("# Temporal stabilization")
         lines.append(f"clip = haf.DepanStabilize(clip, dxmax={dxmax}, dymax={dymax})")
         lines.append("")
@@ -535,6 +550,11 @@ def main():
 
     # Generate VapourSynth script
     vs_script = generate_vs_script(input_path, params, args.job_id, crop_info)
+
+    # FIX-P6-8: Log warning for unknown field_order
+    if params.get("field_order") == "unknown":
+        logger.warning("STAGE1_UNKNOWN_FIELD_ORDER",
+                      "field_order=unknown, skipping QTGMC deinterlace (conservative)")
 
     # ISSUE-039 fix: hard validation of IVTC-before-QTGMC ordering in generated script
     needs_ivtc = params.get("needs_ivtc", False)

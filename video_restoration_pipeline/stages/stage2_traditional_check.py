@@ -138,6 +138,20 @@ def main():
                     logger.warning("STAGE2_FRAMERATE_CHECK", f"Frame rate check failed: {e}")
 
                 logger.info("TRADITIONAL_GATE", "Traditional restoration completed, proceeding to AI stages")
+
+                # FIX-P7-5: Copy stage1 output to step2_traditional intermediate
+                # so stage7 can find it in the fallback chain
+                import shutil
+                param_hash = params.get("param_hash", "")
+                step2_name = f"{job_id}_{Path(input_name).stem}_step2_traditional_p{param_hash}.mkv" if param_hash else f"{job_id}_{Path(input_name).stem}_step2_traditional.mkv"
+                step2_path = os.path.join(temp_dir, step2_name)
+                try:
+                    if not os.path.exists(step2_path):
+                        shutil.copyfile(stage1_output, step2_path)
+                        logger.info("STAGE2_COPY", f"Copied stage1 output to {step2_path}")
+                except Exception as copy_err:
+                    logger.warning("STAGE2_COPY_WARN", f"Failed to copy stage1 to step2 path: {copy_err}")
+
                 return 0
     except Exception as e:
         logger.warning("STAGE2_CHECK_FAIL", f"Quality check failed: {e}")
