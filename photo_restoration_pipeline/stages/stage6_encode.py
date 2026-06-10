@@ -198,7 +198,7 @@ def main():
     no_wsl_redirect = params.get("no_wsl_redirect", False)
     platform = params.get("platform", "auto")
     redirected_path, original_output_path, _, _ = wsl_redirect_path(
-        output_path, no_wsl_redirect=no_wsl_redirect, platform=platform
+        output_path, no_wsl_redirect=no_wsl_redirect, target_platform=platform
     )
     if original_output_path:
         logger.info("STAGE6_WSL_REDIRECT",

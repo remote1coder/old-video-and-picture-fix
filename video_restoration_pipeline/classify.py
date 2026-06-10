@@ -5,6 +5,7 @@ Classifies videos into: ANALOG_TAPE, DV_DIGITAL, HDV_AVCHD
 Detects field order, PSF, IVTC requirements.
 """
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, Tuple
@@ -138,7 +139,7 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
     gtff, gbff, gprog, gund = _parse_idet_counts(global_idet)
     gtotal = gtff + gbff + gprog + gund
     if gtotal == 0:
-        return "unknown", 0.0, []
+        return "unknown", 0.0, [], fps
 
     gprog_ratio = gprog / gtotal
 
@@ -147,23 +148,23 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
         # Method B: MediaInfo auxiliary check (v6.32 §3.9 / v7.32 §3.9)
         # If MediaInfo explicitly indicates PSF, skip expensive SSIM test
         if _check_psf_mediainfo(input_path):
-            return "psf", gprog_ratio, []
+            return "psf", gprog_ratio, [], fps
         # Method C: SSIM field similarity check
         if _check_psf_ssim(input_path):
-            return "psf", gprog_ratio, []
+            return "psf", gprog_ratio, [], fps
 
     # If too short or no video stream, skip segmentation
     if duration < 3.0 or not video_stream:
         if gprog_ratio > 0.95:
-            return "progressive", gprog_ratio, []
+            return "progressive", gprog_ratio, [], fps
         elif gtff / gtotal > 0.8:
-            return "tt", gtff / gtotal, []
+            return "tt", gtff / gtotal, [], fps
         elif gbff / gtotal > 0.8:
-            return "bb", gbff / gtotal, []
+            return "bb", gbff / gtotal, [], fps
         elif gprog_ratio > 0.5:
-            return "progressive", gprog_ratio, []
+            return "progressive", gprog_ratio, [], fps
         else:
-            return "unknown", 0.3, []
+            return "unknown", 0.3, [], fps
 
     # Sliding window analysis: 2-second windows, 1-second step
     window_duration = 2.0  # seconds
@@ -209,15 +210,15 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
     if not windows:
         # Fallback to global result
         if gprog_ratio > 0.95:
-            return "progressive", gprog_ratio, []
+            return "progressive", gprog_ratio, [], fps
         elif gtff / gtotal > 0.8:
-            return "tt", gtff / gtotal, []
+            return "tt", gtff / gtotal, [], fps
         elif gbff / gtotal > 0.8:
-            return "bb", gbff / gtotal, []
+            return "bb", gbff / gtotal, [], fps
         elif gprog_ratio > 0.5:
-            return "progressive", gprog_ratio, []
+            return "progressive", gprog_ratio, [], fps
         else:
-            return "unknown", 0.3, []
+            return "unknown", 0.3, [], fps
 
     # Merge consecutive windows with same field order
     segments = []
@@ -261,19 +262,19 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
         # v6.3: field_order valid values are tt/bb/psf/progressive/unknown ONLY.
         # "mixed" is not a valid field_order; use "unknown" with field_segments.
         avg_conf = sum(w["confidence"] for w in windows) / len(windows)
-        return "unknown", avg_conf, frame_segments
+        return "unknown", avg_conf, frame_segments, fps
 
     # Not mixed, return global result
     if gprog_ratio > 0.95:
-        return "progressive", gprog_ratio, []
+        return "progressive", gprog_ratio, [], fps
     elif gtff / gtotal > 0.8:
-        return "tt", gtff / gtotal, []
+        return "tt", gtff / gtotal, [], fps
     elif gbff / gtotal > 0.8:
-        return "bb", gbff / gtotal, []
+        return "bb", gbff / gtotal, [], fps
     elif gprog_ratio > 0.5:
-        return "progressive", gprog_ratio, []
+        return "progressive", gprog_ratio, [], fps
     else:
-        return "unknown", 0.3, []
+        return "unknown", 0.3, [], fps
 
 
 def detect_field_order(input_path: str) -> Tuple[str, float]:
@@ -283,7 +284,7 @@ def detect_field_order(input_path: str) -> Tuple[str, float]:
     Valid values: tt, bb, psf, progressive, unknown
     """
     # Delegate to segment-aware detector, discard segments for simple callers
-    field_order, confidence, _ = detect_field_order_segments(input_path)
+    field_order, confidence, _, _ = detect_field_order_segments(input_path)
     return field_order, confidence
 
 
@@ -383,6 +384,9 @@ def _check_psf_ssim(input_path: str) -> bool:
     computes adaptive-window SSIM on Y channel.
     Returns True if SSIM > 0.98 (likely PSF).
     Uses 3-frame average for robustness.
+
+    FIX-P6-4: Excludes static regions (OSD/logos) via frame-difference masking.
+    FIX-P6-5: Ensures temporary files are always cleaned up.
     """
     try:
         import tempfile
@@ -395,56 +399,99 @@ def _check_psf_ssim(input_path: str) -> bool:
         for idx in frame_indices:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
+            tmp_next = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp_next.close()
+            try:
+                r = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-v", "error",
+                     "-i", input_path, "-vf", f"select=eq(n\\,{idx})",
+                     "-frames:v", "1", "-f", "image2", "-y", tmp.name],
+                    capture_output=True, timeout=30, shell=False
+                )
 
-            r = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-v", "error",
-                 "-i", input_path, "-vf", f"select=eq(n\\,{idx})",
-                 "-frames:v", "1", "-f", "image2", "-y", tmp.name],
-                capture_output=True, timeout=30, shell=False
-            )
+                if r.returncode != 0:
+                    continue
 
-            if r.returncode != 0:
-                continue
+                # FIX-P6-4: Extract adjacent frame for static-region mask
+                r_next = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-v", "error",
+                     "-i", input_path, "-vf", f"select=eq(n\\,{idx+1})",
+                     "-frames:v", "1", "-f", "image2", "-y", tmp_next.name],
+                    capture_output=True, timeout=30, shell=False
+                )
 
-            img = Image.open(tmp.name).convert("L")
-            arr = np.array(img, dtype=np.float64)
+                img = Image.open(tmp.name).convert("L")
+                arr = np.array(img, dtype=np.float64)
 
-            # Detect and crop black borders
-            crop_top, crop_bottom, crop_left, crop_right = _detect_black_borders_frame(arr)
-            # Ensure we keep at least 50% of the frame
-            min_h = arr.shape[0] // 2
-            min_w = arr.shape[1] // 2
-            effective_h = arr.shape[0] - crop_top - crop_bottom
-            effective_w = arr.shape[1] - crop_left - crop_right
-            if effective_h < min_h or effective_w < min_w:
-                # Too aggressive crop, use minimal crop
-                crop_top = min(crop_top, arr.shape[0] // 4)
-                crop_bottom = min(crop_bottom, arr.shape[0] // 4)
-                crop_left = min(crop_left, arr.shape[1] // 4)
-                crop_right = min(crop_right, arr.shape[1] // 4)
+                # Detect and crop black borders
+                crop_top, crop_bottom, crop_left, crop_right = _detect_black_borders_frame(arr)
+                # Ensure we keep at least 50% of the frame
+                min_h = arr.shape[0] // 2
+                min_w = arr.shape[1] // 2
+                effective_h = arr.shape[0] - crop_top - crop_bottom
+                effective_w = arr.shape[1] - crop_left - crop_right
+                if effective_h < min_h or effective_w < min_w:
+                    # Too aggressive crop, use minimal crop
+                    crop_top = min(crop_top, arr.shape[0] // 4)
+                    crop_bottom = min(crop_bottom, arr.shape[0] // 4)
+                    crop_left = min(crop_left, arr.shape[1] // 4)
+                    crop_right = min(crop_right, arr.shape[1] // 4)
 
-            if crop_top + crop_bottom < arr.shape[0] and crop_left + crop_right < arr.shape[1]:
-                arr = arr[crop_top:arr.shape[0]-crop_bottom,
-                          crop_left:arr.shape[1]-crop_right]
+                if crop_top + crop_bottom < arr.shape[0] and crop_left + crop_right < arr.shape[1]:
+                    arr = arr[crop_top:arr.shape[0]-crop_bottom,
+                              crop_left:arr.shape[1]-crop_right]
 
-            # Separate fields
-            top_field = arr[0::2, :]
-            bottom_field = arr[1::2, :]
+                # FIX-P6-4: Build static-region mask from adjacent-frame difference
+                if r_next.returncode == 0:
+                    img_next = Image.open(tmp_next.name).convert("L")
+                    arr_next = np.array(img_next, dtype=np.float64)
+                    if (crop_top + crop_bottom < arr_next.shape[0] and
+                            crop_left + crop_right < arr_next.shape[1]):
+                        arr_next = arr_next[crop_top:arr_next.shape[0]-crop_bottom,
+                                            crop_left:arr_next.shape[1]-crop_right]
+                    if arr_next.shape == arr.shape:
+                        frame_diff = np.abs(arr - arr_next)
+                        mask = frame_diff > 5.0
+                    else:
+                        mask = np.ones_like(arr, dtype=bool)
+                else:
+                    mask = np.ones_like(arr, dtype=bool)
 
-            # Handle odd height
-            h = min(top_field.shape[0], bottom_field.shape[0])
-            top_field = top_field[:h, :]
-            bottom_field = bottom_field[:h, :]
+                # Separate fields
+                top_field = arr[0::2, :]
+                bottom_field = arr[1::2, :]
 
-            if top_field.size == 0 or bottom_field.size == 0:
-                continue
+                # FIX-P6-4: Replace static regions with independent noise so they
+                # do not artificially inflate SSIM
+                mask_top = mask[0::2, :]
+                mask_bottom = mask[1::2, :]
+                rng = np.random.default_rng(idx)
+                noise_top = rng.normal(128, 20, top_field.shape)
+                noise_bottom = rng.normal(128, 20, bottom_field.shape)
+                top_field = np.where(mask_top, top_field, noise_top)
+                bottom_field = np.where(mask_bottom, bottom_field, noise_bottom)
 
-            # Adaptive window size
-            win_size = max(3, min(11, (arr.shape[1] // 40) | 1, (arr.shape[0] // 40) | 1))
-            win_size = min(win_size, min(arr.shape[0], arr.shape[1]))
+                # Handle odd height
+                h = min(top_field.shape[0], bottom_field.shape[0])
+                top_field = top_field[:h, :]
+                bottom_field = bottom_field[:h, :]
 
-            ssim = _compute_ssim_windowed(top_field, bottom_field, win_size)
-            ssim_values.append(ssim)
+                if top_field.size == 0 or bottom_field.size == 0:
+                    continue
+
+                # Adaptive window size
+                win_size = max(3, min(11, (arr.shape[1] // 40) | 1, (arr.shape[0] // 40) | 1))
+                win_size = min(win_size, min(arr.shape[0], arr.shape[1]))
+
+                ssim = _compute_ssim_windowed(top_field, bottom_field, win_size)
+                ssim_values.append(ssim)
+            finally:
+                # FIX-P6-5: Always clean up temp files
+                for t in (tmp, tmp_next):
+                    try:
+                        os.unlink(t.name)
+                    except Exception:
+                        pass
 
         if not ssim_values:
             return False
@@ -480,74 +527,76 @@ def _detect_blockiness_and_blur(input_path: str) -> Dict[str, float]:
         # Extract one frame from middle of video
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp.close()
-        r = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-v", "error",
-             "-ss", "00:00:02", "-i", input_path,
-             "-frames:v", "1", "-f", "image2", "-y", tmp.name],
-            capture_output=True, timeout=30, shell=False
-        )
-        if r.returncode != 0:
-            return scores
-
-        img = Image.open(tmp.name).convert("L")
-        arr = np.array(img, dtype=np.float64)
-
-        # Blockiness: compare pixel difference at 8-pixel boundaries vs interior
-        h, w = arr.shape
-        # Horizontal block boundaries (rows at multiples of 8)
-        h_diff_boundary = []
-        h_diff_interior = []
-        for y in range(1, h):
-            row_diff = np.abs(arr[y, :] - arr[y - 1, :]).mean()
-            if y % 8 == 0:
-                h_diff_boundary.append(row_diff)
-            else:
-                h_diff_interior.append(row_diff)
-
-        # Vertical block boundaries (cols at multiples of 8)
-        v_diff_boundary = []
-        v_diff_interior = []
-        for x in range(1, w):
-            col_diff = np.abs(arr[:, x] - arr[:, x - 1]).mean()
-            if x % 8 == 0:
-                v_diff_boundary.append(col_diff)
-            else:
-                v_diff_interior.append(col_diff)
-
-        if h_diff_interior and v_diff_interior and h_diff_boundary and v_diff_boundary:
-            avg_interior = (np.mean(h_diff_interior) + np.mean(v_diff_interior)) / 2 + 1e-6
-            avg_boundary = (np.mean(h_diff_boundary) + np.mean(v_diff_boundary)) / 2
-            blockiness = avg_boundary / avg_interior
-            # Normalize to 0-1 range (typical blockiness 1.0-5.0)
-            scores["blockiness_score"] = min(1.0, max(0.0, (blockiness - 1.0) / 3.0))
-
-        # Blur: Laplacian variance (lower = more blurred)
         try:
-            import cv2
-            lap = cv2.Laplacian(arr.astype(np.float32), cv2.CV_32F)
-            lap_var = lap.var()
-            # Typical lap_var: sharp ~1000+, blurred ~50-200
-            scores["blur_score"] = min(1.0, max(0.0, 1.0 - (lap_var / 800.0)))
+            r = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-v", "error",
+                 "-ss", "00:00:02", "-i", input_path,
+                 "-frames:v", "1", "-f", "image2", "-y", tmp.name],
+                capture_output=True, timeout=30, shell=False
+            )
+            if r.returncode != 0:
+                return scores
 
-            # Noise: residual mean after 3x3 median filter
-            median_img = cv2.medianBlur(arr.astype(np.uint8), 3).astype(np.float64)
-            noise = np.abs(arr - median_img).mean()
-            # Normalize: typical noise 2-20
-            scores["noise_score"] = min(1.0, max(0.0, noise / 15.0))
-        except Exception:
-            # Fallback without cv2: simple gradient variance
-            gx = np.diff(arr, axis=1)
-            gy = np.diff(arr, axis=0)
-            grad_var = (gx.var() + gy.var()) / 2
-            scores["blur_score"] = min(1.0, max(0.0, 1.0 - (grad_var / 500.0)))
-            # Simple noise estimate from high-frequency residual
-            noise = np.abs(arr[1:, 1:] - arr[:-1, :-1]).mean()
-            scores["noise_score"] = min(1.0, max(0.0, noise / 15.0))
+            img = Image.open(tmp.name).convert("L")
+            arr = np.array(img, dtype=np.float64)
 
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
+            # Blockiness: compare pixel difference at 8-pixel boundaries vs interior
+            h, w = arr.shape
+            # Horizontal block boundaries (rows at multiples of 8)
+            h_diff_boundary = []
+            h_diff_interior = []
+            for y in range(1, h):
+                row_diff = np.abs(arr[y, :] - arr[y - 1, :]).mean()
+                if y % 8 == 0:
+                    h_diff_boundary.append(row_diff)
+                else:
+                    h_diff_interior.append(row_diff)
+
+            # Vertical block boundaries (cols at multiples of 8)
+            v_diff_boundary = []
+            v_diff_interior = []
+            for x in range(1, w):
+                col_diff = np.abs(arr[:, x] - arr[:, x - 1]).mean()
+                if x % 8 == 0:
+                    v_diff_boundary.append(col_diff)
+                else:
+                    v_diff_interior.append(col_diff)
+
+            if h_diff_interior and v_diff_interior and h_diff_boundary and v_diff_boundary:
+                avg_interior = (np.mean(h_diff_interior) + np.mean(v_diff_interior)) / 2 + 1e-6
+                avg_boundary = (np.mean(h_diff_boundary) + np.mean(v_diff_boundary)) / 2
+                blockiness = avg_boundary / avg_interior
+                # Normalize to 0-1 range (typical blockiness 1.0-5.0)
+                scores["blockiness_score"] = min(1.0, max(0.0, (blockiness - 1.0) / 3.0))
+
+            # Blur: Laplacian variance (lower = more blurred)
+            try:
+                import cv2
+                lap = cv2.Laplacian(arr.astype(np.float32), cv2.CV_32F)
+                lap_var = lap.var()
+                # Typical lap_var: sharp ~1000+, blurred ~50-200
+                scores["blur_score"] = min(1.0, max(0.0, 1.0 - (lap_var / 800.0)))
+
+                # Noise: residual mean after 3x3 median filter
+                median_img = cv2.medianBlur(arr.astype(np.uint8), 3).astype(np.float64)
+                noise = np.abs(arr - median_img).mean()
+                # Normalize: typical noise 2-20
+                scores["noise_score"] = min(1.0, max(0.0, noise / 15.0))
+            except Exception:
+                # Fallback without cv2: simple gradient variance
+                gx = np.diff(arr, axis=1)
+                gy = np.diff(arr, axis=0)
+                grad_var = (gx.var() + gy.var()) / 2
+                scores["blur_score"] = min(1.0, max(0.0, 1.0 - (grad_var / 500.0)))
+                # Simple noise estimate from high-frequency residual
+                noise = np.abs(arr[1:, 1:] - arr[:-1, :-1]).mean()
+                scores["noise_score"] = min(1.0, max(0.0, noise / 15.0))
+        finally:
+            # FIX-P6-5: Always clean up temp file
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
     except Exception:
         pass
     return scores
@@ -624,8 +673,8 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     # Dimensions
     result["original_width"] = video_stream.get("width", 0)
     result["original_height"] = video_stream.get("height", 0)
-    result["native_width"] = result["original_width"]
-    result["native_height"] = result["original_height"]
+    result["native_width"] = video_stream.get("coded_width", result["original_width"])
+    result["native_height"] = video_stream.get("coded_height", result["original_height"])
 
     # DAR from display_aspect_ratio
     dar = video_stream.get("display_aspect_ratio", "")
@@ -660,7 +709,7 @@ def classify_video(input_path: str) -> Dict[str, Any]:
         result["confidence"] = 0.70
 
     # Field order detection (with segment-aware mixed field order support)
-    field_order, fo_confidence, field_segments = detect_field_order_segments(input_path)
+    field_order, fo_confidence, field_segments, fps = detect_field_order_segments(input_path)
     result["field_order"] = field_order
     result["is_psf"] = (field_order == "psf")
 
@@ -670,15 +719,15 @@ def classify_video(input_path: str) -> Dict[str, Any]:
 
     # IVTC detection: analog tape with TFF/BFF likely needs IVTC
     # Mixed field order materials skip IVTC (IVTC assumes consistent field order globally)
+    # FIX-P6-7: Only NTSC (29.97/30fps) interlaced sources need IVTC; PAL (25fps) does not
+    is_ntsc = abs(fps - 29.97) < 1.0 or abs(fps - 30.0) < 1.0
     interlaced_orders = ("tt", "bb")
     if field_order == "unknown" and field_segments:
         # Skip IVTC for mixed field order; per-segment QTGMC handles deinterlacing
         result["needs_ivtc"] = False
-    elif result["detected_class"] == "ANALOG_TAPE" and field_order in interlaced_orders:
-        result["needs_ivtc"] = True
-    elif result["detected_class"] == "DV_DIGITAL" and field_order in interlaced_orders:
-        # DV may need IVTC if it has pulldown
-        result["needs_ivtc"] = True  # Auto-detect will verify
+    elif is_ntsc and field_order in interlaced_orders:
+        if result["detected_class"] in ("ANALOG_TAPE", "DV_DIGITAL"):
+            result["needs_ivtc"] = True
 
     # V-P-014 fix: pixel feature analysis enhancement
     pixel_features = _detect_blockiness_and_blur(input_path)

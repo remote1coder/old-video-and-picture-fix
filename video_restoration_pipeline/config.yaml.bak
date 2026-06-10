@@ -1,0 +1,208 @@
+# ============================================
+# 老影像修复 - 视频修复套件配置文件
+# 参数优先级：命令行 > user_overrides > paths > global > 内置默认值
+# ============================================
+
+global:
+  output_dir: "./output"
+  temp_dir: "./temp"
+  encoder: "svtav1"
+  crf: 24
+  preset: 4
+  preset_max_quality: true
+  pix_fmt: "yuv420p10le"
+  color_range: "limited"
+  platform: "auto"
+  gpu_priority: ["cuda", "rocm", "mps", "cpu"]
+  log_level: "INFO"
+  log_dir: "./logs"
+  manifest_format: "yaml"
+  log_max_lines: 10000
+  log_backup_count: 5
+  log_max_line_bytes: 1048576
+  vs_bit_depth: 16
+  cleanup_intermediates: true
+  retry_count: 2
+  no_wsl_redirect: false
+  svt_tile_rows: 2
+  svt_tile_cols: 2
+
+paths:
+  analog_tape:
+    ivtc: "VIVTC"
+    ivtc_alt: "sRestore"
+    ivtc_auto_fallback: true
+    ivtc_fallback_threshold:
+      tff_bff_percent: 10
+      progressive_percent: 90
+    deinterlace: "QTGMC"
+    denoise: "TemporalDegrain2"
+    denoise_params:
+      degrainTR: 2
+      grainLevel: 2
+    target_resolution: "720x480"
+    target_fps: "auto"
+    chroma_shift: true
+    crf: 24
+    qtgmc_preset: "Slow"
+    qtgmc_ezdenoise: 2
+    qtgmc_sharpness: 0.5
+    qtgmc_chromamotion: true
+    qtgmc_sourcematch: 3
+    qtgmc_input_type: 0
+    qtgmc_fps_divisor: 2
+    qtgmc_input_type_rule: "field_order"
+    qtgmc_tff_required: true
+    qtgmc_clear_fieldbased: true
+    stabilize: "DepanStabilize"
+    stabilize_params:
+      dxmax: 10
+      dymax: 10
+
+  dv_digital:
+    ivtc: "auto"
+    deinterlace: "QTGMC"
+    psf_handling: "SeparateFields_Weave"
+    psf_handling_alt: "SeparateFields_DoubleWeave_SelectEvery"
+    deblock: "Deblock_QED"
+    deblock_alt: "ffmpeg_deblock"
+    target_resolution: "720x480"
+    target_fps: "auto"
+    crf: 24
+    qtgmc_preset: "Slower"
+    qtgmc_ezdenoise: 1
+    qtgmc_sharpness: 0.3
+    qtgmc_chromamotion: true
+    qtgmc_sourcematch: 3
+    qtgmc_input_type: 0
+    qtgmc_fps_divisor: 2
+    qtgmc_input_type_rule: "field_order"
+    qtgmc_tff_required: true
+    qtgmc_clear_fieldbased: true
+
+  hdv_avchd:
+    ivtc: "auto"
+    deinterlace: "QTGMC"
+    psf_handling: "SeparateFields_Weave"
+    psf_handling_alt: "SeparateFields_DoubleWeave_SelectEvery"
+    deblock: "DeblockPP7"
+    target_resolution: "1920x1080"
+    crf: 26
+    qtgmc_preset: "Slower"
+    qtgmc_ezdenoise: 1
+    qtgmc_sharpness: 0.3
+    qtgmc_chromamotion: true
+    qtgmc_sourcematch: 3
+    qtgmc_input_type: 0
+    qtgmc_fps_divisor: 2
+    qtgmc_input_type_rule: "field_order"
+    qtgmc_tff_required: true
+    qtgmc_clear_fieldbased: true
+
+audio_override:
+  # v7.3：各素材类型可独立覆盖全局音频参数
+  # 优先级：命令行 > user_overrides > paths.audio_override > global.audio > 内置默认值
+  analog_tape:
+    hum_freq: 50
+    hum_harmonics: 3
+    hum_bandwidth: 2
+    hum_width_type: "h"
+    hum_dual: false
+    hum_dual_ratio_threshold: 3.0
+    hum_lowfreq_energy_threshold: 0.3
+    hum_fft_window: "adaptive"
+    hum_fft_overlap: 0.5
+    hum_fft_window_func: "hann"
+    denoise: "afftdn"
+  dv_digital:
+    hum_freq: 50
+    hum_harmonics: 3
+    hum_bandwidth: 2
+    hum_width_type: "h"
+    hum_dual: false
+    hum_dual_ratio_threshold: 3.0
+    hum_lowfreq_energy_threshold: 0.3
+    hum_fft_window: "adaptive"
+    hum_fft_overlap: 0.5
+    hum_fft_window_func: "hann"
+    denoise: "afftdn"
+  hdv_avchd:
+    hum_freq: 50
+    hum_harmonics: 3
+    hum_bandwidth: 2
+    hum_width_type: "h"
+    hum_dual: false
+    hum_dual_ratio_threshold: 3.0
+    hum_lowfreq_energy_threshold: 0.3
+    hum_fft_window: "adaptive"
+    hum_fft_overlap: 0.5
+    hum_fft_window_func: "hann"
+    denoise: "afftdn"
+
+grain_factory3:
+  enabled: true
+  analog_tape:
+    g1str: 1.0
+    g2str: 0.2
+    g3str: 0.2
+    temp_avg: 0  # V-P-012 fix: temporal averaging for grain continuity
+  dv_digital:
+    g1str: 1.0
+    g2str: 0.2
+    g3str: 0.2
+    temp_avg: 0
+  hdv_avchd:
+    g1str: 0.8
+    g2str: 0.2
+    g3str: 0.2
+    temp_avg: 0
+  addgrainc_enabled: false
+  addgrainc_ratio: 0.2
+
+ai:
+  enabled: false
+  face_restore: "GFPGAN"
+  upscale_model: "RealESRGAN_x2plus"
+  upscale_scale: 2
+  max_scale: 4
+  lanczos_target: "auto"
+  grain_strength: 0.3
+  force_traditional_first: true
+  force_allow_banned_upscale: false
+  gpu_memory_fallback: true
+  face_detect_fallback: ["RetinaFace", "YOLOv8-face", "MTCNN"]
+  face_detect_threshold: 0.8
+  face_detect_threshold_lowres: 0.6
+  face_detect_lowres_max_dimension: 720
+  static_segment_duration: 2.0  # V-P-013 fix: minimum static segment duration in seconds
+  ban_original_input_pixels: true
+  ban_intermediate_pixels: true
+
+audio:
+  enabled: true
+  extract_first: true
+  process_before_mux: true
+  denoise: "afftdn"
+  hum_filter: "bandreject_multi"
+  hum_freq: 50
+  hum_harmonics: 3
+  hum_bandwidth: 2
+  hum_width_type: "h"
+  hum_auto_detect_seconds: 30
+  hum_energy_threshold: 0.005
+  hum_dual: false
+  hum_dual_ratio_threshold: 3.0
+  hum_lowfreq_energy_threshold: 0.3
+  hum_fft_window: "adaptive"
+  hum_fft_overlap: 0.5
+  hum_fft_window_func: "hann"
+  codec: "aac"
+  bitrate: "320k"
+  sample_rate: "auto"
+  ffmpeg_min_version: "4.4"
+  fallback_denoise: "arnndn"
+  arnndn_model_url: "https://github.com/NullModel/arnndn-models"
+  arnndn_model_50hz: "arnndn_50Hz.pb"
+  arnndn_model_60hz: "arnndn_60Hz.pb"
+  multichannel_preserve: true
+  compand_syntax_note: "subprocess_list_mode_points_pipe_or_space_separated"

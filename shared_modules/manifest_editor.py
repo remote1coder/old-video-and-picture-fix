@@ -17,7 +17,7 @@ from typing import Optional
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from manifest_loader import load_manifest, save_manifest, update_job_status  # noqa: E402
+from manifest_loader import load_manifest, save_manifest, update_job_status, _update_meta_counts  # noqa: E402
 
 
 def _set_nested(d: dict, key_path: str, value):
@@ -26,6 +26,37 @@ def _set_nested(d: dict, key_path: str, value):
     for k in keys[:-1]:
         d = d.setdefault(k, {})
     d[keys[-1]] = value
+
+
+def _parse_value(value: str):
+    """Parse user input string to Python value."""
+    if value.lower() == "true":
+        return True
+    elif value.lower() == "false":
+        return False
+    elif value.lower() == "none":
+        return None
+    else:
+        try:
+            if "." in value:
+                return float(value)
+            else:
+                return int(value)
+        except ValueError:
+            return value
+
+
+def _find_config_upwards(manifest_path: str, max_levels: int = 5) -> str:
+    """Search for config.yaml upwards from manifest directory."""
+    p = Path(manifest_path).resolve().parent
+    for _ in range(max_levels):
+        cand = p / "config.yaml"
+        if cand.exists():
+            return str(cand)
+        if p.parent == p:
+            break
+        p = p.parent
+    return ""
 
 
 def list_jobs(manifest_path: str, status_filter: Optional[str] = None,
@@ -93,6 +124,9 @@ def set_user_override(manifest_path: str, job_id: str,
                     pass
             
             _set_nested(overrides, key, parsed_value)
+            # FIX-P4-8: update timestamp on modification
+            from datetime import datetime
+            job["updated_at"] = datetime.now().astimezone().isoformat()
             print(f"Set {key}={parsed_value} for job {job_id}")
             break
     save_manifest(manifest, manifest_path)
@@ -104,6 +138,9 @@ def set_priority(manifest_path: str, job_id: str, priority: int):
     for job in manifest.get("jobs", []):
         if job.get("job_id") == job_id:
             job["priority"] = priority
+            # FIX-P4-8: update timestamp on modification
+            from datetime import datetime
+            job["updated_at"] = datetime.now().astimezone().isoformat()
             print(f"Set priority={priority} for job {job_id}")
             break
     save_manifest(manifest, manifest_path)
@@ -129,7 +166,7 @@ def interactive_tui(manifest_path: str):
     
     console.print(Panel(f"Manifest Editor: {manifest_path}\n"
                         f"Total jobs: {len(jobs)}\n"
-                        f"Commands: [y]=accept [e]=edit [s]=skip [p]=priority [q]=quit",
+                        f"Commands: [y]=accept [e]=edit [s]=skip [p]=priority [c]=class [q]=quit",
                         title="Interactive Review"))
     
     for i, job in enumerate(jobs):
@@ -153,17 +190,25 @@ def interactive_tui(manifest_path: str):
         console.print(table)
         
         while True:
-            choice = console.input("[y/e/s/p/q] ? ").strip().lower()
+            choice = console.input("[y/e/s/p/c/q] ? ").strip().lower()
             if choice == "y":
                 job["status"] = "PENDING"
+                _update_meta_counts(manifest)
                 break
             elif choice == "e":
                 key = console.input("Parameter key (dot notation supported): ").strip()
                 val = console.input("Value: ").strip()
-                set_user_override(manifest_path, job["job_id"], key, val)
+                overrides = job.setdefault("user_overrides", {})
+                parsed_value = _parse_value(val)
+                _set_nested(overrides, key, parsed_value)
+                # FIX-P4-2: edit in-memory only; save at loop end
+                from datetime import datetime
+                job["updated_at"] = datetime.now().astimezone().isoformat()
+                console.print(f"Set {key}={parsed_value} for job {job['job_id']}")
                 break
             elif choice == "s":
                 job["status"] = "SKIP"
+                _update_meta_counts(manifest)
                 break
             elif choice == "p":
                 try:
@@ -172,11 +217,60 @@ def interactive_tui(manifest_path: str):
                 except ValueError:
                     console.print("Invalid priority")
                 break
+            elif choice == "c":
+                new_class = console.input(
+                    "New class (ANALOG_TAPE/DV_DIGITAL/HDV_AVCHD/SCAN_PRINT/DIGITAL_PHOTO): "
+                ).strip().upper()
+                valid_classes = ("ANALOG_TAPE", "DV_DIGITAL", "HDV_AVCHD", "SCAN_PRINT", "DIGITAL_PHOTO")
+                if new_class in valid_classes:
+                    old_class = job.get("detected_class", "UNKNOWN")
+                    job["detected_class"] = new_class
+                    
+                    config_path = manifest.get("meta", {}).get("config_path")
+                    if not config_path:
+                        config_path = _find_config_upwards(manifest_path)
+                    if not Path(config_path).exists():
+                        console.print(f"[red]Config not found: {config_path}[/red]")
+                        break
+                    
+                    from manifest_generate import load_config, map_class_to_path_params
+                    config = load_config(config_path)
+                    
+                    job["recommended_params"] = map_class_to_path_params(new_class, config)
+                    
+                    audio_override = config.get("audio_override", {})
+                    type_key_map = {
+                        "ANALOG_TAPE": "analog_tape",
+                        "DV_DIGITAL": "dv_digital",
+                        "HDV_AVCHD": "hdv_avchd",
+                    }
+                    type_key = type_key_map.get(new_class)
+                    if type_key and type_key in audio_override:
+                        job["recommended_params"]["audio_override"] = dict(audio_override[type_key])
+                    
+                    orig_w = job.get("original_width", 0)
+                    orig_h = job.get("original_height", 0)
+                    if new_class in ("SCAN_PRINT", "DIGITAL_PHOTO"):
+                        job["ai_upscale_banned"] = (orig_w > 3840 or orig_h > 2160)
+                    elif new_class == "HDV_AVCHD":
+                        job["ai_upscale_banned"] = (orig_h >= 1080 or orig_w >= 1920)
+                    elif new_class == "ANALOG_TAPE":
+                        job["ai_upscale_banned"] = (orig_h > 1080 or orig_w > 1920)
+                    
+                    from datetime import datetime
+                    job["updated_at"] = datetime.now().astimezone().isoformat()
+                    console.print(f"[green]Class changed to {new_class}[/green]")
+                    console.print(f"[yellow]ai_upscale_banned = {job['ai_upscale_banned']}[/yellow]")
+                else:
+                    console.print("[red]Invalid class[/red]")
+                break
             elif choice == "q":
+                _update_meta_counts(manifest)
                 save_manifest(manifest, manifest_path)
                 console.print("Manifest saved. Quitting.")
                 return
     
+    _update_meta_counts(manifest)
     save_manifest(manifest, manifest_path)
     console.print("All jobs reviewed. Manifest saved.")
 
@@ -188,7 +282,7 @@ def _interactive_basic(manifest_path: str):
     
     print(f"Manifest Editor: {manifest_path}")
     print(f"Total jobs: {len(jobs)}")
-    print("Commands: y=accept e=edit s=skip p=priority q=quit")
+    print("Commands: y=accept e=edit s=skip p=priority c=class q=quit")
     
     for i, job in enumerate(jobs):
         if job.get("status") not in ("PENDING", "FAILED"):
@@ -200,17 +294,25 @@ def _interactive_basic(manifest_path: str):
         print(f"  Status: {job.get('status')} | Priority: {job.get('priority', 0)}")
         
         while True:
-            choice = input("[y/e/s/p/q] ? ").strip().lower()
+            choice = input("[y/e/s/p/c/q] ? ").strip().lower()
             if choice == "y":
                 job["status"] = "PENDING"
+                _update_meta_counts(manifest)
                 break
             elif choice == "e":
                 key = input("Parameter key: ").strip()
                 val = input("Value: ").strip()
-                set_user_override(manifest_path, job["job_id"], key, val)
+                overrides = job.setdefault("user_overrides", {})
+                parsed_value = _parse_value(val)
+                _set_nested(overrides, key, parsed_value)
+                # FIX-P4-2: edit in-memory only; save at loop end
+                from datetime import datetime
+                job["updated_at"] = datetime.now().astimezone().isoformat()
+                print(f"Set {key}={parsed_value} for job {job['job_id']}")
                 break
             elif choice == "s":
                 job["status"] = "SKIP"
+                _update_meta_counts(manifest)
                 break
             elif choice == "p":
                 try:
@@ -218,11 +320,60 @@ def _interactive_basic(manifest_path: str):
                 except ValueError:
                     print("Invalid priority")
                 break
+            elif choice == "c":
+                new_class = input(
+                    "New class (ANALOG_TAPE/DV_DIGITAL/HDV_AVCHD/SCAN_PRINT/DIGITAL_PHOTO): "
+                ).strip().upper()
+                valid_classes = ("ANALOG_TAPE", "DV_DIGITAL", "HDV_AVCHD", "SCAN_PRINT", "DIGITAL_PHOTO")
+                if new_class in valid_classes:
+                    old_class = job.get("detected_class", "UNKNOWN")
+                    job["detected_class"] = new_class
+                    
+                    config_path = manifest.get("meta", {}).get("config_path")
+                    if not config_path:
+                        config_path = _find_config_upwards(manifest_path)
+                    if not Path(config_path).exists():
+                        print(f"Config not found: {config_path}")
+                        break
+                    
+                    from manifest_generate import load_config, map_class_to_path_params
+                    config = load_config(config_path)
+                    
+                    job["recommended_params"] = map_class_to_path_params(new_class, config)
+                    
+                    audio_override = config.get("audio_override", {})
+                    type_key_map = {
+                        "ANALOG_TAPE": "analog_tape",
+                        "DV_DIGITAL": "dv_digital",
+                        "HDV_AVCHD": "hdv_avchd",
+                    }
+                    type_key = type_key_map.get(new_class)
+                    if type_key and type_key in audio_override:
+                        job["recommended_params"]["audio_override"] = dict(audio_override[type_key])
+                    
+                    orig_w = job.get("original_width", 0)
+                    orig_h = job.get("original_height", 0)
+                    if new_class in ("SCAN_PRINT", "DIGITAL_PHOTO"):
+                        job["ai_upscale_banned"] = (orig_w > 3840 or orig_h > 2160)
+                    elif new_class == "HDV_AVCHD":
+                        job["ai_upscale_banned"] = (orig_h >= 1080 or orig_w >= 1920)
+                    elif new_class == "ANALOG_TAPE":
+                        job["ai_upscale_banned"] = (orig_h > 1080 or orig_w > 1920)
+                    
+                    from datetime import datetime
+                    job["updated_at"] = datetime.now().astimezone().isoformat()
+                    print(f"Class changed to {new_class}")
+                    print(f"ai_upscale_banned = {job['ai_upscale_banned']}")
+                else:
+                    print("Invalid class")
+                break
             elif choice == "q":
+                _update_meta_counts(manifest)
                 save_manifest(manifest, manifest_path)
                 print("Saved. Quitting.")
                 return
     
+    _update_meta_counts(manifest)
     save_manifest(manifest, manifest_path)
     print("All jobs reviewed. Manifest saved.")
 

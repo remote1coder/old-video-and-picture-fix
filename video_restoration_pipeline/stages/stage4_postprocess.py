@@ -12,6 +12,7 @@ v6.3 Compliance:
 import os
 import sys
 import json
+import hashlib
 import argparse
 import glob
 import subprocess
@@ -51,15 +52,48 @@ def main():
     # Find stage3 output - deterministic by mtime
     pattern = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
     candidates = glob.glob(os.path.join(temp_dir, pattern))
+    # P8-11 fallback A: if no stage3 output, look for stage2 output
     if not candidates:
-        logger.info("STAGE4_SKIP", "No AI upscale output")
-        return 3
+        pattern2 = f"{job_id}_{Path(input_name).stem}_step2_traditional*"
+        candidates2 = glob.glob(os.path.join(temp_dir, pattern2))
+        if candidates2:
+            candidates2.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            stage3_output = candidates2[0]
+            logger.info("STAGE4_FALLBACK", "No stage3 output, using stage2 output",
+                        input=stage3_output)
+        else:
+            logger.info("STAGE4_SKIP", "No AI upscale or traditional output")
+            return 3
+    else:
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        stage3_output = candidates[0]
 
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    stage3_output = candidates[0]
+    # P8-7: Compute param_hash for intermediate filename
+    try:
+        from checkpoint import compute_param_hash
+    except Exception:
+        import hashlib
+        def compute_param_hash(input_path, params):
+            param_str = json.dumps(params, sort_keys=True, ensure_ascii=False)
+            file_id = str(os.path.getsize(input_path)) + str(int(os.path.getmtime(input_path)))
+            return hashlib.sha256((param_str + file_id).encode()).hexdigest()[:16]
+
+    core_params = {
+        "color_lift_r": params.get("color_lift_r", 0.02),
+        "color_lift_g": params.get("color_lift_g", 0.01),
+        "color_lift_b": params.get("color_lift_b", 0.01),
+        "color_gamma_r": params.get("color_gamma_r", 0.98),
+        "color_gamma_g": params.get("color_gamma_g", 0.98),
+        "color_gamma_b": params.get("color_gamma_b", 0.98),
+        "color_gain_r": params.get("color_gain_r", 1.02),
+        "color_gain_g": params.get("color_gain_g", 1.02),
+        "color_gain_b": params.get("color_gain_b", 1.02),
+        "vs_bit_depth": params.get("vs_bit_depth", 16),
+    }
+    param_hash = compute_param_hash(stage3_output, core_params)
 
     output_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step4_postprocess.mkv")
+        f"{job_id}_{Path(input_name).stem}_step4_postprocess_p{param_hash}.mkv")
 
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         logger.info("STAGE4_SKIP", "Post-process already done")
@@ -104,14 +138,12 @@ def main():
         "eq=saturation=1.05:contrast=1.02"
     )
 
-    # v6.3 §3.6: Intermediate format must be FFV1 YUV420P16
+    # v6.3 §3.6 / P8-8: Intermediate format must be FFV1 YUV420P16
     vs_bit_depth = params.get("vs_bit_depth", 16)
-    if vs_bit_depth == 16:
-        pix_fmt = "yuv420p16le"
-    elif vs_bit_depth == 10:
-        pix_fmt = "yuv420p10le"
-    else:
-        pix_fmt = "yuv420p"
+    if vs_bit_depth != 16:
+        logger.warning("STAGE4_BITDEPTH_FORCE",
+                       f"vs_bit_depth={vs_bit_depth}, forcing 16bit for intermediate")
+    pix_fmt = "yuv420p16le"
 
     cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",

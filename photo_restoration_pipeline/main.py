@@ -386,7 +386,7 @@ def _run_single_job(job: Dict[str, Any],
     from checkpoint import wsl_redirect_path
     temp_dir = params.get("temp_dir", "./temp")
     redirected_temp, orig_temp, _, _ = wsl_redirect_path(
-        temp_dir, no_wsl_redirect=no_wsl_redirect, platform=platform
+        temp_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform
     )
     if orig_temp:
         logger.info("WSL_REDIRECT", f"temp_dir: {temp_dir} -> {redirected_temp}")
@@ -395,7 +395,7 @@ def _run_single_job(job: Dict[str, Any],
         temp_dir = redirected_temp
     output_dir = params.get("output_dir", "./output")
     redirected_out, orig_out, _, _ = wsl_redirect_path(
-        output_dir, no_wsl_redirect=no_wsl_redirect, platform=platform
+        output_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform
     )
     if orig_out:
         logger.info("WSL_REDIRECT", f"output_dir: {output_dir} -> {redirected_out}")

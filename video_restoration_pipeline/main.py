@@ -3,7 +3,7 @@
 Video Restoration Pipeline - Main Controller
 Orchestrates video restoration stages with manifest-driven batch processing.
 
-v7.3 Compliance:
+v7.32 Compliance:
 - Parallel worker pool for concurrent job processing
 - Disk space estimation before processing
 - Preview mode support
@@ -37,7 +37,8 @@ def parse_args():
                         help="Config file path")
     parser.add_argument("--manifest", "-m", help="Use existing manifest")
     parser.add_argument("--output-manifest", help="Output manifest path for --scan")
-    parser.add_argument("--preview", action="store_true", help="Preview mode")
+    parser.add_argument("--preview-only", action="store_true",
+                        help="Preview mode (generate preview frames/clips without full processing)")
     parser.add_argument("--keep-intermediates", action="store_true",
                         help="Keep intermediate files")
     parser.add_argument("--no-wsl-redirect", action="store_true",
@@ -121,16 +122,6 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
                 params[k] = v
                 _log_override(k, old, v, "paths")
 
-    # Apply audio_override for the detected material type (v7.3 §3.1)
-    # Priority: CLI > user_overrides > recommended_params > audio_override > global.audio > defaults
-    # V-P-005 fix: read audio_override from config root (not paths sub-key)
-    audio_override = config.get("audio_override", {})
-    if path_key in audio_override:
-        for k, v in audio_override[path_key].items():
-            old = params.get(k)
-            params[k] = v
-            _log_override(k, old, v, "audio_override")
-
     # Override with job recommended_params
     rec_params = job.get("recommended_params", {})
     if rec_params:
@@ -152,6 +143,15 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
             else:
                 params[k] = v
             _log_override(k, old, v, "user_overrides")
+
+    # Apply audio_override for the detected material type
+    # FIX-P5-4: 优先级：CLI > user_overrides > audio_override > global.audio > defaults
+    audio_override = config.get("audio_override", {})
+    if path_key in audio_override:
+        for k, v in audio_override[path_key].items():
+            old = params.get(k)
+            params[k] = v
+            _log_override(k, old, v, "audio_override")
 
     # Override with CLI
     if cli_overrides:
@@ -369,14 +369,15 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     if _gpu:
         cli_overrides["gpu_backend"] = _gpu
     # ISSUE-V-MAIN-001 / BUG-047: propagate AI CLI overrides into params
+    # FIX-P5-1: 必须使用 ai_ 前缀键名，与 merge_params() 中 ai_config 展开逻辑保持一致
     if _ai_enabled is True:
-        cli_overrides["enabled"] = True
+        cli_overrides["ai_enabled"] = True
     if _ai_scale is not None:
-        cli_overrides["upscale_scale"] = _ai_scale
+        cli_overrides["ai_upscale_scale"] = _ai_scale
     if _face_restore is not None:
-        cli_overrides["face_restore"] = _face_restore
+        cli_overrides["ai_face_restore"] = _face_restore
     if _ai_model is not None:
-        cli_overrides["upscale_model"] = _ai_model
+        cli_overrides["ai_upscale_model"] = _ai_model
 
     # Merge params
     params = merge_params(job, config, cli_overrides, logger)
@@ -390,10 +391,10 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         temp_dir = params.get("temp_dir", "./temp")
         output_dir = params.get("output_dir", "./output")
         redirected_temp, original_temp, _, _ = wsl_redirect_path(
-            temp_dir, no_wsl_redirect=no_wsl_redirect, platform=platform_val
+            temp_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform_val
         )
         redirected_output, original_output, _, _ = wsl_redirect_path(
-            output_dir, no_wsl_redirect=no_wsl_redirect, platform=platform_val
+            output_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform_val
         )
         if original_temp:
             logger.info("WSL_REDIRECT", f"temp_dir: {temp_dir} -> {redirected_temp}",
@@ -463,6 +464,28 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
             if stage_num == 2:
+                # FIX-P5-5: 校验 stage2 输出文件存在、非空、可解码
+                temp_dir = params.get("temp_dir", "./temp")
+                input_name = Path(input_path).name
+                pattern = f"{temp_dir}/{job_id}_{input_name}_step2*"
+                import glob
+                candidates = glob.glob(pattern)
+                if not candidates:
+                    job_logger.error("TRADITIONAL_GATE_BLOCK", "Stage 2 output file missing")
+                    return 86, "Traditional restoration output missing"
+                candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                step2_output = candidates[0]
+                if os.path.getsize(step2_output) == 0:
+                    job_logger.error("TRADITIONAL_GATE_BLOCK", "Stage 2 output file is empty")
+                    return 86, "Traditional restoration output empty"
+                try:
+                    from checkpoint import verify_ffprobe_decodeable
+                    if not verify_ffprobe_decodeable(step2_output):
+                        job_logger.error("TRADITIONAL_GATE_BLOCK", "Stage 2 output not decodeable by ffprobe")
+                        return 86, "Traditional restoration output not decodeable"
+                except Exception as e:
+                    job_logger.error("TRADITIONAL_GATE_BLOCK", f"Stage 2 output verification failed: {e}")
+                    return 86, f"Traditional restoration verification failed: {e}"
                 traditional_stage_completed = True
                 job_logger.info("TRADITIONAL_GATE",
                                "Traditional restoration completed, proceeding to AI stages")
@@ -482,12 +505,10 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 return 86, stderr
             return exit_code, stderr
 
-        # V-P-007 fix: block AI stages if traditional check failed
-        force_traditional_first = params.get("force_traditional_first", True)
-        if force_traditional_first and stage_num == 2 and not traditional_stage_completed:
-            job_logger.error("TRADITIONAL_GATE_BLOCK",
-                            "Traditional restoration not verified, blocking AI stages")
-            return 86, "Traditional restoration verification failed"
+        # FIX-P5-7: 删除不可达的 traditional_stage_completed gate 冗余代码
+        # 注：traditional_stage_completed 在 exit_code==0 或 ==3 时已设为 True；
+        # 若 exit_code 为其他值，已在上方 else 分支提前 return。
+        # 因此以下 gate 逻辑已在前面的 if/else 中完整覆盖，此处无需重复检查。
 
         # Cleanup old intermediates after successful stage
         if params.get("cleanup_intermediates", True):
@@ -681,15 +702,18 @@ def main():
             job_id = job.get("job_id", "")
             input_name = Path(job.get("input_path", "")).name
             last_completed = -1
-            # Scan step0..step7 to find highest valid intermediate
+            # FIX-P5-6: Scan step0..step7 to find highest valid intermediate, check all candidates
+            import glob
             for stage_num in range(7, -1, -1):
-                import glob
                 pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
                 candidates = glob.glob(pattern)
                 if candidates:
                     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                    if verify_ffprobe_decodeable(candidates[0]):
-                        last_completed = stage_num
+                    for cand in candidates:
+                        if verify_ffprobe_decodeable(cand):
+                            last_completed = stage_num
+                            break
+                    if last_completed >= 0:
                         break
             job["last_completed_stage"] = last_completed
             if last_completed >= 0:
@@ -699,8 +723,19 @@ def main():
                 job["status"] = "PENDING"
                 job["resume_from_stage"] = last_completed + 1
             else:
-                logger.info("FAILED_KEEP",
-                           f"Job {job_id} no valid intermediates, keeping FAILED")
+                # FIX-P5-2: 删除所有损坏的中间文件，并重新标记为 PENDING
+                for stage_num in range(8):
+                    pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
+                    for fpath in glob.glob(pattern):
+                        try:
+                            os.remove(fpath)
+                            logger.info("FAILED_CLEANUP", f"Removed corrupt intermediate: {fpath}")
+                        except Exception as e:
+                            logger.warning("FAILED_CLEANUP_FAIL", f"Could not remove {fpath}: {e}")
+                job["status"] = "PENDING"
+                job.pop("resume_from_stage", None)
+                logger.info("FAILED_DOWNGRADE",
+                           f"Job {job_id} no valid intermediates, cleaned up and downgraded to PENDING")
         save_manifest(manifest, manifest_path)
     except Exception as e:
         logger.warning("FAILED_CHECK", f"FAILED job check skipped: {e}")
@@ -757,7 +792,7 @@ def main():
 
     # V-P-009 fix: enhanced preview mode with motion segments
     # Also handle mode == "preview"
-    if args.preview or (mode == "preview"):
+    if args.preview_only or (mode == "preview"):
         from preview import extract_preview_frames, generate_preview_clip, generate_comparison_frames
         for job in jobs[:3]:
             try:

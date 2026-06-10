@@ -57,6 +57,13 @@ def main():
 
     logger.info("STAGE0_START", "Extracting audio", input=args.input)
 
+    # FIX-P7-3: Skip extraction if source has no audio stream
+    from audio_utils import get_audio_info
+    audio_info = get_audio_info(args.input)
+    if audio_info.get("channels") is None:
+        logger.info("STAGE0_NO_AUDIO", "Source has no audio stream, skipping extraction")
+        return 0
+
     success = extract_audio(args.input, output_audio, codec="copy")
 
     if success:
