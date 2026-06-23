@@ -19,3 +19,6 @@ shixian.md
 .claude/
 agents.md
 CLAUDE.md
+/models/
+*.rnnn
+*.pth
