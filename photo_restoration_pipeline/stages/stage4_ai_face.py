@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-Stage 5: Photo Face / Portrait Restoration
+Stage 4: Photo Face / Portrait Restoration
 GFPGAN / CodeFormer for face restoration in photos.
 Full-frame processing (no temporal constraints for static images).
+
+# FIX-P10-1: Renamed from stage5_ai_face.py to stage4_ai_face.py per v7.32 §3.1
+# Face restore now runs BEFORE postprocess (stage5), per spec order:
+# stage1→stage2_ai_pre→stage3_ai_upscale→stage4_ai_face→stage5_postprocess→stage6_encode
+# NOTE: Grain synthesis has been MOVED to stage5_postprocess.py per v7.32 §3.1
 
 v6.3 / v7.32 Compliance:
 - Face detection fallback list from config is honored
 - Face detection thresholds and low-res max dimension respected
-- Bans original/intermediate pixels from AI face restore (only traditional-processed allowed)
-- Portrait color matching (v7.32 §3.10.7): after face restoration, automatically aligns
-  face white-balance to neck/hands using LAB mean/std matching with feather blending
+- Bans original/intermediate pixels from AI face restore
+  (only traditional-processed allowed)
+- Portrait color matching (v7.32 §3.10.7): after face restoration, automatically
+  aligns face white-balance to neck/hands using LAB mean/std matching with
+  feather blending
 """
 
 import os
@@ -58,12 +65,14 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
         # If mask covers the whole image (extreme case), skip blending
         mask_ratio = np.mean(mask)
         if mask_ratio > 0.95 or mask_ratio < 0.01:
-            shutil.copy2(restored_path, output_path)
+            # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
+            shutil.copyfile(restored_path, output_path)
             return True
 
         # Convert mask to PIL image for Gaussian blur
         mask_img = Image.fromarray((mask * 255).astype(np.uint8))
-        mask_blurred = mask_img.filter(ImageFilter.GaussianBlur(radius=feather_width))
+        mask_blurred = mask_img.filter(
+            ImageFilter.GaussianBlur(radius=feather_width))
         mask_smooth = np.array(mask_blurred, dtype=np.float32) / 255.0
         mask_smooth = np.clip(mask_smooth, 0.0, 1.0)
         # Expand to 3 channels
@@ -79,26 +88,11 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
     except Exception:
         # Fallback: direct copy if blending fails
         try:
-            shutil.copy2(restored_path, output_path)
+            # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
+            shutil.copyfile(restored_path, output_path)
             return True
         except Exception:
             return False
-
-
-def _add_grain_gmic(input_path: str, output_path: str,
-                      strength: float, size: float, roughness: float) -> bool:
-    """Add film grain using G'MIC (v6.32 §3.10.4: run in stage5 after all AI processing)."""
-    try:
-        cmd = [
-            "gmic", input_path,
-            "-film_grain", str(int(strength * 100)),
-            str(size), str(roughness),
-            "-o", output_path,
-        ]
-        r = subprocess.run(cmd, capture_output=True, timeout=300, shell=False)
-        return r.returncode == 0
-    except Exception:
-        return False
 
 
 def _detect_faces(input_path: str, params: dict, logger=None) -> bool:
@@ -109,13 +103,15 @@ def _detect_faces(input_path: str, params: dict, logger=None) -> bool:
     return len(_detect_face_boxes(input_path, params, logger)) > 0
 
 
-def _detect_face_boxes(input_path: str, params: dict, logger=None) -> list:
+def _detect_face_boxes(input_path: str, params: dict,
+                       logger=None) -> list:
     """Detect faces and return list of bounding boxes [(x, y, w, h), ...].
 
     Each detector is tried in fallback order until at least one face is found.
     Boxes are returned in the coordinate space of the input image.
     """
-    face_detect_fallback = params.get("face_detect_fallback", ["RetinaFace", "YOLOv8-face", "MTCNN"])
+    face_detect_fallback = params.get(
+        "face_detect_fallback", ["RetinaFace", "YOLOv8-face", "MTCNN"])
     threshold = params.get("face_detect_threshold", 0.8)
     threshold_lowres = params.get("face_detect_threshold_lowres", 0.6)
     lowres_max = params.get("face_detect_lowres_max_dimension", 720)
@@ -124,7 +120,9 @@ def _detect_face_boxes(input_path: str, params: dict, logger=None) -> list:
         from PIL import Image
         with Image.open(input_path) as img:
             img_w, img_h = img.size
-            is_lowres = max(img_w, img_h) <= lowres_max
+            # FIX-P12-1: v7.32 §3.10.5: short_edge (min) determines lowres
+            # ORIGINAL: max(img_w, img_h) <= lowres_max (wrong: uses long edge)
+            is_lowres = min(img_w, img_h) <= lowres_max
             actual_threshold = threshold_lowres if is_lowres else threshold
     except Exception:
         actual_threshold = threshold
@@ -142,10 +140,14 @@ def _detect_face_boxes(input_path: str, params: dict, logger=None) -> list:
                             score = face.get("score", 0)
                             if score >= actual_threshold:
                                 fa = face.get("facial_area", [0, 0, 0, 0])
-                                valid_boxes.append((fa[0], fa[1], fa[2] - fa[0], fa[3] - fa[1]))
+                                valid_boxes.append(
+                                    (fa[0], fa[1], fa[2] - fa[0], fa[3] - fa[1]))
                         if valid_boxes:
                             if logger:
-                                logger.info("STAGE5_FACE_DETECT", f"Faces found via RetinaFace: {len(valid_boxes)} (threshold={actual_threshold})")
+                                logger.info("STAGE4_FACE_DETECT",
+                                            f"Faces found via RetinaFace: "
+                                            f"{len(valid_boxes)} "
+                                            f"(threshold={actual_threshold})")
                             return valid_boxes
                 except Exception:
                     pass
@@ -161,7 +163,10 @@ def _detect_face_boxes(input_path: str, params: dict, logger=None) -> list:
                             boxes.append((x1, y1, x2 - x1, y2 - y1))
                         if boxes:
                             if logger:
-                                logger.info("STAGE5_FACE_DETECT", f"Faces found via YOLOv8: {len(boxes)} (threshold={actual_threshold})")
+                                logger.info("STAGE4_FACE_DETECT",
+                                            f"Faces found via YOLOv8: "
+                                            f"{len(boxes)} "
+                                            f"(threshold={actual_threshold})")
                             return boxes
                 except Exception:
                     pass
@@ -169,7 +174,8 @@ def _detect_face_boxes(input_path: str, params: dict, logger=None) -> list:
                 try:
                     from mtcnn import MTCNN
                     import cv2
-                    img = cv2.cvtColor(cv2.imread(input_path), cv2.COLOR_BGR2RGB)
+                    img = cv2.cvtColor(
+                        cv2.imread(input_path), cv2.COLOR_BGR2RGB)
                     detector_obj = MTCNN()
                     faces = detector_obj.detect_faces(img)
                     if faces and len(faces) > 0:
@@ -178,10 +184,14 @@ def _detect_face_boxes(input_path: str, params: dict, logger=None) -> list:
                             confidence = face.get("confidence", 0)
                             if confidence >= actual_threshold:
                                 box = face.get("box", [0, 0, 0, 0])
-                                valid_boxes.append((box[0], box[1], box[2], box[3]))
+                                valid_boxes.append(
+                                    (box[0], box[1], box[2], box[3]))
                         if valid_boxes:
                             if logger:
-                                logger.info("STAGE5_FACE_DETECT", f"Faces found via MTCNN: {len(valid_boxes)} (threshold={actual_threshold})")
+                                logger.info("STAGE4_FACE_DETECT",
+                                            f"Faces found via MTCNN: "
+                                            f"{len(valid_boxes)} "
+                                            f"(threshold={actual_threshold})")
                             return valid_boxes
                 except Exception:
                     pass
@@ -189,118 +199,26 @@ def _detect_face_boxes(input_path: str, params: dict, logger=None) -> list:
             continue
 
     if logger:
-        logger.warning("STAGE5_NO_FACE", "No faces detected with any fallback detector")
+        logger.warning("STAGE4_NO_FACE",
+                       "No faces detected with any fallback detector")
+    # NOTE: FIX-P12-2 lowres area filter is applied in main() after
+    # _detect_face_boxes returns, since this function returns early
+    # from each detector.
     return []
 
 
-def _match_portrait_color(image_path: str, face_boxes: list,
-                          output_path: str, logger=None) -> bool:
-    """Automated half-body portrait color matching per v7.32 §3.10.7.
-
-    After face restoration (GFPGAN/CodeFormer), the restored face often has
-    different white-balance/color from the original neck/hands. This function
-    aligns the face's LAB distribution to the neck region using mean/std
-    matching (histogram specification simplified).
-
-    Steps:
-      1. Estimate neck ROI below each face box.
-      2. Convert face and neck regions to LAB.
-      3. For each LAB channel, match face mean/std to neck mean/std.
-      4. Feather-blend corrected face back into the image.
-    """
-    try:
-        import numpy as np
-        from PIL import Image, ImageFilter
-        import cv2
-
-        img = Image.open(image_path).convert("RGB")
-        img_arr = np.array(img, dtype=np.float32)
-        h_img, w_img = img_arr.shape[:2]
-
-        # Build a combined mask for all face regions
-        face_mask = np.zeros((h_img, w_img), dtype=np.float32)
-        corrected = img_arr.copy()
-
-        for (fx, fy, fw, fh) in face_boxes:
-            # Clamp box to image bounds
-            x1 = max(0, fx)
-            y1 = max(0, fy)
-            x2 = min(w_img, fx + fw)
-            y2 = min(h_img, fy + fh)
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            # Estimate neck region: directly below face, same width, 0.4x face height
-            ny1 = y2
-            ny2 = min(h_img, y2 + int(fh * 0.4))
-            nx1 = x1
-            nx2 = x2
-            if ny2 <= ny1:
-                continue
-
-            face_roi = img_arr[y1:y2, x1:x2]
-            neck_roi = img_arr[ny1:ny2, nx1:nx2]
-            if neck_roi.size == 0:
-                continue
-
-            # Convert to LAB using OpenCV
-            face_bgr = cv2.cvtColor(face_roi.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            neck_bgr = cv2.cvtColor(neck_roi.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            face_lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-            neck_lab = cv2.cvtColor(neck_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-            # Mean/std matching per channel
-            matched_lab = face_lab.copy()
-            for c in range(3):
-                f_mean = face_lab[:, :, c].mean()
-                f_std = face_lab[:, :, c].std() + 1e-6
-                n_mean = neck_lab[:, :, c].mean()
-                n_std = neck_lab[:, :, c].std() + 1e-6
-                matched_lab[:, :, c] = (matched_lab[:, :, c] - f_mean) * (n_std / f_std) + n_mean
-
-            # Clamp LAB valid ranges
-            matched_lab[:, :, 0] = np.clip(matched_lab[:, :, 0], 0, 255)
-            matched_lab[:, :, 1] = np.clip(matched_lab[:, :, 1], 0, 255)
-            matched_lab[:, :, 2] = np.clip(matched_lab[:, :, 2], 0, 255)
-
-            # Convert back to RGB
-            matched_bgr = cv2.cvtColor(matched_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-            matched_rgb = cv2.cvtColor(matched_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-
-            corrected[y1:y2, x1:x2] = matched_rgb
-            face_mask[y1:y2, x1:x2] = 1.0
-
-        # If no valid face was processed, skip
-        if face_mask.max() < 0.5:
-            shutil.copy2(image_path, output_path)
-            return True
-
-        # Feather the mask edge
-        mask_img = Image.fromarray((face_mask * 255).astype(np.uint8))
-        mask_blurred = mask_img.filter(ImageFilter.GaussianBlur(radius=8))
-        mask_smooth = np.array(mask_blurred, dtype=np.float32) / 255.0
-        mask_smooth = np.clip(mask_smooth, 0.0, 1.0)
-        mask_smooth = np.stack([mask_smooth] * 3, axis=2)
-
-        blended = mask_smooth * corrected + (1.0 - mask_smooth) * img_arr
-        blended = np.clip(blended, 0, 255).astype(np.uint8)
-        Image.fromarray(blended).save(output_path)
-        return True
-    except Exception as e:
-        if logger:
-            logger.warning("STAGE5_COLOR_MATCH_FAIL", f"Portrait color matching failed: {e}")
-        try:
-            shutil.copy2(image_path, output_path)
-            return True
-        except Exception:
-            return False
+# NOTE: _match_portrait_color was moved to stage5_postprocess.py in FIX-P12-6.
+# Color matching must execute after ALL AI processing (face restore + upscale)
+# and before grain synthesis, per v7.32 §3.10.7 spec order.
 
 
-def run_gfpgan(input_path: str, output_dir: str, params: dict = None) -> bool:
+def run_gfpgan(input_path: str, output_dir: str,
+               params: dict = None) -> bool:
     """Run GFPGAN on a single image.
 
     Args:
-        params: optional dict with 'face_restore_version' and 'face_restore_upscale'
+        params: optional dict with 'face_restore_version'
+                and 'face_restore_upscale'
     """
     # Bug 11.22 fix: read version and upscale from config instead of hardcoding
     version = "1.4"
@@ -330,7 +248,8 @@ def run_gfpgan(input_path: str, output_dir: str, params: dict = None) -> bool:
                 "-v", version,
                 "-s", str(upscale),
             ]
-            r = subprocess.run(cmd, capture_output=True, timeout=600, shell=False)
+            r = subprocess.run(
+                cmd, capture_output=True, timeout=600, shell=False)
             return r.returncode == 0
 
         # Fallback: Python API
@@ -340,7 +259,8 @@ def run_gfpgan(input_path: str, output_dir: str, params: dict = None) -> bool:
             model_dir = str(project_root / "models")
         model_path = os.path.join(model_dir, f"GFPGANv{version}.pth")
 
-        # BUG-050 fix: Use json.dumps() for safe path quoting to prevent single-quote injection
+        # BUG-050 fix: Use json.dumps() for safe path quoting
+        # to prevent single-quote injection
         import json as _json
         safe_input = _json.dumps(input_path)
         safe_model = _json.dumps(model_path)
@@ -353,24 +273,29 @@ def run_gfpgan(input_path: str, output_dir: str, params: dict = None) -> bool:
             f"import cv2; "
             f"import torch; "
             f"img = cv2.imread({safe_input}, cv2.IMREAD_COLOR); "
-            f"restorer = GFPGANer(model_path={safe_model}, upscale={upscale}, arch='clean', "
+            f"restorer = GFPGANer(model_path={safe_model}, "
+            f"upscale={upscale}, arch='clean', "
             f"channel_only=False, bg_upsampler=None); "
-            f"_, _, output = restorer.enhance(img, has_aligned=False, only_center_face=False); "
+            f"_, _, output = restorer.enhance(img, has_aligned=False, "
+            f"only_center_face=False); "
             f"import os; "
-            f"out_path = os.path.join({safe_output_dir}, os.path.basename({safe_input})); "
+            f"out_path = os.path.join({safe_output_dir}, "
+            f"os.path.basename({safe_input})); "
             f"cv2.imwrite(out_path, output)",
         ]
-        r = subprocess.run(cmd, capture_output=True, timeout=600, shell=False)
+        r = subprocess.run(
+            cmd, capture_output=True, timeout=600, shell=False)
         return r.returncode == 0
     except Exception:
         return False
 
 
-def run_codeformer(input_path: str, output_dir: str, params: dict = None) -> bool:
+def run_codeformer(input_path: str, output_dir: str,
+                   params: dict = None) -> bool:
     """Run CodeFormer on a single image.
 
-    Bug 11.13 fix: fallback no longer copies original; it attempts real inference
-    or returns False so the caller knows CodeFormer failed.
+    Bug 11.13 fix: fallback no longer copies original; it attempts real
+    inference or returns False so the caller knows CodeFormer failed.
     """
     try:
         # Try inference_codeformer.py script
@@ -392,7 +317,8 @@ def run_codeformer(input_path: str, output_dir: str, params: dict = None) -> boo
                 "--face_upsample",
                 "--bg_upsampler", "realesrgan",
             ]
-            r = subprocess.run(cmd, capture_output=True, timeout=600, shell=False)
+            r = subprocess.run(
+                cmd, capture_output=True, timeout=600, shell=False)
             if r.returncode == 0:
                 return True
 
@@ -405,7 +331,7 @@ def run_codeformer(input_path: str, output_dir: str, params: dict = None) -> boo
         if not os.path.exists(model_path):
             return False  # No model available, cannot perform inference
 
-        # BUG-051 fix: Use json.dumps() for safe path quoting to prevent single-quote injection
+        # BUG-051 fix: Use json.dumps() for safe path quoting
         import json as _json
         safe_input = _json.dumps(input_path)
         safe_model = _json.dumps(model_path)
@@ -413,55 +339,72 @@ def run_codeformer(input_path: str, output_dir: str, params: dict = None) -> boo
         cmd = [
             sys.executable, "-c",
             f"import sys; sys.path.insert(0, 'CodeFormer'); "
-            f"from codeformer.facelib.utils.face_restoration_helper import FaceRestoreHelper; "
+            f"from codeformer.facelib.utils.face_restoration_helper "
+            f"import FaceRestoreHelper; "
             f"from codeformer.basicsr.utils.registry import ARCH_REGISTRY; "
             f"import cv2; import torch; import numpy as np; import os; "
             f"img = cv2.imread({safe_input}); "
             f"if img is None: raise RuntimeError('Failed to load image'); "
-            f"# Attempt CodeFormer inference via FaceRestoreHelper + ARCH_REGISTRY; "
             f"try: "
             f"    device = 'cuda' if torch.cuda.is_available() else 'cpu'; "
-            f"    helper = FaceRestoreHelper(upscale_factor=1, face_size=512); "
+            f"    helper = FaceRestoreHelper("
+            f"upscale_factor=1, face_size=512); "
             f"    helper.read_image(img); "
-            f"    helper.get_face_landmarks_5(only_center_face=False, resize=640, eye_dist_threshold=5); "
+            f"    helper.get_face_landmarks_5("
+            f"only_center_face=False, resize=640, "
+            f"eye_dist_threshold=5); "
             f"    helper.align_warp_face(); "
-            f"    codeformer_net = ARCH_REGISTRY.get('CodeFormer')(dim_embd=512, codebook_size=1024, "
-            f"        n_head=8, n_layers=9, connect_list=['32', '64', '128', '256']).to(device); "
+            f"    codeformer_net = ARCH_REGISTRY.get('CodeFormer')"
+            f"(dim_embd=512, codebook_size=1024, "
+            f"n_head=8, n_layers=9, "
+            f"connect_list=['32','64','128','256']).to(device); "
             f"    ckpt = torch.load({safe_model}, map_location=device); "
-            f"    codeformer_net.load_state_dict(ckpt['params_ema'] if 'params_ema' in ckpt else ckpt); "
+            f"    codeformer_net.load_state_dict("
+            f"ckpt['params_ema'] if 'params_ema' in ckpt else ckpt); "
             f"    codeformer_net.eval(); "
             f"    for idx, cropped_face in enumerate(helper.cropped_faces): "
-            f"        face_t = torch.from_numpy(cropped_face / 255.).permute(2,0,1).unsqueeze(0).float().to(device); "
+            f"        face_t = torch.from_numpy("
+            f"cropped_face / 255.).permute(2,0,1).unsqueeze(0)"
+            f".float().to(device); "
             f"        with torch.no_grad(): "
-            f"            output = codeformer_net(face_t, w=0.9, adain=True)[0]; "
-            f"        restored = (output.squeeze(0).permute(1,2,0).cpu().numpy() * 255).clip(0,255).astype(np.uint8); "
+            f"            output = codeformer_net("
+            f"face_t, w=0.9, adain=True)[0]; "
+            f"        restored = (output.squeeze(0).permute(1,2,0)"
+            f".cpu().numpy() * 255).clip(0,255).astype(np.uint8); "
             f"        helper.add_restored_face(restored); "
             f"    helper.get_inverse_affine(None); "
-            f"    result = helper.paste_faces_to_input_image(upsample_img=img); "
-            f"    out_path = os.path.join({safe_output_dir}, os.path.basename({safe_input})); "
+            f"    result = helper.paste_faces_to_input_image("
+            f"upsample_img=img); "
+            f"    out_path = os.path.join({safe_output_dir}, "
+            f"os.path.basename({safe_input})); "
             f"    cv2.imwrite(out_path, result); "
             f"except Exception as e: "
             f"    print('CodeFormer fallback failed:', e, file=sys.stderr); "
             f"    sys.exit(1); ",
         ]
-        r = subprocess.run(cmd, capture_output=True, timeout=600, shell=False)
+        r = subprocess.run(
+            cmd, capture_output=True, timeout=600, shell=False)
         return r.returncode == 0
     except Exception:
         return False
 
 
-def _resolve_input_source(temp_dir: str, job_id: str, input_name: str) -> str:
+def _resolve_input_source(temp_dir: str, job_id: str,
+                          input_name: str) -> str:
     """Resolve valid input source for face restore.
 
-    Only traditional-processed or post-processed sources are valid.
+    Only traditional-processed or AI-upscaled sources are valid.
     Bans raw original input.
     """
     stem = Path(input_name).stem
-    for pat in ["step4_postprocess*", "step3_upscale*", "step1_preprocess*"]:
+    # FIX-P10-1: updated search order for new stage numbering
+    for pat in ["step3_upscale*", "step2_ai_pre*",
+                "step1_preprocess*"]:
         pattern = f"{job_id}_{stem}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
         if candidates:
-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            candidates.sort(
+                key=lambda p: os.path.getmtime(p), reverse=True)
             return candidates[0]
     return ""
 
@@ -488,98 +431,143 @@ def main():
     face_restore = params.get("face_restore", "")
     ai_enabled = params.get("ai_enabled", False)
     if not ai_enabled or not face_restore:
-        logger.info("STAGE5_SKIP", "Face restore not enabled")
+        logger.info("STAGE4_SKIP", "Face restore not enabled")
         return 3
 
     temp_dir = params.get("temp_dir", "./temp")
+    # FIX-P12-3: WSL2 redirect for temp_dir per v7.32 §3.10.10
+    no_wsl_redirect = params.get("no_wsl_redirect", False)
+    platform = params.get("platform", "auto")
+    try:
+        from checkpoint import wsl_redirect_path
+        redirected_temp, _, _, _ = wsl_redirect_path(
+            temp_dir, no_wsl_redirect=no_wsl_redirect,
+            target_platform=platform
+        )
+        if redirected_temp != temp_dir:
+            logger.info("STAGE4_WSL_REDIRECT",
+                       f"WSL temp_dir redirect: {temp_dir} -> {redirected_temp}")
+            temp_dir = redirected_temp
+            params["temp_dir"] = temp_dir
+    except Exception:
+        pass
     job_id = args.job_id
     input_name = Path(args.input).name
 
     # Resolve input source
     input_source = _resolve_input_source(temp_dir, job_id, input_name)
     if not input_source:
-        logger.error("STAGE5_NO_INPUT", "No input found")
+        logger.error("STAGE4_NO_INPUT", "No input found")
         return 82
 
+    # FIX-P10-1: step number is now 4
     output_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step5_face.png")
+        f"{job_id}_{Path(input_name).stem}_step4_face.png")
 
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return 3
 
-    logger.info("STAGE5_START", f"Face restore: {face_restore}")
+    logger.info("STAGE4_START", f"Face restore: {face_restore}")
 
-    # Pre-detect faces using configured fallback list; also get boxes for color matching
+    # Pre-detect faces using configured fallback list;
+    # also get boxes for color matching
     face_boxes = _detect_face_boxes(input_source, params, logger)
+
+    # FIX-P12-2: Low-res area filter per v7.32 §3.10.5
+    # Low-res images: only allow face restore if face box > 10% of image area
+    lowres_max = params.get("face_detect_lowres_max_dimension", 720)
+    try:
+        from PIL import Image
+        with Image.open(input_source) as _img:
+            _w, _h = _img.size
+        is_lowres = min(_w, _h) <= lowres_max
+        if is_lowres and face_boxes:
+            img_area = _w * _h
+            filtered = []
+            for (bx, by, bw, bh) in face_boxes:
+                if (bw * bh) > 0.10 * img_area:
+                    filtered.append((bx, by, bw, bh))
+            if not filtered:
+                logger.warning("STAGE4_LOWRES_AREA_SKIP",
+                    f"Low-res faces < 10% area, skipping face restore "
+                    f"per v7.32 §3.10.5")
+                return 3
+            face_boxes = filtered
+    except Exception:
+        pass
+
     if not face_boxes:
-        logger.info("STAGE5_NO_FACE_SKIP", "No faces detected, skipping face restore")
+        logger.info("STAGE4_NO_FACE_SKIP",
+                    "No faces detected, skipping face restore")
         return 3
 
     face_dir = os.path.join(temp_dir, f"{job_id}_face")
     os.makedirs(face_dir, exist_ok=True)
     blended_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step5_face_blended.png")
+        f"{job_id}_{Path(input_name).stem}_step4_face_blended.png")
 
     success = False
     if face_restore == "GFPGAN":
         if run_gfpgan(input_source, face_dir, params):
-            face_files = sorted(Path(face_dir).rglob("*.png"),
-                               key=lambda p: p.stat().st_mtime, reverse=True)
+            face_files = sorted(
+                Path(face_dir).rglob("*.png"),
+                key=lambda p: p.stat().st_mtime, reverse=True)
             if face_files:
-                if feather_blend(input_source, str(face_files[0]), blended_path, feather_width=8):
+                if feather_blend(input_source, str(face_files[0]),
+                                 blended_path, feather_width=8):
                     success = True
                 else:
-                    logger.error("STAGE5_BLEND_FAIL", "Feather blend failed")
+                    logger.error("STAGE4_BLEND_FAIL",
+                                 "Feather blend failed")
                     return 83
 
     elif face_restore == "CodeFormer":
         if run_codeformer(input_source, face_dir, params):
-            face_files = sorted(Path(face_dir).rglob("*.png"),
-                               key=lambda p: p.stat().st_mtime, reverse=True)
+            face_files = sorted(
+                Path(face_dir).rglob("*.png"),
+                key=lambda p: p.stat().st_mtime, reverse=True)
             if face_files:
-                if feather_blend(input_source, str(face_files[0]), blended_path, feather_width=8):
+                if feather_blend(input_source, str(face_files[0]),
+                                 blended_path, feather_width=8):
                     success = True
                 else:
-                    logger.error("STAGE5_BLEND_FAIL", "Feather blend failed")
+                    logger.error("STAGE4_BLEND_FAIL",
+                                 "Feather blend failed")
                     return 83
 
     if not success:
-        logger.error("STAGE5_FAILED", "Face restore failed")
+        logger.error("STAGE4_FAILED", "Face restore failed")
         return 83
 
     # P-26 fix: half-body portrait color matching per v7.32 §3.10.7
-    enable_color_match = params.get("portrait_color_match", True)
-    if enable_color_match and face_boxes:
-        if _match_portrait_color(blended_path, face_boxes, output_path, logger):
-            logger.info("STAGE5_DONE", f"Face restore complete ({face_restore}) with color matching")
-        else:
-            logger.warning("STAGE5_COLOR_MATCH_SKIP", "Color matching failed, using blended result")
-            shutil.copy2(blended_path, output_path)
-    else:
-        shutil.copy2(blended_path, output_path)
-        logger.info("STAGE5_DONE", f"Face restore complete ({face_restore})")
+    # FIX-P12-6: Color matching MOVED to stage5_postprocess.py per spec order.
+    # Stage4 now only persists face_boxes metadata for stage5 to consume.
+    # Save face_boxes to metadata file for stage5 color matching
+    face_meta_path = os.path.join(
+        temp_dir, f"{job_id}_{Path(input_name).stem}_face_boxes.json")
+    try:
+        with open(face_meta_path, "w", encoding="utf-8") as f:
+            json.dump({"face_boxes": face_boxes}, f)
+        logger.info("STAGE4_FACE_META", f"Saved face_boxes metadata: {face_meta_path}")
+    except Exception as e:
+        logger.warning("STAGE4_FACE_META_FAIL", f"Failed to save face_boxes: {e}")
 
-    # PHOTO-AUDIT-014 fix: Grain synthesis runs AFTER all AI processing (v6.32 §3.10.4)
-    # G'MIC film_grain must execute in stage5 after face restore completes
-    grain_enabled = params.get("grain_synthesis", True)
-    if grain_enabled:
-        grain_strength = params.get("grain_strength", 0.3)
-        grain_size = params.get("grain_size", 1.0)
-        grain_roughness = params.get("grain_roughness", 0.5)
-        grain_temp = os.path.join(temp_dir,
-            f"{job_id}_{Path(input_name).stem}_grain_temp.png")
-        logger.info("STAGE5_GRAIN", "Adding film grain via G'MIC (post-AI)")
-        if _add_grain_gmic(output_path, grain_temp,
-                           grain_strength, grain_size, grain_roughness):
-            shutil.move(grain_temp, output_path)
-            logger.info("STAGE5_GRAIN_DONE", "Film grain applied after face restore")
-        else:
-            logger.warning("STAGE5_GRAIN_FAIL", "G'MIC grain synthesis failed, using ungrained output")
-            if os.path.exists(grain_temp):
-                os.remove(grain_temp)
+    # FIX-P11-10: Use copyfile (not copy2) per v7.32 §3.10.10
+    # copy2 copies metadata which causes PermissionError on WSL2 NTFS mounts
+    shutil.copyfile(blended_path, output_path)
+    logger.info("STAGE4_DONE",
+                f"Face restore complete ({face_restore})")
+
+    # NOTE: Grain synthesis has been MOVED to stage5_postprocess.py
+    # per v7.32 §3.1 (post-processing stage handles grain after all AI)
 
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    # FIX-P11-5: main() must return explicit int exit code per v7.32 §3.5
+    # ORIGINAL: sys.exit(main() or 0) — "or 0" masks None returns
+    rc = main()
+    if rc is None:
+        rc = 86  # validation failure — main() must always return explicit exit code
+    sys.exit(rc)

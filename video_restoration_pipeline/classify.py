@@ -88,7 +88,7 @@ def _parse_idet_counts(idet_output: str) -> Tuple[int, int, int, int]:
     return tff_count, bff_count, progressive_count, undetermined_count
 
 
-def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
+def detect_field_order_segments(input_path: str) -> Tuple[str, float, list, float]:
     """Detect field order with variable-field-order segmentation.
 
     Uses sliding-window idet analysis. Splits video into 2-second windows
@@ -144,7 +144,10 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
     gprog_ratio = gprog / gtotal
 
     # PSF check
-    if gprog_ratio > 0.90 and fo_meta in ("tt", "bb", "tff", "bff"):
+    # FIX-P6-1: PSF check per v7.32 §3.9: "ffprobe field_order 非 progressive" triggers PSF check
+    # ORIGINAL: if gprog_ratio > 0.90 and fo_meta in ("tt", "bb", "tff", "bff"):
+    # "unknown" (no field_order metadata) must also trigger PSF detection
+    if gprog_ratio > 0.90 and fo_meta not in ("progressive",):
         # Method B: MediaInfo auxiliary check (v6.32 §3.9 / v7.32 §3.9)
         # If MediaInfo explicitly indicates PSF, skip expensive SSIM test
         if _check_psf_mediainfo(input_path):
@@ -166,9 +169,17 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list]:
         else:
             return "unknown", 0.3, [], fps
 
-    # Sliding window analysis: 2-second windows, 1-second step
-    window_duration = 2.0  # seconds
-    step = 1.0             # seconds
+    # FIX-P6-10: Frame-based sliding window per v7.32 §3.10.13
+    # ORIGINAL: Time-based (2.0s window, 1.0s step) — wrong for low-fps (10fps) content
+    # where 2s = only 20 frames, below the ≥30-frame minimum per spec
+    min_window_frames = 30  # v7.32 §3.10.13: ≥30 frames
+    step_frames = 15        # half-window step
+    window_duration = min_window_frames / fps if fps > 0 else 2.0
+    step = step_frames / fps if fps > 0 else 1.0
+    # Ensure window doesn't exceed video length
+    if duration > 0 and window_duration > duration / 2:
+        window_duration = max(0.5, duration / 2)
+        step = window_duration / 2
     windows = []
 
     num_windows = max(1, int((duration - window_duration) / step) + 1)
@@ -377,6 +388,126 @@ def _compute_ssim_windowed(a: np.ndarray, b: np.ndarray,
     return float(np.mean(ssim_values)) if ssim_values else 0.0
 
 
+def _check_psf_ssim_consecutive(input_path: str) -> bool:
+    """Consecutive 3-frame average SSIM check per v7.32 §3.9.
+
+    When the primary SSIM (non-consecutive frames [0,25,50]) falls in the
+    0.95–0.98 ambiguous range, extract 3 consecutive frames starting from
+    frame 0 and compute average field SSIM.  If avg > 0.95 → PSF.
+
+    FIX-E2: Replaces the previous min(ssim_values) > 0.95 approach to match
+    the spec's "连续3帧平均 SSIM 校验" requirement exactly.
+    """
+    try:
+        import tempfile
+        from PIL import Image
+
+        consecutive_indices = [0, 1, 2]
+        ssim_values = []
+
+        for idx in consecutive_indices:
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            tmp_next = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp_next.close()
+            try:
+                r = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-v", "error",
+                     "-i", input_path, "-vf", f"select=eq(n\\,{idx})",
+                     "-frames:v", "1", "-f", "image2", "-y", tmp.name],
+                    capture_output=True, timeout=30, shell=False
+                )
+                if r.returncode != 0:
+                    continue
+
+                # Extract adjacent frame for static-region mask
+                r_next = subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-v", "error",
+                     "-i", input_path, "-vf", f"select=eq(n\\,{idx+1})",
+                     "-frames:v", "1", "-f", "image2", "-y", tmp_next.name],
+                    capture_output=True, timeout=30, shell=False
+                )
+
+                img = Image.open(tmp.name).convert("L")
+                arr = np.array(img, dtype=np.float64)
+
+                # Detect and crop black borders
+                crop_top, crop_bottom, crop_left, crop_right = _detect_black_borders_frame(arr)
+                min_h = arr.shape[0] // 2
+                min_w = arr.shape[1] // 2
+                effective_h = arr.shape[0] - crop_top - crop_bottom
+                effective_w = arr.shape[1] - crop_left - crop_right
+                if effective_h < min_h or effective_w < min_w:
+                    crop_top = min(crop_top, arr.shape[0] // 4)
+                    crop_bottom = min(crop_bottom, arr.shape[0] // 4)
+                    crop_left = min(crop_left, arr.shape[1] // 4)
+                    crop_right = min(crop_right, arr.shape[1] // 4)
+
+                if crop_top + crop_bottom < arr.shape[0] and crop_left + crop_right < arr.shape[1]:
+                    arr = arr[crop_top:arr.shape[0]-crop_bottom,
+                              crop_left:arr.shape[1]-crop_right]
+
+                # Build static-region mask from adjacent-frame difference
+                if r_next.returncode == 0:
+                    img_next = Image.open(tmp_next.name).convert("L")
+                    arr_next = np.array(img_next, dtype=np.float64)
+                    if (crop_top + crop_bottom < arr_next.shape[0] and
+                            crop_left + crop_right < arr_next.shape[1]):
+                        arr_next = arr_next[crop_top:arr_next.shape[0]-crop_bottom,
+                                            crop_left:arr_next.shape[1]-crop_right]
+                    if arr_next.shape == arr.shape:
+                        frame_diff = np.abs(arr - arr_next)
+                        mask = frame_diff > 5.0
+                    else:
+                        mask = np.ones_like(arr, dtype=bool)
+                else:
+                    mask = np.ones_like(arr, dtype=bool)
+
+                # Separate fields
+                top_field = arr[0::2, :]
+                bottom_field = arr[1::2, :]
+
+                # Replace static regions with independent noise
+                mask_top = mask[0::2, :]
+                mask_bottom = mask[1::2, :]
+                rng = np.random.default_rng(idx + 100)
+                noise_top = rng.normal(128, 20, top_field.shape)
+                noise_bottom = rng.normal(128, 20, bottom_field.shape)
+                top_field = np.where(mask_top, top_field, noise_top)
+                bottom_field = np.where(mask_bottom, bottom_field, noise_bottom)
+
+                # Handle odd height
+                h = min(top_field.shape[0], bottom_field.shape[0])
+                top_field = top_field[:h, :]
+                bottom_field = bottom_field[:h, :]
+
+                if top_field.size == 0 or bottom_field.size == 0:
+                    continue
+
+                # Adaptive window size
+                win_size = max(3, min(11, (arr.shape[1] // 40) | 1, (arr.shape[0] // 40) | 1))
+                win_size = min(win_size, min(arr.shape[0], arr.shape[1]))
+
+                ssim = _compute_ssim_windowed(top_field, bottom_field, win_size)
+                ssim_values.append(ssim)
+            finally:
+                for t in (tmp, tmp_next):
+                    try:
+                        os.unlink(t.name)
+                    except Exception:
+                        pass
+
+        if len(ssim_values) < 2:
+            # Not enough consecutive frames to validate
+            return False
+
+        consec_avg = float(np.mean(ssim_values))
+        return consec_avg > 0.95
+
+    except Exception:
+        return False
+
+
 def _check_psf_ssim(input_path: str) -> bool:
     """Check if fields have high SSIM (PSF indicator).
 
@@ -498,13 +629,15 @@ def _check_psf_ssim(input_path: str) -> bool:
 
         avg_ssim = float(np.mean(ssim_values))
 
-        # Primary threshold: > 0.98 = PSF
+        # Primary threshold: > 0.98 = PSF per v7.32 §3.9
         if avg_ssim > 0.98:
             return True
-        # Secondary check: 0.95-0.98 range requires all 3 frames to agree
+        # FIX-E2: Secondary check for 0.95-0.98 range per v7.32 §3.9
+        # Spec requires "连续3帧平均 SSIM 校验" — extract 3 consecutive frames
+        # and compute their average SSIM. This is the spec-compliant implementation
+        # replacing the previous min(ssim_values)>0.95 approach.
         if avg_ssim >= 0.95:
-            min_ssim = min(ssim_values)
-            return min_ssim > 0.95
+            return _check_psf_ssim_consecutive(input_path)
         return False
 
     except Exception:
@@ -524,13 +657,19 @@ def _detect_blockiness_and_blur(input_path: str) -> Dict[str, float]:
 
     scores = {"blockiness_score": 0.0, "blur_score": 0.0, "noise_score": 0.0}
     try:
+        # FIX-P6-11: Dynamic seek position: 10% of duration or 2s minimum
+        # ORIGINAL: Hardcoded "-ss", "00:00:02" — fails for very short clips
+        info = run_ffprobe(input_path)
+        duration = float(info.get("format", {}).get("duration", 0))
+        seek_time = max(2.0, duration * 0.1) if duration > 0 else 2.0
+
         # Extract one frame from middle of video
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp.close()
         try:
             r = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-v", "error",
-                 "-ss", "00:00:02", "-i", input_path,
+                 "-ss", str(seek_time), "-i", input_path,
                  "-frames:v", "1", "-f", "image2", "-y", tmp.name],
                 capture_output=True, timeout=30, shell=False
             )
@@ -712,6 +851,8 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     field_order, fo_confidence, field_segments, fps = detect_field_order_segments(input_path)
     result["field_order"] = field_order
     result["is_psf"] = (field_order == "psf")
+    # FIX-P6-11: Include fps in output per v7.32 §3.9
+    result["fps"] = fps
 
     # Store segments if mixed field order detected
     if field_segments:

@@ -1,6 +1,7 @@
 # ============================================
 # 老影像修复 - 视频修复套件配置文件
-# 参数优先级：命令行 > user_overrides > paths > global > 内置默认值
+# 参数优先级：CLI > user_overrides > recommended_params > audio_override > paths > global+audio+ai > defaults
+# FIX-P5-1: Corrected priority order per v7.32 §3.2
 # ============================================
 
 global:
@@ -32,6 +33,9 @@ paths:
     ivtc: "VIVTC"
     ivtc_alt: "sRestore"
     ivtc_auto_fallback: true
+    # FIX-P2-5: VFM mode and VDecimate cycle per v7.32 §3.10.13
+    vfm_mode: 1
+    vdecimate_cycle: 5
     ivtc_fallback_threshold:
       tff_bff_percent: 10
       progressive_percent: 90
@@ -50,7 +54,7 @@ paths:
     qtgmc_chromamotion: true
     qtgmc_sourcematch: 3
     qtgmc_input_type: 0
-    qtgmc_fps_divisor: 1
+    qtgmc_fps_divisor: 2    # FIX-P5-2: Changed from 1 to 2 per v7.32 §3.2 / CLAUDE.md §5
     qtgmc_input_type_rule: "field_order"
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true
@@ -62,6 +66,9 @@ paths:
 
   dv_digital:
     ivtc: "auto"
+    # FIX-P2-5: VFM mode and VDecimate cycle per v7.32 §3.10.13
+    vfm_mode: 1
+    vdecimate_cycle: 5
     deinterlace: "QTGMC"
     psf_handling: "SeparateFields_Weave"
     psf_handling_alt: "SeparateFields_DoubleWeave_SelectEvery"
@@ -76,13 +83,16 @@ paths:
     qtgmc_chromamotion: true
     qtgmc_sourcematch: 3
     qtgmc_input_type: 0
-    qtgmc_fps_divisor: 1
+    qtgmc_fps_divisor: 2    # FIX-P5-2: Changed from 1 to 2 per v7.32 §3.2 / CLAUDE.md §5
     qtgmc_input_type_rule: "field_order"
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true
 
   hdv_avchd:
     ivtc: "auto"
+    # FIX-P2-5: VFM mode and VDecimate cycle per v7.32 §3.10.13
+    vfm_mode: 1
+    vdecimate_cycle: 5
     deinterlace: "QTGMC"
     psf_handling: "SeparateFields_Weave"
     psf_handling_alt: "SeparateFields_DoubleWeave_SelectEvery"
@@ -95,7 +105,7 @@ paths:
     qtgmc_chromamotion: true
     qtgmc_sourcematch: 3
     qtgmc_input_type: 0
-    qtgmc_fps_divisor: 1
+    qtgmc_fps_divisor: 2    # FIX-P5-2: Changed from 1 to 2 per v7.32 §3.2 / CLAUDE.md §5
     qtgmc_input_type_rule: "field_order"
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true
@@ -185,7 +195,8 @@ audio:
   process_before_mux: true
   denoise: "afftdn"
   hum_filter: "bandreject_multi"
-  hum_freq: 50
+  # FIX-P7-1: null = auto-detect; 50 or 60 = user forced override per v6.32 §7.12
+  hum_freq: null
   hum_harmonics: 3
   hum_bandwidth: 2
   hum_width_type: "h"

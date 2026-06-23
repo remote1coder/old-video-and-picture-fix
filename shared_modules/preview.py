@@ -155,6 +155,29 @@ def _get_total_frames(input_path: str) -> int:
     return 0
 
 
+def _get_video_bit_depth(input_path: str) -> Optional[int]:
+    """Get video bit depth using ffprobe.
+
+    FIX-P3-7: Avoid wasting space by forcing rgb48be for 8bit sources.
+    Returns None if bit depth cannot be determined (conservative fallback
+    to rgb48be).
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=bits_per_raw_sample",
+             "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            val = r.stdout.strip()
+            if val and val != "N/A":
+                return int(val)
+    except Exception:
+        pass
+    return None
+
+
 def extract_preview_frames(input_path: str, output_dir: str,
                            num_frames: int = 6,
                            target_fps: Optional[float] = None) -> List[str]:
@@ -239,43 +262,54 @@ def extract_preview_frames(input_path: str, output_dir: str,
 
     # ISSUE-V-PREV-001 fix: detect VFR and switch to frame-number extraction
     vfr = _is_vfr(input_path)
+    pts_ok = True
     total_frames = 0
     if vfr:
         pts_ok = _check_pts_monotonic(input_path)
         if not pts_ok:
             logger = get_logger()
             logger.warning("PREVIEW_VFR_PTS_BAD",
-                          "VFR detected with non-monotonic PTS, falling back to PTS-based extraction")
+                          "VFR detected with non-monotonic PTS, "
+                          "switching to PTS-coverage extraction")
         total_frames = _get_total_frames(input_path)
+
+    # FIX-P3-7: Use dynamic pix_fmt based on source bit depth.
+    # 8bit sources -> rgb24 (saves ~50% PNG space), 10bit+ -> rgb48be
+    bit_depth = _get_video_bit_depth(input_path)
+    pix_fmt = "rgb24" if (bit_depth and bit_depth <= 8) else "rgb48be"
 
     for pos in positions:
         out_file = out_path / f"{stem}_preview_{pos:.2f}.png"
 
         try:
-            if vfr and total_frames > 0:
+            # FIX-P3-5: Per v7.32 §3.8(注): Use frame-number extraction only
+            # when VFR + valid PTS + known frame count. If PTS is
+            # non-monotonic, fall back to PTS-based seeking.
+            if vfr and pts_ok and total_frames > 0:
                 # Frame-number-based extraction for VFR accuracy
                 target_frame = int(pos * total_frames)
                 subprocess.run(
                     ["ffmpeg", "-hide_banner", "-v", "error",
                      "-i", input_path,
-                     "-vf", f"select=eq(n\\,{target_frame})",
+                     # FIX-P3-4: shell=False no escaping needed
+                     "-vf", f"select=eq(n,{target_frame})",
                      "-vsync", "vfr",
                      "-frames:v", "1",
-                     "-pix_fmt", "rgb48be",  # FIX-P3-1: 10bit/16bit PNG per v7.32 §3.8
+                     "-pix_fmt", pix_fmt,
                      "-compression_level", "9",
                      "-f", "image2",
                      "-y", str(out_file)],
                     capture_output=True, timeout=30, shell=False
                 )
             else:
-                # Standard output seeking for CFR material
+                # Standard PTS-based output seeking (CFR or VFR with bad PTS)
                 target_time = pos * duration
                 subprocess.run(
                     ["ffmpeg", "-hide_banner", "-v", "error",
                      "-i", input_path,
                      "-ss", str(target_time),
                      "-frames:v", "1",
-                     "-pix_fmt", "rgb48be",  # FIX-P3-1: 10bit/16bit PNG per v7.32 §3.8
+                     "-pix_fmt", pix_fmt,
                      "-compression_level", "9",
                      "-f", "image2",
                      "-y", str(out_file)],
@@ -312,14 +346,15 @@ def generate_preview_clip(input_path: str, output_path: str,
         frame_count = max(1, int(fps * duration_sec))
         
         # ISSUE-SHARED-PV-001 fix: Single-stage ffmpeg directly to animated WebP.
-        # Uses input seeking (-ss before -i) for fast seek, limits duration with -t.
+        # FIX-P3-3: Per v7.32 §3.8: Use output seeking (-ss AFTER -i) for
+        # accuracy. Input seeking before -i can misposition on VFR content.
         # Falls back to two-stage PNG extraction if single-stage fails.
         # FIX-P3-6: Dynamic frame count by fps per v7.32 §3.10.21
         vf = f"fps={fps},scale={target_width}:-2"
         r = subprocess.run(
             ["ffmpeg", "-hide_banner", "-v", "error",
-             "-ss", str(start_sec),
              "-i", input_path,
+             "-ss", str(start_sec),      # ← output seeking (after -i)
              "-t", str(duration_sec),
              "-vf", vf,
              "-c:v", "libwebp",
@@ -341,15 +376,24 @@ def generate_preview_clip(input_path: str, output_path: str,
         try:
             r_extract = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-v", "error",
-                 "-ss", str(start_sec),
                  "-i", input_path,
+                 "-ss", str(start_sec),      # ← output seeking (after -i)
                  "-t", str(duration_sec),
                  "-vf", f"scale={target_width}:-2",
                  "-vsync", "vfr",
                  "-y", str(temp_dir / f"{stem}_frame_%03d.png")],
                 capture_output=True, timeout=60, shell=False
             )
-            
+
+            # FIX-P3-8: Verify stage 1 succeeded before attempting stage 2
+            if r_extract.returncode != 0:
+                return False
+
+            # Verify at least one PNG was extracted
+            png_files = sorted(temp_dir.glob(f"{stem}_frame_*.png"))
+            if not png_files:
+                return False
+
             r2 = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-v", "error",
                  "-framerate", str(fps),
@@ -360,7 +404,7 @@ def generate_preview_clip(input_path: str, output_path: str,
                  "-y", output_path],
                 capture_output=True, timeout=120, shell=False
             )
-            
+
             return r2.returncode == 0
         finally:
             # Cleanup temp frames
@@ -392,20 +436,19 @@ def generate_comparison_frames(original_path: str, processed_path: str,
     if _is_photo(original_path):
         try:
             from PIL import Image
-            orig = Image.open(original_path)
-            proc = Image.open(processed_path)
-            
-            # Create side-by-side
-            w = max(orig.width, proc.width)
-            h = max(orig.height, proc.height)
-            combined = Image.new("RGB", (w * 2, h))
-            combined.paste(orig.resize((w, h)), (0, 0))
-            combined.paste(proc.resize((w, h)), (w, 0))
-            
-            out_file = out_path / f"{stem}_compare.png"
-            combined.save(out_file)
-            if out_file.exists():
-                results.append(str(out_file))
+            # FIX-P3-7: Use context manager to properly close image resources
+            with Image.open(original_path) as orig, \
+                 Image.open(processed_path) as proc:
+                w = max(orig.width, proc.width)
+                h = max(orig.height, proc.height)
+                combined = Image.new("RGB", (w * 2, h))
+                combined.paste(orig.resize((w, h)), (0, 0))
+                combined.paste(proc.resize((w, h)), (w, 0))
+
+                out_file = out_path / f"{stem}_compare.png"
+                combined.save(out_file)
+                if out_file.exists():
+                    results.append(str(out_file))
         except Exception:
             pass
     else:
@@ -480,13 +523,17 @@ def detect_motion_segments(input_path: str, num_segments: int = 3,
         )
         duration = float(r.stdout.strip())
         if duration <= 0:
-            return [(0.0, 0.0)]
+            # FIX-P3-8: Return empty list instead of misleading
+            # [(0.0, 0.0)] — caller can distinguish "no segments"
+            # from "segment at t=0.0 with score 0.0"
+            return []
         
         # Sample frames every ~0.5s for motion analysis
         sample_interval = max(0.5, segment_duration)
         num_samples = int(duration / sample_interval)
         if num_samples < 2:
-            return [(0.0, 0.0)]
+            # FIX-P3-8: Return empty list — too short for motion analysis
+            return []
         
         # BUG-061 fix: Use system temp directory instead of input file's parent
         # to avoid PermissionError on read-only locations (e.g., optical drives,
@@ -511,7 +558,8 @@ def detect_motion_segments(input_path: str, num_segments: int = 3,
             for _, fp in frames:
                 fp.unlink(missing_ok=True)
             temp_dir.rmdir()
-            return [(0.0, 0.0)]
+            # FIX-P3-8: Return empty list — insufficient frames
+            return []
         
         # Calculate motion scores (MAD between adjacent frames)
         from PIL import Image
@@ -557,12 +605,14 @@ def detect_motion_segments(input_path: str, num_segments: int = 3,
                     break
         
         if not selected:
-            selected = [(0.0, 0.0)]
+            # FIX-P3-8: Return empty list instead of misleading placeholder
+            return []
         
         return selected
     
     except Exception:
-        return [(0.0, 0.0)]
+        # FIX-P3-8: Return empty list on error
+        return []
 
 
 def generate_motion_preview_clips(input_path: str, output_dir: str,
@@ -589,6 +639,9 @@ def generate_motion_preview_clips(input_path: str, output_dir: str,
     stem = Path(input_path).stem
     
     segments = detect_motion_segments(input_path, num_segments, segment_duration)
+    # FIX-P3-8: Handle empty segment list gracefully
+    if not segments:
+        return []
     results = []
     
     for idx, (start_sec, score) in enumerate(segments):
@@ -596,5 +649,40 @@ def generate_motion_preview_clips(input_path: str, output_dir: str,
         if generate_preview_clip(input_path, str(out_file), start_sec,
                                  segment_duration, target_width):
             results.append(str(out_file))
-    
+
     return results
+
+
+def auto_generate_comparison_if_needed(
+    original_path: str,
+    processed_path: str,
+    output_dir: str,
+    config: dict = None,
+    num_pairs: int = 3
+) -> List[str]:
+    """Auto-generate comparison frames when force_allow_banned_upscale is enabled.
+
+    Per v7.32 §3.8: Automatically generate before/after comparison frames
+    when force_allow_banned_upscale: true.
+
+    Args:
+        original_path: Original input path
+        processed_path: Processed output path
+        output_dir: Directory to save comparison frames
+        config: Full pipeline config dict
+        num_pairs: Number of comparison pairs
+
+    Returns:
+        List of comparison frame paths (empty if not triggered)
+    """
+    if config is None:
+        return []
+
+    # Check force_allow_banned_upscale in ai config hierarchy
+    ai_config = config.get("ai", {})
+    if not ai_config.get("force_allow_banned_upscale", False):
+        return []
+
+    return generate_comparison_frames(
+        original_path, processed_path, output_dir, num_pairs
+    )

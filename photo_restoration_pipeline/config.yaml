@@ -9,8 +9,8 @@ global:
   encoder: "avifenc"
   crf: 24
   preset: 4
-  pix_fmt: "yuv420p10le"
-  color_range: "limited"
+  # FIX-P10-9: Removed pix_fmt and color_range (video-only concepts)
+  # Photo AVIF params are in photo.avif_params section below
   platform: "auto"
   gpu_priority: ["cuda", "rocm", "mps", "cpu"]
   log_level: "INFO"
@@ -21,7 +21,11 @@ global:
   log_max_line_bytes: 1048576
   cleanup_intermediates: true
   retry_count: 2
+  # FIX-P10-14: no_wsl_redirect is CLI-only per v7.32 §3.10.10
+  # Kept here as default value; CLI --no-wsl-redirect overrides this
   no_wsl_redirect: false
+  # FIX-P10-14: workers is CLI-only per v7.32 §3.3
+  # Kept here as default value; CLI --workers overrides this
   workers: 1
 
 paths:
@@ -43,6 +47,9 @@ photo:
   max_long_edge: 3840
   max_short_edge: 2160
   dpi_threshold: 1200
+  # FIX-P11-10: Per v6.32 §4.2.1: explicit input color space override
+  # auto = detect from ICC profile; sRGB/AdobeRGB/ProPhoto = user-specified
+  input_color_space: "auto"
   channel_degradation_std_threshold: 0.15
   channel_degradation_mean_threshold: 0.08
   channel_degradation_mean_threshold_severe: 0.15
@@ -77,8 +84,8 @@ photo:
   deband_threshold: 1.2
   grain_synthesis: true
   grain_strength: 0.3
-  grain_size: 1.0
-  grain_roughness: 0.5
+  grain_size: 0.5    # FIX-R13-1: Changed from 1.0 to 0.5 per v7.32 §3.10.4 (Laplacian pyramid depth)
+  grain_roughness: 0   # FIX-P12-12: Changed from 0.5 to 0 per v7.32 §3.10.4 (0=pure fine grain/film)
   gmic_windows_quote: "double"
   gmic_windows_disable_delayed_expansion: true
   gmic_windows_shell: false
@@ -101,12 +108,17 @@ audio:
 ai:
   enabled: false
   face_restore: "GFPGAN"
+  # Supported upscale models per v7.32 §3.1:
+  #   RealESRGAN_x2plus / RealESRGAN_x4plus — general-purpose (default)
+  #   DAT_x2 / DAT_x4 — preferred for photo scans (PyTorch only)
+  #   GPEN_x2 / GPEN_x4 — full-body portrait enhancement (v6.32 §4)
+  # Fallback chain: on primary model failure, tries alternatives in priority order
+  # (DAT -> RealESRGAN -> GPEN for photos)
   upscale_model: "RealESRGAN_x2plus"
   upscale_scale: 2
   model_dir: ""  # Empty = auto-detect PROJECT_ROOT/models; set explicit path if needed
   max_scale: 4
   lanczos_target: "auto"
-  grain_strength: 0.3
   force_traditional_first: true
   force_allow_banned_upscale: false
   gpu_memory_fallback: true

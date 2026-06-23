@@ -52,11 +52,13 @@
 | Stage | File | Purpose | Input → Output |
 |-------|------|---------|----------------|
 | 1 | `stages/stage1_preprocess.py` | Preprocessing (colorspace, scratch removal, deblock, deband, channel correction) | photo → processed TIFF |
-| 2 | `stages/stage2_traditional_check.py` | Quality verification | processed → verified |
-| 3 | `stages/stage3_ai_upscale.py` | AI super-resolution (Real-ESRGAN/DAT) | verified → upscaled PNG |
-| 4 | `stages/stage4_postprocess.py` | Post-processing (region separation, selective processing, Lanczos resize) | upscaled → refined TIFF |
-| 5 | `stages/stage5_ai_face.py` | Face restoration (GFPGAN/CodeFormer) + grain synthesis (post-AI) | refined → face-restored PNG |
-| 6 | `stages/stage6_encode.py` | Final AVIF encoding (YUV420 10bit / RGB444 16bit lossless) | face-restored → final .avif |
+| 2 | `stages/stage2_ai_pre.py` | AI pre-processing (single-channel correction for AI upscale input) | processed → corrected |
+| 3 | `stages/stage3_ai_upscale.py` | AI super-resolution (Real-ESRGAN/DAT/GPEN) | corrected → upscaled PNG/TIFF |
+| 4 | `stages/stage4_ai_face.py` | Face restoration (GFPGAN/CodeFormer) + feather blend | upscaled → face-restored PNG |
+| 5 | `stages/stage5_postprocess.py` | Post-processing (selective local processing, portrait color match, grain synthesis) | face-restored → refined PNG/TIFF |
+| 6 | `stages/stage6_encode.py` | Final AVIF encoding (YUV420 10bit / RGB444 16bit lossless) | refined → final .avif |
+
+**注意**: 旧版文件 `stage4_postprocess.py` 和 `stage5_ai_face.py` 已于 Round 12 清理删除。v7.32 §3.1 修正了照片管线阶段顺序：face restore (stage4) 先于 postprocess (stage5)，grain synthesis 移至 stage5。
 
 ### 2.2 Stage Communication
 - Stages communicate via intermediate files in temp_dir
@@ -128,8 +130,8 @@ File: `photo_restoration_pipeline/config.yaml`
 Key sections:
 - `global` — global defaults
 - `paths` — per-type settings (scan_print, digital_photo)
-- `photo` — photo-specific defaults (scratch_remove, deblock_strength, deband_threshold, grain_synthesis, avif_params, avif_rgb444_params, channel_correction_*)
-- `grain_factory3` — `enabled: false` (photos don't use GrainFactory3)
+- `photo` — photo-specific defaults (scratch_remove, deblock_strength, deband_threshold, grain_synthesis, grain_strength, grain_size, grain_roughness, avif_params, avif_rgb444_params, channel_correction_*)
+- `grain_factory3` — `enabled: false` (photos don't use GrainFactory3; use Laplacian pyramid grain in stage5 instead)
 - `audio` — `enabled: false` (photos don't process audio)
 - `ai` — AI upscaling configuration
 
@@ -246,7 +248,8 @@ Returns exit code 80 if any required dependency is missing.
 - ~~**spawn 三约束预检**~~ ✅ 已修复（基础实现）。
 - ~~**人脸检测 Python 包名一致性**: 仍使用 `retinaface`，如需严格匹配规范 `retina-face` 包名，可调整。~~ ✅ 已修复：错误提示已改为 `pip install retina-face`（PyPI 官方包名），模块检测仍使用 `retinaface`。
 - **`sRestore` 滤镜的显式独立校验**: 当前仍在 `check_vs_minimal_calls()` 中间接包含。
-- **G'MIC 具体滤镜**（`-repair`, `-deblock`, `-deband`, `-film_grain`）可用性验证: 已检查 G'MIC 存在性，但未对具体滤镜做最小参数集测试。
+- **G'MIC 具体滤镜**（`-repair`, `-deblock`, `-deband`）可用性验证: 已检查 G'MIC 存在性，但未对具体滤镜做最小参数集测试。
+- **`-film_grain` 不存在于 G'MIC**: 经联网搜索验证（G'MIC 官方 `gui_filters.txt` 2026-06-11 更新），G'MIC CLI 中不存在 `-film_grain` 命令。实际存在的颗粒相关命令为 `mc_film_grain`（社区滤镜）、`-fx_simulate_grain`、`-fx_simulate_film`。Round 13 已将照片 grain 合成替换为纯 Python 拉普拉斯金字塔实现，不再依赖 G'MIC。
 - **avifenc 版本解析和 `--jobs` 支持检测**（照片流程需要）。
 - ~~**AI 模型 MD5 校验**: 未启用（所有模型 `md5` 字段为 `None`）。~~ ✅ 已修复：支持外部 `md5_manifest.json` 清单加载，无 MD5 时输出配置指导警告。
 
@@ -292,6 +295,7 @@ Returns exit code 80 if any required dependency is missing.
 | **SM-ARCH-013** | 人脸检测包名不匹配 | dependency_check.py | ✅ 已修复 |
 | **SM-ARCH-014** | AI 模型 MD5 校验未启用 | dependency_check.py | ✅ 已修复 |
 | **SM-ARCH-015** | 预览未实现运动幅度检测 | preview.py | ✅ 已修复 |
+| **P12-12** | G'MIC `-film_grain` 不存在，照片 grain 合成从未生效 | photo/stage5_postprocess.py | ⚠️ Round 13 修复中 |
 
 
 ---

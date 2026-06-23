@@ -7,7 +7,6 @@ Audio is stored temporarily for stage7 to process and mux.
 Exit codes: 0=success, 3=skipped, 82=IO error
 """
 
-import os
 import sys
 import json
 import argparse
@@ -18,6 +17,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
 from audio_utils import extract_audio  # noqa: E402
+from checkpoint import wsl_redirect_path  # noqa: E402
 
 
 def _load_params(args):
@@ -44,15 +44,33 @@ def main():
 
     # Determine output path
     temp_dir = params.get("temp_dir", "./temp")
-    os.makedirs(temp_dir, exist_ok=True)
+
+    # FIX-P7-4: WSL2 temp_dir redirect per v7.32 §3.10.10
+    # ORIGINAL: no WSL2 redirect, could write to slow /mnt/ paths
+    no_wsl_redirect = getattr(args, "no_wsl_redirect", False) or params.get("no_wsl_redirect", False)
+    platform = params.get("platform", "auto")
+    try:
+        redirected_temp, _, _, _ = wsl_redirect_path(
+            temp_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform
+        )
+        if redirected_temp != temp_dir:
+            logger.info("STAGE0_WSL_REDIRECT",
+                        f"WSL redirect: {temp_dir} -> {redirected_temp}")
+            temp_dir = redirected_temp
+    except Exception:
+        pass  # wsl_redirect_path not available or not in WSL
+
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
 
     input_name = Path(args.input).stem
     # V-P-018 fix: use consistent extension with stage7 lookup
-    output_audio = os.path.join(temp_dir, f"{args.job_id}_{input_name}.audio")
+    # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
+    # ORIGINAL: output_audio = os.path.join(temp_dir, f"...") / os.path.exists()
+    output_audio_obj = Path(temp_dir) / f"{args.job_id}_{input_name}.audio"
 
     # Check if already exists
-    if os.path.exists(output_audio) and os.path.getsize(output_audio) > 0:
-        logger.info("STAGE0_SKIP", "Audio already extracted", path=output_audio)
+    if output_audio_obj.exists() and output_audio_obj.stat().st_size > 0:
+        logger.info("STAGE0_SKIP", "Audio already extracted", path=str(output_audio_obj))
         return 3
 
     logger.info("STAGE0_START", "Extracting audio", input=args.input)
@@ -64,6 +82,7 @@ def main():
         logger.info("STAGE0_NO_AUDIO", "Source has no audio stream, skipping extraction")
         return 0
 
+    output_audio = str(output_audio_obj)
     success = extract_audio(args.input, output_audio, codec="copy")
 
     if success:

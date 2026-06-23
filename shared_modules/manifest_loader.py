@@ -6,6 +6,8 @@ Loads manifests (YAML/JSONL), validates, filters by status, sorts by priority.
 
 import yaml  # type: ignore[import-untyped]
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -68,8 +70,10 @@ def _verify_photo_integrity(path: str, bit_depth: int = 8) -> bool:
         from PIL import Image
         import numpy as np
         
-        img = Image.open(path)
-        arr = np.array(img)
+        # FIX-P4-15: Use context manager for PIL Image
+        # ORIGINAL: img = Image.open(path); arr = np.array(img)
+        with Image.open(path) as img:
+            arr = np.array(img)
         
         # Handle various modes
         if len(arr.shape) == 2:
@@ -125,8 +129,9 @@ def _verify_photo_integrity(path: str, bit_depth: int = 8) -> bool:
             low, high = 10, 245
         elif effective_depth == 10:
             low, high = 40, 980
-        else:  # 16bit
-            low, high = 4096, 60160
+        else:  # 16bit — full range for photos per v6.32 §7.9
+            # ORIGINAL: low, high = 4096, 60160
+            low, high = 0, max_val
         
         if not (low <= global_mean <= high):
             if global_mean < 5 or global_mean > max_val - 5:
@@ -150,6 +155,14 @@ def filter_jobs(manifest: Dict[str, Any],
 
     filtered = []
     for job in manifest.get("jobs", []):
+        # FIX-P4-1: Validate required fields per v7.32 §3.4.5
+        if not validate_job(job):
+            logging.warning(
+                "Invalid job %s: missing required fields "
+                "(input_path/detected_class/status), skipping",
+                job.get("job_id", "UNKNOWN")
+            )
+            continue
         if job.get("status") in statuses:
             if job.get("status") == "FAILED":
                 job = _handle_failed_job(job)
@@ -171,7 +184,6 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         import sys
         import re
-        import glob
         # BUG-060 fix: Use parent directory (shared_modules/) instead of project root
         # to ensure checkpoint.py is found regardless of project structure.
         sys.path.insert(0, str(Path(__file__).parent))
@@ -181,10 +193,13 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
         job_id = job["job_id"]
         input_name = Path(job["input_path"]).stem
 
-        # Normalize path separator for cross-platform glob compatibility
-        temp_dir_norm = temp_dir.replace("\\", "/")
-        pattern = f"{temp_dir_norm}/{job_id}_{input_name}_step*"
-        intermediates = glob.glob(pattern)
+        # FIX-P4-6: Use pathlib.Path.glob() instead of glob.glob()
+        # ORIGINAL: import glob; temp_dir_norm = temp_dir.replace("\\", "/");
+        #           pattern = f"{temp_dir_norm}/{job_id}_{input_name}_step*";
+        #           intermediates = glob.glob(pattern)
+        temp_dir_path = Path(temp_dir)
+        pattern = f"{job_id}_{input_name}_step*"
+        intermediates = [str(p) for p in sorted(temp_dir_path.glob(pattern))]
 
         if not intermediates:
             job["status"] = "PENDING"
@@ -235,21 +250,28 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def save_manifest(manifest: Dict[str, Any], path: str):
-    """Save manifest back to disk."""
+    """Save manifest back to disk atomically. FIX-P4-16: atomic write."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.endswith(".jsonl"):
-        # FIX-P4-7: write meta to separate .meta.json file
-        meta_path = p.with_suffix(".meta.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(manifest["meta"], f, ensure_ascii=False, indent=2)
-        with open(path, "w", encoding="utf-8") as f:
-            for job in manifest["jobs"]:
-                f.write(json.dumps(job, ensure_ascii=False) + "\n")
-    else:
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(manifest, f, allow_unicode=True, sort_keys=False)
+    tmp_path = p.with_suffix(p.suffix + ".tmp")
+    try:
+        if path.endswith(".jsonl"):
+            # FIX-P4-7: write meta to separate .meta.json file
+            meta_path = p.with_suffix(".meta.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(manifest["meta"], f, ensure_ascii=False, indent=2)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for job in manifest["jobs"]:
+                    f.write(json.dumps(job, ensure_ascii=False) + "\n")
+        else:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                yaml.dump(manifest, f, allow_unicode=True, sort_keys=False)
+        # Atomic rename on same filesystem
+        tmp_path.replace(p)
+    except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Failed to save manifest atomically: {e}") from e
 
 
 def update_job_status(manifest: Dict[str, Any], job_id: str,
@@ -260,7 +282,6 @@ def update_job_status(manifest: Dict[str, Any], job_id: str,
             job["status"] = status
             if error_message:
                 job["error_message"] = error_message
-            from datetime import datetime
             job["updated_at"] = datetime.now().astimezone().isoformat()
             break
 

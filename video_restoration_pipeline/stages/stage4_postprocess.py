@@ -7,14 +7,20 @@ v6.3 Compliance:
 - Uses standard FFmpeg filters (gblur/unsharp)
 - Output format: FFV1 YUV420P16 (per v6.3 §3.6)
 - Deterministic intermediate matching
+
+P8 Fixes Applied:
+- P8-2: Match _forced_upscale suffix per v7.32 §3.10.2 L3
+- P8-4: Skin/hair protection in selective processing per v6.32 §3
+- P8-5: WSL2 temp_dir redirect per v6.32 §7.3
+- P8-8: Enforce checkpoint.compute_param_hash (no local fallback)
+- P8-9: Removed unsharp from textured regions per v6.32 §3
+- P8-10: Saturation/contrast conditional on config per v6.32 §3
+- P8-13: Validate stage3 output with ffprobe per v6.32 §7.1
 """
 
-import os
 import sys
 import json
-import hashlib
 import argparse
-import glob
 import subprocess
 from pathlib import Path
 
@@ -45,38 +51,64 @@ def main():
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
+    # FIX-P8-5: WSL2 temp_dir redirect per v6.32 §7.3
+    # ORIGINAL: No WSL2 redirect, causing I/O bottleneck on /mnt/ paths
     temp_dir = params.get("temp_dir", "./temp")
+    try:
+        from checkpoint import wsl_redirect_path
+        _, _, temp_dir, _ = wsl_redirect_path("", temp_dir=temp_dir,
+                                               logger=logger)
+    except Exception:
+        pass
     job_id = args.job_id
     input_name = Path(args.input).name
 
     # Find stage3 output - deterministic by mtime
-    pattern = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
-    candidates = glob.glob(os.path.join(temp_dir, pattern))
+    # FIX-P8-2: Match both step3_upscale and step3_forced_upscale per v7.32 §3.10.2 L3
+    # ORIGINAL: Only matched step3_upscale*, missing _forced_upscale suffix
+    pattern_upscale = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
+    pattern_forced = f"{job_id}_{Path(input_name).stem}_step3_forced_upscale*"
+    candidates = list(Path(temp_dir).glob(pattern_upscale)) + \
+                 list(Path(temp_dir).glob(pattern_forced))
     # P8-11 fallback A: if no stage3 output, look for stage2 output
     if not candidates:
         pattern2 = f"{job_id}_{Path(input_name).stem}_step2_traditional*"
-        candidates2 = glob.glob(os.path.join(temp_dir, pattern2))
+        candidates2 = list(Path(temp_dir).glob(pattern2))
         if candidates2:
-            candidates2.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            stage3_output = candidates2[0]
-            logger.info("STAGE4_FALLBACK", "No stage3 output, using stage2 output",
+            candidates2.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            stage3_output = str(candidates2[0])
+            logger.info("STAGE4_FALLBACK",
+                        "No stage3 output, using stage2 output",
                         input=stage3_output)
         else:
-            logger.info("STAGE4_SKIP", "No AI upscale or traditional output")
+            logger.info("STAGE4_SKIP",
+                        "No AI upscale or traditional output")
             return 3
     else:
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        stage3_output = candidates[0]
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        stage3_output = str(candidates[0])
+
+    # FIX-P8-13: Validate stage3 output with ffprobe per v6.32 §7.1
+    # ORIGINAL: No validation, could process undecodable input
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error", stage3_output],
+            capture_output=True, timeout=30, shell=False
+        )
+        if r.returncode != 0:
+            logger.error("STAGE4_INPUT_UNDECODABLE",
+                         "Stage 3 output undecodable")
+            return 82
+    except Exception as e:
+        logger.error("STAGE4_INPUT_CHECK_FAIL", str(e))
+        return 82
 
     # P8-7: Compute param_hash for intermediate filename
-    try:
-        from checkpoint import compute_param_hash
-    except Exception:
-        import hashlib
-        def compute_param_hash(input_path, params):
-            param_str = json.dumps(params, sort_keys=True, ensure_ascii=False)
-            file_id = str(os.path.getsize(input_path)) + str(int(os.path.getmtime(input_path)))
-            return hashlib.sha256((param_str + file_id).encode()).hexdigest()[:16]
+    # FIX-P8-8: Enforce checkpoint.compute_param_hash per v7.32 §3.10.19
+    # ORIGINAL: Local fallback used SHA-256 without file content hash,
+    #           silently degrading param_hash quality
+    # checkpoint is a hard dependency - fail fast if not available
+    from checkpoint import compute_param_hash
 
     core_params = {
         "color_lift_r": params.get("color_lift_r", 0.02),
@@ -92,10 +124,14 @@ def main():
     }
     param_hash = compute_param_hash(stage3_output, core_params)
 
-    output_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step4_postprocess_p{param_hash}.mkv")
+    # FIX-P8-10: Use Path instead of os.path.join
+    output_path = str(
+        Path(temp_dir) /
+        f"{job_id}_{Path(input_name).stem}"
+        f"_step4_postprocess_p{param_hash}.mkv"
+    )
 
-    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+    if Path(output_path).exists() and Path(output_path).stat().st_size > 0:
         logger.info("STAGE4_SKIP", "Post-process already done")
         return 3
 
@@ -104,8 +140,9 @@ def main():
     # ISSUE-V-S4-001 / ISSUE-V-S4-002 fix:
     # Selective local processing with gradient-variance region split +
     # feathered transition + final lift/gamma/gain color grading.
-    # Per v6.32 / v7.32: flat regions -> mild gblur; textured -> unsharp;
-    # feathered mask >=8px; colorbalance for lift/gamma/gain.
+    # Per v6.32 / v7.32: flat regions -> mild gblur; textured -> preserve;
+    # skin/hair -> completely excluded; feathered mask >=8px;
+    # colorbalance for lift/gamma/gain.
     lift_r = params.get("color_lift_r", 0.02)
     lift_g = params.get("color_lift_g", 0.01)
     lift_b = params.get("color_lift_b", 0.01)
@@ -116,33 +153,60 @@ def main():
     gain_g = params.get("color_gain_g", 1.02)
     gain_b = params.get("color_gain_b", 1.02)
 
+    # FIX-P8-4: Selective local processing per v6.32 §3
+    # ORIGINAL: No skin/hair protection; unsharp applied to textured regions
+    # Per v6.32 §3: "Human subjects, skin, hair regions are COMPLETELY
+    # EXCLUDED from the mask." Flat regions: mild gblur denoise.
+    # Textured regions: preserve original (no sharpening per spec).
     filter_chain = (
         "split[main][tmp];"
-        # Edge-based region mask: high edge response -> textured (white in mask)
+        # Edge-based region mask (detect flat vs textured)
         "[tmp]edgedetect=mode=colormix:low=0.05:high=0.15,"
         "format=gray,"
-        "geq=lum='if(lt(lum(X,Y),30),0,if(gt(lum(X,Y),90),255,255*(lum(X,Y)-30)/60))'[maskraw];"
-        # Feathered mask via gaussian blur (sigma=6 gives ~12px transition, >=8px per spec)
-        "[maskraw]gblur=sigma=6[mask];"
-        # Flat branch: mild denoise/blur for smooth regions
+        "geq=lum='if(lt(lum(X,Y),30),0,"
+        "if(gt(lum(X,Y),90),255,"
+        "255*(lum(X,Y)-30)/60))'[maskraw];"
+        # Skin-tone detection mask (YCbCr skin range)
+        # Per v6.32 §3: protect human subjects from any processing
+        "[main]format=yuv420p,"
+        "geq=lum='if(between(cb(X,Y),77,127)*between(cr(X,Y),133,173)"
+        "*gt(lum(X,Y),80),255,0)',"
+        "cb='128',cr='128'[skinmask];"
+        # Invert: skin=0 (protect), non-skin=255 (allow processing)
+        "[skinmask]negate[noskin];"
+        # Combine: flat non-skin areas only
+        "[maskraw][noskin]blend=all_mode=multiply[combinedmask];"
+        # Feathered mask via gaussian blur (sigma=6 -> ~12px, >=8px per spec)
+        "[combinedmask]gblur=sigma=6[mask];"
+        # Flat branch: mild denoise for smooth regions
         "[main]gblur=sigma=0.6[flat];"
-        # Detail branch: mild sharpening for textured regions
-        "[main]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.4[detail];"
+        # Detail branch: preserve original (no unsharp per v6.32 §3)
+        # FIX-P8-9: Removed unsharp; textured regions kept as-is
+        "[main]copy[detail];"
         # Masked merge with feathered transition
         "[flat][detail][mask]maskedmerge,"
         # Final color grading: lift/gamma/gain via colorbalance
         f"colorbalance=rs={lift_r}:gs={lift_g}:bs={lift_b}:"
         f"rm={gamma_r}:gm={gamma_g}:bm={gamma_b}:"
-        f"rh={gain_r}:gh={gain_g}:bh={gain_b},"
-        # Saturation/contrast fine tune
-        "eq=saturation=1.05:contrast=1.02"
+        f"rh={gain_r}:gh={gain_g}:bh={gain_b}"
     )
 
-    # v6.3 §3.6 / P8-8: Intermediate format must be FFV1 YUV420P16
+    # FIX-P8-10: Only apply saturation/contrast if explicitly configured
+    # ORIGINAL: Always applied eq=saturation=1.05:contrast=1.02
+    # Per v6.32 §3: no implicit saturation/contrast changes
+    saturation = params.get("post_saturation", 1.0)
+    contrast = params.get("post_contrast", 1.0)
+    if saturation != 1.0 or contrast != 1.0:
+        filter_chain += (
+            f",eq=saturation={saturation}:contrast={contrast}"
+        )
+
+    # v6.3 §3.6: Intermediate format must be FFV1 YUV420P16
     vs_bit_depth = params.get("vs_bit_depth", 16)
     if vs_bit_depth != 16:
         logger.warning("STAGE4_BITDEPTH_FORCE",
-                       f"vs_bit_depth={vs_bit_depth}, forcing 16bit for intermediate")
+                       f"vs_bit_depth={vs_bit_depth}, "
+                       "forcing 16bit for intermediate")
     pix_fmt = "yuv420p16le"
 
     cmd = [
@@ -158,11 +222,14 @@ def main():
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                           timeout=3600, shell=False)
-        if r.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            logger.info("STAGE4_DONE", "Post-processing complete", output=output_path)
+        if (r.returncode == 0 and Path(output_path).exists()
+                and Path(output_path).stat().st_size > 0):
+            logger.info("STAGE4_DONE", "Post-processing complete",
+                        output=output_path)
             return 0
         else:
-            logger.error("STAGE4_FAILED", f"Post-processing failed: {r.stderr[:300]}")
+            logger.error("STAGE4_FAILED",
+                         f"Post-processing failed: {r.stderr[:300]}")
             return 84
     except subprocess.TimeoutExpired:
         logger.error("STAGE4_TIMEOUT", "Post-processing timed out")

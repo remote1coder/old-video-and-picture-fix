@@ -19,12 +19,17 @@ from logger import get_logger  # noqa: E402
 
 def _compute_fft_window_size(sample_rate: int) -> int:
     """Compute adaptive FFT window size for ~85ms duration.
-    
+
     Formula: 2^ceil(log2(sample_rate * 0.085))
-    Examples: 48kHz -> 4096, 44.1kHz -> 4096, 96kHz -> 8192
+    Minimum: max(result, 4096) per v7.32 §3.10.22
+    Examples: 48kHz -> 4096, 44.1kHz -> 4096, 96kHz -> 8192, 8kHz -> 4096 (clamped)
     """
     target_samples = sample_rate * 0.085
-    return int(2 ** math.ceil(math.log2(target_samples)))
+    n = int(2 ** math.ceil(math.log2(target_samples)))
+    # FIX-P3-4: Per v7.32 §3.10.22: enforce minimum N for low-frequency
+    # resolution. At 4096 points, 48kHz gives ~11.7Hz/bin, sufficient for
+    # 45-65Hz analysis.
+    return max(n, 4096)
 
 
 def detect_hum_frequency(audio_path: str, sample_rate: int = 48000,
@@ -50,15 +55,35 @@ def detect_hum_frequency(audio_path: str, sample_rate: int = 48000,
     }
     
     try:
+        # FIX-P3-2: Probe audio duration; if shorter than analyze_seconds,
+        # analyze full audio per v7.32 §3.10.9: "分析音频前 30 秒（若时长
+        # <30s 则分析全音频）"
+        audio_duration = None
+        try:
+            r_dur = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 audio_path],
+                capture_output=True, text=True, timeout=10,
+                shell=False
+            )
+            if r_dur.returncode == 0 and r_dur.stdout.strip():
+                audio_duration = float(r_dur.stdout.strip())
+        except Exception:
+            pass
+
         # Extract audio to raw PCM for FFT analysis
-        cmd = [
-            "ffmpeg", "-y", "-i", audio_path,
-            "-t", str(analyze_seconds),
+        cmd = ["ffmpeg", "-y", "-i", audio_path]
+        if audio_duration is None or audio_duration > analyze_seconds:
+            cmd.extend(["-t", str(analyze_seconds)])
+        cmd.extend([
             "-ar", str(sample_rate),
             "-ac", "1",  # mono for analysis
             "-f", "s16le", "-"
-        ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=60, shell=False)
+        ])
+        proc = subprocess.run(cmd, capture_output=True, timeout=60,
+                              shell=False)
         if proc.returncode != 0:
             return result
         
@@ -332,10 +357,30 @@ def process_audio(audio_path: str, output_path: str,
         # ORDER IS CRITICAL: bandreject FIRST (removes strong single-freq noise),
         # then afftdn/arnndn (noise spectrum estimation needs clean signal)
         filters = []
+        # FIX-P3-2: Promote filter_complex/final_label to function scope so
+        # Step 1 (hum) and Step 2 (denoise) can share the same filter_complex
+        filter_complex = None
+        final_label = "[aout]"
 
         # Step 1: Hum detection and removal (BEFORE noise reduction)
         hum_result = detect_hum_frequency(audio_path, sample_rate, audio_config)
         primary_freq = hum_result["primary_freq"]
+
+        # FIX-P3-1: Per v7.32 §3.10.22 / v6.32 §7.12: Allow user to override hum_freq
+        user_hum_freq = audio_config.get("hum_freq")
+        if user_hum_freq is not None:
+            user_freq = int(user_hum_freq)
+            if user_freq in (50, 60):
+                if primary_freq != user_freq:
+                    logger.info("AUDIO_HUM_OVERRIDE",
+                               f"User override hum_freq={user_freq}Hz "
+                               f"(auto-detected={primary_freq}Hz)")
+                primary_freq = user_freq
+            else:
+                logger.warning("AUDIO_HUM_OVERRIDE_INVALID",
+                              f"Invalid hum_freq={user_freq}, must be 50 or 60. "
+                              f"Using auto-detected {primary_freq}Hz")
+
         # FIX-P3-4: Log warning when no low-frequency content detected
         if hum_result.get("primary_freq") == 50 and hum_result.get("hum_ratio", 0) == 0.0:
             logger.warning("AUDIO_HUM_DEFAULT",
@@ -360,74 +405,174 @@ def process_audio(audio_path: str, output_path: str,
                            filters=hum_filters,
                            is_dual=is_dual)
             else:
-                # FIX-P3-2: FFmpeg <4.4, use arnndn for hum removal per v7.32 §3.10.22 / v6.32 §7.12
+                # FIX-P3-2: FFmpeg <4.4, use arnndn for hum removal per v7.32 §3.10.22
+                # Per v7.32 §3.10.9: per-channel processing, no downmix
                 arnndn_model = _get_arnndn_model_path(audio_config, primary_freq)
                 if not arnndn_model:
                     arnndn_model = audio_config.get("arnndn_model", "")
                 if arnndn_model and Path(arnndn_model).exists():
-                    # arnndn models trained on mono 48kHz
                     if num_channels > 1:
-                        filters.append("aformat=channel_layouts=mono")
-                    filters.append(f"arnndn=m='{arnndn_model}'")
-                    if num_channels > 1:
-                        filters.append(f"aformat=channel_layouts={channel_layout}")
-                    logger.info("AUDIO_HUM_ARNNDN",
-                               f"FFmpeg <4.4, using arnndn for {primary_freq}Hz hum removal",
-                               model=arnndn_model)
+                        # Per-channel arnndn using filter_complex (no downmix!)
+                        # FIX-P3-6: Extended channel_map for 3ch/4ch per
+                        # v7.32 §3.10.9: "严禁混缩为立体声"
+                        channel_map = {
+                            1: ["FC"],
+                            2: ["FL", "FR"],
+                            3: ["FL", "FR", "LFE"],          # 2.1
+                            4: ["FL", "FR", "BL", "BR"],     # Quad / 3.1
+                            6: ["FL", "FR", "FC", "LFE", "BL", "BR"],
+                            8: ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+                        }
+                        ch_names = channel_map.get(num_channels, ["FL", "FR"])
+                        fc_parts = []
+                        for i, ch in enumerate(ch_names):
+                            fc_parts.append(f"[0:a]pan=mono|c0={ch}[ch{i}]")
+                            fc_parts.append(
+                                f"[ch{i}]arnndn=m={arnndn_model}[ch{i}_h]"
+                            )
+                        merge_inputs = "".join(
+                            f"[ch{i}_h]" for i in range(len(ch_names))
+                        )
+                        fc_parts.append(
+                            f"{merge_inputs}amerge=inputs={len(ch_names)}[aout]"
+                        )
+                        filter_complex = ";".join(fc_parts)
+                        final_label = "[aout]"
+                        logger.info("AUDIO_HUM_ARNNDN_MULTICHANNEL",
+                                   f"Per-channel arnndn hum removal for "
+                                   f"{num_channels}ch (FFmpeg <4.4)",
+                                   model=arnndn_model)
+                    else:
+                        filters.append(f"arnndn=m={arnndn_model}")
+                        logger.info("AUDIO_HUM_ARNNDN",
+                                   f"Using arnndn for {primary_freq}Hz hum "
+                                   f"removal (FFmpeg <4.4)",
+                                   model=arnndn_model)
                 else:
-                    logger.warning("AUDIO_HUM_ARNNDN_MISSING",
-                                  f"arnndn model not found for {primary_freq}Hz, "
-                                  "skipping hum removal (FFmpeg <4.4)")
+                    # FIX-P3-3: Per v7.32 §3.10.22: afftdn fallback when
+                    # arnndn unavailable
+                    # FIX-P3-5: Step 1 hum removal fallback — gentler noise
+                    # reduction to avoid damaging speech when replacing
+                    # targeted bandreject filters
+                    logger.warning("AUDIO_HUM_ARNNDN_FALLBACK",
+                                  f"arnndn model not found for "
+                                  f"{primary_freq}Hz, falling back to afftdn "
+                                  "for hum removal (FFmpeg <4.4)")
+                    filters.append("afftdn=nr=6:nf=-25")
 
         # Step 2: Noise reduction (AFTER bandreject)
-        filter_complex = None
         if denoise:
             arnndn_model = _get_arnndn_model_path(audio_config, primary_freq)
             if not arnndn_model:
                 # Fallback to config-provided path
                 arnndn_model = audio_config.get("arnndn_model", "")
-            
+
             if arnndn_model and Path(arnndn_model).exists():
-                # FIX-P3-3: Per-channel arnndn to preserve multi-channel layout per v7.32 §3.10.9
+                # FIX-P3-2: Per-channel arnndn to preserve multi-channel
+                # layout per v7.32 §3.10.9
+                # FIX-P3-1: Per v6.32 §7.30: arnndn stereo input has
+                # community-reported bugs on some CPUs. Use per-channel
+                # filter_complex for ALL multi-channel arnndn processing,
+                # regardless of FFmpeg version.
+                # FIX-P3-6: Extended channel_map for 3ch/4ch per
+                # v7.32 §3.10.9: "严禁混缩为立体声"
                 if num_channels > 1:
+                    # Migrate bandreject from -af to filter_complex so
+                    # they chain correctly with per-channel arnndn
+                    bandreject_filters = [
+                        f for f in filters
+                        if f.startswith("bandreject")
+                    ]
+                    for br in bandreject_filters:
+                        filters.remove(br)
+
                     channel_map = {
+                        1: ["FC"],
                         2: ["FL", "FR"],
+                        3: ["FL", "FR", "LFE"],          # 2.1
+                        4: ["FL", "FR", "BL", "BR"],     # Quad / 3.1
                         6: ["FL", "FR", "FC", "LFE", "BL", "BR"],
                         8: ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
                     }
                     ch_names = channel_map.get(num_channels, ["FL", "FR"])
-                    
-                    # Extract bandreject filters to preserve order (bandreject before arnndn)
-                    bandreject_filters = [f for f in filters if f.startswith("bandreject")]
-                    for br in bandreject_filters:
-                        filters.remove(br)
-                    # Also remove any aformat/arnndn from Step 1 (FFmpeg < 4.4 fallback)
-                    step1_audio_filters = [f for f in filters if f.startswith("aformat") or f.startswith("arnndn")]
-                    for sf in step1_audio_filters:
-                        filters.remove(sf)
-                    
-                    filter_complex = ""
-                    for i, ch in enumerate(ch_names):
-                        filter_complex += f"[0:a]pan=mono|c0={ch}[ch{i}];"
-                        if bandreject_filters:
-                            br_chain = "|".join(bandreject_filters)
-                            filter_complex += f"[ch{i}]{br_chain}[ch{i}_br];"
-                            filter_complex += f"[ch{i}_br]arnndn=m='{arnndn_model}'[ch{i}_d];"
-                        else:
-                            filter_complex += f"[ch{i}]arnndn=m='{arnndn_model}'[ch{i}_d];"
-                    
-                    merge_inputs = "".join(f"[ch{i}_d]" for i in range(len(ch_names)))
-                    filter_complex += f"{merge_inputs}amerge=inputs={len(ch_names)}[aout]"
-                    logger.info("AUDIO_ARNNDN_MULTICHANNEL", 
-                               f"Per-channel arnndn processing for {num_channels}ch layout")
+
+                    if filter_complex is not None:
+                        # Append denoise to existing filter_complex
+                        # (from Step 1 FFmpeg<4.4 per-channel arnndn hum)
+                        fc_parts = [filter_complex]
+                        for i, ch in enumerate(ch_names):
+                            fc_parts.append(
+                                f"[{final_label[1:-1]}]pan=mono|c0=c{i}"
+                                f"[dch{i}]"
+                            )
+                            fc_parts.append(
+                                f"[dch{i}]arnndn=m={arnndn_model}"
+                                f"[dch{i}_out]"
+                            )
+                        merge_inputs = "".join(
+                            f"[dch{i}_out]" for i in range(len(ch_names))
+                        )
+                        fc_parts.append(
+                            f"{merge_inputs}amerge=inputs="
+                            f"{len(ch_names)}[aout2]"
+                        )
+                        filter_complex = ";".join(fc_parts)
+                        final_label = "[aout2]"
+                        logger.info(
+                            "AUDIO_ARNNDN_MULTICHANNEL_APPEND",
+                            f"Appended per-channel arnndn denoise to "
+                            f"existing filter_complex for {num_channels}ch",
+                            model=arnndn_model)
+                    else:
+                        # Build new filter_complex with bandreject +
+                        # arnndn per channel
+                        fc_parts = []
+                        for i, ch in enumerate(ch_names):
+                            fc_parts.append(
+                                f"[0:a]pan=mono|c0={ch}[ch{i}]"
+                            )
+                            if bandreject_filters:
+                                br_chain = ",".join(bandreject_filters)
+                                fc_parts.append(
+                                    f"[ch{i}]{br_chain}[ch{i}_br]"
+                                )
+                                fc_parts.append(
+                                    f"[ch{i}_br]arnndn=m={arnndn_model}"
+                                    f"[ch{i}_d]"
+                                )
+                            else:
+                                fc_parts.append(
+                                    f"[ch{i}]arnndn=m={arnndn_model}"
+                                    f"[ch{i}_d]"
+                                )
+                        merge_inputs = "".join(
+                            f"[ch{i}_d]" for i in range(len(ch_names))
+                        )
+                        fc_parts.append(
+                            f"{merge_inputs}amerge=inputs="
+                            f"{len(ch_names)}[aout]"
+                        )
+                        filter_complex = ";".join(fc_parts)
+                        final_label = "[aout]"
+                        logger.info(
+                            "AUDIO_ARNNDN_MULTICHANNEL",
+                            f"Per-channel arnndn processing for "
+                            f"{num_channels}ch",
+                            model=arnndn_model)
                 else:
-                    filters.append(f"arnndn=m='{arnndn_model}'")
-                    logger.info("AUDIO_DENOISE", "Using arnndn noise reduction", model=arnndn_model)
+                    filters.append(f"arnndn=m={arnndn_model}")
+                    logger.info("AUDIO_DENOISE",
+                               "Using arnndn noise reduction",
+                               model=arnndn_model)
             else:
                 # Fallback to afftdn
+                # FIX-P3-5: Step 2 broad-spectrum denoise fallback — slightly
+                # stronger settings than hum fallback, but still conservative
+                # to avoid artifacts
                 if not ffmpeg_ok:
                     logger.warning("AUDIO_ARNNDN_MISSING",
-                                  f"arnndn model not found for {primary_freq}Hz, using afftdn fallback")
+                                  f"arnndn model not found for "
+                                  f"{primary_freq}Hz, using afftdn fallback")
                 filters.append("afftdn=nr=10:nf=-20")
                 logger.info("AUDIO_DENOISE", "Using afftdn noise reduction")
 
@@ -444,13 +589,28 @@ def process_audio(audio_path: str, output_path: str,
 
         # Build command
         if filter_complex:
-            # FIX-P3-3: Append remaining filters (compand, asetpts) to filter_complex
-            post_filters = [f for f in filters if not f.startswith("bandreject") and not f.startswith("arnndn") and not f.startswith("aformat")]
+            # FIX-P3-2: Append remaining filters (compand, asetpts) to
+            # filter_complex using tracked final_label
+            # FIX-P3-9: When filter_complex is active, arnndn/bandreject are
+            # already inside it. Only append "post-processing" filters
+            # (compand, asetpts) that were added after the per-channel
+            # filter_complex was built.
+            # CAUTION: If a non-per-channel arnndn is ever added to filters[],
+            # this exclusion logic must be revisited — currently safe because
+            # mono arnndn only occurs when filter_complex is None.
+            post_filters = [
+                f for f in filters
+                if not f.startswith("bandreject")
+                and not f.startswith("arnndn")
+                and not f.startswith("aformat")
+            ]
             if post_filters:
-                filter_complex += f";[aout]{','.join(post_filters)}[aout2]"
-                map_label = "[aout2]"
+                filter_complex += (
+                    f";{final_label}{','.join(post_filters)}[aout_final]"
+                )
+                map_label = "[aout_final]"
             else:
-                map_label = "[aout]"
+                map_label = final_label
             cmd = [
                 "ffmpeg", "-y", "-i", audio_path,
                 "-vn",
@@ -585,7 +745,25 @@ def check_av_sync(video_path: str, audio_path: str,
     if logger is None:
         logger = get_logger()
 
-    def _get_duration(path: str) -> float:
+    def _get_duration(path: str, is_video: bool = False) -> float:
+        """Get media duration. For video, try stream-level first
+        (more accurate for VFR content)."""
+        if is_video:
+            # FIX-P3-9: Try stream-level duration first for VFR accuracy
+            try:
+                r = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", path],
+                    capture_output=True, text=True, timeout=30, shell=False
+                )
+                if r.returncode == 0:
+                    val = r.stdout.strip()
+                    if val and val != "N/A":
+                        return float(val)
+            except Exception:
+                pass
+        # Fallback to format-level duration
         try:
             r = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -598,8 +776,8 @@ def check_av_sync(video_path: str, audio_path: str,
             pass
         return 0.0
 
-    v_dur = _get_duration(video_path)
-    a_dur = _get_duration(audio_path)
+    v_dur = _get_duration(video_path, is_video=True)
+    a_dur = _get_duration(audio_path, is_video=False)
 
     if v_dur <= 0 or a_dur <= 0:
         logger.error("AV_SYNC_FAIL", "Cannot determine video or audio duration")

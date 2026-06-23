@@ -7,7 +7,7 @@ Stage 6: Photo Final Encoding
 
 v6.3/v7.3 Compliance:
 - Supports both avif_params (YUV420 10-bit) and avif_rgb444_params (RGB444 16-bit lossless)
-- Grain synthesis moved to stage4_postprocess.py per v7.3 spec
+- Grain synthesis moved to stage5_postprocess.py per v7.32 §3.1
 - Proper CICP tagging
 """
 
@@ -17,7 +17,9 @@ import json
 import argparse
 import glob
 import subprocess
+import shutil
 from pathlib import Path
+from typing import Optional
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
@@ -45,17 +47,24 @@ def _get_avifenc_version() -> tuple:
     return (0, 0, 0)
 
 
-def _resolve_jobs_value(jobs: str) -> str:
+def _resolve_jobs_value(jobs: str) -> Optional[str]:
     """Resolve --jobs value based on avifenc version.
 
-    libavif <1.1.0 does not support 'all' keyword; use CPU count instead.
+    FIX-P12-10: Per v6.32 §7.29:
+    - <0.9.2: --jobs not supported, return None
+    - 0.9.2–1.0.x: 'all' not supported, return cpu count
+    - >=1.1.0: 'all' keyword supported
     """
     if jobs != "all":
         return str(jobs)
     version = _get_avifenc_version()
     if version >= (1, 1, 0):
         return "all"
-    return str(min(os.cpu_count() or 1, 32))
+    elif version >= (0, 9, 2):
+        return str(min(os.cpu_count() or 1, 32))
+    else:
+        # <0.9.2 does not support --jobs at all
+        return None
 
 
 def _build_avifenc_cmd(input_path: str, output_path: str, params: dict, use_rgb444: bool = False) -> list:
@@ -96,7 +105,10 @@ def _build_avifenc_cmd(input_path: str, output_path: str, params: dict, use_rgb4
     if lossless:
         cmd.append("--lossless")
 
-    cmd.extend(["--jobs", _resolve_jobs_value(jobs)])
+    # FIX-P12-10: --jobs may be None for avifenc <0.9.2
+    jobs_val = _resolve_jobs_value(jobs)
+    if jobs_val is not None:
+        cmd.extend(["--jobs", jobs_val])
     cmd.extend([input_path, output_path])
 
     return cmd
@@ -164,17 +176,17 @@ def main():
             output_path = os.path.join(output_dir,
                 f"{Path(input_name).stem}_restored.png")
         try:
-            import shutil
-            shutil.copy2(args.input, output_path)
+            shutil.copyfile(args.input, output_path)
             logger.warning("STAGE6_FALLBACK", f"avifenc missing, saved PNG: {output_path}")
             return 0
         except Exception as e:
             logger.error("STAGE6_FAILED", f"Encoding failed: {e}")
             return 80
 
-    # Find input: stage5 > stage4 > stage3 > stage1 - sort by mtime
+    # FIX-P10-1: Updated search order for new stage numbering
+    # Find input: stage5_postprocess > stage4_face > stage3_upscale > stage2_ai_pre > stage1_preprocess
     input_source = None
-    for pat in ["step5_face*", "step4_postprocess*", "step3_upscale*", "step1_preprocess*"]:
+    for pat in ["step5_postprocess*", "step4_face*", "step3_upscale*", "step2_ai_pre*", "step1_preprocess*"]:
         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
         if candidates:
@@ -301,7 +313,7 @@ def main():
             else:
                 fallback_path = output_path.rsplit(".", 1)[0] + ".png"
                 import shutil
-                shutil.copy2(working_path, fallback_path)
+                shutil.copyfile(working_path, fallback_path)
                 logger.warning("STAGE6_FALLBACK", f"avifenc failed, saved PNG fallback: {fallback_path}")
             # WSL copyback for fallback too (Bug P-29 fix)
             if original_output_path:
@@ -314,4 +326,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    # FIX-P11-5: main() must return explicit int exit code per v7.32 §3.5
+    # ORIGINAL: sys.exit(main() or 0) — "or 0" masks None returns
+    rc = main()
+    if rc is None:
+        rc = 86  # validation failure — main() must always return explicit exit code
+    sys.exit(rc)
