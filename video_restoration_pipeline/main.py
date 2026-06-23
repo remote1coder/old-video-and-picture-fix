@@ -64,8 +64,10 @@ def parse_args():
                         help="AI upscale factor 2x or 4x (overrides config.ai.upscale_scale)")
     parser.add_argument("--face-restore", choices=["GFPGAN", "CodeFormer", ""], default=None,
                         help="Face restore model (overrides config.ai.face_restore)")
-    parser.add_argument("--ai-model", choices=["RealESRGAN_x2plus", "RealESRGAN_x4plus",
-                                                "DAT_x2", "DAT_x4"], default=None,
+    parser.add_argument("--ai-model", choices=["realesr-general-x4v3",
+                                                "RealESRGAN_x2plus", "RealESRGAN_x4plus",
+                                                "DAT_x2", "DAT_x4",
+                                                "DAT_2_x2", "DAT_2_x4"], default=None,
                         help="AI upscale model (overrides config.ai.upscale_model)")
     # ISSUE-V-MGEN-003: incremental manifest scan
     parser.add_argument("--incremental", action="store_true",
@@ -389,7 +391,11 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         stages.append((4, "stage4_postprocess.py"))
 
     face_restore = params.get("face_restore", "")
-    if ai_enabled and face_restore:
+    # FIX-P1-12: stage5 (face restore) must run AFTER stage3/4 (AI upscale).
+    # When ai_upscale_banned=True and force_allow=False, stage3/4 are skipped
+    # (line above), so stage5 would have no input → fail. Gate stage5 with the
+    # same banned condition. (force_allow=True keeps stage5 as normal.)
+    if ai_enabled and face_restore and not (ai_banned and not force_allow):
         stages.append((5, "stage5_ai_face.py"))
 
     stages.append((6, "stage6_grain_synthesis.py"))

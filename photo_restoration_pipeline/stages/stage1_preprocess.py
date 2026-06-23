@@ -592,13 +592,14 @@ def apply_channel_correction(img_path: str, output_path: str,
                         # Near-constant channel: just shift mean
                         corrected[:, :, c] = ch - ch_mean + target_mean
 
-        # Clamp to valid range
-        corrected = np.clip(corrected, 0.0, 1.0)
-
-        # Optional soft compression
+        # FIX-P1-3: Reinhard tone mapping BEFORE clamp (standard order per
+        # v7.32 §3.10.6). Tone-map first to compress out-of-range highlights/
+        # shadows, THEN clamp. Clamping first would hard-clip super-white/
+        # super-black detail that tone mapping is meant to preserve.
         if params.get("channel_correction_soft_compress", True):
             corrected = _reinhard_tone_map(corrected)
-            corrected = np.clip(corrected, 0.0, 1.0)
+        # Clamp to valid range (after tone mapping)
+        corrected = np.clip(corrected, 0.0, 1.0)
 
         # Convert back to sRGB
         if formula == "iec61966-2-1":
@@ -809,60 +810,56 @@ def main():
     if params.get("scratch_remove", True):
         logger.info("STAGE1_SCRATCH", "Removing scratches")
         scratch_out = working_path + ".scratch.tif"
-        # FIX-P11-1: G'MIC commands require '-' prefix per CLI syntax
-        # ORIGINAL: ["fx_remove_scratches", ...] → G'MIC interprets as filename
-        scratch_strength = str(params.get("scratch_remove_strength", 20))
-        success = False
-        stderr = ""
-        for cmd_name in ["-fx_remove_scratches", "-remove_scratches"]:
-            success, stderr = run_gmic(working_path, scratch_out,
-                                       cmd_name, scratch_strength)
-            if success:
-                break
-            logger.warning("STAGE1_SCRATCH_CMD",
-                          f"G'MIC {cmd_name} failed, trying next: "
-                          f"{stderr[:200]}")
-
-        # Fallback to despeckle if all scratch commands fail
+        # FIX-A1: G'MIC stdlib has no -fx_remove_scratches/-remove_scratches/
+        # -despeckle commands. Use real stdlib command -denoise_haar (Haar
+        # wavelet denoise) as scratch/isolated-defect approximation.
+        # scratch_remove_strength(0-100) → denoise_haar threshold(0.5-2.5)
+        scratch_strength = params.get("scratch_remove_strength", 20)
+        haar_thresh = 0.5 + (max(0, min(100, scratch_strength)) / 100.0) * 2.0
+        success, stderr = run_gmic(working_path, scratch_out,
+                                   "-denoise_haar", f"{haar_thresh:.3f}")
         if not success:
-            logger.warning("STAGE1_SCRATCH_FALLBACK",
-                          "fx_remove_scratches unavailable, "
-                          "falling back to -despeckle")
-            success, stderr = run_gmic(working_path, scratch_out,
-                                       "-despeckle", scratch_strength)
+            logger.warning("STAGE1_SCRATCH_CMD",
+                          f"G'MIC -denoise_haar failed: {stderr[:200]}")
 
         if success and Path(scratch_out).exists():
             working_path = scratch_out
-        elif not success:
+        else:
             logger.error("STAGE1_SCRATCH_FAIL",
                         f"G'MIC scratch removal failed: {stderr}")
             return PHOTO_ERR_GMIC_FAIL
 
-    # Deblock (DCT-based via G'MIC)
+    # Deblock (JPEG-like block artifacts)
     if params.get("deblock_strength", 0) > 0:
-        logger.info("STAGE1_DEBLOCK", "DCT deblocking")
+        logger.info("STAGE1_DEBLOCK", "Deblocking")
         deblock_out = working_path + ".deblock.tif"
-        # G'MIC -deblock operates in DCT transform domain for JPEG-like artifacts
+        # FIX-A1: G'MIC stdlib has no -deblock. Use real stdlib command
+        # -denoise_patchpca (patch-PCA denoise) which targets block/patch
+        # artifacts. deblock_strength(0-100) → threshold(0.5-3.0)
+        deblock_strength = params.get("deblock_strength", 25)
+        pca_thresh = 0.5 + (max(0, min(100, deblock_strength)) / 100.0) * 2.5
         success, stderr = run_gmic(working_path, deblock_out,
-                          "-deblock",
-                          str(params.get("deblock_strength", 25)))
+                          "-denoise_patchpca", f"{pca_thresh:.3f}")
         if success and Path(deblock_out).exists():
             working_path = deblock_out
         elif not success:
-            logger.error("STAGE1_DEBLOCK_FAIL", f"G'MIC -deblock failed: {stderr}")
+            logger.error("STAGE1_DEBLOCK_FAIL", f"G'MIC -denoise_patchpca failed: {stderr}")
             return PHOTO_ERR_GMIC_FAIL
 
     # Deband
     if params.get("deband_threshold", 0) > 0:
         logger.info("STAGE1_DEBAND", "Debanding")
         deband_out = working_path + ".deband.tif"
+        # FIX-A1: G'MIC stdlib has no -deband. Use real stdlib command
+        # -denoise_haar (light smoothing) for banding. deband_threshold
+        # (default 1.2) maps directly to denoise_haar threshold.
         success, stderr = run_gmic(working_path, deband_out,
-                          "-deband",
+                          "-denoise_haar",
                           str(params.get("deband_threshold", 1.2)))
         if success and Path(deband_out).exists():
             working_path = deband_out
         elif not success:
-            logger.error("STAGE1_DEBAND_FAIL", f"G'MIC -deband failed: {stderr}")
+            logger.error("STAGE1_DEBAND_FAIL", f"G'MIC -denoise_haar (deband) failed: {stderr}")
             return PHOTO_ERR_GMIC_FAIL
 
     # Grain extraction moved BEFORE scratch removal per v6.32 §4.2.1 (FIX-P11-3)

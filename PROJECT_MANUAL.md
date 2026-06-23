@@ -130,15 +130,25 @@ havsfunc==33
 mkdir models
 cd models
 
-# RealESRGAN (AI放大)
-wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.0/RealESRGAN_x2plus.pth
-wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.0/RealESRGAN_x4plus.pth
+# RealESRGAN (AI放大，默认 realesr-general-x4v3 通用修复版)
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
+# 可选备用: realesr-general-wdn-x4v3.pth / RealESRGAN_x2plus.pth / RealESRGAN_x4plus.pth
 
 # GFPGAN (面部修复)
-wget https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
+wget https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth
 
-# DAT (AI放大备选，可选)
-# 从 https://github.com/ckkelvinchan/DAT/releases 下载 DAT_x2.pth 和 DAT_x4.pth
+# DAT (AI放大备选，默认 DAT-2)
+# 从 https://github.com/zhengchen1999/DAT 的 README Google Drive 链接下载 DAT_2_x2.pth 和 DAT_2_x4.pth
+# （官方仓库是 zhengchen1999/DAT，模型在 Google Drive/百度网盘，不在 GitHub Releases）
+
+# CodeFormer (面部修复备选)
+# 从 https://github.com/sczhou/CodeFormer 的 Google Drive 下载 codeformer.pth
+
+# arnndn (音频降噪，FFmpeg<4.4 降级用)
+# 从 https://github.com/richardpl/arnndn-models 下载 std.rnnn 放入 models/
+
+# RetinaFace 人脸检测权重
+# detection_Resnet50_Final.pth 放入 models/ 或 facexlib/weights/（facexlib 缺失时自动下载）
 
 cd ..
 ```
@@ -248,7 +258,7 @@ global:
 
 ai:
   enabled: false                   # 是否启用AI放大
-  upscale_model: "RealESRGAN_x2plus"
+  upscale_model: "realesr-general-x4v3"
   upscale_scale: 2                 # 放大倍数 (仅支持 2 或 4)
   face_restore: ""                 # GFPGAN 或 CodeFormer，空字符串表示不启用
   force_traditional_first: true    # 强制先执行传统修复
@@ -295,7 +305,7 @@ photo:
 
 ai:
   enabled: false
-  upscale_model: "RealESRGAN_x2plus"
+  upscale_model: "realesr-general-x4v3"
   upscale_scale: 2                 # 仅支持 2 或 4
   face_restore: ""                 # GFPGAN 或 CodeFormer
   force_traditional_first: true

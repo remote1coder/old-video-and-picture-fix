@@ -584,8 +584,18 @@ def _run_single_job(job: Dict[str, Any],
                 logger.info("USER_SKIP", "User declined low-confidence file")
                 return 3
 
+    # FIX-P1-11: Inject manifest job's recommended_params and user_overrides
+    # into the merge so the 6-layer priority chain (Layer 4/5) actually
+    # takes effect. Previously these were never passed → user edits in
+    # --edit-manifest were silently dropped.
+    merge_input = dict(cli_params)
+    if job.get("recommended_params"):
+        merge_input["recommended_params"] = job["recommended_params"]
+    if job.get("user_overrides"):
+        merge_input["user_overrides"] = job["user_overrides"]
+
     # Parameter merge (with override logging)
-    params = merge_params(config, detected_class, cli_params, logger=logger)
+    params = merge_params(config, detected_class, merge_input, logger=logger)
     params["detected_class"] = detected_class
     params["confidence"] = confidence
     params["ai_upscale_banned"] = ai_upscale_banned

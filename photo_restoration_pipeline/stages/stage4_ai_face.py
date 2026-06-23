@@ -327,7 +327,7 @@ def run_codeformer(input_path: str, output_dir: str,
         if not model_dir:
             project_root = SCRIPT_DIR.parent.parent.resolve()
             model_dir = str(project_root / "models")
-        model_path = os.path.join(model_dir, "CodeFormer.pth")
+        model_path = os.path.join(model_dir, "codeformer.pth")
         if not os.path.exists(model_path):
             return False  # No model available, cannot perform inference
 

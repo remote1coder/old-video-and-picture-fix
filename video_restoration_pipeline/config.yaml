@@ -40,10 +40,10 @@ paths:
       tff_bff_percent: 10
       progressive_percent: 90
     deinterlace: "QTGMC"
-    denoise: "TemporalDegrain2"
+    denoise: "TemporalDegrain"          # havsfunc VS 函数名（无"2"，r33 真实参数 sigma/blockWidth）
     denoise_params:
-      degrainTR: 2
-      grainLevel: 2
+      sigma: 16
+      blockWidth: 16
     target_resolution: "720x480"
     target_fps: "auto"
     chroma_shift: true
@@ -173,8 +173,9 @@ grain_factory3:
 ai:
   enabled: false
   face_restore: "GFPGAN"
-  upscale_model: "RealESRGAN_x2plus"
+  upscale_model: "realesr-general-x4v3"
   upscale_scale: 2
+  model_dir: ""  # Empty = auto-detect PROJECT_ROOT/models; set explicit path if needed
   max_scale: 4
   lanczos_target: "auto"
   grain_strength: 0.3
@@ -213,8 +214,7 @@ audio:
   sample_rate: "auto"
   ffmpeg_min_version: "4.4"
   fallback_denoise: "arnndn"
-  arnndn_model_url: "https://github.com/NullModel/arnndn-models"
-  arnndn_model_50hz: "arnndn_50Hz.pb"
-  arnndn_model_60hz: "arnndn_60Hz.pb"
+  arnndn_model_url: "https://github.com/richardpl/arnndn-models"
+  arnndn_model: "std.rnnn"          # Xiph RNNoise 原版通用模型（.rnnn，非 .pb）
   multichannel_preserve: true
   compand_syntax_note: "subprocess_list_mode_points_pipe_or_space_separated"

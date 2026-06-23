@@ -584,26 +584,31 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
     # FIX-P9-10: VFR sample interval based on actual FPS per v7.32 §3.10.5
     # ~5 samples per second; interval = max(1, int(fps * 0.2))
     # Falls back to every 5th frame if fps unknown
-    sample_fps = fps_val if fps_val > 0 else 25.0
-    # Compute fps_val from probe info if available
-    if fps_val <= 0:
-        try:
-            r_fps = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=r_frame_rate",
-                 "-of", "default=noprint_wrappers=1:nokey=1",
-                 video_path],
-                capture_output=True, text=True, timeout=10, shell=False
-            )
-            if r_fps.returncode == 0 and r_fps.stdout.strip():
-                fps_raw = r_fps.stdout.strip()
-                if "/" in fps_raw:
-                    num, den = fps_raw.split("/")
-                    sample_fps = float(num) / float(den) if float(den) else 25.0
-                else:
-                    sample_fps = float(fps_raw)
-        except Exception:
-            sample_fps = 25.0
+    # FIX-P0-1: fps_val was referenced but never defined in this scope →
+    # NameError when face_restore enabled. Derive fps from avg_interval
+    # (already computed above from PTS) first, then probe r_frame_rate.
+    sample_fps = 25.0
+    if avg_interval > 0:
+        sample_fps = 1.0 / avg_interval
+    try:
+        r_fps = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
+            capture_output=True, text=True, timeout=10, shell=False
+        )
+        if r_fps.returncode == 0 and r_fps.stdout.strip():
+            fps_raw = r_fps.stdout.strip()
+            if "/" in fps_raw:
+                num, den = fps_raw.split("/")
+                sample_fps = float(num) / float(den) if float(den) else sample_fps
+            else:
+                sample_fps = float(fps_raw)
+    except Exception:
+        pass
+    if sample_fps <= 0:
+        sample_fps = 25.0
     sample_interval = max(1, int(sample_fps * 0.2))  # ~5 samples per second
 
     cmd = [
@@ -1053,35 +1058,23 @@ def _match_face_color_opencv(frame_dir: str, face_boxes_dict: dict,
 
 def _match_face_color_gmic(frame_dir: str, face_boxes_dict: dict,
                             logger_obj=None):
-    """Plan B: G'MIC match_histogram for color matching per v7.32 §3.10.7.
+    """Plan B: G'MIC transfer_histogram for color matching per v7.32 §3.10.7.
 
-    Uses G'MIC CLI transfer_colors command with pre-generated ROI masks.
+    FIX-A1: G'MIC 3.7.6 has NO -transfer_colors/-match_histogram command
+    (verified via `gmic -help`). The real command is -transfer_histogram,
+    which requires a reference image. Without a per-frame neck/hand reference
+    extracted via landmark detection, a global single-image transfer is not
+    applicable. So Plan B logs a WARNING and returns without modifying frames,
+    letting Plan C (manual intermediate) take over. Full ROI-based matching
+    should use Plan A (OpenCV LAB), which is the primary path.
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
     """
-    # Determine gmic executable path
-    gmic_path = shutil.which("gmic")
-    if not gmic_path:
-        gmic_path = shutil.which("gmic.exe")
-    if not gmic_path:
-        raise RuntimeError("G'MIC not found in PATH")
-    for fp in sorted(Path(frame_dir).glob("*.png")):
-        frame_key = fp.name
-        boxes = face_boxes_dict.get(frame_key, [])
-        if not boxes:
-            continue
-        # Use G'MIC transfer_colors for simple global color matching
-        # This is a simplified approach; full ROI masking requires landmark detection
-        try:
-            subprocess.run(
-                [gmic_path, str(fp), "-transfer_colors[0]", "0,0,1,100,3",
-                 "-output", str(fp)],
-                capture_output=True, timeout=30, shell=False
-            )
-        except Exception:
-            pass
     if logger_obj:
-        logger_obj.info("STAGE5_COLOR_GMIC",
-                        "Plan B: G'MIC color matching applied")
+        logger_obj.warning("STAGE5_COLOR_GMIC_SKIP",
+                           "Plan B (G'MIC) skipped: -transfer_colors/-match_histogram "
+                           "do not exist in G'MIC 3.7.6; -transfer_histogram needs a "
+                           "reference image. Falling back to Plan C.")
+    return
 
 
 def _save_intermediate_for_manual(frame_dir: str,
