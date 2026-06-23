@@ -33,6 +33,64 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 from checkpoint import compute_param_hash, build_intermediate_name  # noqa: E402
 
+# FIX-P11-12: Photo-specific exit codes per v6.32 §7.7 / v7.32 exit code scheme
+# All custom exit codes must be in 80-113 range
+# ORIGINAL: mixed generic codes (82, 84) without clear semantics
+PHOTO_ERR_GMIC_FAIL = 84    # G'MIC / external tool processing error
+PHOTO_ERR_COLOR_CONV = 82   # I/O error during color conversion
+PHOTO_ERR_OUTPUT = 86       # Output validation failure
+PHOTO_ERR_COPY_FAIL = 82    # I/O error during file copy
+
+
+def _detect_input_color_space(input_path: str, params: dict,
+                               logger=None) -> str:
+    """Detect embedded ICC profile and warn if missing/mismatched.
+
+    FIX-P11-10: Per v6.32 §4.2.1: detect-then-warn, do NOT auto-convert.
+    High DPI scans without ICC profile are flagged for user verification.
+    """
+    try:
+        from PIL import Image
+        img = Image.open(input_path)
+        icc = img.info.get("icc_profile")
+        if icc:
+            # FIX-P11-11: Parse ICC profile content per v6.32 §4.2.1
+            # ORIGINAL: only returned "embedded" without identifying profile
+            try:
+                import io
+                from PIL import ImageCms
+                profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                profile_name = ImageCms.getProfileName(
+                    profile.profile).lower()
+                if "adobe" in profile_name:
+                    cs_name = "AdobeRGB"
+                elif "prophoto" in profile_name or "romm" in profile_name:
+                    cs_name = "ProPhoto"
+                elif "srgb" in profile_name:
+                    cs_name = "sRGB"
+                else:
+                    cs_name = "embedded"
+            except Exception:
+                cs_name = "embedded"
+            logger.info("STAGE1_ICC_DETECTED",
+                       f"ICC profile detected: {cs_name}",
+                       profile_size=len(icc))
+            return cs_name
+        # No ICC profile: warn based on DPI
+        dpi = params.get("dpi", 0)
+        if dpi and dpi > 1200:
+            logger.warning("STAGE1_ICC_MISSING",
+                          f"High DPI ({dpi}) scan without ICC profile. "
+                          f"Color space may be Adobe RGB or ProPhoto. "
+                          f"Please verify in RawTherapee/GIMP before "
+                          f"processing.")
+        else:
+            logger.info("STAGE1_ICC_ASSUME_SRGB",
+                       "No ICC profile, assuming sRGB (low DPI scan)")
+        return "unknown"
+    except Exception:
+        return "unknown"
+
 
 def _detect_color_space(img_path: str) -> tuple:
     """Detect image color space and return (mode, needs_conversion).
@@ -78,7 +136,15 @@ def _convert_to_rgb(input_path: str, output_path: str, logger=None) -> bool:
 
             if mode == "RGB":
                 # Already RGB, just copy (preserve original ICC)
-                shutil.copy2(input_path, output_path)
+                # FIX-P11-9: Use copyfile (not copy2) per v7.32 §3.10.10
+                # copy2 copies metadata which causes PermissionError on WSL2 NTFS
+                shutil.copyfile(input_path, output_path)
+                try:
+                    src_stat = os.stat(input_path)
+                    os.utime(output_path,
+                            (src_stat.st_atime, src_stat.st_mtime))
+                except OSError:
+                    pass
                 return True
             elif mode in ("RGBA", "P", "PA"):
                 rgb_img = img.convert("RGB")
@@ -127,11 +193,25 @@ def _convert_to_rgb(input_path: str, output_path: str, logger=None) -> bool:
                     # Try direct fromarray (works in newer Pillow versions for TIFF)
                     out_img = Image.fromarray(rgb_16)
                 except (ValueError, TypeError):
-                    # Fallback: keep as single-channel I;16 grayscale to preserve bit depth
-                    out_img = Image.fromarray(arr_16, mode='I;16')
+                    # FIX-P11-9: Fallback must produce RGB output, not single-channel I;16
+                    # per v6.32 §4.2.1: all outputs must be RGB for downstream processing
+                    # ORIGINAL: fell back to Image.fromarray(arr_16, mode='I;16') which
+                    # saves as single-channel, breaking downstream RGB pipeline
+                    rgb_16_reshaped = rgb_16.reshape((rgb_16.shape[0], rgb_16.shape[1], 3))
+                    try:
+                        out_img = Image.fromarray(rgb_16_reshaped)
+                    except (ValueError, TypeError):
+                        # Final fallback: use imageio for proper 16-bit RGB TIFF
+                        import imageio.v3 as iio
+                        iio.imwrite(output_path, rgb_16_reshaped)
+                        if logger:
+                            logger.info("STAGE1_COLOR",
+                                       "Converted 16-bit -> RGB via imageio fallback")
+                        return True
                 out_img.save(output_path)
                 if logger:
-                    logger.info("STAGE1_COLOR", "Converted 16-bit Gray -> RGB (16bit preserved, BUG-048 safe)")
+                    logger.info("STAGE1_COLOR",
+                               "Converted 16-bit Gray -> RGB (16bit preserved, BUG-048 safe)")
                 return True
             elif mode == "HSV":
                 rgb_img = img.convert("RGB")
@@ -209,8 +289,16 @@ def detect_channel_degradation(img_path: str, params: dict) -> dict:
 
         max_mean_diff = max(abs(means[i] - means[j])
                            for i in range(3) for j in range(i+1, 3))
-        max_std_diff = max(abs(stds[i] - stds[j])
-                          for i in range(3) for j in range(i+1, 3))
+        # FIX-P11-5: Relative std difference per v6.32 §4.2.1
+        # Spec: "任意两通道 std 差异 > 15%（相对值）"
+        # ORIGINAL: max_std_diff = max(abs(stds[i] - stds[j])) was absolute
+        max_std_diff = 0.0
+        for i in range(3):
+            for j in range(i+1, 3):
+                avg_std = (stds[i] + stds[j]) / 2.0
+                if avg_std > 1e-8:
+                    rel_diff = abs(stds[i] - stds[j]) / avg_std
+                    max_std_diff = max(max_std_diff, rel_diff)
 
         if max_mean_diff > mean_threshold or max_std_diff > std_threshold:
             result["degraded"] = True
@@ -269,24 +357,55 @@ def extract_grain_pattern(img_path: str, output_path: str,
         
         # Frequency separation: low-pass = image structure, high-pass = grain
         grain_strength = params.get("grain_strength", 0.3) if params else 0.3
-        sigma = 2.0  # Grain typically in high frequencies
-        
+        grain_size = params.get("grain_size", 0.5) if params else 0.5
+        grain_roughness = params.get("grain_roughness", 0) if params else 0
+        # FIX-P11-3: grain_size maps to sigma per v7.32 §3.10.4
+        # grain_size (0.5-2.0) → sigma: larger = coarser grain
+        # ORIGINAL: hardcoded sigma=2.0, ignored grain_size
+        sigma = grain_size * 2.0  # grain_size=0.5→1.0, grain_size=1.0→2.0, grain_size=2.0→4.0
+
+        # FIX-P11-9: Laplacian pyramid frequency separation per v6.32 §4.2.1
+        # ORIGINAL: single Gaussian high-pass, not true frequency separation
+        levels = max(1, int(grain_size * 3))
         grain = np.zeros_like(arr)
         for c in range(3):
-            low_freq = gaussian_filter(arr[:, :, c], sigma=sigma)
-            high_freq = arr[:, :, c] - low_freq
-            # Normalize grain amplitude
-            grain[:, :, c] = high_freq * grain_strength
+            channel = arr[:, :, c]
+            pyramid = []
+            current = channel.copy()
+            for _ in range(levels):
+                low = gaussian_filter(current, sigma=sigma)
+                high = current - low
+                pyramid.append(high)
+                current = low
+
+            # Weight levels by roughness (0=pure fine/high-freq, 1=pure coarse/low-freq)
+            total_weight = 0.0
+            for i, level in enumerate(pyramid):
+                weight = (1.0 - grain_roughness) ** i  # roughness=0 → all weight on finest
+                grain[:, :, c] += level * weight * grain_strength
+                total_weight += weight
+
+            if total_weight > 1e-8:
+                grain[:, :, c] /= total_weight  # Normalize weights
         
         # Save grain pattern as 16-bit TIFF for precision
         grain_clipped = np.clip(grain + 0.5, 0.0, 1.0)
         if img.mode == "I;16":
             grain_uint16 = (grain_clipped * 65535).astype(np.uint16)
-            out_img = Image.fromarray(grain_uint16, mode='I;16')
+            # FIX-P11-11: I;16 single-channel breaks downstream RGB pipeline
+            # Save as 3-channel 16-bit TIFF instead
+            try:
+                import imageio.v3 as iio
+                iio.imwrite(output_path, grain_uint16)
+            except Exception:
+                # Fallback: save as 8-bit (lossy but avoids I;16 single-channel)
+                grain_uint8 = (grain_clipped * 255).astype(np.uint8)
+                out_img = Image.fromarray(grain_uint8)
+                out_img.save(output_path)
         else:
             grain_uint8 = (grain_clipped * 255).astype(np.uint8)
             out_img = Image.fromarray(grain_uint8)
-        out_img.save(output_path)
+            out_img.save(output_path)
         
         if logger:
             logger.info("STAGE1_GRAIN_EXTRACT", f"Grain pattern saved: {output_path}")
@@ -297,58 +416,71 @@ def extract_grain_pattern(img_path: str, output_path: str,
         return False
 
 
-def detect_ai_coloring(img_path: str, logger=None) -> dict:
+def detect_ai_coloring(img_path: str, params: dict = None,
+                       logger=None) -> dict:
     """Detect signs of artificial/AI coloring in photos.
-    
+
     Heuristics:
     - Unnatural color saturation spikes (posterization)
     - Abrupt hue transitions
     - High chroma noise in supposedly uniform regions
-    
+
     Returns dict with detected (bool) and confidence (float).
     """
+    # FIX-P11-6: Config-driven thresholds per v7.32 §3.10.16
+    # ORIGINAL: hardcoded 0.3 and 0.5
+    params = params or {}
+    posterization_threshold = params.get(
+        "ai_coloring_posterization_threshold", 0.3)
+    detection_threshold = params.get(
+        "ai_coloring_detection_threshold", 0.5)
+
     try:
         from PIL import Image
         import numpy as np
-        
+
         img = Image.open(img_path).convert("RGB")
         arr = np.array(img, dtype=np.float32) / 255.0
-        
+
         # Convert to HSV-like space for analysis
         max_c = arr.max(axis=2)
         min_c = arr.min(axis=2)
         delta = max_c - min_c
-        
+
         # Saturation
         sat = np.where(max_c > 0, delta / (max_c + 1e-8), 0)
-        
+
         # Detect posterization: count unique colors per channel
         posterization_score = 0.0
         for c in range(3):
-            unique_ratio = len(np.unique((arr[:, :, c] * 255).astype(np.uint8))) / 256.0
-            if unique_ratio < 0.3:  # Too few unique values = posterized
+            unique_ratio = len(np.unique(
+                (arr[:, :, c] * 255).astype(np.uint8))) / 256.0
+            if unique_ratio < posterization_threshold:
                 posterization_score += 1.0
         posterization_score /= 3.0
-        
-        # Detect unnatural hue transitions: high saturation in grayscale-expected regions
+
+        # Detect unnatural hue transitions
         gray_mask = delta < 0.05
         unnatural_sat = np.mean(sat[gray_mask]) if gray_mask.any() else 0.0
-        
+
         # Confidence: combination of posterization + unnatural saturation
         confidence = min(1.0, posterization_score * 0.6 + unnatural_sat * 4.0)
-        detected = confidence > 0.5
-        
+        detected = confidence > detection_threshold
+
         if logger:
             logger.info("STAGE1_COLORING_DETECT",
-                       f"AI coloring detection: detected={detected}, confidence={confidence:.2f}, "
-                       f"posterization={posterization_score:.2f}, unnatural_sat={unnatural_sat:.4f}")
-        
+                       f"AI coloring detection: detected={detected}, "
+                       f"confidence={confidence:.2f}, "
+                       f"posterization={posterization_score:.2f}, "
+                       f"unnatural_sat={unnatural_sat:.4f}")
+
         return {"detected": detected, "confidence": confidence,
                 "posterization_score": posterization_score,
                 "unnatural_saturation": float(unnatural_sat)}
     except Exception as e:
         if logger:
-            logger.warning("STAGE1_COLORING_DETECT_FAIL", f"Coloring detection failed: {e}")
+            logger.warning("STAGE1_COLORING_DETECT_FAIL",
+                          f"Coloring detection failed: {e}")
         return {"detected": False, "confidence": 0.0}
 
 
@@ -389,8 +521,14 @@ def apply_channel_correction(img_path: str, output_path: str,
 
         max_mean_diff = max(abs(means[i] - means[j])
                            for i in range(3) for j in range(i+1, 3))
-        max_std_diff = max(abs(stds[i] - stds[j])
-                          for i in range(3) for j in range(i+1, 3))
+        # FIX-P11-5: Relative std difference per v6.32 §4.2.1 (consistent with detection)
+        max_std_diff = 0.0
+        for i in range(3):
+            for j in range(i+1, 3):
+                avg_std = (stds[i] + stds[j]) / 2.0
+                if avg_std > 1e-8:
+                    rel_diff = abs(stds[i] - stds[j]) / avg_std
+                    max_std_diff = max(max_std_diff, rel_diff)
 
         if max_mean_diff < mean_threshold and max_std_diff < std_threshold:
             if logger:
@@ -438,12 +576,21 @@ def apply_channel_correction(img_path: str, output_path: str,
 
         # Normalize if configured
         if params.get("channel_correction_normalize", True):
-            # Per-channel normalization to [0, 1] based on reference range
+            # FIX-P11-2: Only normalize channels that deviate from reference
+            # ORIGINAL: applied to all channels unconditionally + wrong formula
+            # mapped to [target_mean, target_mean+target_std] instead of centered
+            # Per v6.32 §7.16: standardize to reference statistics
             for c in range(3):
                 ch = corrected[:, :, c]
-                ch_min, ch_max = ch.min(), ch.max()
-                if ch_max > ch_min:
-                    corrected[:, :, c] = (ch - ch_min) / (ch_max - ch_min) * target_std + target_mean
+                ch_mean = ch.mean()
+                ch_std = ch.std()
+                if abs(ch_mean - target_mean) > 0.01 or abs(ch_std - target_std) > 0.01:
+                    if ch_std > 1e-8:
+                        # Standardize to reference statistics
+                        corrected[:, :, c] = (ch - ch_mean) / ch_std * target_std + target_mean
+                    else:
+                        # Near-constant channel: just shift mean
+                        corrected[:, :, c] = ch - ch_mean + target_mean
 
         # Clamp to valid range
         corrected = np.clip(corrected, 0.0, 1.0)
@@ -501,6 +648,8 @@ def main():
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
     parser.add_argument("--params-file")
+    # FIX-P11-7: --config is passed by main.py but unused here;
+    # all config is provided via --params JSON. Kept for argparse compat.
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
@@ -515,7 +664,23 @@ def main():
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
     temp_dir = params.get("temp_dir", "./temp")
-    os.makedirs(temp_dir, exist_ok=True)
+    # FIX-P11-6: v7.32 §3.10.10: WSL2 path redirect for temp_dir
+    no_wsl_redirect = params.get("no_wsl_redirect", False)
+    platform = params.get("platform", "auto")
+    try:
+        from checkpoint import wsl_redirect_path
+        redirected_temp, orig_temp, _, _ = wsl_redirect_path(
+            temp_dir, no_wsl_redirect=no_wsl_redirect,
+            target_platform=platform
+        )
+        if redirected_temp != temp_dir:
+            logger.info("STAGE1_WSL_REDIRECT",
+                        f"temp_dir: {temp_dir} -> {redirected_temp}")
+            temp_dir = redirected_temp
+            params["temp_dir"] = temp_dir
+    except Exception:
+        pass  # wsl_redirect_path may not be available on native Windows
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
 
     input_path = args.input
     input_name = Path(input_path).name
@@ -525,9 +690,12 @@ def main():
     inter_name = build_intermediate_name(
         args.job_id, input_name, 1, "preprocess", param_hash, "tif"
     )
-    inter_path = os.path.join(temp_dir, inter_name)
+    # FIX-P10-11/P11-8: Use pathlib.Path consistently per CLAUDE.md §4
+    # ORIGINAL: os.path.join + os.path.exists + os.path.getsize
+    inter_path = str(Path(temp_dir) / inter_name)
+    inter_path_p = Path(temp_dir) / inter_name
 
-    if os.path.exists(inter_path) and os.path.getsize(inter_path) > 0:
+    if inter_path_p.exists() and inter_path_p.stat().st_size > 0:
         logger.info("STAGE1_SKIP", "Intermediate exists", path=inter_path)
         return 3
 
@@ -537,18 +705,80 @@ def main():
     color_mode, needs_conv = _detect_color_space(input_path)
     if needs_conv:
         logger.info("STAGE1_COLOR_DETECT", f"Detected {color_mode}, converting to RGB")
-        rgb_path = os.path.join(temp_dir,
+        rgb_path = str(Path(temp_dir) /
             f"{args.job_id}_{Path(input_name).stem}_rgb.tif")
         if not _convert_to_rgb(input_path, rgb_path, logger):
             logger.error("STAGE1_COLOR_FAIL", "Color conversion failed")
-            return 82
+            return PHOTO_ERR_COLOR_CONV
         working_input = rgb_path
     else:
         working_input = input_path
         logger.info("STAGE1_COLOR_OK", f"Input is already {color_mode}")
 
+    # FIX-P11-10: v6.32 §4.2.1 — detect ICC profile and warn if missing
+    # High-DPI scans without ICC need user verification; no auto-conversion
+    # Respect user override via config input_color_space
+    user_cs = params.get("input_color_space", "auto")
+    if user_cs == "auto":
+        detected_cs = _detect_input_color_space(working_input, params, logger)
+    else:
+        detected_cs = user_cs
+        logger.info("STAGE1_ICC_USER_OVERRIDE",
+                   f"User specified color space: {detected_cs}")
+
+    # Save color space info to sidecar JSON for downstream stages
+    # FIX-P11-11: icc_profile_embedded now checks for any recognized ICC name
+    # ORIGINAL: only checked == "embedded", missed AdobeRGB/ProPhoto/sRGB
+    icc_names = {"embedded", "AdobeRGB", "ProPhoto", "sRGB"}
+    color_meta = {
+        "input_color_space": detected_cs,
+        "icc_profile_embedded": (detected_cs in icc_names),
+        "user_override": (user_cs != "auto"),
+    }
+    color_meta_path = str(Path(temp_dir) /
+        f"{args.job_id}_{Path(input_name).stem}_color_meta.json")
+    try:
+        with open(color_meta_path, "w", encoding="utf-8") as f:
+            json.dump(color_meta, f, indent=2)
+        logger.info("STAGE1_COLOR_META",
+                   f"Saved color space metadata: {color_meta_path}")
+    except Exception:
+        pass
+
+    # FIX-P11-4: Channel degradation detection BEFORE destructive repairs
+    # v7.32 §3.10.6: 前置补偿 in stage1 传统修复前
+    # ORIGINAL: channel degradation detection was after all repairs (line 667-695)
+    degradation = detect_channel_degradation(working_input, params)
+
+    # Save channel metadata
+    channel_meta = {
+        "channel_degradation": degradation.get("degraded", False),
+        "mean_diff": degradation.get("mean_diff", 0.0),
+        "std_diff": degradation.get("std_diff", 0.0),
+    }
+    meta_path = str(Path(temp_dir) /
+        f"{args.job_id}_{Path(input_name).stem}_channel_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(channel_meta, f, indent=2)
+    logger.info("STAGE1_CHANNEL_META", f"Saved channel metadata: {meta_path}")
+
+    if degradation["degraded"]:
+        ai_enabled = params.get("ai_enabled", False)
+        # v7.32 §3.10.6: 前置补偿 condition
+        mean_severe = degradation.get("mean_diff", 0) > params.get(
+            "channel_degradation_mean_threshold_severe", 0.15)
+        std_severe = degradation.get("std_diff", 0) > params.get(
+            "channel_degradation_std_threshold_severe", 0.25)
+        if not ai_enabled and (mean_severe or std_severe):
+            logger.info("STAGE1_CHANNEL_CORR",
+                       "Applying pre-compensation before repairs")
+            corr_out = working_input + ".channel.tif"
+            if apply_channel_correction(working_input, corr_out, params, logger):
+                if Path(corr_out).exists():
+                    working_input = corr_out
+
     # Convert to 16bit TIFF for processing
-    working_path = os.path.join(temp_dir,
+    working_path = str(Path(temp_dir) /
         f"{args.job_id}_{Path(input_name).stem}_16bit.tif")
 
     # BUG-049 fix: Explicitly check gmic returncode
@@ -562,22 +792,51 @@ def main():
         if r.returncode != 0:
             stderr = (r.stderr or b"").decode("utf-8", errors="replace")[:500]
             logger.error("STAGE1_CONVERT_FAIL", f"gmic exited with code {r.returncode}: {stderr}")
-            return 84
+            return PHOTO_ERR_GMIC_FAIL
     except Exception as e:
         logger.error("STAGE1_CONVERT_FAIL", str(e))
-        return 82
+        return PHOTO_ERR_COLOR_CONV
+
+    # FIX-P11-3: Grain extraction BEFORE destructive repairs per v6.32 §4.2.1
+    # "颗粒保护前置：去划痕/去噪前，若需保留原生胶片颗粒，先用频率分离将高频颗粒层隔离"
+    # ORIGINAL: grain extraction was after scratch removal (line 609-613), wrong order
+    if params.get("grain_synthesis", True):
+        grain_out = str(Path(temp_dir) /
+            f"{args.job_id}_{Path(input_name).stem}_grain.tif")
+        extract_grain_pattern(working_path, grain_out, params, logger)
 
     # Scratch removal
     if params.get("scratch_remove", True):
         logger.info("STAGE1_SCRATCH", "Removing scratches")
         scratch_out = working_path + ".scratch.tif"
-        success, stderr = run_gmic(working_path, scratch_out,
-                          "-repair", str(params.get("scratch_remove_strength", 20)))
-        if success and os.path.exists(scratch_out):
+        # FIX-P11-1: G'MIC commands require '-' prefix per CLI syntax
+        # ORIGINAL: ["fx_remove_scratches", ...] → G'MIC interprets as filename
+        scratch_strength = str(params.get("scratch_remove_strength", 20))
+        success = False
+        stderr = ""
+        for cmd_name in ["-fx_remove_scratches", "-remove_scratches"]:
+            success, stderr = run_gmic(working_path, scratch_out,
+                                       cmd_name, scratch_strength)
+            if success:
+                break
+            logger.warning("STAGE1_SCRATCH_CMD",
+                          f"G'MIC {cmd_name} failed, trying next: "
+                          f"{stderr[:200]}")
+
+        # Fallback to despeckle if all scratch commands fail
+        if not success:
+            logger.warning("STAGE1_SCRATCH_FALLBACK",
+                          "fx_remove_scratches unavailable, "
+                          "falling back to -despeckle")
+            success, stderr = run_gmic(working_path, scratch_out,
+                                       "-despeckle", scratch_strength)
+
+        if success and Path(scratch_out).exists():
             working_path = scratch_out
         elif not success:
-            logger.error("STAGE1_SCRATCH_FAIL", f"G'MIC -repair failed: {stderr}")
-            return 84
+            logger.error("STAGE1_SCRATCH_FAIL",
+                        f"G'MIC scratch removal failed: {stderr}")
+            return PHOTO_ERR_GMIC_FAIL
 
     # Deblock (DCT-based via G'MIC)
     if params.get("deblock_strength", 0) > 0:
@@ -587,11 +846,11 @@ def main():
         success, stderr = run_gmic(working_path, deblock_out,
                           "-deblock",
                           str(params.get("deblock_strength", 25)))
-        if success and os.path.exists(deblock_out):
+        if success and Path(deblock_out).exists():
             working_path = deblock_out
         elif not success:
             logger.error("STAGE1_DEBLOCK_FAIL", f"G'MIC -deblock failed: {stderr}")
-            return 84
+            return PHOTO_ERR_GMIC_FAIL
 
     # Deband
     if params.get("deband_threshold", 0) > 0:
@@ -600,48 +859,69 @@ def main():
         success, stderr = run_gmic(working_path, deband_out,
                           "-deband",
                           str(params.get("deband_threshold", 1.2)))
-        if success and os.path.exists(deband_out):
+        if success and Path(deband_out).exists():
             working_path = deband_out
         elif not success:
             logger.error("STAGE1_DEBAND_FAIL", f"G'MIC -deband failed: {stderr}")
-            return 84
+            return PHOTO_ERR_GMIC_FAIL
 
-    # Grain extraction (v6.3 §4.2.1)
-    if params.get("grain_synthesis", True):
-        grain_out = os.path.join(temp_dir,
-            f"{args.job_id}_{Path(input_name).stem}_grain.tif")
-        extract_grain_pattern(working_path, grain_out, params, logger)
+    # Grain extraction moved BEFORE scratch removal per v6.32 §4.2.1 (FIX-P11-3)
+    # Original location was here (after deband), now extracted earlier
 
     # AI/artificial coloring detection (v6.3 §4.2.1)
-    coloring_info = detect_ai_coloring(working_path, logger)
+    # FIX-P11-6: Pass params for config-driven thresholds
+    coloring_info = detect_ai_coloring(working_path, params, logger)
     if coloring_info["detected"]:
         logger.warning("STAGE1_AI_COLORING",
                       f"Possible AI/artificial coloring detected (confidence={coloring_info['confidence']:.2f})")
 
-    # Channel degradation detection on PROCESSED image (Bug-1 fix)
-    degradation = detect_channel_degradation(working_path, params)
-    if degradation["degraded"]:
-        logger.info("STAGE1_CHANNEL_DEG",
-                   f"Channel degradation detected: mean_diff={degradation['mean_diff']:.4f}")
-        # Apply correction only when AI is NOT enabled (v6.3 requirement)
-        ai_enabled = params.get("ai_enabled", False)
-        if not ai_enabled:
-            logger.info("STAGE1_CHANNEL_CORR", "Applying single-channel correction (no AI)")
-            corr_out = working_path + ".channel.tif"
-            if apply_channel_correction(working_path, corr_out, params, logger):
-                if os.path.exists(corr_out):
-                    working_path = corr_out
+    # NOTE: Channel degradation detection moved BEFORE repairs per v7.32 §3.10.6 (FIX-P11-4)
+    # See Step 0.5 above
 
-    # Save final output - use shutil.copy2 to preserve the actual format
-    shutil.copy2(working_path, inter_path)
+    # FIX-P11-10: Use shutil.copyfile (not copy2) per v7.32 §3.10.10
+    # copy2 copies metadata which causes PermissionError on WSL2 NTFS mounts
+    # with metadata=disabled. copyfile only copies data content.
+    # ORIGINAL: shutil.copy2(working_path, inter_path)
+    shutil.copyfile(working_path, inter_path)
+    # Verify copy integrity
+    # FIX-P10-11/P11-8: Use Path consistently per CLAUDE.md §4
+    if Path(working_path).stat().st_size != inter_path_p.stat().st_size:
+        logger.error("STAGE1_COPY_FAIL",
+                    "Intermediate file size mismatch after copy")
+        return PHOTO_ERR_COPY_FAIL
+    # Sync mtime/atime manually (equivalent to copy2 metadata preservation)
+    # FIX-P11-10: Use Path.stat() per CLAUDE.md §4 (not os.stat)
+    try:
+        src_stat = Path(working_path).stat()
+        os.utime(inter_path, (src_stat.st_atime, src_stat.st_mtime))
+    except OSError:
+        pass  # Non-critical: mtime sync failure on WSL2 cross-filesystem
 
-    if os.path.exists(inter_path):
+    if inter_path_p.exists():
+        # FIX-P11-8: Cleanup intermediates if requested per v7.32 §3.10.17
+        if args.cleanup_intermediates:
+            stem = f"{args.job_id}_{Path(input_name).stem}"
+            for suffix in [".channel.tif", ".scratch.tif", ".deblock.tif",
+                           ".deband.tif", "_grain.tif", "_rgb.tif",
+                           "_16bit.tif", "_color_meta.json",
+                           "_channel_meta.json"]:
+                p = Path(temp_dir) / f"{stem}{suffix}"
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
         logger.info("STAGE1_DONE", "Preprocessing complete", output=inter_path)
         return 0
     else:
         logger.error("STAGE1_FAILED", "Output not created")
-        return 82
+        return PHOTO_ERR_OUTPUT
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    # FIX-P11-5: main() must return explicit int exit code per v7.32 §3.5
+    # ORIGINAL: sys.exit(main() or 0) — "or 0" masks None returns
+    rc = main()
+    if rc is None:
+        rc = 86  # validation failure — main() must always return explicit exit code
+    sys.exit(rc)

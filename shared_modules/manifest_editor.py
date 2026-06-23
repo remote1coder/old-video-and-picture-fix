@@ -12,6 +12,7 @@ v7.32 Compliance:
 
 import sys
 from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -97,7 +98,7 @@ def set_job_status(manifest_path: str, job_id: str, status: str):
 def set_user_override(manifest_path: str, job_id: str,
                       key: str, value: str):
     """Set user override parameter for a job.
-    
+
     Supports nested keys via dot notation (e.g., 'avif_params.speed').
     Values are parsed as int, float, bool, or string.
     """
@@ -105,27 +106,10 @@ def set_user_override(manifest_path: str, job_id: str,
     for job in manifest.get("jobs", []):
         if job.get("job_id") == job_id:
             overrides = job.setdefault("user_overrides", {})
-            
-            # Auto-detect type
-            parsed_value = value
-            if value.lower() == "true":
-                parsed_value = True
-            elif value.lower() == "false":
-                parsed_value = False
-            elif value.lower() == "none":
-                parsed_value = None
-            else:
-                try:
-                    if "." in value:
-                        parsed_value = float(value)
-                    else:
-                        parsed_value = int(value)
-                except ValueError:
-                    pass
-            
+            # FIX-P4-4: Reuse module-level _parse_value(), eliminate code duplication
+            parsed_value = _parse_value(value)
             _set_nested(overrides, key, parsed_value)
             # FIX-P4-8: update timestamp on modification
-            from datetime import datetime
             job["updated_at"] = datetime.now().astimezone().isoformat()
             print(f"Set {key}={parsed_value} for job {job_id}")
             break
@@ -139,7 +123,6 @@ def set_priority(manifest_path: str, job_id: str, priority: int):
         if job.get("job_id") == job_id:
             job["priority"] = priority
             # FIX-P4-8: update timestamp on modification
-            from datetime import datetime
             job["updated_at"] = datetime.now().astimezone().isoformat()
             print(f"Set priority={priority} for job {job_id}")
             break
@@ -182,6 +165,9 @@ def interactive_tui(manifest_path: str):
         table.add_row("Status", str(job.get("status")))
         table.add_row("Priority", str(job.get("priority", 0)))
         table.add_row("AI Banned", str(job.get("ai_upscale_banned", False)))
+        # FIX-P4-13: Show skip_reason per v7.32 §3.4.3
+        if job.get("skip_reason"):
+            table.add_row("Skip Reason", str(job.get("skip_reason")))
         
         rec = job.get("recommended_params", {})
         if rec:
@@ -202,7 +188,6 @@ def interactive_tui(manifest_path: str):
                 parsed_value = _parse_value(val)
                 _set_nested(overrides, key, parsed_value)
                 # FIX-P4-2: edit in-memory only; save at loop end
-                from datetime import datetime
                 job["updated_at"] = datetime.now().astimezone().isoformat()
                 console.print(f"Set {key}={parsed_value} for job {job['job_id']}")
                 break
@@ -211,11 +196,15 @@ def interactive_tui(manifest_path: str):
                 _update_meta_counts(manifest)
                 break
             elif choice == "p":
+                # FIX-P4-17: Default priority=1 per v7.32 §3.4.4
+                # ORIGINAL: p = int(console.input("Priority (int): ").strip())
                 try:
-                    p = int(console.input("Priority (int): ").strip())
-                    job["priority"] = p
+                    raw = console.input("Priority (default=1): ").strip()
+                    job["priority"] = int(raw) if raw else 1
                 except ValueError:
-                    console.print("Invalid priority")
+                    job["priority"] = 1  # fallback to spec default
+                job["updated_at"] = datetime.now().astimezone().isoformat()
+                console.print(f"Priority set to {job['priority']} for job {job['job_id']}")
                 break
             elif choice == "c":
                 new_class = console.input(
@@ -225,7 +214,8 @@ def interactive_tui(manifest_path: str):
                 if new_class in valid_classes:
                     old_class = job.get("detected_class", "UNKNOWN")
                     job["detected_class"] = new_class
-                    
+                    job["confidence"] = 1.0  # FIX-P4-5: manual class = certainty
+
                     config_path = manifest.get("meta", {}).get("config_path")
                     if not config_path:
                         config_path = _find_config_upwards(manifest_path)
@@ -233,7 +223,7 @@ def interactive_tui(manifest_path: str):
                         console.print(f"[red]Config not found: {config_path}[/red]")
                         break
                     
-                    from manifest_generate import load_config, map_class_to_path_params
+                    from manifest_generate import load_config, map_class_to_path_params, _compute_photo_ai_banned
                     config = load_config(config_path)
                     
                     job["recommended_params"] = map_class_to_path_params(new_class, config)
@@ -250,16 +240,20 @@ def interactive_tui(manifest_path: str):
                     
                     orig_w = job.get("original_width", 0)
                     orig_h = job.get("original_height", 0)
+                    # FIX-P4-10/P4-12: Use _compute_photo_ai_banned for photo classes
+                    # ORIGINAL: job["ai_upscale_banned"] = (orig_w > 3840 or orig_h > 2160)
                     if new_class in ("SCAN_PRINT", "DIGITAL_PHOTO"):
-                        job["ai_upscale_banned"] = (orig_w > 3840 or orig_h > 2160)
+                        job["ai_upscale_banned"] = _compute_photo_ai_banned(orig_w, orig_h)
                     elif new_class == "HDV_AVCHD":
                         job["ai_upscale_banned"] = (orig_h >= 1080 or orig_w >= 1920)
                     elif new_class == "ANALOG_TAPE":
                         job["ai_upscale_banned"] = (orig_h > 1080 or orig_w > 1920)
-                    
-                    from datetime import datetime
+                    else:
+                        # FIX-P4-2: DV_DIGITAL etc. must reset ai_upscale_banned to False
+                        job["ai_upscale_banned"] = False
+
                     job["updated_at"] = datetime.now().astimezone().isoformat()
-                    console.print(f"[green]Class changed to {new_class}[/green]")
+                    console.print(f"[green]Class changed from {old_class} to {new_class}[/green]")
                     console.print(f"[yellow]ai_upscale_banned = {job['ai_upscale_banned']}[/yellow]")
                 else:
                     console.print("[red]Invalid class[/red]")
@@ -292,6 +286,9 @@ def _interactive_basic(manifest_path: str):
         print(f"  Input: {job.get('input_path')}")
         print(f"  Class: {job.get('detected_class')} (confidence: {job.get('confidence', 0):.2f})")
         print(f"  Status: {job.get('status')} | Priority: {job.get('priority', 0)}")
+        # FIX-P4-13: Show skip_reason per v7.32 §3.4.3
+        if job.get("skip_reason"):
+            print(f"  Skip Reason: {job.get('skip_reason')}")
         
         while True:
             choice = input("[y/e/s/p/c/q] ? ").strip().lower()
@@ -306,7 +303,6 @@ def _interactive_basic(manifest_path: str):
                 parsed_value = _parse_value(val)
                 _set_nested(overrides, key, parsed_value)
                 # FIX-P4-2: edit in-memory only; save at loop end
-                from datetime import datetime
                 job["updated_at"] = datetime.now().astimezone().isoformat()
                 print(f"Set {key}={parsed_value} for job {job['job_id']}")
                 break
@@ -315,10 +311,15 @@ def _interactive_basic(manifest_path: str):
                 _update_meta_counts(manifest)
                 break
             elif choice == "p":
+                # FIX-P4-17: Default priority=1 per v7.32 §3.4.4
+                # ORIGINAL: job["priority"] = int(input("Priority: ").strip())
                 try:
-                    job["priority"] = int(input("Priority: ").strip())
+                    raw = input("Priority (default=1): ").strip()
+                    job["priority"] = int(raw) if raw else 1
                 except ValueError:
-                    print("Invalid priority")
+                    job["priority"] = 1  # fallback to spec default
+                job["updated_at"] = datetime.now().astimezone().isoformat()
+                print(f"Priority set to {job['priority']}")
                 break
             elif choice == "c":
                 new_class = input(
@@ -328,7 +329,8 @@ def _interactive_basic(manifest_path: str):
                 if new_class in valid_classes:
                     old_class = job.get("detected_class", "UNKNOWN")
                     job["detected_class"] = new_class
-                    
+                    job["confidence"] = 1.0  # FIX-P4-5: manual class = certainty
+
                     config_path = manifest.get("meta", {}).get("config_path")
                     if not config_path:
                         config_path = _find_config_upwards(manifest_path)
@@ -336,7 +338,7 @@ def _interactive_basic(manifest_path: str):
                         print(f"Config not found: {config_path}")
                         break
                     
-                    from manifest_generate import load_config, map_class_to_path_params
+                    from manifest_generate import load_config, map_class_to_path_params, _compute_photo_ai_banned
                     config = load_config(config_path)
                     
                     job["recommended_params"] = map_class_to_path_params(new_class, config)
@@ -353,16 +355,20 @@ def _interactive_basic(manifest_path: str):
                     
                     orig_w = job.get("original_width", 0)
                     orig_h = job.get("original_height", 0)
+                    # FIX-P4-10/P4-12: Use _compute_photo_ai_banned for photo classes
+                    # ORIGINAL: job["ai_upscale_banned"] = (orig_w > 3840 or orig_h > 2160)
                     if new_class in ("SCAN_PRINT", "DIGITAL_PHOTO"):
-                        job["ai_upscale_banned"] = (orig_w > 3840 or orig_h > 2160)
+                        job["ai_upscale_banned"] = _compute_photo_ai_banned(orig_w, orig_h)
                     elif new_class == "HDV_AVCHD":
                         job["ai_upscale_banned"] = (orig_h >= 1080 or orig_w >= 1920)
                     elif new_class == "ANALOG_TAPE":
                         job["ai_upscale_banned"] = (orig_h > 1080 or orig_w > 1920)
-                    
-                    from datetime import datetime
+                    else:
+                        # FIX-P4-2: DV_DIGITAL etc. must reset ai_upscale_banned to False
+                        job["ai_upscale_banned"] = False
+
                     job["updated_at"] = datetime.now().astimezone().isoformat()
-                    print(f"Class changed to {new_class}")
+                    print(f"Class changed from {old_class} to {new_class}")
                     print(f"ai_upscale_banned = {job['ai_upscale_banned']}")
                 else:
                     print("Invalid class")

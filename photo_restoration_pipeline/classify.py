@@ -54,8 +54,11 @@ def _analyze_pixel_features(input_path: str) -> Dict[str, Any]:
         h, w = gray.shape
         
         # Blockiness: detect 8x8 DCT grid artifacts via gradient variance
+        # FIX-P11-12: blockiness only meaningful for JPEG per v7.32 §3.9
+        # ORIGINAL: computed for all formats (PNG/TIFF have no DCT artifacts)
         blockiness = 0.0
-        if h >= 16 and w >= 16:
+        if h >= 16 and w >= 16 and str(input_path).lower().endswith(
+                ('.jpg', '.jpeg')):
             dx = np.diff(gray, axis=1)
             dy = np.diff(gray, axis=0)
             # Measure periodicity at 8-pixel intervals
@@ -79,8 +82,13 @@ def _analyze_pixel_features(input_path: str) -> Dict[str, Any]:
         return {"blockiness": 0.0, "blur_laplacian_var": 0.0, "noise_std": 0.0}
 
 
-def classify_photo(input_path: str) -> Dict[str, Any]:
+def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
     """Classify photo and return metadata.
+
+    Args:
+        input_path: Path to photo file.
+        config: Optional config dict for threshold overrides.
+            Reads max_long_edge, max_short_edge, dpi_threshold from config.
 
     Returns:
     - detected_class: SCAN_PRINT | DIGITAL_PHOTO
@@ -89,7 +97,17 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
     - native_width, native_height, native_dar
     - dpi: int or None
     - ai_upscale_banned: bool (based on pixel dimensions, target resolution, and DPI)
+    - field_order: one of five valid values per v7.32 §3.9:
+        "progressive" (photos, default), "tff" (video top-field-first),
+        "bff" (video bottom-field-first), "mixed" (mixed field order),
+        "unknown" (unreadable/cannot determine)
     """
+    # FIX-P11-2: Read thresholds from config instead of hardcoding per v6.32 §7.7
+    cfg = config or {}
+    max_long = cfg.get("max_long_edge", 3840)
+    max_short = cfg.get("max_short_edge", 2160)
+    dpi_threshold = cfg.get("dpi_threshold", 1200)
+
     result: Dict[str, Any] = {
         "detected_class": "UNKNOWN",
         "confidence": 0.0,
@@ -100,6 +118,7 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
         "native_dar": "",
         "dpi": None,
         "ai_upscale_banned": False,
+        "field_order": "progressive",  # FIX-P11-6: Photos are inherently progressive per v7.32 §3.9
         "file_size": 0,
         "file_mtime": 0,
         "file_hash_prefix": "",
@@ -130,12 +149,18 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
             except Exception:
                 pass
             result["native_width"], result["native_height"] = native_w, native_h
-            # Compute native DAR as ratio string (v7.32 §3.4.1: "4:3", "16:9")
-            w, h = img.size
-            if h > 0:
+            # FIX-P11-1: Compute native DAR from EXIF native dimensions, not current file size
+            # per v7.32 §3.9: native_dar must use native_width/native_height (EXIF original)
+            # ORIGINAL: w, h = img.size (used current file size, wrong for cropped images)
+            w, h = native_w, native_h
+            # FIX-P11-14: Check both w>0 and h>0 per v7.32 §3.9
+            # ORIGINAL: only checked h>0, division by zero if w=0
+            if w > 0 and h > 0:
                 from math import gcd
                 g = gcd(w, h)
                 result["native_dar"] = f"{w//g}:{h//g}"
+            else:
+                result["native_dar"] = ""
             # Try to get DPI
             dpi_info = img.info.get("dpi")
             if dpi_info:
@@ -143,8 +168,27 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # FIX-P11-2: field_order for unreadable images per v7.32 §3.9
+    if result["original_width"] == 0 or result["original_height"] == 0:
+        result["field_order"] = "unknown"  # Cannot determine if file unreadable
+
     # ExifTool metadata
     exif = run_exiftool(input_path)
+
+    # FIX-P11-4: Try exiftool XResolution/YResolution if PIL DPI not found
+    # Per v7.32 §3.9: classification uses exiftool metadata for DPI
+    if result["dpi"] is None:
+        x_res = exif.get("XResolution", "")
+        y_res = exif.get("YResolution", "")
+        try:
+            res_str = x_res or y_res
+            if "/" in str(res_str):
+                num, den = str(res_str).split("/")
+                result["dpi"] = int(int(num) / int(den))
+            elif res_str:
+                result["dpi"] = int(float(res_str))
+        except (ValueError, ZeroDivisionError):
+            pass
 
     # Pixel-level feature analysis for enhanced classification
     pixel_features = _analyze_pixel_features(input_path)
@@ -163,6 +207,15 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
     if scanner_lower or "scan" in software_lower or "scan" in make_lower:
         result["detected_class"] = "SCAN_PRINT"
         result["confidence"] = 0.95
+    # FIX-P11-8: DPI discrete value detection per v7.32 §3.9
+    # "分辨率离散值" - scanner DPI values are typically at standard resolutions
+    elif result.get("dpi"):
+        SCANNER_DPI_DISCRETE = {300, 600, 1200, 2400, 3200, 4800, 6400}
+        dpi = result["dpi"]
+        dpi_discrete_match = any(abs(dpi - sd) <= 5 for sd in SCANNER_DPI_DISCRETE)
+        if dpi_discrete_match:
+            result["detected_class"] = "SCAN_PRINT"
+            result["confidence"] = 0.80
     elif model or make:
         result["detected_class"] = "DIGITAL_PHOTO"
         result["confidence"] = 0.90
@@ -191,24 +244,34 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
         if result["detected_class"] == "SCAN_PRINT":
             result["confidence"] = min(0.99, result["confidence"] + 0.03)
 
-    # AI upscale ban check (v6.3 §4.4)
-    # Unified ban logic using config-driven thresholds:
-    # max_long_edge=3840, max_short_edge=2160, dpi_threshold=1200
+    # AI upscale ban check (v6.32 §4.2.1 / v7.32 §3.10.2)
+    # FIX-P11-2: Unified ban logic using config-driven thresholds (not hardcoded)
+    # FIX-P11-11: Corrected spec reference from "v6.3 §4.4" (nonexistent) to
+    # "v6.32 §4.2.1 / v7.32 §3.10.2" per actual document structure
+    # ORIGINAL: comment referenced "v6.3 §4.4" which does not exist
     w = result["original_width"]
     h = result["original_height"]
     dpi = result.get("dpi")
 
     # Ban 1: source pixel dimensions exceed max_long_edge/max_short_edge thresholds
-    max_long = 3840
-    max_short = 2160
-    if w > max_long or h > max_short:
+    # FIX-P11-1: v7.32 §3.10.2: judge by long_edge/short_edge, NOT fixed width/height
+    # ORIGINAL: if w > max_long or h > max_short: (wrong for portrait images)
+    long_edge = max(w, h)
+    short_edge = min(w, h)
+    ban_reasons = []
+    if long_edge > max_long or short_edge > max_short:
         result["ai_upscale_banned"] = True
+        ban_reasons.append(f"pixel_exceeds:{long_edge}x{short_edge}>{max_long}x{max_short}")
 
-    # Ban 2: DPI exceeds 1200 (high-DPI scans have sufficient detail already)
-    if dpi and dpi > 1200:
+    # Ban 2: DPI exceeds config threshold (high-DPI scans have sufficient detail)
+    if dpi and dpi > dpi_threshold:
         result["ai_upscale_banned"] = True
+        ban_reasons.append(f"dpi_exceeds:{dpi}>{dpi_threshold}")
 
-    # v6.3 §5.3 predictive ban: if source at 2x would exceed 1080p target
+    if ban_reasons:
+        result["ban_reasons"] = ban_reasons
+
+    # FIX-P11-11: v6.32 §4.2.1 / v7.32 §3.10.2 predictive ban: if source at 2x would exceed 1080p target
     # This is a soft indicator - actual enforcement is in Stage 3
     # We don't set ai_upscale_banned=True here, just log for reference
     # Stage 3 enforces the actual 1080p target resolution limit
@@ -222,14 +285,40 @@ def classify_photo(input_path: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # FIX-P11-3: v7.32 §3.9: Confidence threshold handling
+    # Confidence < 80%: interactive mode requires manual confirmation,
+    # batch mode marks SKIP in manifest
+    # FIX-P11-12: UNKNOWN class gets special skip reason per v7.32 §3.9
+    CONFIDENCE_THRESHOLD = 0.80
+    if result["detected_class"] == "UNKNOWN":
+        result["needs_confirmation"] = True
+        result["skip_reason"] = (
+            f"Cannot classify image (UNKNOWN), "
+            f"confidence={result['confidence']:.2f}. "
+            f"Manual classification required."
+        )
+    elif result["confidence"] < CONFIDENCE_THRESHOLD:
+        result["needs_confirmation"] = True
+        result["skip_reason"] = (
+            f"Low confidence ({result['confidence']:.2f} < {CONFIDENCE_THRESHOLD}), "
+            f"class={result['detected_class']}"
+        )
+
     return result
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python classify.py <photo_file>")
+        print("Usage: python classify.py <photo_file> [config_json]")
         sys.exit(81)
 
-    result = classify_photo(sys.argv[1])
+    config = None
+    if len(sys.argv) >= 3:
+        try:
+            config = json.loads(sys.argv[2])
+        except Exception:
+            config = None
+
+    result = classify_photo(sys.argv[1], config)
     print(json.dumps(result, indent=2, ensure_ascii=False))

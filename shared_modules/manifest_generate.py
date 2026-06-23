@@ -108,8 +108,31 @@ def map_class_to_path_params(detected_class: str, config: Dict[str, Any]) -> Dic
             result["audio_override"] = dict(audio_override[type_key])
         elif "default" in audio_override:
             result["audio_override"] = dict(audio_override["default"])
-    
+
+    # FIX-P4-14: Add path reference key per v7.32 §3.4.1
+    class_to_path_key = {
+        "ANALOG_TAPE": "analog_tape",
+        "DV_DIGITAL": "dv_digital",
+        "HDV_AVCHD": "hdv_avchd",
+        "SCAN_PRINT": "scan_print",
+        "DIGITAL_PHOTO": "digital_photo",
+    }
+    if detected_class in class_to_path_key:
+        result["path"] = class_to_path_key[detected_class]
+
     return result
+
+
+def _compute_photo_ai_banned(orig_w: int, orig_h: int) -> bool:
+    """Compute ai_upscale_banned for photo categories per v7.32 §3.9.
+
+    Uses long_edge/short_edge logic:
+    long_edge = max(w,h), short_edge = min(w,h)
+    Ban if long_edge > 3840 OR short_edge > 2160.
+    """
+    long_edge = max(orig_w, orig_h)
+    short_edge = min(orig_w, orig_h)
+    return long_edge > 3840 or short_edge > 2160
 
 
 def _get_duration(input_path: str, classification: Dict[str, Any]) -> float:
@@ -215,8 +238,14 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                 confidence = classification.get("confidence", 0.0)
 
                 # Determine status
+                # FIX-P4-13: Record skip_reason per v7.32 §3.4.3
+                skip_reason = ""
                 if confidence < 0.80:
                     status = "SKIP"
+                    skip_reason = (
+                        f"Low confidence ({confidence:.2f} < 0.80), "
+                        f"detected as {detected_class}"
+                    )
                     manifest["meta"]["skipped"] += 1
                 else:
                     status = "PENDING"
@@ -225,14 +254,17 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                 # Map to path params
                 path_params = map_class_to_path_params(detected_class, config)
 
-                # FIX-P4-4: AI upscale banned: compute directly in generate.py per spec
+                # FIX-P4-3: generate.py is the sole authority for ai_upscale_banned
+                # Do NOT preserve classify.py's initial value; recompute from pixel dims
                 orig_w = classification.get("original_width", 0) or 0
                 orig_h = classification.get("original_height", 0) or 0
-                ai_banned = classification.get("ai_upscale_banned", False)
-                
-                # Hard recalculation based on original pixel dimensions
+                # ORIGINAL: ai_banned = classification.get("ai_upscale_banned", False)
+                ai_banned = False
+
+                # FIX-P4-10: Hard recalculation based on original pixel dimensions
+                # Uses long_edge/short_edge per v7.32 §3.9
                 if detected_class in ("SCAN_PRINT", "DIGITAL_PHOTO"):
-                    if orig_w > 3840 or orig_h > 2160:
+                    if _compute_photo_ai_banned(orig_w, orig_h):
                         ai_banned = True
                 elif detected_class == "HDV_AVCHD":
                     if orig_h >= 1080 or orig_w >= 1920:
@@ -240,6 +272,7 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                 elif detected_class == "ANALOG_TAPE":
                     if orig_h > 1080 or orig_w > 1920:
                         ai_banned = True
+                # DV_DIGITAL: never banned (SD material, well below thresholds)
 
                 # Determine output path
                 out_name = f.stem + "_restored"
@@ -269,6 +302,7 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                     "output_path": job_out_path,
                     "log_path": str(Path(log_dir) / f"job_{job_id:03d}.log"),
                     "error_message": "",
+                    "skip_reason": skip_reason,  # FIX-P4-13: v7.32 §3.4.3
                     "created_at": now_iso(),
                     "updated_at": now_iso(),
                     "original_width": classification.get("original_width", 0),

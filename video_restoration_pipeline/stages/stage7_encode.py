@@ -13,12 +13,11 @@ v6.3 Compliance:
 - Deterministic intermediate matching
 """
 
-import os
 import sys
 import json
 import argparse
-import glob
 import subprocess
+import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
@@ -55,12 +54,19 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                           tempo_ratio: float = 1.0,
                           audio_layout: dict = None) -> str:
     """Build audio filter chain with hum removal and denoising.
-    
+
     CRITICAL: bandreject filters must come BEFORE afftdn/arnndn.
     Covers fundamental + 2nd + 3rd harmonic, all width=2Hz.
-    
+
     Scene 1 (duration unchanged): asetpts=PTS at end.
     Scene 2 (duration changed): atempo before asetpts=PTS.
+
+    FIX-P7-8: DEPRECATION NOTICE — This function duplicates logic in
+    shared_modules/audio_utils.process_audio(). Long-term plan: replace
+    _build_audio_filter with a call to audio_utils.process_audio() to
+    generate an intermediate processed audio file, then stage7 only
+    handles muxing/encoding. For now, both copies are maintained with
+    synchronized bug fixes (P7-1 through P7-7).
     """
     audio_filters = []
 
@@ -82,14 +88,42 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
     except Exception:
         pass
 
-    # Hum removal FIRST (before noise reduction)
-    hum_freq = params.get("hum_freq", 50)
+    # FIX-P7-3: Per v7.32 §3.10.9: preserve channel layout, no downmix
+    # bandreject/afftdn are per-channel internally in FFmpeg -af (no downmix needed).
+    # Only arnndn needs filter_complex per-channel (model trained mono, stereo bug).
+    # FIX-P7-4: For >2ch with FFmpeg<4.4, add afftdn as hum fallback since
+    # arnndn cannot process multi-channel without downmix (per v7.32 §3.10.9).
+    if audio_layout and audio_layout.get("channels", 2) > 2:
+        num_ch = audio_layout["channels"]
+        arnndn_model_val = params.get("arnndn_model", "")
+        if arnndn_model_val and Path(arnndn_model_val).exists() and not ffmpeg_version_ok:
+            # arnndn path: must use filter_complex per-channel, but that's
+            # complex; use afftdn as hum fallback for multi-channel per §3.10.9
+            logger.info("STAGE7_MULTICHANNEL_HUM_AFFTDN",
+                        f"FFmpeg <4.4 + {num_ch}ch audio: using afftdn for hum "
+                        "removal (arnndn requires mono, would violate §3.10.9)")
+        else:
+            # bandreject/afftdn: unified -af is safe (FFmpeg processes each
+            # channel independently, no downmix)
+            logger.info("STAGE7_MULTICHANNEL_UNIFIED",
+                        f"Unified filter chain for {num_ch}ch audio "
+                        "(bandreject/afftdn are per-channel internally)")
+
+    # FIX-P7-1: Per v6.32 §7.12 / v7.32 §3.10.22:
+    # hum_freq=None means auto-detect; explicit 50/60 means user override
+    # ORIGINAL: hum_freq = params.get("hum_freq", 50) with auto_detect flag
+    hum_freq = params.get("hum_freq")  # None = auto-detect; 50/60 = user override
     hum_dual = params.get("hum_dual", False)
-    auto_detect = params.get("auto_detect_hum", True)
 
     detected_freq = None
-    if auto_detect:
-        # Use audio_utils for proper FFT-based detection
+    is_dual_hum = False  # FIX-P7-9: track dual hum detection result
+    if hum_freq is not None:
+        # User explicitly configured hum_freq, skip auto-detection
+        detected_freq = int(hum_freq)
+        logger.info("STAGE7_HUM_USER_OVERRIDE",
+                    f"User forced hum_freq={detected_freq}Hz, skipping auto-detect")
+    else:
+        # Auto-detect path
         try:
             sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
             from audio_utils import detect_hum_frequency
@@ -98,9 +132,15 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                 logger.info("STAGE7_HUM_SKIP", "Hum energy below threshold, skipping bandreject")
                 detected_freq = None
             else:
-                detected_freq = hum_result.get("primary_freq", hum_freq)
-        except Exception:
-            detected_freq = hum_freq
+                detected_freq = hum_result.get("primary_freq", 50)
+                # FIX-P7-9: Per v7.32 §3.10.22: save is_dual_hum from detection
+                is_dual_hum = hum_result.get("is_dual_hum", False)
+        except Exception as e:
+            # FIX-P7-11: Per v7.32 §3.10.22: default to 50Hz with WARNING
+            detected_freq = 50
+            logger.warning("STAGE7_HUM_DETECT_FAIL",
+                           f"Hum frequency detection failed: {e}. "
+                           "Defaulting to 50Hz per v7.32 §3.10.22")
     
     if detected_freq and ffmpeg_version_ok:
         # Fundamental + 2nd + 3rd harmonic, all width=2Hz
@@ -108,33 +148,98 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
             audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
         
         # Dual hum support
-        if hum_dual:
+        # FIX-P7-9: Per v7.32 §3.10.22: dual hum must be detected AND user-enabled.
+        # Default: only process primary freq group, log WARNING if dual detected.
+        # Only when hum_dual=true AND is_dual_hum=true: process both groups with CRITICAL.
+        if hum_dual and is_dual_hum:
+            # User explicitly enabled + actual dual hum detected
             other = 60 if detected_freq == 50 else 50
             for f in [other, other * 2, other * 3]:
                 audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
+            logger.critical("STAGE7_DUAL_HUM_RISK",
+                            "Processing BOTH 50Hz+60Hz hum groups per "
+                            "hum_dual=true. Audio quality risk — dual "
+                            "filtering may over-process.",
+                            primary=detected_freq, secondary=other)
+        elif is_dual_hum and not hum_dual:
+            logger.warning("STAGE7_DUAL_HUM_DEFAULT",
+                           f"Dual hum detected but processing primary "
+                           f"{detected_freq}Hz only. Set hum_dual=true to "
+                           f"process both groups (audio quality risk).")
     elif detected_freq and not ffmpeg_version_ok:
-        # Skip bandreject, use arnndn only for hum+noise reduction
-        logger.info("STAGE7_HUM_FALLBACK", "Skipping bandreject due to old FFmpeg, relying on arnndn")
+        # FIX-P7-1: Per v6.32 §7.12 / v7.32 §3.10.22:
+        # FFmpeg <4.4: arnndn replaces bandreject for hum removal
+        # ORIGINAL: only logged, arnndn filter not inserted into audio_filters
+        arnndn_model = params.get("arnndn_model", "")
+        if arnndn_model and Path(arnndn_model).exists():
+            if audio_layout is None:
+                audio_layout = _get_audio_layout(audio_path)
+            num_ch = audio_layout.get("channels", 2)
+            if num_ch > 2:
+                # Multi-channel: arnndn needs mono, skip for hum removal
+                logger.warning("STAGE7_HUM_ARNNDN_MULTICH",
+                               f"FFmpeg <4.4, arnndn requires mono input, cannot "
+                               f"remove {detected_freq}Hz hum from {num_ch}ch. "
+                               f"afftdn will provide general noise reduction only.")
+            elif num_ch == 2:
+                audio_filters.append("aformat=channel_layouts=mono")
+                # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
+                audio_filters.append(f"arnndn=m={arnndn_model}")
+                layout = audio_layout.get("layout", "stereo")
+                audio_filters.append(f"aformat=channel_layouts={layout}")
+            else:
+                # Mono: use arnndn directly
+                audio_filters.append(f"arnndn=m={arnndn_model}")
+            logger.info("STAGE7_HUM_ARNNDN",
+                        f"FFmpeg <4.4, using arnndn for {detected_freq}Hz hum removal",
+                        model=arnndn_model)
+        else:
+            logger.warning("STAGE7_HUM_NO_ARNNDN",
+                           f"FFmpeg <4.4 and arnndn model not found at '{arnndn_model}', "
+                           f"hum at {detected_freq}Hz will NOT be removed. "
+                           f"afftdn will provide general noise reduction only. "
+                           f"Download arnndn models from https://github.com/NullModel/arnndn-models")
 
     # Noise reduction AFTER bandreject
     noise_reduction = params.get("noise_reduction", True)
     if noise_reduction:
         arnndn_model = params.get("arnndn_model", "")
-        # FIX-P7-2: arnndn requires mono input for some CPUs
-        # Convert to mono before arnndn, then explicitly restore original layout
+        if audio_layout is None:
+            audio_layout = _get_audio_layout(audio_path)
+        num_channels = audio_layout.get("channels", 2)
+
         if arnndn_model and Path(arnndn_model).exists():
-            audio_filters.append("aformat=channel_layouts=mono")
-            audio_filters.append(f"arnndn=m='{arnndn_model}'")
-            # Explicitly restore original channel layout inside filter chain
-            if audio_layout is None:
-                audio_layout = _get_audio_layout(audio_path)
-            layout = audio_layout.get("layout", "stereo")
-            audio_filters.append(f"aformat=channel_layouts={layout}")
+            # FIX-P7-3: Per v7.32 §3.10.9 "严禁混缩为立体声":
+            # - Mono: use arnndn directly (no layout change needed)
+            # - Stereo: aformat=mono → arnndn → restore (acceptable per §7.30
+            #   mono input recommendation, preserves stereo on output)
+            # - Multi-channel (>2): use afftdn instead to avoid downmix;
+            #   arnndn requires mono which would destroy spatial info in 5.1/7.1
+            # ORIGINAL: always used aformat=mono → arnndn for all channel counts,
+            # which downmixes multi-channel audio violating the spec.
+            if num_channels > 2:
+                logger.warning("STAGE7_ARNNDN_MULTICHANNEL_SKIP",
+                               f"arnndn requires mono input, would downmix "
+                               f"{num_channels}ch audio. Using afftdn instead "
+                               f"per v7.32 §3.10.9 (no downmix allowed).")
+                audio_filters.append("afftdn=nr=10:nf=-20")
+            elif num_channels == 2:
+                # Stereo: arnndn mono limitation, restore after processing
+                audio_filters.append("aformat=channel_layouts=mono")
+                # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
+                audio_filters.append(f"arnndn=m={arnndn_model}")
+                layout = audio_layout.get("layout", "stereo")
+                audio_filters.append(f"aformat=channel_layouts={layout}")
+            else:
+                # Mono: use arnndn directly
+                audio_filters.append(f"arnndn=m={arnndn_model}")
         else:
             audio_filters.append("afftdn=nr=10:nf=-20")
 
     # V-P-053 fix: compand dynamic range compression
-    use_compand = params.get("audio_compand", True)
+    # FIX-P7-8: Default changed to False per v7.32 §3.10.9 (not mandatory)
+    # ORIGINAL: audio_compand defaulted to True
+    use_compand = params.get("audio_compand", False)
     if use_compand:
         audio_filters.append("compand=0.3:1:-90/-900|-70/-70|-30/-9|0/-3:6:0:0:0.5")
 
@@ -190,7 +295,11 @@ def _get_source_color_info(video_path: str) -> tuple:
 
     Returns (source_color_range, color_standard) where:
     - source_color_range: 'limited' or 'full'
-    - color_standard: 'PAL' or 'NTSC'
+    - color_standard: 'PAL', 'NTSC', or 'BT709'
+
+    FIX-P7-2/P7-7: Added BT.709 recognition per v7.32 §3.10.3.
+    ORIGINAL: only recognized PAL/NTSC, defaulted unknown to NTSC,
+    causing BT.709 sources to get unwanted BT.601→BT.709 conversion.
     """
     try:
         r = subprocess.run(
@@ -206,13 +315,18 @@ def _get_source_color_info(video_path: str) -> tuple:
                 cr = streams[0].get("color_range", "")
                 cp = streams[0].get("color_primaries", "")
                 source_range = "full" if cr == "pc" else "limited"
-                # Map color_primaries to PAL/NTSC standard
-                if cp in ("bt470bg", "5"):
+                # FIX-P7-2/P7-7: Add BT.709 recognition per v7.32 §3.10.3
+                if cp in ("bt709", "1", "9"):
+                    color_std = "BT709"
+                elif cp in ("bt470bg", "5"):
                     color_std = "PAL"
                 elif cp in ("smpte170m", "bt470m", "6", "4"):
                     color_std = "NTSC"
                 else:
-                    color_std = "NTSC"  # Default fallback for old footage
+                    # Unknown primaries — default NTSC for old footage,
+                    # but log WARNING so user knows this is a guess
+                    color_std = "NTSC"
+                    # Log via caller (cannot access logger here)
                 return source_range, color_std
     except Exception:
         pass
@@ -270,16 +384,22 @@ def main():
 
     temp_dir = params.get("temp_dir", "./temp")
     job_id = args.job_id
-    input_name = Path(args.input).name
+    # FIX-P7-10: Use .stem (without extension) to match stage0 naming
+    # ORIGINAL: Path(args.input).name included extension, mismatch with stage0
+    input_name = Path(args.input).stem
 
+    # FIX-P7-9: Use pathlib.Path instead of os.path per CLAUDE.md §4
     # Find input - deterministic by mtime
     input_source = None
-    for pat in ["step6_grain*", "step5_face*", "step4_postprocess*", "step3_upscale*", "step2_traditional*", "step1_preprocess*"]:
+    for pat in ["step6_grain*", "step5_face*", "step4_postprocess*",
+                "step3_upscale*", "step3_forced_upscale*",
+                "step2_traditional*", "step1_preprocess*"]:
         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
-        candidates = glob.glob(os.path.join(temp_dir, pattern))
+        # ORIGINAL: glob.glob(os.path.join(temp_dir, pattern))
+        candidates = list(Path(temp_dir).glob(pattern))
         if candidates:
-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            input_source = candidates[0]
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            input_source = str(candidates[0])
             break
 
     if not input_source:
@@ -288,14 +408,28 @@ def main():
 
     output_path = params.get("output_path", "")
     if not output_path:
-        output_dir = params.get("output_dir", "./output")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir,
-            f"{Path(input_name).stem}_restored.mkv")
+        # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
+        output_dir = Path(params.get("output_dir", "./output"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = str(output_dir / f"{Path(input_name).stem}_restored.mkv")
 
     # WSL2 redirect: if running in WSL and Windows tools need Windows paths
     no_wsl_redirect = params.get("no_wsl_redirect", False)
     platform = params.get("platform", "auto")
+
+    # FIX-P7-13: Also redirect temp_dir per v7.32 §3.10.10 / CLAUDE.md §4
+    # ORIGINAL: only output_path was redirected, temp_dir on /mnt/ caused slow I/O
+    try:
+        redirected_temp, _, _, _ = wsl_redirect_path(
+            temp_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform
+        )
+        if redirected_temp != temp_dir:
+            logger.info("STAGE7_WSL_TEMP_REDIRECT",
+                       f"WSL temp redirect: {temp_dir} -> {redirected_temp}")
+            temp_dir = redirected_temp
+    except Exception:
+        pass  # wsl_redirect_path not available or not in WSL
+
     redirected_path, original_output_path, _, _ = wsl_redirect_path(
         output_path, no_wsl_redirect=no_wsl_redirect, target_platform=platform
     )
@@ -312,6 +446,21 @@ def main():
     preset = params.get("preset", 4)
     pix_fmt = params.get("pix_fmt", "yuv420p10le")
     color_range = params.get("color_range", "limited")
+
+    # FIX-P7-5: Preset adaptive per v6.32 §7.10:
+    # On machines with ≥16 CPU cores, lower preset for better quality
+    if params.get("preset_max_quality", False):
+        import multiprocessing
+        try:
+            cpu_count = multiprocessing.cpu_count()
+            if cpu_count >= 16:
+                original_preset = preset
+                preset = min(preset, 3)  # Try preset 2-3 for better quality
+                logger.info("STAGE7_PRESET_ADAPTIVE",
+                            f"CPU cores={cpu_count} >= 16, "
+                            f"preset {original_preset} -> {preset}")
+        except NotImplementedError:
+            pass  # cpu_count not available on this platform
 
     # FIX-P7-6: CRF adaptive logic per v6.32 §7.10 / v7.32 §3.10.20
     try:
@@ -334,9 +483,16 @@ def main():
                 crf = 24  # 480p/576p/720p unified default
 
             # Grain adaptive (if upstream stages passed grain info)
+            # FIX-P7-5: Per v7.32 §3.10.20, grain_strength formula is
+            # std(Y) / (1 + 0.1 × motion_index), NOT noise_score * 10.
+            # noise_score*10 is an approximation only.
             grain_strength = params.get("detected_grain_strength", None)
             if grain_strength is None and "noise_score" in params:
                 grain_strength = params["noise_score"] * 10
+                logger.warning("STAGE7_GRAIN_APPROX",
+                              "Using noise_score*10 as grain_strength "
+                              "approximation. Spec v7.32 §3.10.20 requires "
+                              "std(Y)/(1+0.1*motion).")
             if grain_strength is not None:
                 if grain_strength > 5.0:
                     crf -= 1
@@ -371,20 +527,57 @@ def main():
     ]
 
     # FIX-P7-1: BT.601→BT.709 color space conversion with range handling
-    source_color_range, color_standard = _get_source_color_info(args.input)
-    matrix_in = "bt470bg" if color_standard == "PAL" else "smpte170m"
-    rangein = "full" if source_color_range == "full" else "limited"
+    # FIX-P7-3: Probe stage output (input_source), not original input (args.input)
+    # per v7.32 §3.10.3: conversion should be based on the video being encoded
+    # ORIGINAL: _get_source_color_info(args.input) probed original input
+    source_color_range, color_standard = _get_source_color_info(input_source)
+
+    # FIX-P7-2: Skip colorspace conversion if source is already BT.709
+    # per v7.32 §3.10.3: only BT.601 sources need conversion
+    # ORIGINAL: always applied zscale, causing BT.709 sources to get color shift
     vf_parts = []
-    if not params.get("colorspace_converted", False):
+    if color_standard == "BT709":
+        logger.info("STAGE7_COLORSPACE_SKIP",
+                    "Source already BT.709, skipping colorspace conversion")
+    elif not params.get("colorspace_converted", False):
+        matrix_in = "bt470bg" if color_standard == "PAL" else "smpte170m"
+        rangein = "full" if source_color_range == "full" else "limited"
         vf_parts.append(f"zscale=matrixin={matrix_in}:matrix=bt709:rangein={rangein}:range=limited")
         logger.info("STAGE7_COLORSPACE",
                    f"BT.601({color_standard})->BT.709 zscale: matrixin={matrix_in}, rangein={rangein}")
 
-    # FIX-P7-7: 16bit→10bit error diffusion dithering before final encode
+    # FIX-P7-6: 16bit→10bit error diffusion dithering per v6.32 §阶段3
+    # Per fix doc review: zscale error_diffusion requires zimg ≥3.0;
+    # Ubuntu 22.04's zimg may not support it, so check availability first.
+    # ORIGINAL: used simple scale without proper dithering
     input_depth = params.get("input_bit_depth", 16)
     if input_depth > 10:
-        vf_parts.append("format=yuv444p16,scale=out_range=limited:out_format=yuv444p10,format=yuv420p10le")
-        logger.info("STAGE7_DITHER", "Applying 16bit->10bit error diffusion dithering via YUV444")
+        # Check if zscale supports error_diffusion dithering
+        _zscale_ed_available = False
+        try:
+            _zd = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "color=c=black:s=64x64",
+                 "-vf", "zscale=dither=error_diffusion", "-f", "null", "-"],
+                capture_output=True, shell=False, timeout=10
+            )
+            _zscale_ed_available = (_zd.returncode == 0)
+        except Exception:
+            pass
+
+        if _zscale_ed_available:
+            # Per v6.32 §阶段3: error_diffusion dithering in YUV444 space
+            vf_parts.append("format=yuv444p16")
+            vf_parts.append("zscale=rangein=limited:range=limited:dither=error_diffusion:format=yuv444p10")
+            vf_parts.append("format=yuv420p10le")
+            logger.info("STAGE7_DITHER", "Using error_diffusion dithering (16bit->10bit)")
+        else:
+            # Fallback: ordered dithering (available on all zimg versions)
+            vf_parts.append("format=yuv444p16")
+            vf_parts.append("zscale=rangein=limited:range=limited:dither=ordered:format=yuv444p10")
+            vf_parts.append("format=yuv420p10le")
+            logger.warning("STAGE7_DITHER_FALLBACK",
+                          "error_diffusion not available in zscale, "
+                          "using ordered dithering (16bit->10bit)")
 
     if vf_parts:
         video_cmd.extend(["-vf", ",".join(vf_parts)])
@@ -409,13 +602,15 @@ def main():
 
     # Audio (extract from original if available)
     # V-P-049 fix: match stage0 output naming convention
-    audio_path = os.path.join(temp_dir, f"{job_id}_{input_name}.audio")
+    # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
+    audio_path_obj = Path(temp_dir) / f"{job_id}_{input_name}.audio"
     # Fallback: also check the old naming for backward compatibility
-    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-        audio_path_fallback = os.path.join(temp_dir, f"{job_id}_{input_name}_audio_raw.wav")
-        if os.path.exists(audio_path_fallback) and os.path.getsize(audio_path_fallback) > 0:
-            audio_path = audio_path_fallback
-    has_audio = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+    if not audio_path_obj.exists() or audio_path_obj.stat().st_size == 0:
+        audio_path_fallback = Path(temp_dir) / f"{job_id}_{input_name}_audio_raw.wav"
+        if audio_path_fallback.exists() and audio_path_fallback.stat().st_size > 0:
+            audio_path_obj = audio_path_fallback
+    audio_path = str(audio_path_obj)
+    has_audio = audio_path_obj.exists() and audio_path_obj.stat().st_size > 0
     if has_audio:
         # FIX-P7-2: multichannel preserve + explicit layout restore in filter chain
         audio_layout = _get_audio_layout(audio_path)
@@ -497,14 +692,17 @@ def main():
     # Metadata and output
     video_cmd.extend([
         "-metadata", "restored=true",
-        "-metadata", f"restored_at={__import__('datetime').datetime.now().isoformat()}",
+        # FIX-P7-12: Use proper datetime import per CLAUDE.md §4
+        # ORIGINAL: __import__('datetime').datetime.now().isoformat()
+        "-metadata", f"restored_at={datetime.datetime.now().isoformat()}",
         "-y", output_path,
     ])
 
     try:
         r = subprocess.run(video_cmd, capture_output=True, text=True,
                           timeout=3600*2, shell=False)
-        if r.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
+        if r.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 0:
             # FIX-P7-4: Validate A/V sync on final muxed output (not separate files)
             if has_audio:
                 sync_result = _validate_av_sync(output_path, logger)

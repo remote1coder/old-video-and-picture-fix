@@ -13,6 +13,7 @@ v7.3 Compliance:
 """
 
 import sys
+import ast
 import shutil
 import subprocess
 import importlib.util
@@ -135,15 +136,21 @@ def check_ffmpeg_filters(pipeline_type: str = "photo") -> List[str]:
     if code != 0:
         return ["  - Cannot list FFmpeg filters"]
     missing = []
-    # Parse filter list for exact filter name matches
-    # ffmpeg -filters output format:  ... filter_name ...
+    # FIX-P3-4: Improved FFmpeg filter parsing per v7.32 §3.6
+    # ORIGINAL: parsed parts[1] without verifying FLAGS column format,
+    # could misinterpret header lines or description words as filter names.
     available = set()
     for line in out.splitlines():
-        parts = line.strip().split()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
         if len(parts) >= 2:
-            # Filter names are in the second column (after the flags like "A..T")
-            fname = parts[1].strip()
-            available.add(fname)
+            # FFmpeg -filters format: FLAGS FILTER_NAME ...description
+            # FLAGS is like "A..T", ".F.T", etc. (letters and dots only)
+            first = parts[0]
+            if re.match(r'^[A-Z\.]{1,5}$', first):
+                available.add(parts[1])
     for f in required_filters:
         if f not in available:
             missing.append(f"  - FFmpeg filter '{f}' not available")
@@ -206,7 +213,29 @@ def check_ffmpeg_filters_minimal_calls(pipeline_type: str = "photo") -> List[str
     ], timeout=15)
     if code != 0:
         errors.append(f"  - zscale test failed: {err[:200]}")
-    
+
+    # FIX-P2-4: Test 6: compand (audio dynamic range compression)
+    # per v7.32 §3.6
+    code, _, err = run_cmd([
+        "ffmpeg", "-f", "lavfi", "-i", "sine=frequency=1000:duration=1",
+        "-af", "compand=.3|.3:1|1:-90/-60|-60/-30|-15/-15|-15/-15|-30/0",
+        "-f", "null", "-"
+    ], timeout=15)
+    if code != 0:
+        errors.append(f"  - compand test failed: {err[:200]}")
+
+    # FIX-P2-4: Test 7: arnndn (only if model files available)
+    # per v6.32 §7.30
+    arnndn_model = Path("./models/arnndn_50Hz.pb")
+    if arnndn_model.exists():
+        code, _, err = run_cmd([
+            "ffmpeg", "-f", "lavfi", "-i", "sine=frequency=50:duration=1",
+            "-af", f"arnndn=m={arnndn_model}",
+            "-f", "null", "-"
+        ], timeout=15)
+        if code != 0:
+            errors.append(f"  - arnndn test failed: {err[:200]}")
+
     return errors
 
 
@@ -365,7 +394,8 @@ def check_python_packages(pipeline_type: str = "photo") -> List[str]:
             ("numpy", "NumPy"),
             ("yaml", "PyYAML"),
             ("PIL", "Pillow"),
-            ("scipy", "SciPy (for Stage 4 region separation)"),
+            ("scipy", "SciPy (for Stage 5 region separation + Laplacian pyramid grain)"),
+            ("xxhash", "xxhash (FIX-P2-9: required for checkpoint hash per v7.32 §3.10.19)"),
         ]
     else:
         required = [
@@ -377,6 +407,7 @@ def check_python_packages(pipeline_type: str = "photo") -> List[str]:
             ("PIL", "Pillow"),
             ("requests", "requests"),
             ("rich", "rich (TUI)"),
+            ("xxhash", "xxhash (FIX-P2-9: required for checkpoint hash per v7.32 §3.10.19)"),
         ]
     missing = []
     for mod_name, desc in required:
@@ -386,27 +417,34 @@ def check_python_packages(pipeline_type: str = "photo") -> List[str]:
     return missing
 
 
-def check_face_detection_packages(config: Optional[Dict] = None) -> List[str]:
-    """Check face detection Python packages (if AI enabled).
-    
-    Per v7.32 §3.6: Must confirm 'retina-face' (PyPI package name),
-    'ultralytics', 'mtcnn' are installed.
-    Note: The Python import module name for retina-face is 'retinaface'.
+_FACE_DETECT_ORDER = [
+    ("retinaface", "retina-face", "RetinaFace"),
+    ("ultralytics", "ultralytics", "YOLOv8-face"),
+    ("mtcnn", "mtcnn", "MTCNN"),
+]
+
+
+def check_face_detection_packages(config: Optional[Dict] = None) -> Tuple[List[str], Optional[str]]:
+    """Check face detection packages and determine default model.
+
+    Per v7.32 §3.6: checks in RetinaFace → YOLOv8-face → MTCNN order,
+    first available becomes default.
+
+    Returns (missing_list, default_model_name).
     """
     if config and not config.get("ai", {}).get("enabled", False):
-        return []
-    # (module_name, pip_package_name)
-    required = [
-        ("retinaface", "retina-face"),
-        ("ultralytics", "ultralytics"),
-        ("mtcnn", "mtcnn"),
-    ]
+        return [], None
+
     missing = []
-    for mod_name, pip_name in required:
+    default_model = None
+    for mod_name, pip_name, display_name in _FACE_DETECT_ORDER:
         spec = importlib.util.find_spec(mod_name)
         if spec is None:
             missing.append(f"  - {pip_name}: not installed (pip install {pip_name})")
-    return missing
+        elif default_model is None:
+            default_model = display_name
+
+    return missing, default_model
 
 
 def check_ai_cli_tools() -> List[str]:
@@ -455,7 +493,7 @@ def check_ai_cli_tools() -> List[str]:
     return missing
 
 
-def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) -> List[str]:
+def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) -> Tuple[List[str], List[str]]:
     """Check AI model weights exist and validate MD5 checksums.
     
     Per v7.32 §3.6: Each model must have MD5 + download URL;
@@ -479,62 +517,123 @@ def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) 
         except Exception:
             pass
     
+    # FIX-P2-4: Added aliases for CodeFormer per v7.32 §3.6
+    # FIX-P3-1: MD5 values left as None — use external md5_manifest.json
+    # for actual checksums. Per v7.32 §3.6: each model must have MD5 + URL.
+    # Hard-coding unverified MD5s is worse than no check (false mismatches).
+    # Users should create models/md5_manifest.json with verified hashes.
     required_models = {
         "RealESRGAN_x2plus.pth": {
             "url": "https://github.com/xinntao/Real-ESRGAN/releases",
-            "md5": None,  # Fill with actual MD5 or use external manifest
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
         },
         "RealESRGAN_x4plus.pth": {
             "url": "https://github.com/xinntao/Real-ESRGAN/releases",
-            "md5": None,
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
         },
         "GFPGANv1.4.pth": {
             "url": "https://github.com/TencentARC/GFPGAN/releases",
-            "md5": None,
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
         },
         "DAT_x2.pth": {
             "url": "https://github.com/ckkelvinchan/DAT/releases",
-            "md5": None,
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
         },
         "DAT_x4.pth": {
             "url": "https://github.com/ckkelvinchan/DAT/releases",
-            "md5": None,
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
+        },
+        "GPEN_x2.pth": {
+            "url": "https://github.com/yangxy/GPEN/releases",
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
+        },
+        "GPEN_x4.pth": {
+            "url": "https://github.com/yangxy/GPEN/releases",
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
         },
         "CodeFormer.pth": {
             "url": "https://github.com/sczhou/CodeFormer/releases",
-            "md5": None,
+            "md5": None,  # Please add verified MD5 to md5_manifest.json
+            "aliases": ["codeformer.pth", "codeformer_v0.1.pth",
+                        "weights/CodeFormer/codeformer.pth"],
         },
     }
     missing = []
+    warnings = []
+
+    # FIX-P2-1: When no MD5 is configured at all, degrade to WARNING (non-blocking)
+    # per v7.32 §3.6
+    no_md5_configured = (
+        not external_md5 and
+        not any(info.get("md5") for info in required_models.values())
+    )
+    if no_md5_configured and not skip_md5_check:
+        warnings.append(
+            f"  - WARNING: No MD5 checksums configured for any model. "
+            f"Create {manifest_path} with verified hashes to enable verification."
+        )
+        skip_md5_check = True  # Downgrade to non-blocking
+
     for model_name, info in required_models.items():
         model_path = models_path / model_name
+        actual_path = model_path
+
+        # FIX-P2-4: Check primary path, then aliases per v7.32 §3.6
         if not model_path.exists():
-            missing.append(f"  - {model_name}: not found in {models_path} (download: {info['url']})")
-            continue
-        
+            aliases = info.get("aliases", [])
+            found = False
+            for alias in aliases:
+                alias_path = models_path / alias
+                if alias_path.exists():
+                    actual_path = alias_path
+                    found = True
+                    break
+            if not found:
+                alias_info = f" (also checked aliases: {aliases})" if aliases else ""
+                missing.append(
+                    f"  - {model_name}: not found in {models_path}{alias_info} "
+                    f"(download: {info['url']})"
+                )
+                continue
+
+        # MD5 check on actual_path
         expected_md5 = info.get("md5") or external_md5.get(model_name)
         if expected_md5:
             import hashlib
             h = hashlib.md5()
-            with open(model_path, "rb") as f:
-                while chunk := f.read(65536):
+            with open(actual_path, "rb") as f:
+                # FIX-P3-3: Replaced walrus operator per CLAUDE.md §4
+                # ORIGINAL: while chunk := f.read(65536):
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
                     h.update(chunk)
             actual_md5 = h.hexdigest()
             if actual_md5 != expected_md5:
-                missing.append(f"  - {model_name}: MD5 mismatch (expected {expected_md5}, got {actual_md5})")
-        else:
-            # FIX-P1-6: No MD5 configured → ERROR per v7.32 §3.6
-            if skip_md5_check:
                 missing.append(
+                    f"  - {model_name}: MD5 mismatch "
+                    f"(expected {expected_md5}, got {actual_md5})"
+                )
+        else:
+            # FIX-P3-1-REV: No MD5 configured.
+            # Per v7.32 §3.6 each model must have MD5 + URL, but hard-coding
+            # unverified MD5s is worse than no check.
+            # Users should create md5_manifest.json with verified hashes.
+            # WARNING → non-blocking (skip_md5_check=True),
+            # ERROR → blocking (skip_md5_check=False).
+            if skip_md5_check:
+                warnings.append(
                     f"  - {model_name}: WARNING - MD5 checksum not configured. "
-                    f"Create {manifest_path} with {{'{model_name}': '<md5_hash>'}} to enable verification"
+                    f"Create {manifest_path} with {{'{model_name}': '<md5_hash>'}} "
+                    f"to enable verification"
                 )
             else:
                 missing.append(
                     f"  - {model_name}: ERROR - MD5 verification not configured. "
                     f"Create {manifest_path} or use --skip-md5-check to bypass"
                 )
-    return missing
+    return missing, warnings
 
 
 def check_arnndn_models(config: Optional[Dict] = None, ffmpeg_version_ok: bool = True) -> List[str]:
@@ -569,7 +668,10 @@ def check_gmic_filters() -> List[str]:
     BUG-062 fix: Use per-filter exact query (gmic -h filtername) instead of
     substring matching in the full help text to avoid false positives.
     """
-    required_filters = ["repair", "deblock", "deband", "film_grain"]
+    required_filters = ["repair", "deblock", "deband"]
+    # FIX-R13-1: Removed "film_grain" — G'MIC CLI does not contain
+    # this command. Photo grain synthesis now uses pure Python Laplacian
+    # pyramid implementation.
     missing = []
     for f in required_filters:
         try:
@@ -607,20 +709,161 @@ def check_gpu_backends() -> Tuple[bool, List[str]]:
         return False, messages
 
 
+class _SpawnTargetVisitor(ast.NodeVisitor):
+    """AST visitor to find multiprocessing Process/Pool target= arguments.
+
+    FIX-P3-2: Per v7.32 §3.10.18 constraint 3, spawn target must be a
+    module-level global function. This visitor detects:
+    - multiprocessing.Process(target=...)
+    - multiprocessing.Pool(..., initializer=...)
+    - mp.Process / ctx.Process (aliased imports)
+    - get_context('spawn').Process(target=...)
+
+    Invalid targets: lambda, attribute access (method), call expression,
+    subscript, nested function definition.
+    """
+
+    def __init__(self, label: str, issues: List[str]):
+        self.label = label
+        self.issues = issues
+        self._mp_names: List[str] = []  # Names that refer to multiprocessing
+
+    def _describe_node(self, node: ast.AST) -> str:
+        """Return a human-readable description of an AST node for error messages."""
+        if isinstance(node, ast.Lambda):
+            return "lambda"
+        elif isinstance(node, ast.Attribute):
+            return f"attribute/method access ({ast.dump(node)})"
+        elif isinstance(node, ast.Call):
+            return f"function call ({ast.dump(node)})"
+        elif isinstance(node, ast.Subscript):
+            return f"subscript ({ast.dump(node)})"
+        elif isinstance(node, ast.Name):
+            return f"name '{node.id}'"
+        else:
+            return f"{type(node).__name__} ({ast.dump(node)})"
+
+    def _is_mp_call(self, node: ast.Call) -> bool:
+        """Check if a Call node is a multiprocessing Process/Pool call."""
+        # multiprocessing.Process(...)
+        if isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            if attr in ("Process", "Pool"):
+                # Check if the value is 'multiprocessing' or an alias
+                if isinstance(node.func.value, ast.Name):
+                    if node.func.value.id in self._mp_names:
+                        return True
+                # get_context('spawn').Process(...)
+                if isinstance(node.func.value, ast.Attribute):
+                    if node.func.value.attr == "get_context":
+                        return True
+                # multiprocessing.get_context('spawn').Process(...)
+                if isinstance(node.func.value, ast.Call):
+                    callee = node.func.value.func
+                    if (isinstance(callee, ast.Attribute)
+                            and callee.attr == "get_context"):
+                        return True
+        return False
+
+    def _check_target_arg(self, node: ast.Call, arg_name: str,
+                          line: int) -> None:
+        """Check a single keyword argument (target/initializer)."""
+        for kw in node.keywords:
+            if kw.arg != arg_name:
+                continue
+            value = kw.value
+            # Valid: simple Name reference (module-level function)
+            if isinstance(value, ast.Name):
+                continue
+            # Invalid: everything else
+            desc = self._describe_node(value)
+            self.issues.append(
+                f"  - {self.label}: spawn constraint 3 violation at line "
+                f"{line}: '{arg_name}=' is {desc}, must be module-level "
+                f"global function per v7.32 §3.10.18"
+            )
+
+    def visit_Import(self, node: ast.Import) -> None:
+        """Track 'import multiprocessing' and aliases."""
+        for alias in node.names:
+            if alias.name == "multiprocessing":
+                self._mp_names.append(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        """Track 'from multiprocessing import Process/Pool'."""
+        if node.module and "multiprocessing" in node.module:
+            for alias in node.names:
+                if alias.name in ("Process", "Pool"):
+                    self._mp_names.append(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        """Check multiprocessing.Process/Pool calls for invalid targets."""
+        if self._is_mp_call(node):
+            line = getattr(node, "lineno", 0)
+            self._check_target_arg(node, "target", line)
+            self._check_target_arg(node, "initializer", line)
+        # Also check direct Process(...)/Pool(...) when imported directly
+        if isinstance(node.func, ast.Name):
+            if node.func.id in self._mp_names:
+                line = getattr(node, "lineno", 0)
+                self._check_target_arg(node, "target", line)
+                self._check_target_arg(node, "initializer", line)
+        self.generic_visit(node)
+
+
+def _check_spawn_targets_ast(path: str, label: str,
+                              issues: List[str]) -> None:
+    """AST-based check for spawn constraint 3: target must be module-level.
+
+    FIX-P3-2: Uses ast.parse() to recursively analyze multiprocessing
+    Process/Pool calls and verify their target= parameter is a simple
+    module-level global function reference, not a lambda, method, or
+    nested function. Per v7.32 §3.10.18 constraint 3.
+    """
+    if not path or not Path(path).exists():
+        return
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+        tree = ast.parse(content, filename=path)
+    except SyntaxError:
+        # If file has syntax errors, skip AST analysis (line-based check
+        # in _check_single_file will catch obvious issues)
+        return
+    except Exception:
+        return
+
+    visitor = _SpawnTargetVisitor(label, issues)
+    visitor.visit(tree)
+
+
 def check_spawn_compliance(target_script: Optional[str] = None,
                              related_modules: Optional[List[str]] = None) -> List[str]:
     """Check PyTorch spawn compliance.
-    
+
     Per v7.32 §3.10.18:
     1. Main script all top-level executable code in if __name__ == '__main__':
     2. Imported modules: only defs/classes/constants at top level
     3. Target function must be module-level global function
-    
+
     ISSUE-066 fix: also checks related_modules (e.g., main.py, stage scripts)
     for top-level executable code.
     """
     issues = []
-    
+
+    # FIX-P3-2: Improved spawn compliance pre-check per v7.32 §3.10.18
+    # ORIGINAL: Only checked a narrow set of prefixes, missed top-level
+    # constant assignments (X = ...) and decorator lines.
+    _VALID_TOP_LEVEL_PREFIXES = (
+        "#", "import", "from", "def ", "class ",
+        "__", '"""', "'''", " ", "\t", "@",
+    )
+    # FIX-P2-3: Distinguish constant assignments from executable assignments
+    # per v7.32 §3.10.18 constraint 2
+    _TOP_LEVEL_ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\s*=\s')
+    _TOP_LEVEL_EXECUTABLE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\s*=\s.*\(')
+
     def _check_single_file(path: str, label: str) -> None:
         if not path or not Path(path).exists():
             return
@@ -633,22 +876,43 @@ def check_spawn_compliance(target_script: Optional[str] = None,
                 in_main = True
             elif in_main:
                 continue
-            elif stripped and not stripped.startswith(("#", "import", "from", "def ", "class ", 
-                                                        "__", "\"\"\"", "'''", " ", "\t")):
+            elif stripped and not stripped.startswith(_VALID_TOP_LEVEL_PREFIXES):
+                # Allow top-level constant assignments (X = ...)
+                # FIX-P2-3: But flag executable assignments (X = func()) per
+                # v7.32 §3.10.18 constraint 2
+                if _TOP_LEVEL_ASSIGNMENT.match(stripped):
+                    # Flag executable assignments (X = func())
+                    if _TOP_LEVEL_EXECUTABLE.match(stripped):
+                        if i > 20:
+                            issues.append(
+                                f"  - {label}: top-level executable assignment "
+                                f"at line {i+1}: {stripped[:60]}"
+                            )
+                            break
+                    continue
                 if i > 20:  # Skip header comments
-                    issues.append(f"  - {label}: potential top-level executable code at line {i+1}: {stripped[:60]}")
+                    issues.append(
+                        f"  - {label}: potential top-level executable code "
+                        f"at line {i+1}: {stripped[:60]}"
+                    )
                     break
-    
+
+    def _check_file_full(path: str, label: str) -> None:
+        """Run both line-based (constraint 1+2) and AST-based (constraint 3) checks."""
+        _check_single_file(path, label)
+        # FIX-P3-2: AST-based spawn target analysis per v7.32 §3.10.18 constraint 3
+        _check_spawn_targets_ast(path, label, issues)
+
     # Check main script
     if target_script is None:
         target_script = sys.argv[0] if sys.argv else None
     if target_script:
-        _check_single_file(target_script, Path(target_script).name)
-    
+        _check_file_full(target_script, Path(target_script).name)
+
     # ISSUE-066 fix: check related modules
     if related_modules:
         for mod_path in related_modules:
-            _check_single_file(mod_path, Path(mod_path).name)
+            _check_file_full(mod_path, Path(mod_path).name)
     else:
         # Default: discover project Python files adjacent to the main script
         if target_script:
@@ -659,8 +923,8 @@ def check_spawn_compliance(target_script: Optional[str] = None,
                     continue
                 if py_file.resolve() == Path(target_script).resolve():
                     continue
-                _check_single_file(str(py_file), py_file.name)
-    
+                _check_file_full(str(py_file), py_file.name)
+
     return issues
 
 
@@ -685,7 +949,7 @@ def _detect_pipeline_type(config: Optional[Dict] = None) -> str:
 
 def run_all_checks(config: Optional[Dict] = None,
                    pipeline_type: Optional[str] = None,
-                   skip_md5_check: bool = False) -> Tuple[bool, List[str]]:
+                   skip_md5_check: bool = False) -> Tuple[bool, List[str], List[str]]:
     """Run all dependency checks. Returns (all_ok, list_of_issues).
     
     Args:
@@ -693,7 +957,8 @@ def run_all_checks(config: Optional[Dict] = None,
         pipeline_type: Explicit pipeline type override ("photo" or "video")
     """
     issues = []
-    
+    warnings = []
+
     if pipeline_type is None:
         pipeline_type = _detect_pipeline_type(config)
 
@@ -711,7 +976,9 @@ def run_all_checks(config: Optional[Dict] = None,
         # Info message is not an issue; store for caller inspection if needed
         # (callers can inspect config['photo']['avif_params']['jobs'])
 
-    # 2. FFmpeg version (video only, but also for photo metadata)
+    # 2. FFmpeg version + filters
+    # FIX-P3-5: Photo pipeline also needs FFmpeg/ffprobe for metadata reading
+    # per v7.32 §3.6. Photo skips version requirement and audio filters.
     ffmpeg_ok = True
     if pipeline_type != "photo":
         ok, msg = check_ffmpeg_version()
@@ -723,6 +990,13 @@ def run_all_checks(config: Optional[Dict] = None,
             if filt:
                 issues.append("Missing FFmpeg filters:")
                 issues.extend(filt)
+    else:
+        # Photo: verify FFmpeg/ffprobe exist (metadata reading required)
+        # Version check is optional but logged for reference
+        if not shutil.which("ffmpeg"):
+            issues.append("FFmpeg not found (required for photo metadata reading)")
+        if not shutil.which("ffprobe"):
+            issues.append("FFprobe not found (required for photo stream analysis)")
 
     # 3. VS Plugins (video only)
     if pipeline_type != "photo":
@@ -749,11 +1023,15 @@ def run_all_checks(config: Optional[Dict] = None,
         issues.extend(py)
 
     # 7. Face detection packages (if AI enabled)
+    # FIX-P1-3: Handle new Tuple return (missing_list, default_model)
+    # per v7.32 §3.6: first available model becomes default
     if config and config.get("ai", {}).get("enabled", False):
-        face = check_face_detection_packages(config)
-        if face:
+        face_missing, face_default = check_face_detection_packages(config)
+        if face_missing:
             issues.append("Missing face detection packages (AI enabled):")
-            issues.extend(face)
+            issues.extend(face_missing)
+        if face_default:
+            warnings.append(f"Face detection default model: {face_default}")
 
     # 8. AI CLI tools (if AI enabled)
     if config and config.get("ai", {}).get("enabled", False):
@@ -764,10 +1042,16 @@ def run_all_checks(config: Optional[Dict] = None,
 
     # 9. AI models (if AI enabled)
     if config and config.get("ai", {}).get("enabled", False):
-        models = check_ai_models(config.get("model_dir", "./models"), skip_md5_check=skip_md5_check)
-        if models:
+        model_errors, model_warnings = check_ai_models(
+            config.get("model_dir", "./models"), skip_md5_check=skip_md5_check
+        )
+        if model_errors:
             issues.append("Missing AI model weights:")
-            issues.extend(models)
+            issues.extend(model_errors)
+        # FIX-P3-1-REV: Warnings are informational, do not block startup
+        if model_warnings:
+            warnings.append("AI model MD5 warnings (non-blocking):")
+            warnings.extend(model_warnings)
 
     # 10. arnndn models (audio fallback, or FFmpeg <4.4)
     arnndn = check_arnndn_models(config, ffmpeg_version_ok=ffmpeg_ok)
@@ -802,7 +1086,7 @@ def run_all_checks(config: Optional[Dict] = None,
         issues.append("Spawn compliance warnings:")
         issues.extend(spawn_issues)
 
-    return len(issues) == 0, issues
+    return len(issues) == 0, issues, warnings
 
 
 def main():
@@ -831,11 +1115,15 @@ def main():
 
     pipeline_type = None if args.pipeline_type == "auto" else args.pipeline_type
 
-    ok, issues = run_all_checks(config, pipeline_type=pipeline_type, skip_md5_check=args.skip_md5_check)
+    ok, issues, warnings = run_all_checks(config, pipeline_type=pipeline_type, skip_md5_check=args.skip_md5_check)
 
     print("=" * 60)
     print("Dependency Check Results")
     print("=" * 60)
+    if warnings:
+        print(f"\n{len(warnings)} warning(s) (non-blocking):")
+        for w in warnings:
+            print(w)
     if ok:
         print("All required dependencies are satisfied.")
     else:

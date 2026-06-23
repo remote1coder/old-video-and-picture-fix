@@ -136,28 +136,63 @@ def _get_matrix_in(video_path: str, target_res: str, params: dict) -> str:
 
     Priority:
     1. color_primaries from ffprobe (bt470bg->470bg, smpte170m->170m)
-    2. Resolution heuristic (<=576 lines = PAL/470bg)
+    2. Resolution heuristic using SOURCE video height (not target)
+
+    FIX-P6-4: Resolution fallback must use SOURCE video height per v7.32 §3.10.3.
+    ORIGINAL: Used target_res to determine PAL/NTSC, which is wrong for
+    PAL 720x576 source with target_resolution="1280x720" (would return 170m).
     """
-    color_meta = _get_video_color_metadata(video_path)
+    # FIX-P6-7: Accept pre-fetched color_meta from params to avoid duplicate ffprobe call
+    # ORIGINAL: Always called _get_video_color_metadata() — duplicate call in generate_vs_script
+    color_meta = params.get("_color_meta_cache")
+    if color_meta is None:
+        color_meta = _get_video_color_metadata(video_path)
+    return _get_matrix_in_from_meta(video_path, color_meta, target_res, params)
+
+
+def _get_matrix_in_from_meta(video_path: str, color_meta: dict,
+                              target_res: str, params: dict) -> str:
+    """Determine matrix_in_s from pre-fetched color metadata or resolution fallback.
+
+    FIX-P6-7: Extracted from _get_matrix_in to support single ffprobe call pattern.
+    """
     cp = color_meta.get("color_primaries", "")
-    if cp in ("bt470bg", "bt470m"):
+    # FIX-P6-3: bt470m is NTSC (BT.470 System M) -> 170m, not PAL 470bg per v7.32 §3.10.3
+    # ORIGINAL: if cp in ("bt470bg", "bt470m"): return "470bg"
+    # bt470m was incorrectly mapped to PAL 470bg; it's actually NTSC
+    if cp == "bt470bg":
         return "470bg"
     if cp in ("smpte170m", "bt470m"):
         return "170m"
 
-    # Resolution fallback
-    target_h = 480
-    try:
-        if "x" in target_res:
-            parts = target_res.split("x")
-            if len(parts) == 2:
-                target_h = int(parts[1])
-    except (ValueError, IndexError):
-        target_h = 480
+    # FIX-P6-2: BT.709 source — identity, no conversion needed per v7.32 §3.10.3
+    # ORIGINAL: No handling for bt709; BT.709 source was forced through BT.601→BT.709 conversion
+    cs = color_meta.get("colorspace", "")
+    if cp in ("bt709",) or cs in ("bt709",):
+        return "709"
 
-    if target_h <= 576:
-        return "470bg"  # PAL BT.601
-    return "170m"  # NTSC BT.601
+    # FIX-P6-4: Resolution fallback: use SOURCE video height, not target_res
+    source_h = 480
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=height",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            data = json.loads(r.stdout)
+            if data.get("streams"):
+                source_h = int(data["streams"][0].get("height", 480))
+    except Exception:
+        source_h = 480
+
+    # FIX-P6-1: Only exact 576-line = PAL SD BT.601 per v7.32 §3.10.3
+    # ORIGINAL: if source_h <= 576: return "470bg" — NTSC 480-line incorrectly mapped to PAL
+    if source_h == 576:
+        return "470bg"  # PAL SD BT.601
+    return "170m"  # NTSC BT.601 (480-line NTSC SD and all other resolutions)
 
 
 def generate_vs_script(input_path: str, params: dict, job_id: str,
@@ -179,8 +214,16 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     target_res = params.get("target_resolution", "720x480")
     vs_bit_depth = params.get("vs_bit_depth", 16)
 
+    # FIX-P6-7: Fetch color metadata ONCE, cache for _get_matrix_in to reuse
+    # ORIGINAL: _get_video_color_metadata called twice (in _get_matrix_in + here)
+    color_meta = _get_video_color_metadata(input_path)
+    params["_color_meta_cache"] = color_meta
+
     # Determine matrix based on metadata + resolution
     matrix_in = _get_matrix_in(input_path, target_res, params)
+
+    # Clean up cache (don't leak into downstream params)
+    params.pop("_color_meta_cache", None)
 
     # VapourSynth format based on bit depth
     if vs_bit_depth == 16:
@@ -190,15 +233,20 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     else:
         vs_format = "vs.YUV420P8"
 
-    # Determine range from ffprobe metadata (FIX-P6-2)
-    color_meta = _get_video_color_metadata(input_path)
+    # Determine range from pre-fetched color metadata (FIX-P6-2 / FIX-P6-7)
     detected_range = color_meta.get("color_range", "")
     if detected_range == "tv":
         color_range = "limited"
     elif detected_range == "pc":
         color_range = "full"
     else:
+        # FIX-P6-3: Log WARNING when color_range cannot be detected per v6.32 §7.19
+        # "若无法读取源 range 属性，默认假设老影像为 limited range，但记录 WARNING"
         color_range = params.get("color_range", "limited")
+        if detected_range not in ("tv", "pc"):
+            # Will be logged by caller (main()) since generate_vs_script
+            # doesn't have access to logger. Mark in params for downstream logging.
+            params["_color_range_unknown"] = True
     range_in_str = "vs.RANGE_FULL" if color_range == "full" else "vs.RANGE_LIMITED"
     range_out_str = "vs.RANGE_LIMITED"
 
@@ -270,18 +318,55 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         # FIX-P6-11: Optional progressive repair for PSF
         if params.get("psf_use_input_type1", False):
             lines.append("# Optional progressive repair for PSF")
+            # FIX-P6-2: PSF FpsDivisor=1 per v7.32 §3.10.1
+            # ORIGINAL: FpsDivisor={fps_divisor} — PSF restore already produces correct frame rate,
+            # must NOT halve it. FpsDivisor=1 keeps the native PSF frame rate.
             lines.append(f"clip = haf.QTGMC(clip, Preset='{qtgmc_preset}', "
                         f"EZDenoise={qtgmc_ezdenoise}, Sharpness={qtgmc_sharpness}, "
                         f"ChromaMotion={cm_str}, SourceMatch={qtgmc_sourcematch}, "
-                        f"InputType=1, FpsDivisor={fps_divisor})")
+                        f"InputType=1, FpsDivisor=1)")
         lines.append("")
 
     # IVTC (must be before deinterlace)
     if needs_ivtc and not is_psf:
         lines.append("# IVTC - must execute before QTGMC")
         if ivtc == "VIVTC":
-            # V-P-019 fix: VFM and VDecimate on adjacent lines without intervening comments
-            lines.append("clip = core.vivtc.VFM(clip, mode=1, ovr=0).VDecimate(cycle=5)")
+            # FIX-P6-8: VFM mode/VDecimate cycle from config per v6.32 §7.9 / v7.32 §3.10.13
+            # ORIGINAL: hardcoded mode=1, cycle=5
+            vfm_mode = params.get("vfm_mode", 1)
+            vdecimate_cycle = params.get("vdecimate_cycle", 5)
+            # V-P-019 fix: VFM and VDecimate must be chained directly per v7.32 §3.10.13
+            # FIX-P6-7: _Combed diagnostic block between VFM and VDecimate per v7.32 §3.10.13
+            lines.append(f"clip = core.vivtc.VFM(clip, mode={vfm_mode}, ovr=0)")
+            lines.append(f"# _Combed statistics collection (sidecar export) per v7.32 §3.10.13")
+            lines.append(f"_combed_stats = " + r'{"combed_frames": [], "total": 0, "mode": ' + str(vfm_mode) + r'}')
+            lines.append("def _collect_combed(n, f):")
+            lines.append("    if f.props.get('_Combed', 0):")
+            lines.append("        _combed_stats['combed_frames'].append(n)")
+            lines.append("    _combed_stats['total'] += 1")
+            lines.append("    return f")
+            # FIX-E1: ModifyFrame is EXEMPT from the "no filters between VFM/VDecimate" rule
+            # because it only reads frame properties (_Combed) without modifying pixels or
+            # frame attributes. VDecimate's combed-frame detection relies solely on VFM's
+            # output pixel data and _Combed prop, neither of which ModifyFrame alters.
+            # Per v7.32 §3.10.13, the prohibition targets "修改帧内容/属性的滤镜" only.
+            lines.append("_diag = core.std.ModifyFrame(clip, clip, _collect_combed)")
+            lines.append("# Eagerly request first 300 frames to trigger callbacks")
+            lines.append("_max_diag = min(300, clip.num_frames)")
+            lines.append("for _ci in range(_max_diag):")
+            lines.append("    try:")
+            lines.append("        _diag.get_frame(_ci)")
+            lines.append("    except Exception:")
+            lines.append("        break")
+            lines.append("import os as _os, json as _json")
+            lines.append("_sidecar_path = _os.environ.get('VS_COMBED_STATS', '')")
+            lines.append("if _sidecar_path:")
+            lines.append("    try:")
+            lines.append("        with open(_sidecar_path, 'w', encoding='utf-8') as _sf:")
+            lines.append("            _json.dump(_combed_stats, _sf)")
+            lines.append("    except Exception:")
+            lines.append("        pass")
+            lines.append(f"clip = core.vivtc.VDecimate(clip, cycle={vdecimate_cycle})")
         elif ivtc == "sRestore":
             lines.append("clip = haf.srestore(clip, frate=23.976)")
         lines.append("")
@@ -348,7 +433,15 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("")
     elif field_order == "unknown" and not is_psf:
         # v6.3: unknown field_order -> skip QTGMC InputType=0, conservative handling
+        # FIX-P6-5: Clear _FieldBased attribute per v7.32 §3.10.1
+        # ORIGINAL: Only added comment, did not clear _FieldBased property
         lines.append("# field_order=unknown: skipping QTGMC deinterlace (conservative)")
+        lines.append("clip = core.std.SetFieldBased(clip, 0)")
+        lines.append("")
+    elif field_order == "progressive" and not is_psf:
+        # FIX-P6-9: explicit comment for progressive per v7.32 §3.10.1
+        # field_order=progressive: native progressive, skipping QTGMC deinterlace
+        lines.append("# field_order=progressive: native progressive, skipping QTGMC deinterlace")
         lines.append("")
 
     # Denoise
@@ -367,8 +460,15 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append(f"clip = haf.Deblock_QED(clip, quant={deblock_quant})")
         lines.append("")
     elif deblock == "DeblockPP7":
+        # FIX-P6-12: Support configurable DeblockPP7 parameters per v7.32 §3.10.1
+        # ORIGINAL: Hardcoded call with no parameters
+        deblock_pp7_params = params.get("deblock_pp7_params", {})
         lines.append("# Deblocking (HDV)")
-        lines.append("clip = core.deblock.Deblock(clip)")
+        if deblock_pp7_params:
+            pp7_args = ", ".join(f"{k}={v}" for k, v in deblock_pp7_params.items())
+            lines.append(f"clip = core.deblock.Deblock(clip, {pp7_args})")
+        else:
+            lines.append("clip = core.deblock.Deblock(clip)")
         lines.append("")
 
     # Chroma shift
@@ -386,10 +486,15 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("")
 
     # Color space conversion: BT.601 -> BT.709
-    lines.append("# BT.601 -> BT.709 color space conversion")
-    lines.append(f"clip = core.resize.Bicubic(clip, "
-                f"matrix_in_s='{matrix_in}', matrix_s='709', "
-                f"range_in={range_in_str}, range={range_out_str})")
+    # FIX-P6-2: Skip conversion if source is already BT.709 per v7.32 §3.10.3
+    # ORIGINAL: Always applied BT.601→BT.709 conversion even for BT.709 sources
+    if matrix_in == "709":
+        lines.append("# Source is already BT.709, no color conversion needed")
+    else:
+        lines.append("# BT.601 -> BT.709 color space conversion")
+        lines.append(f"clip = core.resize.Bicubic(clip, "
+                    f"matrix_in_s='{matrix_in}', matrix_s='709', "
+                    f"range_in={range_in_str}, range={range_out_str})")
     lines.append("")
 
     # Restore black borders
@@ -404,6 +509,65 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     lines.append("clip.set_output()")
 
     return "\n".join(lines)
+
+
+def _check_combed_and_fallback(vs_path: Path, params: dict, logger) -> bool:
+    """Run quick _Combed diagnostic and return True if sRestore fallback needed.
+
+    FIX-P6-7: Per v7.32 §3.10.13, VFM output must be validated for _Combed
+    markers. If combed_ratio > threshold, sRestore fallback is required.
+
+    Uses the _Combed diagnostic block embedded in the .vpy script.
+    Runs a quick vspipe pass (first 300 frames) to populate sidecar JSON.
+    """
+    combed_stats_path = vs_path.with_suffix(".combed.json")
+    env = {**os.environ, "VS_COMBED_STATS": str(combed_stats_path)}
+
+    # Quick diagnostic pass: request frames 0-299 to populate sidecar
+    # FIX-P6-9: Write y4m stdout to /dev/null instead of capturing to memory
+    # ORIGINAL: capture_output=True stored up to 100MB+ of y4m data in RAM
+    try:
+        with open(os.devnull, 'wb') as devnull_out:
+            r_diag = subprocess.run(
+                ["vspipe", str(vs_path), "-", "-s", "0", "-e", "299"],
+                env=env, stdout=devnull_out, stderr=subprocess.PIPE,
+                shell=False, timeout=120
+            )
+        # Output discarded; sidecar file is the only channel we care about
+    except Exception as e:
+        logger.warning("IVTC_COMBED_DIAG_FAIL",
+                      f"_Combed diagnostic pass failed: {e}")
+        return False
+
+    needs_srestore = False
+    if combed_stats_path.exists():
+        try:
+            with open(combed_stats_path, "r", encoding="utf-8") as f:
+                stats = json.load(f)
+            total = stats.get("total", 0)
+            combed_count = len(stats.get("combed_frames", []))
+            if total > 0:
+                ratio = combed_count / total
+                # Threshold: v7.32 §3.10.13 "continuous multi-frame failure"
+                # 10% is conservative; normal 3:2 Pulldown _Combed < 2%
+                threshold = params.get("ivtc_combed_threshold", 0.10)
+                if ratio > threshold:
+                    logger.warning("IVTC_COMBED_FAIL",
+                                  f"VFM _Combed ratio {ratio:.1%} > threshold "
+                                  f"{threshold:.1%}, sRestore fallback required",
+                                  combed_frames=stats.get("combed_frames")[:20])
+                    needs_srestore = True
+        except Exception as e:
+            logger.warning("IVTC_COMBED_READ_FAIL",
+                          f"Failed to read _Combed sidecar: {e}")
+        finally:
+            # Clean up sidecar
+            try:
+                combed_stats_path.unlink()
+            except Exception:
+                pass
+
+    return needs_srestore
 
 
 def check_deinterlace_quality(video_path: str, logger=None) -> Tuple[bool, float]:
@@ -523,7 +687,26 @@ def main():
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
     temp_dir = params.get("temp_dir", "./temp")
-    os.makedirs(temp_dir, exist_ok=True)
+    # FIX-P6-5: WSL2 defensive check per v7.32 §3.10.10
+    # main.py handles primary WSL2 redirect; this is a defensive fallback
+    if temp_dir.startswith("/mnt/") and not params.get("no_wsl_redirect"):
+        logger.warning("STAGE1_WSL_UNREDIRECTED",
+                      f"temp_dir still on /mnt/: {temp_dir}. "
+                      "Expected main.py to redirect before calling stage.")
+        try:
+            from checkpoint import wsl_redirect_path
+            redirected = wsl_redirect_path(temp_dir)
+            if isinstance(redirected, tuple):
+                redirected = redirected[0]
+            if redirected != temp_dir:
+                logger.info("STAGE1_WSL_REDIRECT",
+                           f"temp_dir redirected: {temp_dir} -> {redirected}")
+                temp_dir = redirected
+        except ImportError:
+            pass
+    # FIX-P6-10: Use pathlib.Path consistently per project convention
+    # ORIGINAL: os.makedirs / os.path.* mixed usage
+    Path(temp_dir).mkdir(parents=True, exist_ok=True)
 
     input_path = args.input
     input_name = Path(input_path).name
@@ -533,9 +716,10 @@ def main():
     inter_name = build_intermediate_name(
         args.job_id, input_name, 1, "preprocess", param_hash, "mkv"
     )
-    inter_path = os.path.join(temp_dir, inter_name)
+    inter_path = str(Path(temp_dir) / inter_name)
 
-    if os.path.exists(inter_path) and os.path.getsize(inter_path) > 0:
+    # FIX-P6-10: pathlib consistency
+    if Path(inter_path).exists() and Path(inter_path).stat().st_size > 0:
         logger.info("STAGE1_SKIP", "Intermediate exists", path=inter_path)
         return 3
 
@@ -550,6 +734,13 @@ def main():
 
     # Generate VapourSynth script
     vs_script = generate_vs_script(input_path, params, args.job_id, crop_info)
+
+    # FIX-P6-3: Log WARNING when color_range cannot be detected per v6.32 §7.19
+    if params.get("_color_range_unknown"):
+        logger.warning("STAGE1_COLOR_RANGE_UNKNOWN",
+                      "Cannot detect color_range from ffprobe, "
+                      "defaulting to limited per v6.32 §7.19")
+        params.pop("_color_range_unknown", None)
 
     # FIX-P6-8: Log warning for unknown field_order
     if params.get("field_order") == "unknown":
@@ -568,7 +759,7 @@ def main():
                         "QTGMC appears before IVTC in generated script; violates v6.3 hard constraint")
             return 81
 
-    vs_path = os.path.join(temp_dir, f"{args.job_id}_{input_name}.vpy")
+    vs_path = str(Path(temp_dir) / f"{args.job_id}_{input_name}.vpy")
     with open(vs_path, "w", encoding="utf-8") as f:
         f.write(vs_script)
 
@@ -576,6 +767,16 @@ def main():
     import hashlib
     script_hash = hashlib.sha256(vs_script.encode("utf-8")).hexdigest()
     logger.info("STAGE1_VPY", f"VS script written: {vs_path}", script_sha256=script_hash)
+
+    # FIX-P6-7: _Combed pre-check for VIVTC path per v7.32 §3.10.13
+    # Run quick diagnostic before main render; if combed_ratio > threshold,
+    # return 86 so main.py can re-run with sRestore
+    ivtc_method = params.get("ivtc", "VIVTC")
+    if needs_ivtc and ivtc_method == "VIVTC" and params.get("ivtc_auto_fallback", True):
+        if _check_combed_and_fallback(Path(vs_path), params, logger):
+            logger.warning("IVTC_COMBED_PRECHECK",
+                          "VFM _Combed pre-check failed, requesting sRestore fallback")
+            return 86
 
     # Render with vspipe -> ffmpeg
     try:
@@ -596,7 +797,7 @@ def main():
         vp.stdout.close()
         _, stderr = ff.communicate(timeout=7200)
 
-        if ff.returncode == 0 and os.path.exists(inter_path):
+        if ff.returncode == 0 and Path(inter_path).exists():
             # V-P-022 fix: IVTC auto-fallback check
             needs_ivtc = params.get("needs_ivtc", False)
             ivtc = params.get("ivtc", "VIVTC")
@@ -611,19 +812,40 @@ def main():
                     srestore_params = dict(params)
                     srestore_params["ivtc"] = "sRestore"
                     vs_script_srestore = generate_vs_script(input_path, srestore_params, args.job_id, crop_info)
-                    vs_path_srestore = os.path.join(temp_dir, f"{args.job_id}_{input_name}_srestore.vpy")
+                    vs_path_srestore = str(Path(temp_dir) / f"{args.job_id}_{input_name}_srestore.vpy")
                     with open(vs_path_srestore, "w", encoding="utf-8") as f:
                         f.write(vs_script_srestore)
                     script_hash_sr = hashlib.sha256(vs_script_srestore.encode("utf-8")).hexdigest()
                     logger.info("STAGE1_VPY_SRESTORE", f"sRestore script written: {vs_path_srestore}", script_sha256=script_hash_sr)
 
+                    # FIX-P6-4: Render sRestore to temporary file first (atomic safety)
+                    # ORIGINAL: Rendered directly to inter_path, corrupting VIVTC output on failure
+                    srestore_inter_path = inter_path + ".srestore.tmp"
+                    ffmpeg_cmd_srestore = [
+                        "ffmpeg", "-hide_banner", "-v", "error",
+                        "-thread_queue_size", "1024",
+                        "-i", "-",
+                        "-c:v", "ffv1",
+                        "-an", "-y", srestore_inter_path
+                    ]
                     vp2 = subprocess.Popen(["vspipe", "--y4m", vs_path_srestore, "-"],
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
-                    ff2 = subprocess.Popen(ffmpeg_cmd, stdin=vp2.stdout,
+                    ff2 = subprocess.Popen(ffmpeg_cmd_srestore, stdin=vp2.stdout,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
                     vp2.stdout.close()
                     _, stderr2 = ff2.communicate(timeout=7200)
-                    if ff2.returncode == 0 and os.path.exists(inter_path):
+                    if ff2.returncode == 0 and Path(srestore_inter_path).exists():
+                        # Atomic replace: only overwrite original on success
+                        import shutil
+                        try:
+                            shutil.move(srestore_inter_path, inter_path)
+                        except OSError:
+                            # Cross-filesystem fallback
+                            shutil.copyfile(srestore_inter_path, inter_path)
+                            try:
+                                os.unlink(srestore_inter_path)
+                            except Exception:
+                                pass
                         # V-P-022: verify sRestore frame rate
                         try:
                             fr_cmd = ["ffprobe", "-hide_banner", "-v", "error",
@@ -647,6 +869,12 @@ def main():
                             logger.warning("STAGE1_FRAMERATE_CHECK", f"Frame rate check failed: {e}")
                         logger.info("STAGE1_SRESTORE_DONE", "sRestore IVTC fallback complete", output=inter_path)
                     else:
+                        # Clean up failed sRestore temp file
+                        try:
+                            if Path(srestore_inter_path).exists():
+                                Path(srestore_inter_path).unlink()
+                        except Exception:
+                            pass
                         err_msg = stderr2.decode()[:300] if stderr2 else "Unknown error"
                         logger.error("STAGE1_SRESTORE_FAIL", f"sRestore render error: {err_msg}")
                         return 84
@@ -676,13 +904,30 @@ def main():
                             detected_fps = num / den if den != 0 else 0
                         else:
                             detected_fps = float(rate_str)
-                        original_fps = params.get("original_fps", 0)
+                        # FIX-P6-6: Also check "fps" key from classify output per v7.32 §3.10.1
+                        # ORIGINAL: Only checked "original_fps" which is never set by main.py
+                        original_fps = params.get("original_fps", params.get("fps", 0))
                         if original_fps > 0 and abs(detected_fps - original_fps) > 0.5:
                             logger.error("STAGE1_PSF_FRAMERATE",
                                         f"PSF output fps {detected_fps} differs from original {original_fps}")
                             return 86
                 except Exception as e:
                     logger.warning("STAGE1_PSF_FRAMERATE_CHECK", f"PSF frame rate check failed: {e}")
+
+            # FIX-P6-12: --cleanup-intermediates removes VS script per v7.32 §3.10.17
+            if args.cleanup_intermediates:
+                try:
+                    vs_path_obj = Path(vs_path)
+                    if vs_path_obj.exists():
+                        vs_path_obj.unlink()
+                        logger.info("STAGE1_CLEANUP", f"Removed VS script: {vs_path}")
+                    # Also remove sRestore script if it exists
+                    srestore_vs = Path(f"{vs_path_obj.stem}_srestore{vs_path_obj.suffix}")
+                    if srestore_vs.exists():
+                        srestore_vs.unlink()
+                        logger.info("STAGE1_CLEANUP", f"Removed sRestore VS script: {srestore_vs}")
+                except Exception as e:
+                    logger.warning("STAGE1_CLEANUP_FAIL", f"Failed to cleanup: {e}")
 
             logger.info("STAGE1_DONE", "Preprocessing complete", output=inter_path)
             return 0

@@ -16,7 +16,6 @@ import sys
 import time
 import argparse
 import subprocess
-import shutil
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
@@ -26,7 +25,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
 from manifest_loader import load_manifest, filter_jobs, save_manifest, update_job_status  # noqa: E402
-from checkpoint import cleanup_old_intermediates, estimate_disk_space  # noqa: E402
+from checkpoint import cleanup_old_intermediates, check_wsl_space  # noqa: E402
 
 
 def parse_args():
@@ -95,9 +94,13 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 def merge_params(job: Dict[str, Any], config: Dict[str, Any],
                  cli_overrides: Dict[str, Any], logger=None) -> Dict[str, Any]:
     """Merge parameters with priority:
-    CLI > user_overrides > paths > global > defaults
+    CLI > user_overrides > recommended_params > audio_override > paths > global+audio+ai > defaults
     Uses deep merge for nested dicts.
     Records PARAM_OVERRIDE events per v7.3 §3.10.12.
+
+    FIX-P5-1: Corrected priority order per v7.32 §3.2 / CLAUDE.md §3:
+      global → paths[type] → audio_override[type] → recommended_params → user_overrides → CLI
+      ai_/audio_ prefix keys are set conditionally (only if not already set by a higher layer).
     """
     params: Dict[str, Any] = {}
     overrides_log = []
@@ -106,74 +109,79 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
         if old_val != new_val:
             overrides_log.append({"key": key, "old": old_val, "new": new_val, "source": source})
 
-    # Start with global
+    def _set_param(k: str, v: Any, source: str, is_dict_merge: bool = False):
+        """Set param and sync ai_/audio_ prefixed variants."""
+        old = params.get(k)
+        if is_dict_merge and isinstance(v, dict) and isinstance(params.get(k), dict):
+            params[k] = _deep_merge(params.get(k, {}), v)
+        else:
+            params[k] = v
+        _log_override(k, old, v, source)
+        # Sync prefixed variants so both forms reflect the override
+        for prefix in ("ai_", "audio_"):
+            pk = f"{prefix}{k}"
+            if pk in params and pk != k:
+                old_p = params[pk]
+                params[pk] = v
+                if old_p != v:
+                    _log_override(pk, old_p, v, source)
+
+    # 1. Start with global
     base = config.get("global", {})
     params = _deep_merge(params, base)
 
-    # Override with path-specific params
-    detected_class = job.get("detected_class", "")
-    path_key = detected_class.lower()
-    paths = config.get("paths", {})
-    if path_key in paths:
-        path_params = paths[path_key]
-        for k, v in path_params.items():
-            if k != "audio_override":
-                old = params.get(k)
-                params[k] = v
-                _log_override(k, old, v, "paths")
-
-    # Override with job recommended_params
-    rec_params = job.get("recommended_params", {})
-    if rec_params:
-        for k, v in rec_params.items():
-            old = params.get(k)
-            if isinstance(v, dict) and isinstance(params.get(k), dict):
-                params[k] = _deep_merge(params.get(k, {}), v)
-            else:
-                params[k] = v
-            _log_override(k, old, v, "recommended_params")
-
-    # Override with user_overrides
-    user_ov = job.get("user_overrides", {})
-    if user_ov:
-        for k, v in user_ov.items():
-            old = params.get(k)
-            if isinstance(v, dict) and isinstance(params.get(k), dict):
-                params[k] = _deep_merge(params.get(k, {}), v)
-            else:
-                params[k] = v
-            _log_override(k, old, v, "user_overrides")
-
-    # Apply audio_override for the detected material type
-    # FIX-P5-4: 优先级：CLI > user_overrides > audio_override > global.audio > defaults
-    audio_override = config.get("audio_override", {})
-    if path_key in audio_override:
-        for k, v in audio_override[path_key].items():
-            old = params.get(k)
-            params[k] = v
-            _log_override(k, old, v, "audio_override")
-
-    # Override with CLI
-    if cli_overrides:
-        for k, v in cli_overrides.items():
-            old = params.get(k)
-            params[k] = v
-            _log_override(k, old, v, "cli")
-
-    # Merge nested config sections (audio, ai) as flat keys for stage script compatibility
+    # 2. Merge audio/ai top-level sections at global priority level
+    #    Conditional assignment: only set if key doesn't already exist
+    #    ORIGINAL: lines 164-174 unconditionally set ai_/audio_ prefixed keys,
+    #    overwriting higher-priority values. Now conditional.
     audio_config = config.get("audio", {})
     for k, v in audio_config.items():
         if k not in params:
             params[k] = v
-        params[f"audio_{k}"] = v
+        if f"audio_{k}" not in params:
+            params[f"audio_{k}"] = v
 
     ai_config = config.get("ai", {})
     for k, v in ai_config.items():
         if k not in params:
             params[k] = v
-        params[f"ai_{k}"] = v
+        if f"ai_{k}" not in params:
+            params[f"ai_{k}"] = v
 
-    # grain_factory3 is accessed as nested dict by stage6: params.get("grain_factory3", {})
+    # 3. Override with path-specific params
+    detected_class = job.get("detected_class", "")
+    path_key = detected_class.lower()
+    paths = config.get("paths", {})
+    if path_key in paths:
+        for k, v in paths[path_key].items():
+            _set_param(k, v, "paths")
+
+    # 4. Override with audio_override (CORRECT POSITION: after paths, before recommended_params)
+    #    ORIGINAL: audio_override was applied after user_overrides (line 147-154),
+    #    causing it to override user_overrides. Now correctly between paths and recommended_params.
+    audio_override = config.get("audio_override", {})
+    if path_key in audio_override:
+        for k, v in audio_override[path_key].items():
+            _set_param(k, v, "audio_override")
+
+    # 5. Override with job recommended_params
+    rec_params = job.get("recommended_params", {})
+    if rec_params:
+        for k, v in rec_params.items():
+            _set_param(k, v, "recommended_params", is_dict_merge=True)
+
+    # 6. Override with user_overrides
+    user_ov = job.get("user_overrides", {})
+    if user_ov:
+        for k, v in user_ov.items():
+            _set_param(k, v, "user_overrides", is_dict_merge=True)
+
+    # 7. Override with CLI (highest priority)
+    if cli_overrides:
+        for k, v in cli_overrides.items():
+            _set_param(k, v, "cli")
+
+    # grain_factory3 as nested dict
     if "grain_factory3" in config:
         if "grain_factory3" not in params:
             params["grain_factory3"] = config["grain_factory3"]
@@ -194,6 +202,10 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     params["input_path"] = job.get("input_path", "")
     params["field_segments"] = job.get("field_segments", [])
     params["duration"] = job.get("duration", 0)
+    # FIX-P6-6: Inject original_fps from classify output for PSF frame rate verification
+    # per v7.32 §3.10.1
+    if "original_fps" not in params:
+        params["original_fps"] = job.get("fps", 0)
 
     # V-P-006 fix: log PARAM_OVERRIDE events
     if logger and overrides_log:
@@ -304,39 +316,6 @@ def _get_video_duration(video_path: str) -> float:
     return 0.0
 
 
-def _check_disk_space(job: Dict[str, Any], config: Dict[str, Any], logger) -> bool:
-    """Check if sufficient disk space is available before processing."""
-    try:
-        # Extract parameters for estimation
-        detected_class = job.get("detected_class", "")
-        width = job.get("original_width", 720)
-        height = job.get("original_height", 480)
-        duration = job.get("duration", 300)
-        fps = 25.0 if detected_class == "HDV_AVCHD" else 29.97
-        
-        # Estimate using checkpoint function with correct signature
-        required = estimate_disk_space(
-            duration=duration,
-            fps=fps,
-            width=width,
-            height=height,
-        )
-        
-        temp_dir = config.get("global", {}).get("temp_dir", "./temp")
-        stat = shutil.disk_usage(temp_dir)
-        available = stat.free
-        # Require 2x the estimated space as safety margin
-        if available < required * 2 * 1024 * 1024:  # Convert MB to bytes
-            logger.error("DISK_SPACE",
-                        f"Insufficient disk space: need ~{required}MB, "
-                        f"have {available // (1024*1024)}MB")
-            return False
-        return True
-    except Exception as e:
-        logger.warning("DISK_SPACE_CHECK", f"Disk space check failed: {e}")
-        return True
-
-
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 args, logger) -> Tuple[int, str]:
     """Process a single job through all stages. Returns (exit_code, stderr)."""
@@ -383,34 +362,10 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     params = merge_params(job, config, cli_overrides, logger)
     params["output_path"] = job.get("output_path", "")
 
-    # V-P-008 fix: WSL2 path redirect for temp_dir and output_dir
-    try:
-        from checkpoint import wsl_redirect_path
-        no_wsl_redirect = params.get("no_wsl_redirect", False)
-        platform_val = params.get("platform", "auto")
-        temp_dir = params.get("temp_dir", "./temp")
-        output_dir = params.get("output_dir", "./output")
-        redirected_temp, original_temp, _, _ = wsl_redirect_path(
-            temp_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform_val
-        )
-        redirected_output, original_output, _, _ = wsl_redirect_path(
-            output_dir, no_wsl_redirect=no_wsl_redirect, target_platform=platform_val
-        )
-        if original_temp:
-            logger.info("WSL_REDIRECT", f"temp_dir: {temp_dir} -> {redirected_temp}",
-                       original_path=temp_dir, redirected_path=redirected_temp)
-            params["temp_dir"] = redirected_temp
-            params["original_temp_dir"] = original_temp
-        if original_output:
-            logger.info("WSL_REDIRECT", f"output_dir: {output_dir} -> {redirected_output}",
-                       original_path=output_dir, redirected_path=redirected_output)
-            params["output_dir"] = redirected_output
-            params["original_output_dir"] = original_output
-    except Exception as e:
-        logger.warning("WSL_REDIRECT_SKIP", f"WSL redirect check failed: {e}")
-
-    # Disk space check
-    if not _check_disk_space(job, config, logger):
+    # FIX-P2-6/§3.10.10: Combined WSL2 redirect + disk space pre-check with fallback chain
+    # Replaces separate WSL redirect block and _check_disk_space().
+    # Per v7.32 §3.10.10: native partition → /mnt/ fallback → FAILED
+    if not check_wsl_space(params, logger=logger, job=job):
         return 87, "Insufficient disk space"
 
     log_dir = params.get("log_dir", "./logs")
@@ -463,6 +418,37 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
+            # FIX-P3-6: Per v7.32 §3.8: Auto-generate forced-upscale comparison
+            # frames after stage3 AI upscale completes successfully
+            if stage_num == 3 and force_allow:
+                try:
+                    from preview import auto_generate_comparison_if_needed
+                    _temp_dir = params.get("temp_dir", "./temp")
+                    _input_name = Path(input_path).name
+                    import glob as _glob
+                    _step3_pattern = f"{_temp_dir}/{job_id}_{_input_name}_step3*"
+                    _step3_cands = _glob.glob(_step3_pattern)
+                    if _step3_cands:
+                        _step3_cands.sort(
+                            key=lambda p: os.path.getmtime(p), reverse=True)
+                        _step3_output = _step3_cands[0]
+                        _comp_frames = auto_generate_comparison_if_needed(
+                            original_path=input_path,
+                            processed_path=_step3_output,
+                            output_dir=params.get("output_dir", "./output"),
+                            config=config,
+                            num_pairs=3
+                        )
+                        if _comp_frames:
+                            job_logger.info(
+                                "PREVIEW_FORCED_UPSCALE",
+                                f"Generated {len(_comp_frames)} "
+                                f"comparison frames",
+                                frames=_comp_frames)
+                except Exception as e:
+                    job_logger.warning(
+                        "PREVIEW_FORCED_UPSCALE_FAIL",
+                        f"Comparison frame generation failed: {e}")
             if stage_num == 2:
                 # FIX-P5-5: 校验 stage2 输出文件存在、非空、可解码
                 temp_dir = params.get("temp_dir", "./temp")
@@ -497,6 +483,31 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                                "Traditional restoration skipped (already done), proceeding to AI stages")
         else:
             job_logger.error("STAGE_FAILED", f"Stage {stage_num} failed: {exit_code}")
+            # FIX-P6-7: VFM _Combed validation failed → auto-fallback to sRestore
+            # per v7.32 §3.10.13
+            if stage_num == 1 and exit_code == 86:
+                combed_fallback = params.get("ivtc_auto_fallback", True)
+                if combed_fallback and params.get("ivtc", "VIVTC") == "VIVTC":
+                    job_logger.warning("IVTC_AUTO_FALLBACK",
+                                      "VFM _Combed check failed, switching to sRestore",
+                                      job_id=job_id)
+                    # Update params for sRestore path
+                    params["ivtc"] = "sRestore"
+                    # Re-run stage1 with sRestore
+                    exit_code2, stderr2 = run_stage(
+                        script_name, job, params, args.get("config"))
+                    if exit_code2 in (0, 3):
+                        job_logger.info("IVTC_SRESTORE_DONE",
+                                       "sRestore IVTC fallback complete")
+                        # Continue with remaining stages
+                        if exit_code2 == 0:
+                            job_logger.info("STAGE_DONE",
+                                           f"Stage {stage_num} complete (sRestore)")
+                        continue
+                    else:
+                        job_logger.error("IVTC_SRESTORE_FAIL",
+                                        "sRestore fallback also failed")
+                        return exit_code2, stderr2
             # V-P-007/V-P-028 fix: force_traditional_first gate
             force_traditional_first = params.get("force_traditional_first", True)
             if force_traditional_first and stage_num == 2:
@@ -513,9 +524,11 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         # Cleanup old intermediates after successful stage
         if params.get("cleanup_intermediates", True):
             temp_dir = params.get("temp_dir", "./temp")
-            input_name = Path(input_path).name
             keep_steps = params.get("keep_steps", 2)
-            cleanup_old_intermediates(temp_dir, job_id, input_name, keep_steps)
+            # FIX-NEW-1: Removed spurious input_name arg — function signature is
+            # cleanup_old_intermediates(temp_dir, job_id, keep_steps, current_step)
+            # and matches files by job_id prefix; input_name is not a parameter.
+            cleanup_old_intermediates(temp_dir, job_id, keep_steps)
 
     logger.info("JOB_DONE", f"Job {job_id} complete")
     return 0, ""
@@ -576,7 +589,10 @@ def main():
     # Dependency check
     try:
         from dependency_check import run_all_checks
-        ok, issues = run_all_checks(config)
+        ok, issues, dep_warnings = run_all_checks(config)
+        if dep_warnings:
+            for w in dep_warnings:
+                logger.warn("DEP_CHECK", w)
         if not ok:
             for issue in issues:
                 logger.error("DEP_CHECK", issue)
@@ -590,9 +606,15 @@ def main():
         if not args.input:
             print("Error: --scan requires --input directories")
             sys.exit(81)
-        manifest_path = args.manifest or str(SCRIPT_DIR / "batch_manifest.yaml")
+        # FIX-P5-3: Use --output-manifest when provided per v7.32 §3.3
+        manifest_path = (getattr(args, 'output_manifest', None)
+                         or args.manifest
+                         or str(SCRIPT_DIR / "batch_manifest.yaml"))
         from manifest_generate import generate_manifest
-        generate_manifest(args.input, manifest_path, config, "video")
+        # FIX-P5-4: Pass --incremental flag to generate_manifest per v7.32 §3.3
+        incremental = getattr(args, 'incremental', False)
+        generate_manifest(args.input, manifest_path, config, "video",
+                          incremental=incremental)
         logger.info("SCAN_DONE", f"Manifest saved to {manifest_path}")
         print(f"Scan complete. Manifest saved to {manifest_path}")
         print("Next: Review with --edit-manifest, then execute with --mode batch")
@@ -668,6 +690,17 @@ def main():
                     k, v = line.split("=", 1)
                     job.setdefault("user_overrides", {})[k.strip()] = v.strip()
                     print(f"  Set {k.strip()} = {v.strip()}")
+        # FIX-P5-7: AI upscale ban double confirmation per v7.32 §3.10.2
+        # In interactive mode, if file is AI-banned and AI is enabled, require explicit override
+        job_params = merge_params(job, config, {}, logger)
+        if job.get("ai_upscale_banned") and job_params.get("ai_enabled"):
+            print(f"\n⚠️  WARNING: This file is flagged as AI-upscale-banned "
+                  f"(detected_class={job.get('detected_class')}).")
+            print(f"  AI super-resolution may produce artifacts on already-high-resolution content.")
+            confirm_ban = input("Force AI upscale anyway? [y/N]: ").strip().lower()
+            if confirm_ban not in ("y", "yes"):
+                print("AI upscale disabled for this file.")
+                job.setdefault("user_overrides", {})["ai_enabled"] = False
         # Run single job
         _run_single_job(job, config, args, logger, manifest, manifest_path)
         try:
@@ -684,7 +717,10 @@ def main():
     elif args.input:
         manifest_path = str(SCRIPT_DIR / "batch_manifest.yaml")
         from manifest_generate import generate_manifest
-        generate_manifest(args.input, manifest_path, config, "video")
+        # FIX-P5-4: Pass --incremental flag to generate_manifest
+        incremental = getattr(args, 'incremental', False)
+        generate_manifest(args.input, manifest_path, config, "video",
+                          incremental=incremental)
     else:
         print("Error: Provide --input or --manifest")
         sys.exit(81)
@@ -786,6 +822,9 @@ def main():
     jobs = filter_jobs(manifest, target_statuses)
     if args.job_id:
         jobs = [j for j in jobs if j.get("job_id") == args.job_id]
+    else:
+        # FIX-P5-5: Sort by priority per v7.32 §3.3: priority=1 first, then others
+        jobs.sort(key=lambda j: (0 if j.get("priority") == 1 else 1))
 
     logger.info("BATCH_START", f"Processing {len(jobs)} video jobs")
     print(f"Processing {len(jobs)} video jobs...")

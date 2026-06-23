@@ -2,7 +2,7 @@
 """
 Stage 3: Photo AI Upscaling
 Integer-scale AI super-resolution for photos.
-Supports: Real-ESRGAN, DAT models.
+Supports: Real-ESRGAN, DAT, GPEN models per v7.32 §3.1.
 
 v6.3 Compliance:
 - Target resolution must be <= 1080p (1920x1080) for AI upscale
@@ -28,22 +28,32 @@ from checkpoint import compute_param_hash, build_intermediate_name, gpu_memory_c
 
 
 def _get_model_basename(model: str) -> str:
-    """Extract model family from full model name."""
+    """Extract model family from full model name.
+
+    Supported families per v7.32 §3.1: RealESRGAN, DAT, GPEN.
+    """
     # e.g. "RealESRGAN_x2plus" -> "RealESRGAN", "DAT_x2" -> "DAT"
     if model.startswith("RealESRGAN"):
         return "RealESRGAN"
     elif model.startswith("DAT"):
         return "DAT"
+    elif model.startswith("GPEN"):
+        return "GPEN"
     return "RealESRGAN"
 
 
 def _get_model_for_scale(model: str, scale: int) -> str:
-    """Get correct model name for a given scale, preserving model family."""
+    """Get correct model name for a given scale, preserving model family.
+
+    Supported families per v7.32 §3.1: RealESRGAN, DAT, GPEN.
+    """
     family = _get_model_basename(model)
     if family == "RealESRGAN":
         return f"RealESRGAN_x{scale}plus"
     elif family == "DAT":
         return f"DAT_x{scale}"
+    elif family == "GPEN":
+        return f"GPEN_x{scale}"
     return f"RealESRGAN_x{scale}plus"
 
 
@@ -72,8 +82,10 @@ def _resolve_input_source(temp_dir: str, job_id: str, input_name: str,
 def _run_realesrgan_vulkan(input_path: str, output_path: str, model: str,
                              scale: int, model_dir: str, use_gpu: bool) -> bool:
     """Run Real-ESRGAN via ncnn-vulkan CLI."""
-    model_path = os.path.join(model_dir, f"{model}.pth")
-    if not os.path.exists(model_path):
+    # FIX-P12-8: ncnn-vulkan uses .param/.bin, not .pth
+    param_path = os.path.join(model_dir, f"{model}.param")
+    bin_path = os.path.join(model_dir, f"{model}.bin")
+    if not (os.path.exists(param_path) and os.path.exists(bin_path)):
         return False
     vulkan_bin = shutil.which("realesrgan-ncnn-vulkan")
     if not vulkan_bin:
@@ -95,8 +107,13 @@ def _run_realesrgan_vulkan(input_path: str, output_path: str, model: str,
 
 
 def _run_realesrgan_python(input_path: str, output_path: str, model: str,
-                           scale: int, model_dir: str, use_gpu: bool) -> bool:
-    """Run Real-ESRGAN via Python API fallback."""
+                           scale: int, model_dir: str, use_gpu: bool,
+                           bit_depth: int = 8) -> bool:
+    """Run Real-ESRGAN via Python API fallback.
+
+    FIX-P12-3: Added bit_depth parameter per v6.32 §4.2.5.
+    When bit_depth=16, output is saved as 16-bit TIFF.
+    """
     model_path = os.path.join(model_dir, f"{model}.pth")
     if not os.path.exists(model_path):
         return False
@@ -106,6 +123,23 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
         safe_model_path = json.dumps(model_path)
         safe_input_path = json.dumps(input_path)
         safe_output_path = json.dumps(output_path)
+        # FIX-P12-3: 16-bit output save logic
+        # FIX-P12-6: PIL I;16 only supports 2D arrays; for 3-channel 16-bit,
+        # use tifffile to save as TIFF (PIL cannot save RGB uint16 directly).
+        # Fallback: save as 8-bit PNG (quality loss) if tifffile unavailable.
+        save_code = (
+            f"if {bit_depth} == 16:\n"
+            f"    out_16 = (output.astype(np.float32) / 255.0 * 65535.0)"
+            f".clip(0, 65535).astype(np.uint16)\n"
+            f"    try:\n"
+            f"        import tifffile; "
+            f"tifffile.imwrite({safe_output_path}, out_16, compression='zlib')\n"
+            f"    except ImportError:\n"
+            f"        Image.fromarray((out_16 // 256).astype(np.uint8))"
+            f".save({safe_output_path})\n"
+            f"else:\n"
+            f"    Image.fromarray(output).save({safe_output_path})"
+        ) if bit_depth == 16 else f"Image.fromarray(output).save({safe_output_path})"
         cmd = [
             sys.executable, "-c",
             f"from realesrgan import RealESRGANer; "
@@ -117,7 +151,7 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
             f"img = Image.open({safe_input_path}).convert('RGB'); "
             f"import numpy as np; "
             f"output, _ = model.enhance(np.array(img)); "
-            f"Image.fromarray(output).save({safe_output_path})",
+            f"{save_code}",
         ]
         r = subprocess.run(cmd, capture_output=True, timeout=1800, shell=False)
         return r.returncode == 0
@@ -161,8 +195,13 @@ def _get_dat_config(model_name: str) -> dict:
 
 
 def _run_dat_pytorch(input_path: str, output_path: str, model: str,
-                     scale: int, model_dir: str, use_gpu: bool) -> bool:
-    """Run DAT model via PyTorch backend (v7.32 §3.1: DAT uses official PyTorch scripts)."""
+                     scale: int, model_dir: str, use_gpu: bool,
+                     bit_depth: int = 8) -> bool:
+    """Run DAT model via PyTorch backend (v7.32 §3.1: DAT uses official PyTorch scripts).
+
+    FIX-P12-3: Added bit_depth parameter per v6.32 §4.2.5.
+    When bit_depth=16, output is saved as 16-bit TIFF.
+    """
     model_path = os.path.join(model_dir, f"{model}.pth")
     if not os.path.exists(model_path):
         return False
@@ -206,19 +245,114 @@ def _run_dat_pytorch(input_path: str, output_path: str, model: str,
         with torch.no_grad():
             output = dat_model(img_tensor)
         output = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-        Image.fromarray(output).save(output_path)
+        # FIX-P12-3: 16-bit output per v6.32 §4.2.5
+        # FIX-P12-6: PIL I;16 only supports 2D arrays; for 3-channel 16-bit,
+        # use tifffile to save as TIFF (PIL cannot save RGB uint16 directly).
+        # Fallback: save as 8-bit PNG if tifffile unavailable.
+        if bit_depth == 16:
+            output_16 = np.clip(output * 65535.0, 0, 65535).astype(np.uint16)
+            try:
+                import tifffile
+                tifffile.imwrite(output_path, output_16, compression="zlib")
+            except ImportError:
+                output_8 = (output_16 // 256).astype(np.uint8)
+                Image.fromarray(output_8).save(output_path)
+        else:
+            output_8 = np.clip(output * 255.0, 0, 255).astype(np.uint8)
+            Image.fromarray(output_8).save(output_path)
+        return True
+    except Exception:
+        return False
+
+
+def _run_gpen_pytorch(input_path: str, output_path: str, model: str,
+                      scale: int, model_dir: str, use_gpu: bool,
+                      bit_depth: int = 8) -> bool:
+    """Run GPEN model via PyTorch backend.
+
+    GPEN is a GAN-based full-body portrait enhancer per v6.32 §4.
+    Best for photos where the person occupies 1/3 to 2/3 of the frame.
+    NOT suitable for face closeups (use GFPGAN/CodeFormer instead).
+
+    Model weights: GPEN_x2.pth / GPEN_x4.pth (yangxy/GPEN GitHub).
+    """
+    model_path = os.path.join(model_dir, f"{model}.pth")
+    if not os.path.exists(model_path):
+        return False
+    try:
+        import torch
+        from PIL import Image
+        import numpy as np
+
+        device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+
+        img = Image.open(input_path).convert("RGB")
+        img_np = np.array(img).astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
+
+        # Try loading as GPEN architecture
+        gpen_model = None
+        try:
+            # GPEN uses rrdbnet_arch or similar from basicsr
+            from basicsr.archs.rrdbnet_arch import RRDBNet
+            # GPEN typically wraps an RRDBNet backbone with a discriminator
+            # The super-resolution variant uses RRDBNet directly
+            gpen_model = RRDBNet(
+                num_in_ch=3, num_out_ch=3,
+                num_feat=64, num_block=23,
+                num_grow_ch=32, scale=scale,
+            )
+            state_dict = torch.load(model_path, map_location=device,
+                                    weights_only=False)
+            # GPEN state dicts may have 'params' or 'params_ema' keys
+            if 'params' in state_dict:
+                sd = state_dict['params']
+            elif 'params_ema' in state_dict:
+                sd = state_dict['params_ema']
+            else:
+                sd = state_dict
+            gpen_model.load_state_dict(sd, strict=False)
+            gpen_model.eval().to(device)
+        except Exception as e:
+            import sys
+            print(f"GPEN architecture load failed for {model}: {e}",
+                  file=sys.stderr)
+
+        if gpen_model is None:
+            return False
+
+        with torch.no_grad():
+            output = gpen_model(img_tensor)
+        output = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        # FIX-P12-6: PIL I;16 only supports 2D arrays; for 3-channel 16-bit,
+        # use tifffile to save as TIFF (PIL cannot save RGB uint16 directly).
+        # Fallback: save as 8-bit PNG if tifffile unavailable.
+        if bit_depth == 16:
+            output_16 = np.clip(output * 65535.0, 0, 65535).astype(np.uint16)
+            try:
+                import tifffile
+                tifffile.imwrite(output_path, output_16, compression="zlib")
+            except ImportError:
+                output_8 = (output_16 // 256).astype(np.uint8)
+                Image.fromarray(output_8).save(output_path)
+        else:
+            output_8 = np.clip(output * 255.0, 0, 255).astype(np.uint8)
+            Image.fromarray(output_8).save(output_path)
         return True
     except Exception:
         return False
 
 
 def run_realesrgan(input_path: str, output_path: str, model: str,
-                   scale: int, model_dir: str = "", use_gpu: bool = True) -> bool:
+                   scale: int, model_dir: str = "", use_gpu: bool = True,
+                   bit_depth: int = 8) -> bool:
     """Run AI upscale on a single image.
 
-    Supports Real-ESRGAN (ncnn-vulkan + Python fallback) and DAT (PyTorch only).
+    Supports Real-ESRGAN (ncnn-vulkan + Python fallback), DAT (PyTorch only),
+    and GPEN (PyTorch only) per v7.32 §3.1.
     PHOTO-AUDIT-011: Added DAT PyTorch backend per v7.32 §3.1.
+    FIX-P12-3: Added bit_depth parameter per v6.32 §4.2.5.
+    FIX-P12-ext: Added GPEN PyTorch backend per v7.32 §3.1 / v6.32 §4.
     """
     if not model_dir:
         project_root = SCRIPT_DIR.parent.resolve()
@@ -226,13 +360,20 @@ def run_realesrgan(input_path: str, output_path: str, model: str,
 
     family = _get_model_basename(model)
     if family == "DAT":
-        # DAT only supports PyTorch backend (ncnn-vulkan may not support DAT weights)
-        return _run_dat_pytorch(input_path, output_path, model, scale, model_dir, use_gpu)
+        # DAT only supports PyTorch backend
+        return _run_dat_pytorch(input_path, output_path, model, scale,
+                                model_dir, use_gpu, bit_depth=bit_depth)
+    elif family == "GPEN":
+        # GPEN only supports PyTorch backend (full-body portrait model)
+        return _run_gpen_pytorch(input_path, output_path, model, scale,
+                                 model_dir, use_gpu, bit_depth=bit_depth)
 
     # RealESRGAN: try ncnn-vulkan first, then Python fallback
-    if _run_realesrgan_vulkan(input_path, output_path, model, scale, model_dir, use_gpu):
+    if _run_realesrgan_vulkan(input_path, output_path, model, scale,
+                              model_dir, use_gpu):
         return True
-    return _run_realesrgan_python(input_path, output_path, model, scale, model_dir, use_gpu)
+    return _run_realesrgan_python(input_path, output_path, model, scale,
+                                  model_dir, use_gpu, bit_depth=bit_depth)
 
 
 def main():
@@ -284,29 +425,35 @@ def main():
                      "Use RealESRGAN_x2plus/x4plus or DAT instead.")
         return 81
 
-    # v6.3 §5.3: Target resolution check - AI upscale only available when target <= 1080p
+    # Read original dimensions from params or fallback to input file
     original_width = params.get("original_width", 0)
     original_height = params.get("original_height", 0)
-    # Fallback: read from input file if job metadata missing
     if original_width == 0 or original_height == 0:
         try:
             from PIL import Image
             with Image.open(args.input) as img:
                 original_width, original_height = img.size
         except Exception:
-            original_width, original_height = 1920, 1080
+            original_width, original_height = 0, 0
 
-    target_w = original_width * scale
-    target_h = original_height * scale
-    # 1080p threshold: 1920x1080
-    if target_w > 1920 or target_h > 1080:
+    # FIX-P12-9: v7.32 §3.10.2: Photo ban uses long_edge/short_edge (not video 1080p)
+    # ORIGINAL: used target_w > 1920 or target_h > 1080 (video 1080p threshold)
+    long_edge = max(original_width, original_height)
+    short_edge = min(original_width, original_height)
+    # Photo ban: original long_edge > 3840 or short_edge > 2160
+    if long_edge > 3840 or short_edge > 2160:
         if force_allow:
             logger.critical("STAGE3_FORCE_ALLOW",
-                           f"FORCE ALLOW: target {target_w}x{target_h} exceeds 1080p but force_allow=true")
+                           f"FORCE ALLOW: original {original_width}x{original_height} "
+                           f"exceeds photo ban threshold (long_edge>{3840}/short_edge>{2160})")
+            logger.warning("STAGE3_FORCE_ALLOW_QUALITY",
+                          f"画质风险：原始分辨率 {original_width}x{original_height} 超过照片禁令阈值，"
+                          f"AI 超分可能产生伪影")
         else:
-            logger.warning("STAGE3_RES_LIMIT",
-                           f"Target resolution {target_w}x{target_h} exceeds 1080p, "
-                           "skipping AI upscale per v6.3 §5.3")
+            logger.warning("STAGE3_BANNED_SIZE",
+                           f"Original {original_width}x{original_height} exceeds photo "
+                           f"ban threshold (long_edge>{3840}/short_edge>{2160}), "
+                           f"skipping AI upscale per v7.32 §3.10.2")
             return 3
 
     # v6.3 §5.3: Enforce traditional-first if configured
@@ -328,6 +475,22 @@ def main():
     ban_intermediate = params.get("ban_intermediate_pixels", True)
 
     temp_dir = params.get("temp_dir", "./temp")
+    # FIX-P12-3: WSL2 redirect for temp_dir per v7.32 §3.10.10
+    no_wsl_redirect = params.get("no_wsl_redirect", False)
+    platform = params.get("platform", "auto")
+    try:
+        from checkpoint import wsl_redirect_path
+        redirected_temp, _, _, _ = wsl_redirect_path(
+            temp_dir, no_wsl_redirect=no_wsl_redirect,
+            target_platform=platform
+        )
+        if redirected_temp != temp_dir:
+            logger.info("STAGE3_WSL_REDIRECT",
+                       f"WSL temp_dir redirect: {temp_dir} -> {redirected_temp}")
+            temp_dir = redirected_temp
+            params["temp_dir"] = temp_dir
+    except Exception:
+        pass
     job_id = args.job_id
     input_name = Path(args.input).name
 
@@ -341,18 +504,54 @@ def main():
 
     logger.info("STAGE3_SOURCE", f"Using {source_type} source", path=stage1_output)
 
+    # FIX-P12-2: Supplementary ban check — intermediate file pixel size
+    # Per v7.32 §3.10.2: intermediate dimensions also trigger ban
+    # (photo: long_edge > 3840 or short_edge > 2160)
+    try:
+        from PIL import Image
+        with Image.open(stage1_output) as img:
+            inter_w, inter_h = img.size
+    except Exception:
+        inter_w, inter_h = original_width, original_height
+
+    # FIX-P12-9: Check both long_edge and short_edge for consistency
+    # with original ban threshold per v7.32 §3.10.2
+    inter_long = max(inter_w, inter_h)
+    inter_short = min(inter_w, inter_h)
+    if inter_long > 3840 or inter_short > 2160:
+        if force_allow:
+            logger.critical("STAGE3_FORCE_ALLOW",
+                           f"FORCE ALLOW: intermediate {inter_w}x{inter_h} "
+                           f"exceeds photo ban threshold "
+                           f"(long_edge>{3840}/short_edge>{2160})")
+            # FIX-P12-7: Per v7.32 §3.10.2
+            logger.warning("STAGE3_FORCE_ALLOW_QUALITY",
+                          f"画质风险：中间文件分辨率 {inter_w}x{inter_h} 超过照片禁令阈值，"
+                          f"AI 超分可能产生伪影")
+        else:
+            logger.warning("STAGE3_INTER_BANNED",
+                           f"Intermediate {inter_w}x{inter_h} exceeds photo "
+                           f"ban threshold (long_edge>{3840}/short_edge>{2160}), "
+                           f"skipping AI upscale per v7.32 §3.10.2")
+            return 3
+
     # v6.3 §5.3: Lanczos target must be "auto" (no pre-resize to AI)
+    # FIX-P12-9: Changed from warning to error (exit 81) per v6.32 §4.2.5
     lanczos_target = params.get("lanczos_target", "auto")
     if lanczos_target and lanczos_target != "auto":
-        logger.warning("STAGE3_LANCZOS_BANNED",
-                       "lanczos_target is set but v6.3 §5.3 prohibits Lanczos pre-processing to AI")
+        logger.error("STAGE3_LANCZOS_BANNED",
+                     "Lanczos pre-processing to AI is BANNED per v6.3 §5.3")
+        return 81
 
     # Output path
     # Bug 11.14 fix: add _forced_upscale suffix when force_allow is true
+    # FIX-P12-3: Use TIFF extension for 16-bit output per v6.32 §4.2.5
+    bit_depth = params.get("photo_bit_depth", 8)
+    out_ext = "tif" if bit_depth == 16 else "png"
     suffix = "_forced_upscale" if force_allow else ""
     param_hash = compute_param_hash(args.input, params)
     inter_name = build_intermediate_name(
-        args.job_id, input_name, 3, f"upscale{suffix}", param_hash, "png"
+        args.job_id, input_name, 3, f"upscale{suffix}", param_hash, out_ext
     )
     output_path = os.path.join(temp_dir, inter_name)
 
@@ -412,14 +611,55 @@ def main():
             use_gpu = False
 
     model_dir = params.get("model_dir", "")
+    # FIX-P12-3: Read bit_depth from params per v6.32 §4.2.5
+    bit_depth = params.get("photo_bit_depth", 8)
+    # When 16-bit, use TIFF extension for output
+    if bit_depth == 16:
+        output_file = os.path.join(
+            upscale_dir, f"{Path(input_name).stem}_x{scale}.tif")
+
+    # FIX-P12-ext: Model fallback chain per v6.32 §4 / v7.32 §3.1
+    # Photo upscale priority: DAT (best for photos) -> Real-ESRGAN (general)
+    # -> GPEN (full-body portrait) -> fail
+    # The user's chosen model is tried first; on failure, fall through the chain.
+    _PHOTO_MODEL_FALLBACK = {
+        "DAT": ["RealESRGAN", "GPEN"],
+        "RealESRGAN": ["DAT", "GPEN"],
+        "GPEN": ["DAT", "RealESRGAN"],
+    }
+
     success = run_realesrgan(
         stage1_output, output_file, actual_model, actual_scale, model_dir,
-        use_gpu=use_gpu
+        use_gpu=use_gpu, bit_depth=bit_depth
     )
+
+    # Model fallback: if primary model fails, try alternatives in priority order
+    if not success:
+        primary_family = _get_model_basename(actual_model)
+        fallback_families = _PHOTO_MODEL_FALLBACK.get(primary_family,
+                                                       ["RealESRGAN", "DAT"])
+        for alt_family in fallback_families:
+            alt_model = _get_model_for_scale(
+                f"{alt_family}_x{actual_scale}plus" if alt_family == "RealESRGAN"
+                else f"{alt_family}_x{actual_scale}",
+                actual_scale)
+            logger.warning("STAGE3_MODEL_FALLBACK",
+                          f"Primary model {actual_model} failed, "
+                          f"trying fallback: {alt_model}")
+            success = run_realesrgan(
+                stage1_output, output_file, alt_model, actual_scale,
+                model_dir, use_gpu=use_gpu, bit_depth=bit_depth
+            )
+            if success:
+                actual_model = alt_model
+                logger.info("STAGE3_FALLBACK_SUCCESS",
+                           f"Fallback to {alt_model} succeeded")
+                break
 
     if success and os.path.exists(output_file):
         import shutil
-        shutil.copy2(output_file, output_path)
+        # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
+        shutil.copyfile(output_file, output_path)
         logger.info("STAGE3_DONE", "Upscale complete",
                     output=output_path, scale=actual_scale,
                     backend=backend if use_gpu else "cpu")
@@ -446,4 +686,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    # FIX-P11-5: main() must return explicit int exit code per v7.32 §3.5
+    # ORIGINAL: sys.exit(main() or 0) — "or 0" masks None returns
+    rc = main()
+    if rc is None:
+        rc = 86  # validation failure — main() must always return explicit exit code
+    sys.exit(rc)

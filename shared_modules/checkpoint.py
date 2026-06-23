@@ -27,26 +27,29 @@ from PIL import Image
 
 
 def get_file_xxhash(filepath: str, hash_length: int = 16) -> str:
-    """Get xxHash of file. Falls back to MD5 if xxhash module unavailable.
-    
+    """Get xxHash of file using xxhash64 algorithm.
+
     Per v7.32 §3.10.19: For files >1GB, sample head/tail/middle blocks
     to avoid long hashing times. Uses xxhash64 (not xxh3_64).
+
+    FIX-P2-9: xxhash is now a hard dependency per v7.32 §3.10.19.
+    Cross-platform hash consistency requires the same algorithm everywhere.
+    MD5 fallback would break checkpoint resume across different environments.
     """
-    # BUG-012 fix: log WARNING when falling back to MD5
+    # FIX-P2-9: xxhash is mandatory — no MD5 fallback per v7.32 §3.10.19
     try:
         import xxhash
-        h = xxhash.xxh64()
     except ImportError:
-        import logging
-        logging.getLogger(__name__).warning(
-            "CHECKPOINT_HASH_FALLBACK",
-            "xxhash module unavailable, falling back to MD5 for file identity hashing"
+        raise ImportError(
+            "xxhash is required for checkpoint hash computation. "
+            "Install with: pip install xxhash"
         )
-        h = hashlib.md5()
-    
-    file_size = os.path.getsize(filepath)
+
+    h = xxhash.xxh64()
+
+    file_size = Path(filepath).stat().st_size
     block_size = 65536
-    
+
     with open(filepath, "rb") as f:
         if file_size > (1024 * 1024 * 1024):  # > 1GB
             # Sample head, middle, tail
@@ -65,7 +68,7 @@ def get_file_xxhash(filepath: str, hash_length: int = 16) -> str:
         else:
             while chunk := f.read(block_size):
                 h.update(chunk)
-    
+
     return h.hexdigest()[:hash_length]
 
 
@@ -87,6 +90,8 @@ CORE_QUALITY_PARAMS = frozenset([
     "qtgmc_chromamotion", "qtgmc_sourcematch", "qtgmc_fps_divisor",
     # IVTC
     "ivtc",
+    "vfm_mode",           # FIX-P2-5: VFM mode per v7.32 §3.7 / §3.10.19
+    "vdecimate_cycle",    # FIX-P2-5: VDecimate cycle per v7.32 §3.7 / §3.10.19
     # Color space
     "matrix_in_s", "matrix_s",
     # AI upscaling
@@ -110,8 +115,10 @@ CORE_QUALITY_PARAMS = frozenset([
     "ivtc_fallback_threshold",
     # Photo-specific parameters (v6.32 §4.2.1 / §7.7)
     "scratch_remove", "scratch_remove_strength",
-    "deblock_strength", "deband_threshold",
-    "grain_synthesis", "grain_strength", "grain_size", "grain_roughness",
+    # FIX-R2-P3-1: Removed duplicate "deblock_strength" (already at line 87)
+    # FIX-R2-P3-1: Removed duplicate "grain_strength" (already at line 100)
+    "deband_threshold",
+    "grain_synthesis", "grain_size", "grain_roughness",
     "photo_bit_depth",
     "channel_correction_formula", "channel_correction_normalize",
     "channel_correction_round", "channel_correction_clamp",
@@ -159,9 +166,28 @@ def compute_param_hash(input_path: str, params: Dict[str, Any]) -> str:
 
     # Extract only quality-related params (recursive nested traversal)
     # FIX-P2-1: Normalize path-like values to filename+suffix for cross-platform hash consistency (v7.32 §3.10.19)
+    # FIX-P3-5: Recursively filter dict values to include only CORE_QUALITY_PARAMS sub-keys (v7.32 §3.10.19)
     def _normalize_value(k: str, v: Any) -> Any:
-        """Strip platform-specific path prefixes for cross-platform hash consistency."""
-        if isinstance(v, str) and ("/" in v or "\\" in v or v.endswith((".pth", ".pb", ".pt", ".onnx"))):
+        """Strip platform-specific path prefixes for cross-platform hash consistency.
+        Recursively filter dict values to include only CORE_QUALITY_PARAMS sub-keys.
+
+        FIX-R2-P1-2: Return empty dict instead of falling back to original
+        when all sub-keys are filtered out. Empty dicts are then filtered
+        by _extract_quality, ensuring non-core sub-keys never affect param_hash.
+        Per v7.32 §3.10.19: only core quality params should influence the hash.
+        """
+        if isinstance(v, dict):
+            result = {}
+            for sk, sv in v.items():
+                if sk in CORE_QUALITY_PARAMS:
+                    result[sk] = _normalize_value(sk, sv)
+                elif isinstance(sv, dict):
+                    nested = _extract_quality(sv)
+                    if nested is not None and nested != {}:
+                        result[sk] = nested
+            return result  # Return empty dict — filtered by _extract_quality
+        if isinstance(v, str) and ("/" in v or "\\" in v or
+                                   v.endswith((".pth", ".pb", ".pt", ".onnx"))):
             return Path(v).name
         return v
 
@@ -200,14 +226,23 @@ def build_intermediate_name(job_id: str,
 def cleanup_old_intermediates(temp_dir: str,
                               job_id: str,
                               keep_steps: int = 2,
-                              current_step: Optional[int] = None) -> None:
+                              current_step: Optional[int] = None,
+                              cleanup_intermediates: bool = True) -> None:
     """Remove old intermediate files, keeping the most recent keep_steps stages.
-    
+
+    Per v6.32 §7.5: cleanup_intermediates option (default True).
+    When False, skip all cleanup operations.
+
     Args:
+        cleanup_intermediates: When False, skip all cleanup. Default True.
         current_step: The current stage number. If None, keeps the most recent
             keep_steps files and deletes all others (useful at job start).
             If specified, deletes files whose step < current_step - keep_steps.
     """
+    # FIX-R2-P1-1: Respect cleanup_intermediates config option per v6.32 §7.5
+    if not cleanup_intermediates:
+        return
+
     temp = Path(temp_dir)
     if not temp.exists():
         return
@@ -371,7 +406,9 @@ def verify_frame_integrity(filepath: str,
                            is_retry: bool = False,
                            samples: int = 4,
                            bit_depth: int = 8,
-                           color_range: str = "limited") -> bool:
+                           color_range: str = "limited",
+                           inter_frame_threshold: int = 80,
+                           inter_frame_threshold_retry: int = 60) -> bool:
     """Verify video/photo file integrity by checking multiple positions.
 
     Per v6.3 §3.7 / §3.10.19:
@@ -465,11 +502,14 @@ def verify_frame_integrity(filepath: str,
         mean_y = info.get("mean", 0)
         # Validate pixel values are in legal range (allows super-black/white)
         if not (y_min <= mean_y <= y_max):
-            # If mean is outside range, check if it's an edge case (very dark/bright scene)
-            # by checking std; high std with extreme mean may still be valid
+            # FIX-R2-P2-3: Per v7.32 §3.10.19: allow legal super-black/white
+            # Only allow slight excursions (<5% of range), reject extreme outliers
             std_y = info.get("std", 0)
+            range_size = y_max - y_min
+            if mean_y < y_min - range_size * 0.05 or mean_y > y_max + range_size * 0.05:
+                return False  # Extreme outlier — definitely corrupted
             if std_y < 1.0:
-                return False
+                return False  # Near-uniform out-of-range — likely corrupted
         frame_means.append(mean_y)
 
     if not frame_means:
@@ -481,12 +521,10 @@ def verify_frame_integrity(filepath: str,
     if mean_of_means < y_min + 1 and all(m < y_min + 5 for m in frame_means):
         return False
 
-    if is_retry:
-        if any(abs(m - mean_of_means) > 60 for m in frame_means):
-            return False
-    else:
-        if any(abs(m - mean_of_means) > 80 for m in frame_means):
-            return False
+    # FIX-R2-P3-4: Use configurable thresholds instead of hardcoded values
+    threshold = inter_frame_threshold_retry if is_retry else inter_frame_threshold
+    if any(abs(m - mean_of_means) > threshold for m in frame_means):
+        return False
 
     return True
 
@@ -523,7 +561,31 @@ def _check_nvidia_smi_vram() -> Optional[int]:
 
 
 def _probe_cuda_paths() -> Optional[str]:
-    """Probe common CUDA library paths and return LD_LIBRARY_PATH addition."""
+    """Probe CUDA library paths and return LD_LIBRARY_PATH addition.
+
+    Per v7.32 §3.10.10:
+    - Check WSL2_CUDA_OVERRIDE env var first (manual override)
+    - Check session cache (WSL2_CUDA_CACHED_PATH) to avoid re-probing
+    - Check hardcoded priority paths
+    - Scan /proc/mounts as fallback
+    - Log friendly error if not found
+    """
+    # FIX-R2-P3-3: Session cache (avoid re-probing per v7.32 §3.10.10)
+    cached = os.environ.get("WSL2_CUDA_CACHED_PATH")
+    if cached:
+        # Validate cached paths still exist
+        if all(Path(p).is_dir() for p in cached.split(":")):
+            return cached
+        # Cache stale, clear it
+        os.environ.pop("WSL2_CUDA_CACHED_PATH", None)
+
+    # 1. Environment variable override (highest priority)
+    override = os.environ.get("WSL2_CUDA_OVERRIDE")
+    if override and Path(override).is_dir():
+        os.environ["WSL2_CUDA_CACHED_PATH"] = override
+        return override
+
+    # 2. Hardcoded priority paths
     cuda_paths = [
         "/usr/local/cuda/lib64",
         "/usr/lib/wsl/lib",
@@ -531,11 +593,37 @@ def _probe_cuda_paths() -> Optional[str]:
     ]
     found = []
     for p in cuda_paths:
-        if os.path.exists(os.path.join(p, "libcuda.so.1")) or \
-           os.path.exists(os.path.join(p, "libnvidia-ml.so.1")):
+        # FIX-P3-6: Use pathlib.Path per CLAUDE.md §4
+        p_path = Path(p)
+        if (p_path / "libcuda.so.1").exists() or \
+           (p_path / "libnvidia-ml.so.1").exists():
             found.append(p)
+
+    # FIX-P2-7: Scan /proc/mounts as fallback per v7.32 §3.10.10
+    if not found:
+        try:
+            with open("/proc/mounts", "r") as f:
+                for line in f:
+                    mount_point = line.split()[1]
+                    # FIX-P3-6: Use pathlib.Path per CLAUDE.md §4
+                    if (Path(mount_point) / "libcuda.so.1").exists():
+                        found.append(mount_point)
+                        break
+        except (OSError, IndexError):
+            pass
+
     if found:
-        return ":".join(found)
+        result = ":".join(found)
+        # FIX-R2-P3-3: Cache for this session per v7.32 §3.10.10
+        os.environ["WSL2_CUDA_CACHED_PATH"] = result
+        return result
+
+    # FIX-P2-7: Friendly error message per v7.32 §3.10.10
+    import logging
+    logging.getLogger(__name__).warning(
+        "CUDA libraries not found in standard paths. "
+        "Set WSL2_CUDA_OVERRIDE=/your/cuda/lib/path to override."
+    )
     return None
 
 
@@ -629,9 +717,11 @@ def is_retryable_error(exit_code: int, stderr: str = "") -> bool:
         return True
     if exit_code == 84 and stderr:
         stderr_lower = stderr.lower()
-        if any(k in stderr_lower for k in ("out of memory", "oom", "no space",
-                                            "errno 28", "cannot allocate")):
+        # FIX-R2-P2-1: OOM/GPU memory issues are retryable (v7.32 §3.7)
+        # Disk full is NOT retryable (v6.32 §7.6: errno 28 is non-retryable)
+        if any(k in stderr_lower for k in ("out of memory", "oom", "cannot allocate")):
             return True
+        # "no space" / "errno 28" indicate disk-full → NOT retryable
     
     # Cross-platform signal codes
     sys_platform = platform.system()
@@ -674,13 +764,14 @@ def is_wsl() -> bool:
 
 def wsl_redirect_path(output_path: str, temp_dir: Optional[str] = None,
                          no_wsl_redirect: bool = False,
-                         target_platform: str = "auto") -> Tuple[str, Optional[str], str, Optional[str]]:
+                         target_platform: str = "auto",
+                         logger: Optional[Any] = None) -> Tuple[str, Optional[str], str, Optional[str]]:
     """Redirect output/temp paths for WSL2 compatibility.
-    
+
     Per v6.32 §7.3 / v7.32 §3.10.10: When output_path OR temp_dir is under /mnt/
     (Windows mount), redirect to Linux native partition to avoid WSL2 I/O
     performance bottleneck.
-    
+
     Returns (redirected_output, original_output_or_None,
              redirected_temp, original_temp_or_None).
     If redirect is active, original paths are saved so caller
@@ -707,7 +798,17 @@ def wsl_redirect_path(output_path: str, temp_dir: Optional[str] = None,
     
     out_redirected, out_original = _redirect_single(output_path)
     temp_redirected, temp_original = _redirect_single(temp_dir)
-    
+
+    # FIX-P3-9: Log redirect action per v7.32 §3.10.10
+    if out_original or temp_original:
+        if logger is not None:
+            logger.info("WSL_REDIRECT",
+                       "Path redirected from /mnt/ to Linux native partition",
+                       original_output=out_original,
+                       redirected_output=out_redirected,
+                       original_temp=temp_original,
+                       redirected_temp=temp_redirected)
+
     return out_redirected, out_original, temp_redirected, temp_original
 
 
@@ -746,7 +847,8 @@ def wsl_copy_back(redirected_path: str, original_path: str,
             except OSError:
                 pass
             # Triple verification
-            if os.path.getsize(src) != os.path.getsize(dst):
+            # FIX-P3-6: Use pathlib.Path.stat() per CLAUDE.md §4
+            if Path(src).stat().st_size != Path(dst).stat().st_size:
                 return False
             if _md5(src) != _md5(dst):
                 return False
@@ -762,9 +864,10 @@ def wsl_copy_back(redirected_path: str, original_path: str,
     tmp_path = original_path + ".tmp"
 
     # FIX-P2-3: rsync-style incremental check per v7.32 §3.10.10
-    if os.path.exists(original_path):
+    # FIX-P3-6: Use pathlib.Path per CLAUDE.md §4
+    if Path(original_path).exists():
         try:
-            if (os.path.getsize(redirected_path) == os.path.getsize(original_path) and
+            if (Path(redirected_path).stat().st_size == Path(original_path).stat().st_size and
                 _md5(redirected_path) == _md5(original_path)):
                 logger.info("WSL_COPY_BACK_SKIP",
                            "Destination already exists with matching hash, skipping copy",
@@ -774,22 +877,24 @@ def wsl_copy_back(redirected_path: str, original_path: str,
             pass
 
     # FIX-P2-2: Disk space pre-check per v7.32 §3.10.10
+    # FIX-R2-P2-2: Use shutil.disk_usage (cross-platform) per v7.32 §3.10.10
+    # FIX-P3-6: Use pathlib.Path per CLAUDE.md §4
     try:
-        target_dir = os.path.dirname(original_path) or "."
-        stat = os.statvfs(target_dir)
-        required_bytes = int(os.path.getsize(redirected_path) * 1.2)
-        available_bytes = stat.f_frsize * stat.f_bavail
+        target_dir = str(Path(original_path).parent) or "."
+        required_bytes = int(Path(redirected_path).stat().st_size * 1.2)
+        available_bytes = shutil.disk_usage(target_dir).free
         if available_bytes < required_bytes:
             logger.error("WSL_COPY_NO_SPACE",
                         f"Target filesystem has {available_bytes/1024/1024:.1f} MB free, "
                         f"needs {required_bytes/1024/1024:.1f} MB. Aborting copy-back.")
             return False
-    except (OSError, AttributeError):
-        pass  # statvfs may fail on some paths; continue at risk
+    except OSError:
+        pass  # disk usage check failed; continue at risk
 
     for attempt in range(1, 4):
         try:
-            os.makedirs(os.path.dirname(original_path) or ".", exist_ok=True)
+            # FIX-P3-6: Use pathlib.Path per CLAUDE.md §4
+            Path(original_path).parent.mkdir(parents=True, exist_ok=True)
             
             # Step 1: copy to .tmp
             if not _copy_and_verify(redirected_path, tmp_path):
@@ -799,7 +904,7 @@ def wsl_copy_back(redirected_path: str, original_path: str,
             
             # Step 2: atomic move or overwrite
             src_dev = os.stat(tmp_path).st_dev
-            dst_dev = os.stat(os.path.dirname(original_path) or ".").st_dev
+            dst_dev = os.stat(str(Path(original_path).parent) or ".").st_dev
             
             if src_dev == dst_dev:
                 # Same filesystem: atomic rename
@@ -811,7 +916,8 @@ def wsl_copy_back(redirected_path: str, original_path: str,
                               "Cross-filesystem copy: atomic rename disabled, using copyfile with .bak backup",
                               original=original_path)
                 # Per v6.32 §7.3: backup old file as .bak before overwriting
-                if os.path.exists(original_path):
+                # FIX-P3-6: Use pathlib.Path per CLAUDE.md §4
+                if Path(original_path).exists():
                     bak_path = original_path + ".bak"
                     try:
                         shutil.copyfile(original_path, bak_path)
@@ -846,39 +952,245 @@ def estimate_disk_space(duration: float = 300,
                         target_bitrate_mbps: float = 10.0,
                         audio_bitrate_kbps: float = 320.0,
                         file_path: Optional[str] = None,
-                        is_photo: bool = False) -> int:
+                        is_photo: bool = False,
+                        upscale_scale: Optional[float] = None) -> int:
     """
     Estimate peak disk space in MB needed for restoration pipeline.
-    
-    Per v6.32 §7.3:
-    - Method 1: width * height * bit_depth/8 * fps * duration * 1.5 (frame sequence)
+
+    Per v6.32 §7.3 / v7.32 §3.10.10:
+    - Coefficient method: source_size × {10|25|50} based on AI upscale factor
+    - Method 1: width * height * bit_depth/8 * fps * duration * 1.5
     - Method 2: duration * target_bitrate_mbps * 1.5 + duration * audio_bitrate_kbps / 8
-    - Uses max of both methods
+    - Uses max of all methods
+    - 2x safety margin
     """
-    if is_photo and file_path and os.path.exists(file_path):
-        # Use actual file size as base for photos
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        # Photo processing typically produces intermediates 3-5x original size
-        # Max intermediate count: ~5 stages
-        peak = file_size_mb * 5 * 5  # 5 stages, 5x each
+    method_coeff = 0.0
+
+    if is_photo and file_path and Path(file_path).exists():
+        file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
+        # FIX-P2-6: Coefficient scales with AI upscale per v7.32 §3.10.10
+        if upscale_scale is None or upscale_scale <= 1:
+            coeff = 10
+        elif upscale_scale <= 2:
+            coeff = 25
+        else:
+            coeff = 50
+        peak = file_size_mb * coeff
     else:
+        # FIX-P2-6: Coefficient-based method (v7.32 §3.10.10 / v6.32 §7.3)
+        if file_path and Path(file_path).exists():
+            file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
+            if upscale_scale is None or upscale_scale <= 1:
+                coeff = 10
+            elif upscale_scale <= 2:
+                coeff = 25
+            else:
+                coeff = 50
+            method_coeff = file_size_mb * coeff
+
         # Video estimation
         if duration <= 0:
-            duration = 300  # Default 5 minutes
+            duration = 300
         if fps <= 0:
             fps = 29.97
-        
-        # Method 1: uncompressed frame sequence (float division for bit_depth)
+
+        # Method 1: uncompressed frame sequence
         bytes_per_pixel = bit_depth / 8.0
         uncompressed_frame_mb = width * height * bytes_per_pixel / (1024 * 1024)
         total_frames = duration * fps
         method1 = uncompressed_frame_mb * total_frames * 1.5
-        
-        # Method 2: bitrate-based estimation (float division)
+
+        # Method 2: bitrate-based estimation
         method2 = (duration * target_bitrate_mbps * 1.5 * 1024 * 1024 / 8 +
                    duration * audio_bitrate_kbps * 1024 / 8) / (1024 * 1024)
-        
-        peak = max(method1, method2)
-    
+
+        peak = max(method1, method2, method_coeff)
+
     # 2x safety margin
     return int(peak * 2)
+
+
+def check_wsl_space(params: Dict[str, Any],
+                    logger: Optional[Any] = None,
+                    job: Optional[Dict[str, Any]] = None) -> bool:
+    """WSL2 path redirect + disk space pre-check with fallback chain.
+
+    Per v7.32 §3.10.10 / v6.32 §7.3:
+    1. Redirect /mnt/ paths to Linux native partition via wsl_redirect_path()
+    2. Estimate disk space via estimate_disk_space() (coefficient + precise methods)
+    3. Check native partition free space >= required × 1.2
+    4. If native partition insufficient → fall back to /mnt/ path + WARNING
+    5. If /mnt/ path also insufficient → ERROR + return False (FAILED)
+    6. Update params with final chosen paths
+
+    Args:
+        params: Merged params dict. Must contain temp_dir, output_dir.
+            For video: also duration, fps, width, height, upscale_scale.
+            For photo: also is_photo, file_path.
+        logger: Optional logger instance (must support .info/.warning/.error).
+        job: Optional job dict for video pipeline (provides duration, width,
+            height, detected_class).
+
+    Returns:
+        True if disk space sufficient (or check skipped), False otherwise.
+    Side effect:
+        Mutates params["temp_dir"], params["output_dir"] and their
+        original-path backup keys.
+    """
+    import shutil
+
+    try:
+        # ── Step 1: WSL2 path redirect ──
+        no_wsl_redirect = params.get("no_wsl_redirect", False)
+        platform_val = params.get("platform", "auto")
+        temp_dir = params.get("temp_dir", "./temp")
+        output_dir = params.get("output_dir", "./output")
+
+        # FIX-R2-P3-2: Single wsl_redirect_path call with both paths
+        # Per v7.32 §3.10.10: wsl_redirect_path handles both output and temp
+        redirected_output, orig_output, redirected_temp, orig_temp = wsl_redirect_path(
+            output_dir, temp_dir=temp_dir,
+            no_wsl_redirect=no_wsl_redirect,
+            target_platform=platform_val, logger=logger
+        )
+
+        # ── Step 2: Estimate disk space ──
+        is_photo = params.get("is_photo", False)
+        file_path = params.get("input_path", params.get("file_path"))
+
+        if is_photo:
+            required_mb = estimate_disk_space(
+                duration=0, fps=1,
+                width=params.get("original_width", 0),
+                height=params.get("original_height", 0),
+                file_path=file_path,
+                is_photo=True,
+                upscale_scale=params.get("upscale_scale",
+                                         params.get("ai_upscale_scale")),
+            )
+        else:
+            # Video: extract from job or params
+            duration = 300
+            fps = 29.97
+            width = 720
+            height = 480
+            detected_class = ""
+            if job:
+                duration = job.get("duration", 300)
+                width = job.get("original_width", 720)
+                height = job.get("original_height", 480)
+                detected_class = job.get("detected_class", "")
+            else:
+                duration = params.get("duration", 300)
+                width = params.get("original_width", 720)
+                height = params.get("original_height", 480)
+
+            if detected_class == "HDV_AVCHD":
+                fps = 25.0
+
+            ai_scale = 0
+            ai_enabled = params.get("ai_enabled", False)
+            if ai_enabled:
+                ai_scale = params.get("ai_upscale_scale",
+                                      params.get("upscale_scale", 0))
+
+            required_mb = estimate_disk_space(
+                duration=duration,
+                fps=fps,
+                width=width,
+                height=height,
+                file_path=file_path,
+                upscale_scale=float(ai_scale) if ai_scale else None,
+            )
+
+        # ── Step 3: Check space on redirected paths with fallback ──
+        # Per v7.32 §3.10.10: 1.2× safety margin on top of
+        # estimate_disk_space's internal 2× margin
+        required_mb_with_margin = required_mb * 1.2
+
+        final_temp = redirected_temp
+        final_output = redirected_output
+
+        for label, redirected, original in [
+            ("temp", redirected_temp, orig_temp),
+            ("output", redirected_output, orig_output),
+        ]:
+            if not redirected:
+                continue
+            try:
+                free_mb = shutil.disk_usage(redirected).free / (1024 * 1024)
+            except OSError:
+                continue
+
+            if free_mb >= required_mb_with_margin:
+                continue  # sufficient
+
+            # ── Step 4: Native partition insufficient → try /mnt/ fallback ──
+            if original:
+                if logger:
+                    logger.warning("WSL_SPACE",
+                        f"{label} path space insufficient on native partition "
+                        f"({free_mb:.0f}MB < {required_mb_with_margin:.0f}MB), "
+                        "falling back to /mnt/ path",
+                        path=redirected, required_mb=required_mb_with_margin,
+                        free_mb=free_mb, label=label)
+                # Fall back to original /mnt/ path
+                try:
+                    free_mb_fallback = shutil.disk_usage(original).free / (1024 * 1024)
+                except OSError:
+                    free_mb_fallback = 0
+
+                if free_mb_fallback >= required_mb_with_margin:
+                    if label == "temp":
+                        final_temp = original
+                        orig_temp = None  # no longer redirected
+                    else:
+                        final_output = original
+                        orig_output = None
+                    if logger:
+                        logger.info("WSL_SPACE_FALLBACK",
+                            f"{label} using /mnt/ fallback path "
+                            f"({free_mb_fallback:.0f}MB available)",
+                            path=original, label=label)
+                    continue
+                else:
+                    # ── Step 5: Both paths insufficient → FAILED ──
+                    if logger:
+                        logger.error("WSL_SPACE",
+                            f"Both native and /mnt/ {label} paths insufficient "
+                            f"(native: {free_mb:.0f}MB, /mnt/: {free_mb_fallback:.0f}MB, "
+                            f"need: {required_mb_with_margin:.0f}MB)",
+                            label=label)
+                    return False
+            else:
+                # Not WSL-redirected, just plain insufficient
+                if logger:
+                    logger.error("DISK_SPACE",
+                        f"Insufficient disk space for {label}: "
+                        f"need ~{required_mb_with_margin:.0f}MB, "
+                        f"have {free_mb:.0f}MB",
+                        label=label, required_mb=required_mb_with_margin,
+                        free_mb=free_mb)
+                return False
+
+        # ── Step 6: Update params with final paths ──
+        params["temp_dir"] = final_temp
+        params["output_dir"] = final_output
+        if orig_temp:
+            params["original_temp_dir"] = orig_temp
+        else:
+            params.pop("original_temp_dir", None)
+        if orig_output:
+            params["original_output_dir"] = orig_output
+        else:
+            params.pop("original_output_dir", None)
+
+        return True
+
+    except Exception as e:
+        # FIX-R2-P2-4: Safe-fail — if we can't verify space, don't proceed
+        # Per v7.32 §3.10.10: disk space check failure should not silently pass
+        if logger:
+            logger.error("DISK_SPACE_CHECK",
+                         f"Disk space check failed (treating as insufficient): {e}")
+        return False

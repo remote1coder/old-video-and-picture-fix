@@ -47,6 +47,9 @@ class StructuredLogger:
         self.log_backup_count = log_backup_count
         self.log_max_line_bytes = log_max_line_bytes
         self.lock = threading.Lock()
+        # FIX-P3-1: Track line count for rotation instead of size estimation
+        # per v7.32 §3.10.12
+        self._line_count = 0
 
         # Determine log file
         if job_id:
@@ -92,22 +95,29 @@ class StructuredLogger:
 
     def _rotate_locked(self, f):
         """Rotate log file when holding a cross-process lock.
-        
-        FIX-P1-4: Uses file size estimate instead of line count to avoid
-        re-reading the entire file under lock. Per v7.32 §3.10.12 / v6.32 §7.4.
+
+        FIX-P3-1: Uses tracked line count instead of size estimation per
+        v7.32 §3.10.12. ORIGINAL used size//200 estimate which was inaccurate.
+        FIX-P2-3-REV: Always use copyfile+truncate for rotation.
+        ORIGINAL (FIX-P2-3): Used os.rename on same filesystem, which invalidated
+        the open file descriptor — after rename, f still pointed to the old
+        inode (now the backup), so subsequent f.write() went to the backup file
+        instead of the new empty log. copyfile+truncate keeps fd valid and
+        avoids the issue entirely. Per v6.32 §7.3, os.rename is forbidden
+        across filesystems; for log rotation, copyfile+truncate is always
+        safe under lock regardless of filesystem.
         """
-        f.seek(0, 2)  # EOF
-        size = f.tell()
-        # Rough estimate: assume average 200 bytes per line
-        estimated_lines = size // 200
-        if estimated_lines >= self.log_max_lines:
+        if self._line_count >= self.log_max_lines:
             ts = int(time.time() * 1000)
             backup = self.log_file.parent / f"{self.log_file.name}.{ts}"
             try:
                 f.flush()
-                import os
-                os.rename(str(self.log_file), str(backup))
-                open(self.log_file, 'a').close()
+                import shutil
+                shutil.copyfile(str(self.log_file), str(backup))
+                f.truncate(0)
+                f.seek(0, 2)
+                self._line_count = 0
+
                 # Clean up old backups if exceeding log_backup_count
                 backups = sorted(
                     self.log_file.parent.glob(f"{self.log_file.name}.*"),
@@ -120,6 +130,7 @@ class StructuredLogger:
                         pass
             except OSError:
                 pass  # Another process already rotated
+        self._line_count += 1
 
     def log(self, level: str, event: str, message: str, **kwargs):
         """Write a structured log entry."""
@@ -158,7 +169,6 @@ class StructuredLogger:
             line_bytes = (json.dumps(safe, ensure_ascii=False) + "\n").encode("utf-8")
 
         with self.lock:
-            self._rotate_if_needed()
             with open(self.log_file, "a+b") as f:
                 if _HAS_FCNTL:
                     # FIX-P1-5: flock → lockf per v6.32 §7.4
@@ -169,17 +179,25 @@ class StructuredLogger:
                     f.flush()
                     fcntl.lockf(f.fileno(), fcntl.LOCK_UN)
                 elif _HAS_MSVCRT:
-                    # Windows: use LK_LOCK (blocking) instead of LK_NBLCK
+                    # FIX-P1-2: Windows rotation under cross-process lock
+                    # ORIGINAL: rotation was done outside the lock via _rotate_if_needed()
+                    # FIX-P2-2: Removed redundant _rotate_if_needed() outside lock.
+                    MAX_LOCK_BYTES = self.log_max_line_bytes + 1024  # safety margin
                     f.seek(0, 2)  # EOF
                     lock_start = f.tell()
-                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, len(line_bytes))
-                    f.write(line_bytes)
-                    f.flush()
-                    # msvcrt.locking requires file pointer at lock start to unlock
-                    f.seek(lock_start)
-                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, len(line_bytes))
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, MAX_LOCK_BYTES)
+                    try:
+                        # Rotate under cross-process lock per v7.32 §3.10.12
+                        self._rotate_locked(f)
+                        f.seek(0, 2)
+                        f.write(line_bytes)
+                        f.flush()
+                    finally:
+                        f.seek(lock_start)
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, MAX_LOCK_BYTES)
                 else:
                     # Fallback: no locking (single-process only)
+                    self._rotate_if_needed()
                     f.write(line_bytes)
                     f.flush()
 
@@ -205,11 +223,14 @@ class StructuredLogger:
     def param_override(self, param_name: str, old_value: Any, new_value: Any,
                        source: str = "unknown"):
         """Log a parameter override event per v7.3 §3.10.12.
-        
-        Source must be one of: user_overrides, paths, global, cli, unknown.
+
+        Source must be one of: user_overrides, audio_override,
+        recommended_params, paths, global, cli, unknown.
         """
-        # BUG-016 fix: restrict source to allowed enumeration values
-        allowed_sources = ("user_overrides", "paths", "global", "cli", "unknown")
+        # FIX-P2-1: Added audio_override per v7.32 §3.2 + §3.10.12
+        # FIX-P1-1: Added recommended_params per v7.32 §3.2 + §3.10.12
+        # ORIGINAL: allowed_sources = ("user_overrides", "paths", "global", "cli", "unknown")
+        allowed_sources = ("user_overrides", "audio_override", "recommended_params", "paths", "global", "cli", "unknown")
         if source not in allowed_sources:
             self.log("WARN", "PARAM_OVERRIDE_INVALID_SOURCE",
                      f"Invalid source '{source}' for param_override, defaulting to 'unknown'",
