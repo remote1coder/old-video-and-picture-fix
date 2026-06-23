@@ -143,15 +143,23 @@ def main():
     # Per v6.32 / v7.32: flat regions -> mild gblur; textured -> preserve;
     # skin/hair -> completely excluded; feathered mask >=8px;
     # colorbalance for lift/gamma/gain.
-    lift_r = params.get("color_lift_r", 0.02)
-    lift_g = params.get("color_lift_g", 0.01)
-    lift_b = params.get("color_lift_b", 0.01)
-    gamma_r = params.get("color_gamma_r", 0.98)
-    gamma_g = params.get("color_gamma_g", 0.98)
-    gamma_b = params.get("color_gamma_b", 0.98)
-    gain_r = params.get("color_gain_r", 1.02)
-    gain_g = params.get("color_gain_g", 1.02)
-    gain_b = params.get("color_gain_b", 1.02)
+    # FIX-P1-2: FFmpeg colorbalance rs/rm/rh are ADDITIVE OFFSETS in [-1,1]
+    # (not multipliers). Config keys keep lift/gamma/gain multiplier-style
+    # names for user familiarity, but values are mapped to offsets here:
+    # offset = (multiplier - 1.0), clamped to [-1,1]. This prevents out-of-
+    # range values (e.g. gain=1.02 → +0.02 offset, not 1.02 which exceeds
+    # [-1,1] and would be rejected by FFmpeg).
+    def _to_offset(v: float) -> float:
+        return max(-1.0, min(1.0, float(v) - 1.0))
+    lift_r = _to_offset(params.get("color_lift_r", 1.02))   # shadows offset
+    lift_g = _to_offset(params.get("color_lift_g", 1.01))
+    lift_b = _to_offset(params.get("color_lift_b", 1.01))
+    gamma_r = _to_offset(params.get("color_gamma_r", 0.98))  # midtones offset
+    gamma_g = _to_offset(params.get("color_gamma_g", 0.98))
+    gamma_b = _to_offset(params.get("color_gamma_b", 0.98))
+    gain_r = _to_offset(params.get("color_gain_r", 1.02))    # highlights offset
+    gain_g = _to_offset(params.get("color_gain_g", 1.02))
+    gain_b = _to_offset(params.get("color_gain_b", 1.02))
 
     # FIX-P8-4: Selective local processing per v6.32 §3
     # ORIGINAL: No skin/hair protection; unsharp applied to textured regions

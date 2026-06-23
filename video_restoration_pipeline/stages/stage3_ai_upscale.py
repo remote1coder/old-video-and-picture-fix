@@ -51,10 +51,13 @@ def estimate_gpu_memory(width: int, height: int, scale: int,
     """Estimate GPU memory requirement in bytes."""
     base = width * height * 3 * 4 * 1 * (2 + scale * scale)
     model_weights = {
-        "RealESRGAN_x2plus": 64 * 1024 * 1024,
-        "RealESRGAN_x4plus": 128 * 1024 * 1024,
-        "DAT_x2": 32 * 1024 * 1024,
-        "DAT_x4": 64 * 1024 * 1024,
+        "realesr-general-x4v3": 18 * 1024 * 1024,   # ncnn .bin ~10-18MB
+        "RealESRGAN_x2plus": 18 * 1024 * 1024,       # ncnn .bin
+        "RealESRGAN_x4plus": 18 * 1024 * 1024,       # ncnn .bin
+        "DAT_x2": 18 * 1024 * 1024,                   # ncnn .bin
+        "DAT_x4": 18 * 1024 * 1024,                   # ncnn .bin
+        "DAT_2_x2": 18 * 1024 * 1024,
+        "DAT_2_x4": 18 * 1024 * 1024,
     }
     weight = model_weights.get(model_name, 64 * 1024 * 1024)
     return base + weight
@@ -146,12 +149,20 @@ def check_gpu_memory(required_bytes: int, logger=None) -> tuple:
 
 
 def _get_model_for_scale(model: str, scale: int) -> str:
-    """Get correct model name for a given scale, preserving model family."""
-    if model.startswith("RealESRGAN"):
+    """Get correct model name for a given scale, preserving model family.
+
+    FIX-P1-15: realesr-general-x4v3 is a 4× ncnn model; for 2× output it
+    stays the same model (ncnn -s 2 downscales). DAT_2 is default.
+    """
+    if model.startswith("realesr-general"):
+        return "realesr-general-x4v3"
+    elif model.startswith("RealESRGAN"):
         return f"RealESRGAN_x{scale}plus"
+    elif model.startswith("DAT_2"):
+        return f"DAT_2_x{scale}"
     elif model.startswith("DAT"):
         return f"DAT_x{scale}"
-    return f"RealESRGAN_x{scale}plus"
+    return "realesr-general-x4v3"
 
 
 # FIX-P8-6+P8-1: Restructured run_realesrgan
@@ -576,7 +587,7 @@ def main():
             pass
 
     # FIX-P8-5: WSL2 temp_dir redirect per v6.32 §7.3
-    model = params.get("upscale_model", "RealESRGAN_x2plus")
+    model = params.get("upscale_model", "realesr-general-x4v3")
     temp_dir = params.get("temp_dir", "./temp")
     try:
         from checkpoint import wsl_redirect_path

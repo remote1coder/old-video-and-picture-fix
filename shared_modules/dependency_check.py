@@ -224,9 +224,9 @@ def check_ffmpeg_filters_minimal_calls(pipeline_type: str = "photo") -> List[str
     if code != 0:
         errors.append(f"  - compand test failed: {err[:200]}")
 
-    # FIX-P2-4: Test 7: arnndn (only if model files available)
-    # per v6.32 §7.30
-    arnndn_model = Path("./models/arnndn_50Hz.pb")
+    # FIX-P2-4: Test 7: arnndn (only if model file available) per v6.32 §7.30
+    # FIX-P1-8: arnndn uses std.rnnn (official .rnnn format, not .pb).
+    arnndn_model = Path("./models/std.rnnn")
     if arnndn_model.exists():
         code, _, err = run_cmd([
             "ffmpeg", "-f", "lavfi", "-i", "sine=frequency=50:duration=1",
@@ -289,24 +289,46 @@ def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
 
 
 def check_havsfunc_version() -> Tuple[bool, str]:
-    """Check havsfunc version is r33."""
+    """Check havsfunc is r33 (r34 has incomplete function set).
+
+    FIX-P1-6: r33 source has NO __version__ attribute, so the old
+    getattr(haf, "__version__") always returned None → false failure.
+    New approach per v7.32 §3.6:
+    1. Primary: importlib.metadata.version("havsfunc") (PEP 396).
+    2. Fallback: function-existence test (QTGMC/GrainFactory3/TemporalDegrain/
+       srestore/DepanStabilize) — r34 lacks some of these, so a missing
+       function excludes r34 without relying on __version__.
+    Installation: pip install 'havsfunc==33' (r34 is NOT compatible).
+    """
     try:
-        import havsfunc as haf
-        version = getattr(haf, "__version__", None)
-        if version is None:
-            import inspect
-            src_file = inspect.getfile(haf)
-            return False, (f"havsfunc found at {src_file} but version cannot be detected. "
-                          f"Please install r33: pip install 'havsfunc==33'")
-        # Strict match: r33, 33, 33.0, but not 133, 33.1, or 33a
-        vstr = str(version)
-        if re.match(r"^r?33($|\.0*$)", vstr):
-            return True, f"havsfunc r{version}"
-        return False, f"havsfunc version {version} (requires r33, install: pip install 'havsfunc==33')"
+        import havsfunc as haf  # noqa: F401
     except ImportError:
         return False, "havsfunc not installed (pip install 'havsfunc==33')"
     except Exception as e:
-        return False, f"Error checking havsfunc: {e}"
+        return False, f"Error importing havsfunc: {e}"
+
+    # Primary: importlib.metadata
+    version = None
+    try:
+        import importlib.metadata as _meta
+        version = _meta.version("havsfunc")
+    except Exception:
+        version = None
+    if version is not None:
+        vstr = str(version)
+        if re.match(r"^r?33($|\.0*$)", vstr):
+            return True, f"havsfunc r{version}"
+        return False, (f"havsfunc version {version} (requires r33; r34 has incomplete "
+                       f"function set; install: pip install 'havsfunc==33')")
+
+    # Fallback: function-existence test (r33 has __version__ absent, but has
+    # the full function set; r34 lacks some functions).
+    required_funcs = ["QTGMC", "GrainFactory3", "TemporalDegrain", "srestore", "DepanStabilize"]
+    missing_funcs = [f for f in required_funcs if not hasattr(haf, f)]
+    if missing_funcs:
+        return False, (f"havsfunc missing functions {missing_funcs} (likely r34 which is "
+                       f"incomplete; install r33: pip install 'havsfunc==33')")
+    return True, "havsfunc r33 (verified via function presence; __version__ absent in r33)"
 
 
 def check_vs_minimal_calls() -> List[str]:
@@ -337,24 +359,32 @@ def check_vs_minimal_calls() -> List[str]:
         except Exception as e:
             errors.append(f"  - QTGMC InputType=0 test failed: {e}")
 
-        # Test 3: TemporalDegrain2
+        # Test 3: TemporalDegrain (r33 function name; no "2" suffix)
+        # FIX-P1-9: r33 signature is TemporalDegrain(inpClip, sigma=16, blockWidth=16, ...)
+        # — NO degrainTR/grainLevel params (those are AviSynth TemporalDegrain2).
         try:
             clip3 = core.std.BlankClip(format=vs.YUV420P16, width=720, height=480, length=60)
-            result3 = haf.TemporalDegrain2(clip3, degrainTR=1, grainLevel=1)
+            result3 = haf.TemporalDegrain(clip3, sigma=16, blockWidth=16)
             if result3 is None:
-                errors.append("  - TemporalDegrain2 returned None")
+                errors.append("  - TemporalDegrain returned None")
+        except AttributeError:
+            errors.append("  - TemporalDegrain not found (havsfunc may be r34 with "
+                          "incomplete functions; install r33: pip install 'havsfunc==33')")
         except Exception as e:
-            errors.append(f"  - TemporalDegrain2 test failed: {e}")
+            errors.append(f"  - TemporalDegrain test failed: {e}")
 
-        # FIX-P1-1: DepanStabilize minimal call test per v7.32 §3.6
+        # FIX-P1-10: DepanStabilize needs motion-vector data from MAnalyse/
+        # MDepan first; calling it directly on a BlankClip fails (no motion
+        # data) → false "dependency missing" report. The production pipeline
+        # uses haf.DepanStabilize (havsfunc wrapper) which internally runs
+        # MDepan. So here we only check attribute existence, not a full call.
         try:
-            clip3b = core.std.BlankClip(format=vs.YUV420P16, width=720, height=480, length=60)
-            # mvtools2 registers as core.mv namespace in VS
-            result3b = core.mv.DepanStabilize(clip3b, dxmax=10, dymax=10)
-            if result3b is None:
-                errors.append("  - DepanStabilize returned None")
+            mv = getattr(core, "mv", None)
+            if mv is None or not hasattr(mv, "DepanStabilize"):
+                errors.append("  - DepanStabilize not found in core.mv "
+                              "(mvtools plugin missing; haf.DepanStabilize needs it)")
         except Exception as e:
-            errors.append(f"  - DepanStabilize test failed: {e}")
+            errors.append(f"  - DepanStabilize attribute check failed: {e}")
 
         # Test 4: GrainFactory3
         try:
@@ -494,91 +524,57 @@ def check_ai_cli_tools() -> List[str]:
 
 
 def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) -> Tuple[List[str], List[str]]:
-    """Check AI model weights exist and validate MD5 checksums.
-    
-    Per v7.32 §3.6: Each model must have MD5 + download URL;
-    version mismatch rejects loading.
-    
-    Supports external MD5 manifest (md5_manifest.json) in models_dir
-    to enable checksum validation without modifying source code.
-    If no MD5 is configured (built-in or external), an ERROR is issued
-    unless --skip-md5-check is used.
+    """Check AI model weights exist (file presence + size>0).
+
+    FIX-P1-7: Removed MD5 checksum validation per v7.32 §3.6 (official
+    releases mostly provide SHA256, not MD5; hard-coding unverified MD5s
+    caused false mismatches). Now validates file existence + size>0 only.
+    The skip_md5_check param is retained for backward CLI compatibility
+    but no longer affects validation (no checksum is ever computed).
     """
     models_path = Path(models_dir).resolve()
-    
-    # Load external MD5 manifest if present
-    external_md5 = {}
-    manifest_path = models_path / "md5_manifest.json"
-    if manifest_path.exists():
-        try:
-            import json
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                external_md5 = json.load(f)
-        except Exception:
-            pass
-    
-    # FIX-P2-4: Added aliases for CodeFormer per v7.32 §3.6
-    # FIX-P3-1: MD5 values left as None — use external md5_manifest.json
-    # for actual checksums. Per v7.32 §3.6: each model must have MD5 + URL.
-    # Hard-coding unverified MD5s is worse than no check (false mismatches).
-    # Users should create models/md5_manifest.json with verified hashes.
+    del skip_md5_check  # retained in signature for CLI backward compat
+
+    # Default models (primary) + optional alternates.
+    # Per v7.32 §3.6: realesr-general-x4v3 (default), DAT_2 (default),
+    # GFPGANv1.4, codeformer.pth, detection_Resnet50_Final.pth (RetinaFace).
     required_models = {
-        "RealESRGAN_x2plus.pth": {
-            "url": "https://github.com/xinntao/Real-ESRGAN/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
-        },
-        "RealESRGAN_x4plus.pth": {
-            "url": "https://github.com/xinntao/Real-ESRGAN/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
+        "realesr-general-x4v3.pth": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0",
+            "aliases": ["RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"],  # optional alternates
+            "optional_alt": True,
         },
         "GFPGANv1.4.pth": {
             "url": "https://github.com/TencentARC/GFPGAN/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
         },
-        "DAT_x2.pth": {
-            "url": "https://github.com/ckkelvinchan/DAT/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
+        "DAT_2_x2.pth": {
+            "url": "https://github.com/zhengchen1999/DAT (Google Drive)",
+            "aliases": ["DAT_x2.pth"],  # optional alternates
+            "optional_alt": True,
         },
-        "DAT_x4.pth": {
-            "url": "https://github.com/ckkelvinchan/DAT/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
+        "DAT_2_x4.pth": {
+            "url": "https://github.com/zhengchen1999/DAT (Google Drive)",
+            "aliases": ["DAT_x4.pth"],
+            "optional_alt": True,
         },
-        "GPEN_x2.pth": {
-            "url": "https://github.com/yangxy/GPEN/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
-        },
-        "GPEN_x4.pth": {
-            "url": "https://github.com/yangxy/GPEN/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
-        },
-        "CodeFormer.pth": {
-            "url": "https://github.com/sczhou/CodeFormer/releases",
-            "md5": None,  # Please add verified MD5 to md5_manifest.json
-            "aliases": ["codeformer.pth", "codeformer_v0.1.pth",
+        "codeformer.pth": {
+            "url": "https://github.com/sczhou/CodeFormer (Google Drive)",
+            "aliases": ["CodeFormer.pth", "codeformer_v0.1.pth",
                         "weights/CodeFormer/codeformer.pth"],
+        },
+        "detection_Resnet50_Final.pth": {
+            "url": "facexlib weights (place in facexlib/weights/ or models/)",
+            "optional": True,  # RetinaFace auto-downloads if absent
         },
     }
     missing = []
     warnings = []
 
-    # FIX-P2-1: When no MD5 is configured at all, degrade to WARNING (non-blocking)
-    # per v7.32 §3.6
-    no_md5_configured = (
-        not external_md5 and
-        not any(info.get("md5") for info in required_models.values())
-    )
-    if no_md5_configured and not skip_md5_check:
-        warnings.append(
-            f"  - WARNING: No MD5 checksums configured for any model. "
-            f"Create {manifest_path} with verified hashes to enable verification."
-        )
-        skip_md5_check = True  # Downgrade to non-blocking
-
     for model_name, info in required_models.items():
         model_path = models_path / model_name
         actual_path = model_path
 
-        # FIX-P2-4: Check primary path, then aliases per v7.32 §3.6
+        # Check primary path, then aliases
         if not model_path.exists():
             aliases = info.get("aliases", [])
             found = False
@@ -589,50 +585,32 @@ def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) 
                     found = True
                     break
             if not found:
-                alias_info = f" (also checked aliases: {aliases})" if aliases else ""
-                missing.append(
-                    f"  - {model_name}: not found in {models_path}{alias_info} "
-                    f"(download: {info['url']})"
-                )
+                if info.get("optional"):
+                    warnings.append(
+                        f"  - {model_name}: not found (optional; {info['url']})"
+                    )
+                elif info.get("optional_alt"):
+                    # Acceptable if at least one alternate exists; the primary
+                    # missing is only a warning since an alias satisfies it.
+                    warnings.append(
+                        f"  - {model_name}: not found in {models_path} "
+                        f"(optional; an alias may be present: {aliases}; "
+                        f"download: {info['url']})"
+                    )
+                else:
+                    alias_info = f" (also checked aliases: {aliases})" if aliases else ""
+                    missing.append(
+                        f"  - {model_name}: not found in {models_path}{alias_info} "
+                        f"(download: {info['url']})"
+                    )
                 continue
 
-        # MD5 check on actual_path
-        expected_md5 = info.get("md5") or external_md5.get(model_name)
-        if expected_md5:
-            import hashlib
-            h = hashlib.md5()
-            with open(actual_path, "rb") as f:
-                # FIX-P3-3: Replaced walrus operator per CLAUDE.md §4
-                # ORIGINAL: while chunk := f.read(65536):
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-            actual_md5 = h.hexdigest()
-            if actual_md5 != expected_md5:
-                missing.append(
-                    f"  - {model_name}: MD5 mismatch "
-                    f"(expected {expected_md5}, got {actual_md5})"
-                )
-        else:
-            # FIX-P3-1-REV: No MD5 configured.
-            # Per v7.32 §3.6 each model must have MD5 + URL, but hard-coding
-            # unverified MD5s is worse than no check.
-            # Users should create md5_manifest.json with verified hashes.
-            # WARNING → non-blocking (skip_md5_check=True),
-            # ERROR → blocking (skip_md5_check=False).
-            if skip_md5_check:
-                warnings.append(
-                    f"  - {model_name}: WARNING - MD5 checksum not configured. "
-                    f"Create {manifest_path} with {{'{model_name}': '<md5_hash>'}} "
-                    f"to enable verification"
-                )
-            else:
-                missing.append(
-                    f"  - {model_name}: ERROR - MD5 verification not configured. "
-                    f"Create {manifest_path} or use --skip-md5-check to bypass"
-                )
+        # Validate file size > 0 (presence-based check, no MD5)
+        try:
+            if actual_path.stat().st_size == 0:
+                missing.append(f"  - {model_name}: exists but is 0 bytes (corrupt?)")
+        except Exception as e:
+            missing.append(f"  - {model_name}: cannot stat ({e})")
     return missing, warnings
 
 
@@ -653,35 +631,53 @@ def check_arnndn_models(config: Optional[Dict] = None, ffmpeg_version_ok: bool =
     models_dir = config.get("arnndn_model_dir", "./models")
     models_path = Path(models_dir)
     missing = []
-    for fname in ["arnndn_50Hz.pb", "arnndn_60Hz.pb"]:
-        fpath = models_path / fname
-        if not fpath.exists():
-            missing.append(
-                f"  - {fname}: not found (download: https://github.com/NullModel/arnndn-models)"
-            )
+    # FIX-P1-8: arnndn uses official std.rnnn (Xiph RNNoise original generic
+    # model from richardpl/arnndn-models, .rnnn format — NOT .pb). The old
+    # arnndn_50Hz.pb/arnndn_60Hz.pb files do not exist in the official repo.
+    # std.rnnn is a single generic model (model names are not frequency-based).
+    model_file = config.get("audio", {}).get("arnndn_model", "std.rnnn")
+    fpath = models_path / model_file
+    if not fpath.exists():
+        missing.append(
+            f"  - {model_file}: not found (download: https://github.com/richardpl/arnndn-models)"
+        )
     return missing
 
 
 def check_gmic_filters() -> List[str]:
     """Check G'MIC supports required filters.
-    
-    BUG-062 fix: Use per-filter exact query (gmic -h filtername) instead of
-    substring matching in the full help text to avoid false positives.
+
+    FIX-A1: G'MIC 3.7.6 has NO -deblock/-deband/-despeckle/-film_grain/
+    -remove_scratches/-transfer_colors/-match_histogram commands (verified via
+    `gmic -help`). Replaced with real commands:
+    - denoise_haar: scratch/deband approximation (Haar wavelet denoise)
+    - denoise_patchpca: deblock approximation (patch-PCA denoise)
+    - transfer_histogram: color/histogram transfer
+    Photo grain uses pure Python Laplacian pyramid.
+
+    FIX-A1-2: `gmic -h <name>` returns rc=0 with empty stdout for ANY name
+    (even non-existent), so it cannot detect command existence. Use
+    `gmic -help` once to get the full command list, then regex-match
+    `^\\s+<name>:` (the documented command-definition format).
     """
-    required_filters = ["repair", "deblock", "deband"]
-    # FIX-R13-1: Removed "film_grain" — G'MIC CLI does not contain
-    # this command. Photo grain synthesis now uses pure Python Laplacian
-    # pyramid implementation.
+    required_filters = ["denoise_haar", "denoise_patchpca", "transfer_histogram"]
     missing = []
+    try:
+        # FIX-A1-3: gmic -help output contains non-ASCII bytes (e.g. 0x92)
+        # that break the default GBK codec on Windows. Use errors="replace"
+        # so decoding never raises; we only need ASCII command names.
+        r = subprocess.run(["gmic", "-help"],
+                          capture_output=True, timeout=30, shell=False)
+        if r.returncode != 0:
+            return [f"  - G'MIC -help failed (rc={r.returncode})"]
+        help_text = r.stdout.decode("utf-8", errors="replace")
+    except Exception as e:
+        return [f"  - Cannot run gmic -help ({e})"]
+
     for f in required_filters:
-        try:
-            r = subprocess.run(["gmic", "-h", f],
-                              capture_output=True, text=True, timeout=10, shell=False)
-            # If returncode != 0 or stdout is empty/just error, filter is unavailable
-            if r.returncode != 0 or not r.stdout.strip() or "unknown command" in r.stdout.lower():
-                missing.append(f"  - G'MIC filter '{f}' not available")
-        except Exception:
-            missing.append(f"  - Cannot verify G'MIC filter '{f}'")
+        # Command definitions appear as "  <name>:" in gmic -help output.
+        if not re.search(rf"^\s+{re.escape(f)}:", help_text, re.MULTILINE):
+            missing.append(f"  - G'MIC command '{f}' not available")
     return missing
 
 

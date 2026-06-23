@@ -445,12 +445,15 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("")
 
     # Denoise
-    if denoise == "TemporalDegrain2":
-        degrain_tr = denoise_params.get("degrainTR", 2)
-        grain_level = denoise_params.get("grainLevel", 2)
+    # FIX-P1-9: havsfunc VS function is TemporalDegrain (no "2" suffix);
+    # r33 params are sigma/blockWidth (NOT degrainTR/grainLevel which are
+    # AviSynth TemporalDegrain2 params).
+    if denoise in ("TemporalDegrain", "TemporalDegrain2"):
+        sigma = denoise_params.get("sigma", 16)
+        block_width = denoise_params.get("blockWidth", 16)
         lines.append("# Temporal denoising")
-        lines.append(f"clip = haf.TemporalDegrain2(clip, "
-                    f"degrainTR={degrain_tr}, grainLevel={grain_level})")
+        lines.append(f"clip = haf.TemporalDegrain(clip, "
+                    f"sigma={sigma}, blockWidth={block_width})")
         lines.append("")
 
     # Deblocking

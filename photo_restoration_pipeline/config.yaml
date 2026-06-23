@@ -114,7 +114,7 @@ ai:
   #   GPEN_x2 / GPEN_x4 — full-body portrait enhancement (v6.32 §4)
   # Fallback chain: on primary model failure, tries alternatives in priority order
   # (DAT -> RealESRGAN -> GPEN for photos)
-  upscale_model: "RealESRGAN_x2plus"
+  upscale_model: "realesr-general-x4v3"
   upscale_scale: 2
   model_dir: ""  # Empty = auto-detect PROJECT_ROOT/models; set explicit path if needed
   max_scale: 4

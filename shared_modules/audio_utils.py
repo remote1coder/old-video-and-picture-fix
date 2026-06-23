@@ -273,9 +273,17 @@ def _get_ffmpeg_version() -> Tuple[bool, str]:
 
 
 def _get_arnndn_model_path(config: Dict[str, Any], primary_freq: int) -> Optional[str]:
-    """Get arnndn model path based on detected primary frequency."""
+    """Get arnndn model path.
+
+    FIX-P1-8: arnndn uses official std.rnnn (Xiph RNNoise original generic
+    model, .rnnn format — NOT frequency-based .pb files). The primary_freq
+    argument is retained for signature compatibility but no longer selects
+    a per-frequency model (RNNoise is a generic denoiser, not a hum filter;
+    hum removal is done by bandreject).
+    """
     models_dir = config.get("arnndn_model_dir", "./models")
-    model_name = f"arnndn_{primary_freq}Hz.pb"
+    audio_cfg = config.get("audio", {}) if isinstance(config.get("audio"), dict) else {}
+    model_name = audio_cfg.get("arnndn_model", config.get("arnndn_model", "std.rnnn"))
     model_path = Path(models_dir) / model_name
     if model_path.exists():
         return str(model_path)

@@ -33,7 +33,8 @@ def _build_vs_script(input_source: str, vs_format: str,
                      g1str: float, g2str: float, g3str: float,
                      addgrainc_ratio: float,
                      use_addgrainc: bool = False,
-                     addgrainc_after_gf3: bool = False) -> str:
+                     addgrainc_after_gf3: bool = False,
+                     temp_avg: float = 0.0) -> str:
     """Build VapourSynth grain synthesis script.
 
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
@@ -67,7 +68,7 @@ def _build_vs_script(input_source: str, vs_format: str,
         f"clip = core.ffms2.Source(source={repr(input_source)})\n"
         f"clip = core.resize.Bicubic(clip, format={vs_format})\n"
         f"clip = haf.GrainFactory3(clip, g1str={g1str}, "
-        f"g2str={g2str}, g3str={g3str})\n"
+        f"g2str={g2str}, g3str={g3str}, temp_avg={temp_avg})\n"
     )
     if addgrainc_after_gf3:
         # FIX-P9-4: Stack AddGrainC after GrainFactory3 for temporal continuity
@@ -304,6 +305,9 @@ def main() -> int:
     g1str = material_grain.get("g1str", 1.0)
     g2str = material_grain.get("g2str", 0.2)
     g3str = material_grain.get("g3str", 0.2)
+    # FIX-P1-13: pass temp_avg to GrainFactory3 (r33 legal param, controls
+    # temporal correlation; default 0 = disabled, AddGrainC fallback used then).
+    temp_avg = grain_cfg.get("temp_avg", material_grain.get("temp_avg", 0.0))
 
     # Validate no illegal params
     if not grain_cfg:
@@ -335,7 +339,8 @@ def main() -> int:
     vs_script = _build_vs_script(
         input_source, vs_format, g1str, g2str, g3str,
         addgrainc_ratio, use_addgrainc=False,
-        addgrainc_after_gf3=addgrainc_enabled)
+        addgrainc_after_gf3=addgrainc_enabled,
+        temp_avg=temp_avg)
     # FIX-P9-11: removed redundant write here — _run_grain_pipeline writes vs_path internally
 
     # Fix: Use vspipe directly (standard VapourSynth CLI tool)
@@ -380,7 +385,8 @@ def main() -> int:
         # FIX-P9-9: halved intensity for standalone fallback per v6.32 §7.17
         addgrain_script = _build_vs_script(
             input_source, vs_format, g1str * 0.5, g2str * 0.5, g3str * 0.5,
-            addgrainc_ratio, use_addgrainc=True)
+            addgrainc_ratio, use_addgrainc=True,
+            temp_avg=temp_avg)
         result2 = _run_grain_pipeline(
             addgrain_script, vs_path, vspipe_cmd, ffmpeg_cmd,
             output_path, logger, fallback_label="AddGrainC")

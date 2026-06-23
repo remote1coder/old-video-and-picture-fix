@@ -577,49 +577,17 @@ def _add_grain_python(input_path: str, output_path: str,
         return False
 
 
-def _add_grain_gmic(input_path: str, output_path: str,
-                     strength: float, size: float,
-                     roughness: float) -> bool:
-    """Add film grain using G'MIC (LEGACY — kept as fallback).
-
-    NOTE: G'MIC CLI does not contain a -film_grain command. This function
-    will always return False. Kept only for potential future compatibility
-    if G'MIC adds grain commands.
-
-    FIX-P12-12: Parameter format documented per v7.32 §3.10.4:
-    - strength: 0-100 integer (config grain_strength * 100)
-    - size: float (config grain_size, 0.5-2.0)
-    - roughness: float (config grain_roughness, 0-1)
-    Format: "strength,size,roughness" (comma-separated)
-    """
-    try:
-        grain_args = (f"{int(strength * 100)},"
-                      f"{size},{roughness}")
-        cmd = [
-            "gmic", input_path,
-            "-film_grain", grain_args,
-            "-o", output_path,
-        ]
-        r = subprocess.run(cmd, capture_output=True, timeout=300, shell=False)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
 def _add_grain(input_path: str, output_path: str,
                strength: float, size: float,
                roughness: float, bit_depth: int = 16) -> bool:
-    """Add film grain — prefers pure Python, falls back to G'MIC.
+    """Add film grain via pure Python Laplacian pyramid.
 
-    FIX-R13-1: Primary implementation is pure Python Laplacian pyramid.
-    G'MIC -film_grain is kept as a no-op fallback for future compatibility.
+    FIX-A1: Removed dead G'MIC -film_grain fallback (G'MIC stdlib has no
+    -film_grain command, verified gmic_stdlib.gmic 3.7.6). Pure Python
+    Laplacian pyramid is the sole implementation per v7.32 §3.10.4.
     """
-    # Primary: Python Laplacian pyramid (always available, reliable)
-    if _add_grain_python(input_path, output_path, strength, size,
-                         roughness, bit_depth):
-        return True
-    # Fallback: G'MIC (currently always fails since -film_grain doesn't exist)
-    return _add_grain_gmic(input_path, output_path, strength, size, roughness)
+    return _add_grain_python(input_path, output_path, strength, size,
+                             roughness, bit_depth)
 
 
 def _extract_flif_chrominance(img: "Image.Image", output_dir: str,
