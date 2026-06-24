@@ -90,6 +90,13 @@ def main():
 
     # FIX-P8-13: Validate stage3 output with ffprobe per v6.32 §7.1
     # ORIGINAL: No validation, could process undecodable input
+    # FIX-R8-W9: explicit size>0 check per v6.32 §7.1 (file existence + size>0
+    # + ffprobe decodable). ORIGINAL only checked ffprobe returncode.
+    stage3_path = Path(stage3_output)
+    if not stage3_path.exists() or stage3_path.stat().st_size == 0:
+        logger.error("STAGE4_INPUT_EMPTY",
+                     f"Stage 3 output missing or empty: {stage3_output}")
+        return 82
     try:
         r = subprocess.run(
             ["ffprobe", "-hide_banner", "-v", "error", stage3_output],
@@ -166,6 +173,10 @@ def main():
     # Per v6.32 §3: "Human subjects, skin, hair regions are COMPLETELY
     # EXCLUDED from the mask." Flat regions: mild gblur denoise.
     # Textured regions: preserve original (no sharpening per spec).
+    # FIX-R8-W8 (方案B): hair is high-frequency texture — edgedetect classifies
+    # it as textured → enters the copy (preserve) branch, so it is implicitly
+    # protected from gblur. Explicit hair segmentation (OpenCV/face parsing)
+    # is deferred pending user decision on precision requirements (round_8 §5).
     filter_chain = (
         "split[main][tmp];"
         # Edge-based region mask (detect flat vs textured)

@@ -148,13 +148,21 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list, floa
     # ORIGINAL: if gprog_ratio > 0.90 and fo_meta in ("tt", "bb", "tff", "bff"):
     # "unknown" (no field_order metadata) must also trigger PSF detection
     if gprog_ratio > 0.90 and fo_meta not in ("progressive",):
+        # FIX-W1: record codec/extension as auxiliary PSF evidence per v7.32 §3.9
+        # ("结合文件扩展名/编码器标记判定为 PSF"). MediaInfo/SSIM remain the primary
+        # criteria; codec/extension only weights the confidence (+0.05) when matched.
+        codec_hint = (video_stream or {}).get("codec_name", "").lower()
+        ext_hint = Path(input_path).suffix.lower()
+        psf_codec_hint = codec_hint in ("dvvideo", "dv") or ext_hint in (".dv", ".m2t", ".m2ts")
         # Method B: MediaInfo auxiliary check (v6.32 §3.9 / v7.32 §3.9)
         # If MediaInfo explicitly indicates PSF, skip expensive SSIM test
         if _check_psf_mediainfo(input_path):
             return "psf", gprog_ratio, [], fps
         # Method C: SSIM field similarity check
         if _check_psf_ssim(input_path):
-            return "psf", gprog_ratio, [], fps
+            # codec/extension match boosts PSF confidence (+0.05) per v7.32 §3.9
+            conf = min(1.0, gprog_ratio + (0.05 if psf_codec_hint else 0.0))
+            return "psf", conf, [], fps
 
     # If too short or no video stream, skip segmentation
     if duration < 3.0 or not video_stream:
@@ -851,6 +859,18 @@ def classify_video(input_path: str) -> Dict[str, Any]:
     field_order, fo_confidence, field_segments, fps = detect_field_order_segments(input_path)
     result["field_order"] = field_order
     result["is_psf"] = (field_order == "psf")
+    # FIX-W2: preserve original TFF/BFF for the PSF path per v7.32 §3.10.1.
+    # detect_field_order_segments returns "psf" when PSF is detected, overwriting
+    # the original ffprobe field_order (tt/bb). SeparateFields+Weave needs the
+    # correct TFF/BFF, otherwise TFF PSF material gets a 1-row vertical offset
+    # after Weave. stage1 reads `psf_tff` for its SeparateFields call.
+    if field_order == "psf":
+        _orig_fo = (video_stream or {}).get("field_order", "unknown")
+        # Normalize ffprobe field_order: tff/top -> True; bff/bottom -> False;
+        # unknown/progressive -> False (conservative; PSF offset is ≤1 row).
+        result["psf_tff"] = _orig_fo in ("tt", "tff", "top", "top_first")
+    else:
+        result["psf_tff"] = False
     # FIX-P6-11: Include fps in output per v7.32 §3.9
     result["fps"] = fps
 
@@ -911,7 +931,18 @@ def classify_video(input_path: str) -> Dict[str, Any]:
         result["ai_upscale_banned"] = False
 
     # Adjust confidence with field order info
-    result["confidence"] = min(float(result.get("confidence", 0.0)), fo_confidence + 0.1)
+    # FIX-W6: don't over-penalize progressive/unknown field order. ORIGINAL capped
+    # overall confidence at fo_confidence+0.1 for ALL field orders; for progressive/
+    # unknown the field-order detection is unreliable and shouldn't dominate. Only
+    # let field_order confidence cap for real interlaced/PSF detections per v7.32 §3.9.
+    if field_order in ("tt", "bb", "psf"):
+        result["confidence"] = min(float(result.get("confidence", 0.0)), fo_confidence + 0.1)
+    else:
+        result["confidence"] = min(float(result.get("confidence", 0.0)), fo_confidence + 0.3)
+
+    # FIX-W7: flag low-confidence classifications for interactive confirmation
+    # per v7.32 §3.9 ("<80% 时交互模式强制人工确认").
+    result["needs_confirmation"] = float(result.get("confidence", 0.0)) < 0.80
 
     return result
 

@@ -23,6 +23,7 @@ import json
 import argparse
 import subprocess
 import shutil
+import re
 from pathlib import Path
 
 import numpy as np
@@ -238,15 +239,58 @@ def _convert_to_rgb(input_path: str, output_path: str, logger=None) -> bool:
         return False
 
 
-def run_gmic(input_path: str, output_path: str, *gmic_args) -> tuple:
+def _build_gmic_whitelist_re(params: dict):
+    """Build a path-whitelist regex for G'MIC args per v7.32 §3.10.25.
+
+    FIX-R11-8: Reads gmic_windows_whitelist from config (a regex char class).
+    Always permits ':' (Windows drive separator — structurally required and
+    safe under shell=False list-arg invocation) by inserting it into the
+    class, since the config value lacks it and would reject all Windows
+    absolute paths. Falls back to a safe default when config is absent.
+    """
+    wl = (params or {}).get("gmic_windows_whitelist")
+    if not wl or not isinstance(wl, str) or not wl.startswith("["):
+        wl = r"[a-zA-Z0-9_\-\./\\]"
+    # Insert ':' before the closing ']' if not already permitted.
+    if ":" not in wl:
+        wl = wl[:-1] + ":" + wl[-1:]
+    try:
+        return re.compile(wl + "+")
+    except re.error:
+        # Malformed config whitelist — fall back to safe default.
+        return re.compile(r"[a-zA-Z0-9_\-\./\\:]+")
+
+
+def _validate_gmic_path(path: str, wl_re) -> str:
+    """Resolve and whitelist-validate a path passed to G'MIC.
+
+    FIX-R11-8: Per v7.32 §3.10.25, paths fed to G'MIC must be resolved and
+    validated to reject shell metacharacters / spaces. Raises ValueError.
+    """
+    p = str(Path(path).resolve())
+    if not wl_re.fullmatch(p):
+        raise ValueError(
+            f"G'MIC path contains forbidden characters (not in whitelist): {p}")
+    return p
+
+
+def run_gmic(input_path: str, output_path: str, *gmic_args,
+             params: dict = None) -> tuple:
     """Run G'MIC with shell=False safety.
 
     Returns:
         (success: bool, stderr: str) tuple per Bug 11.20 fix.
     """
-    cmd = ["gmic", input_path]
+    # FIX-R11-8: Resolve + whitelist-validate paths per v7.32 §3.10.25.
+    wl_re = _build_gmic_whitelist_re(params)
+    try:
+        safe_in = _validate_gmic_path(input_path, wl_re)
+        safe_out = _validate_gmic_path(output_path, wl_re)
+    except ValueError as e:
+        return False, str(e)
+    cmd = ["gmic", safe_in]
     cmd.extend(list(gmic_args))
-    cmd.extend(["-o", output_path])
+    cmd.extend(["-o", safe_out])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=False)
         if r.returncode != 0 and r.stderr:
@@ -266,15 +310,28 @@ def detect_channel_degradation(img_path: str, params: dict) -> dict:
         from PIL import Image
         import numpy as np
         img = Image.open(img_path)
-        # Preserve 16-bit precision for I;16 images
-        if img.mode == "I;16":
-            arr = np.array(img).astype(np.float32) / 65535.0
+        arr_raw = np.array(img)
+        # FIX-R11-6: Unify to 3-channel and normalize by actual bit depth.
+        # I;16 yields a 2D array; 16bit RGB TIFF PIL mode is unreliable.
+        # ORIGINAL: I;16 branch produced a 2D array → arr[:,:,c] IndexError
+        # was swallowed by the outer except → silently returned not-degraded.
+        if arr_raw.ndim == 2:
+            arr_raw = np.stack([arr_raw, arr_raw, arr_raw], axis=-1)
+        elif arr_raw.ndim == 3 and arr_raw.shape[2] == 4:
+            arr_raw = arr_raw[:, :, :3]
+        if arr_raw.dtype == np.uint16:
+            max_val = 65535.0
+        elif arr_raw.dtype == np.uint8:
+            max_val = 255.0
         else:
-            arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
+            # 'I' mode (int32) or other: infer from data range
+            mx = float(arr_raw.max()) if arr_raw.size else 0.0
+            max_val = 65535.0 if mx > 255 else 255.0
+        arr = arr_raw.astype(np.float32) / max_val
 
         # Compute per-channel stats
-        means = [arr[:, :, c].mean() for c in range(3)]
-        stds = [arr[:, :, c].std() for c in range(3)]
+        means = [float(arr[:, :, c].mean()) for c in range(3)]
+        stds = [float(arr[:, :, c].std()) for c in range(3)]
 
         result = {
             "degraded": False,
@@ -287,8 +344,14 @@ def detect_channel_degradation(img_path: str, params: dict) -> dict:
         mean_threshold = params.get("channel_degradation_mean_threshold", 0.08)
         std_threshold = params.get("channel_degradation_std_threshold", 0.15)
 
-        max_mean_diff = max(abs(means[i] - means[j])
-                           for i in range(3) for j in range(i+1, 3))
+        # FIX-R11-11: Per v7.32 §3.10.6 "某通道均值与另两通道均值差异",
+        # compute each channel's deviation from the mean of the OTHER TWO
+        # channels, then take the max. ORIGINAL: pairwise max of abs diff.
+        max_mean_diff = 0.0
+        for c in range(3):
+            others = [means[i] for i in range(3) if i != c]
+            avg_others = sum(others) / 2.0
+            max_mean_diff = max(max_mean_diff, abs(means[c] - avg_others))
         # FIX-P11-5: Relative std difference per v6.32 §4.2.1
         # Spec: "任意两通道 std 差异 > 15%（相对值）"
         # ORIGINAL: max_std_diff = max(abs(stds[i] - stds[j])) was absolute
@@ -304,6 +367,29 @@ def detect_channel_degradation(img_path: str, params: dict) -> dict:
             result["degraded"] = True
             result["mean_diff"] = max_mean_diff
             result["std_diff"] = max_std_diff
+            # FIX-R11-1: Record which channels are degraded per v7.32 §3.10.6
+            # ("记录退化通道"). A channel is degraded if its mean deviates from
+            # the average of the other two beyond mean_threshold, or its std
+            # relatively deviates beyond std_threshold. ORIGINAL: channels=[]
+            # was initialized but never populated.
+            degraded_channels = []
+            for c in range(3):
+                others_m = [means[i] for i in range(3) if i != c]
+                avg_m = sum(others_m) / 2.0
+                others_s = [stds[i] for i in range(3) if i != c]
+                avg_s = sum(others_s) / 2.0
+                mean_bad = abs(means[c] - avg_m) > mean_threshold
+                std_bad = (avg_s > 1e-8
+                           and abs(stds[c] - avg_s) / avg_s > std_threshold)
+                if mean_bad or std_bad:
+                    degraded_channels.append({
+                        "channel": c,
+                        "mean": means[c],
+                        "std": stds[c],
+                        "mean_degraded": mean_bad,
+                        "std_degraded": std_bad,
+                    })
+            result["channels"] = degraded_channels
 
         return result
     except Exception:
@@ -388,20 +474,34 @@ def extract_grain_pattern(img_path: str, output_path: str,
             if total_weight > 1e-8:
                 grain[:, :, c] /= total_weight  # Normalize weights
         
-        # Save grain pattern as 16-bit TIFF for precision
+        # Save grain pattern.
+        # FIX-R11-14: Save as 16-bit TIFF when photo_bit_depth==16 to preserve
+        # precision for downstream grain synthesis per v6.32 §4.2.1. Use
+        # tifffile (preferred) with imageio then PIL I;16 fallbacks.
+        # ORIGINAL: 8bit-only save for non-I;16 inputs dropped precision for
+        # 16bit RGB TIFF sources; I;16 path used imageio only.
         grain_clipped = np.clip(grain + 0.5, 0.0, 1.0)
-        if img.mode == "I;16":
+        bit_depth = (params or {}).get("photo_bit_depth", 16)
+        if bit_depth == 16:
             grain_uint16 = (grain_clipped * 65535).astype(np.uint16)
-            # FIX-P11-11: I;16 single-channel breaks downstream RGB pipeline
-            # Save as 3-channel 16-bit TIFF instead
+            saved_16 = False
             try:
-                import imageio.v3 as iio
-                iio.imwrite(output_path, grain_uint16)
+                import tifffile
+                tifffile.imwrite(output_path, grain_uint16)
+                saved_16 = True
             except Exception:
-                # Fallback: save as 8-bit (lossy but avoids I;16 single-channel)
-                grain_uint8 = (grain_clipped * 255).astype(np.uint8)
-                out_img = Image.fromarray(grain_uint8)
-                out_img.save(output_path)
+                pass
+            if not saved_16:
+                try:
+                    import imageio.v3 as iio
+                    iio.imwrite(output_path, grain_uint16)
+                    saved_16 = True
+                except Exception:
+                    pass
+            if not saved_16:
+                # Last resort: per-channel I;16 via PIL (single channel only)
+                Image.fromarray(grain_uint16[:, :, 0], mode='I;16').save(
+                    output_path)
         else:
             grain_uint8 = (grain_clipped * 255).astype(np.uint8)
             out_img = Image.fromarray(grain_uint8)
@@ -496,31 +596,56 @@ def apply_channel_correction(img_path: str, output_path: str,
         from PIL import Image
         import numpy as np
 
+        # FIX-R11-13: Master toggle for pre-compensation per v7.32 §3.10.6.
+        # When disabled, severe degradation does not trigger correction.
+        if not params.get("channel_correction_enabled", True):
+            if logger:
+                logger.info("STAGE1_CHANNEL_DISABLED",
+                            "channel_correction_enabled=false, skipping "
+                            "pre-compensation per v7.32 §3.10.6")
+            return False
+
         img = Image.open(img_path)
         # Preserve 16-bit if available
+        # FIX-R11-13: Honor channel_correction_float_precision (float32/float64)
+        # per config. ORIGINAL: hardcoded float32, ignored config key.
+        precision = params.get("channel_correction_float_precision", "float32")
+        dtype = np.float64 if precision == "float64" else np.float32
         if img.mode == "I;16":
-            arr = np.array(img).astype(np.float32) / 65535.0
+            arr = np.array(img).astype(dtype) / 65535.0
         else:
-            arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
+            arr = np.array(img.convert("RGB")).astype(dtype) / 255.0
 
         # Convert to linear space
+        # FIX-R11-2: Only IEC 61966-2-1 is allowed per v6.32 §7.16
+        # ("严禁使用简单 pow(x, 2.2) 代替标准分段函数"). Non-IEC formula is
+        # rejected rather than falling back to the forbidden pow(2.2).
+        # ORIGINAL: fell back to np.power(arr, 2.2) for non-IEC formula.
         formula = params.get("channel_correction_formula", "iec61966-2-1")
-        if formula == "iec61966-2-1":
-            linear = _sRGB_to_linear(arr)
-        else:
-            # Fallback: simple gamma 2.2
-            linear = np.power(np.clip(arr, 0.0, 1.0), 2.2)
+        if formula != "iec61966-2-1":
+            if logger:
+                logger.error("STAGE1_CHANNEL_FORMULA",
+                             f"Unsupported channel_correction_formula={formula}, "
+                             f"only 'iec61966-2-1' is allowed per v6.32 §7.16")
+            return False
+        linear = _sRGB_to_linear(arr)
 
         # Compute per-channel stats in linear space
-        means = [linear[:, :, c].mean() for c in range(3)]
-        stds = [linear[:, :, c].std() for c in range(3)]
+        means = [float(linear[:, :, c].mean()) for c in range(3)]
+        stds = [float(linear[:, :, c].std()) for c in range(3)]
 
         # Identify degraded channel(s)
         mean_threshold = params.get("channel_degradation_mean_threshold_severe", 0.15)
         std_threshold = params.get("channel_degradation_std_threshold_severe", 0.25)
 
-        max_mean_diff = max(abs(means[i] - means[j])
-                           for i in range(3) for j in range(i+1, 3))
+        # FIX-R11-11: "channel vs avg of other two" semantics, consistent
+        # with detect_channel_degradation per v7.32 §3.10.6.
+        # ORIGINAL: pairwise max(abs(means[i]-means[j])).
+        max_mean_diff = 0.0
+        for c in range(3):
+            others = [means[i] for i in range(3) if i != c]
+            avg_others = sum(others) / 2.0
+            max_mean_diff = max(max_mean_diff, abs(means[c] - avg_others))
         # FIX-P11-5: Relative std difference per v6.32 §4.2.1 (consistent with detection)
         max_std_diff = 0.0
         for i in range(3):
@@ -602,10 +727,9 @@ def apply_channel_correction(img_path: str, output_path: str,
         corrected = np.clip(corrected, 0.0, 1.0)
 
         # Convert back to sRGB
-        if formula == "iec61966-2-1":
-            srgb = _linear_to_sRGB(corrected)
-        else:
-            srgb = np.power(np.clip(corrected, 0.0, 1.0), 1.0 / 2.2)
+        # FIX-R11-2: IEC 61966-2-1 only (no pow(1/2.2) fallback per v6.32 §7.16).
+        # formula is guaranteed == "iec61966-2-1" (rejected earlier otherwise).
+        srgb = _linear_to_sRGB(corrected)
         srgb = np.clip(srgb, 0.0, 1.0)
 
         # Round and denormalize to configured bit depth
@@ -640,6 +764,162 @@ def apply_channel_correction(img_path: str, output_path: str,
     except Exception as e:
         if logger:
             logger.warning("STAGE1_CHANNEL_FAIL", f"Channel correction failed: {e}")
+        return False
+
+
+def detect_and_crop_black_bars(img_path: str, params: dict,
+                                logger=None, out_dir: str = None) -> tuple:
+    """Detect and crop black bars; return (cropped_path, crop_meta).
+
+    FIX-R11-3: Per v7.32 §3.10.3 / v6.32 §7.26: black bars must be detected
+    and cropped before color-space processing, restored after. Effective area
+    <50% of original OR effective w/h <240px → FAILED (terminate).
+    Returns:
+      (img_path, None) — no black bars detected (unchanged)
+      (cropped_path, {"cropped": True, "box": [...], "original_size": [...]})
+      (None, {"failed": True, "reason": ...}) — FAILED condition
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+        img = Image.open(img_path)
+        arr = np.array(img.convert("RGB"), dtype=np.float32)
+        h, w = arr.shape[:2]
+        gray = arr.mean(axis=2)
+        # FIX-R11-3: Luma threshold. Photos are 8bit-equivalent after
+        # convert("RGB"); 16 is the limited-range 8bit black floor per
+        # v7.32 §3.10.3 and a conservative near-black threshold for full range.
+        thresh = float(params.get("black_bar_luma_threshold", 16))
+
+        def _is_bar_row(r):
+            # Row is a black bar if its mean is below threshold (uniform dark)
+            return float(np.mean(r)) < thresh
+
+        def _is_bar_col(c):
+            return float(np.mean(c)) < thresh
+
+        top = 0
+        while top < h and _is_bar_row(gray[top]):
+            top += 1
+        bot = h
+        while bot > top and _is_bar_row(gray[bot - 1]):
+            bot -= 1
+        left = 0
+        while left < w and _is_bar_col(gray[:, left]):
+            left += 1
+        right = w
+        while right > left and _is_bar_col(gray[:, right - 1]):
+            right -= 1
+
+        eff_w = right - left
+        eff_h = bot - top
+        eff_area = eff_w * eff_h
+        orig_area = w * h
+
+        # FIX-R11-3: Effective area <50% → FAILED
+        if orig_area > 0 and eff_area < orig_area * 0.5:
+            return None, {
+                "failed": True,
+                "reason": "effective_area_lt_50pct",
+                "effective": f"{eff_w}x{eff_h}",
+                "original": f"{w}x{h}",
+            }
+        # FIX-R11-3: Effective w/h <240px → FAILED
+        if eff_w < 240 or eff_h < 240:
+            return None, {
+                "failed": True,
+                "reason": "effective_dim_lt_240",
+                "effective": f"{eff_w}x{eff_h}",
+                "original": f"{w}x{h}",
+            }
+        # No black bars
+        if top == 0 and bot == h and left == 0 and right == w:
+            return img_path, None
+
+        cropped = img.crop((left, top, right, bot))
+        stem = Path(img_path).stem
+        _out_dir = out_dir or str(Path(img_path).parent)
+        out_path = str(Path(_out_dir) / f"{stem}_crop.tif")
+        cropped.save(out_path)
+        if logger:
+            logger.info("STAGE1_BLACKBAR_CROP",
+                        f"Cropped black bars: box=[{left},{top},{right},{bot}] "
+                        f"effective={eff_w}x{eff_h} original={w}x{h}")
+        return out_path, {
+            "cropped": True,
+            "box": [int(left), int(top), int(right), int(bot)],
+            "original_size": [int(w), int(h)],
+        }
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE1_BLACKBAR_DETECT_FAIL",
+                           f"Black bar detection failed: {e}")
+        return img_path, None
+
+
+def restore_black_bars(processed_path: str, crop_meta: dict,
+                        output_path: str, params: dict,
+                        logger=None) -> bool:
+    """Paste processed crop back into original frame size with black borders.
+
+    FIX-R11-3: Per v7.32 §3.10.3, restore black bars after color-space
+    processing using the bit-depth-appropriate black level:
+      8bit limited → 16, 10bit limited → 64, 16bit limited → 4096,
+      full range (any bit depth) → 0.
+    For the photo RGB pipeline the Y black level is applied uniformly to all
+    RGB channels (the U/V neutral table is video-YUV-oriented; photos are RGB).
+    """
+    if not crop_meta or not crop_meta.get("cropped"):
+        shutil.copyfile(processed_path, output_path)
+        return True
+    try:
+        from PIL import Image
+        import numpy as np
+        box = crop_meta["box"]
+        orig_w, orig_h = crop_meta["original_size"]
+        left, top, right, bot = box
+        bit_depth = int(params.get("photo_bit_depth", 16))
+        # FIX-R11-3: black level by bit depth + range per v7.32 §3.10.3
+        range_mode = params.get("black_bar_range", "limited")
+        if range_mode == "full":
+            black_fill = 0
+        else:
+            black_fill = {8: 16, 10: 64, 16: 4096}.get(bit_depth, 0)
+
+        if bit_depth == 16:
+            try:
+                import tifffile
+                crop_arr = tifffile.imread(processed_path)
+            except Exception:
+                crop_arr = np.array(Image.open(processed_path))
+            if crop_arr.ndim == 2:
+                crop_arr = np.stack([crop_arr] * 3, axis=-1)
+            canvas = np.full(
+                (orig_h, orig_w, crop_arr.shape[2]), black_fill,
+                dtype=crop_arr.dtype)
+            canvas[top:bot, left:right] = crop_arr
+            try:
+                import tifffile
+                tifffile.imwrite(output_path, canvas)
+            except Exception:
+                Image.fromarray(canvas[:, :, 0], mode='I;16').save(output_path)
+        else:
+            crop_arr = np.array(Image.open(processed_path).convert("RGB"))
+            canvas = np.full((orig_h, orig_w, 3), black_fill, dtype=np.uint8)
+            canvas[top:bot, left:right] = crop_arr
+            Image.fromarray(canvas).save(output_path)
+        if logger:
+            logger.info("STAGE1_BLACKBAR_RESTORE",
+                        f"Restored black bars: {orig_w}x{orig_h} "
+                        f"black_fill={black_fill} bit_depth={bit_depth}")
+        return True
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE1_BLACKBAR_RESTORE_FAIL", f"{e}")
+        try:
+            shutil.copyfile(processed_path, output_path)
+        except Exception:
+            return False
         return False
 
 
@@ -746,16 +1026,34 @@ def main():
     except Exception:
         pass
 
+    # FIX-R11-3: Black bar detection + crop per v7.32 §3.10.3 / v6.32 §7.26.
+    # Detect/crop before processing; restore at final output. Effective area
+    # <50% or w/h <240px → FAILED (terminate) per spec.
+    crop_meta = None
+    if params.get("black_bar_detection", True):
+        cropped_path, crop_meta = detect_and_crop_black_bars(
+            working_input, params, logger, out_dir=temp_dir)
+        if crop_meta and crop_meta.get("failed"):
+            logger.error("STAGE1_BLACKBAR_FAIL",
+                         f"Black bar crop FAILED: {crop_meta.get('reason')} "
+                         f"(effective={crop_meta.get('effective')}, "
+                         f"original={crop_meta.get('original')}) per v7.32 §3.10.3")
+            return PHOTO_ERR_OUTPUT  # 86 validation failure
+        if cropped_path and cropped_path != working_input:
+            working_input = cropped_path
+
     # FIX-P11-4: Channel degradation detection BEFORE destructive repairs
     # v7.32 §3.10.6: 前置补偿 in stage1 传统修复前
     # ORIGINAL: channel degradation detection was after all repairs (line 667-695)
     degradation = detect_channel_degradation(working_input, params)
 
     # Save channel metadata
+    # FIX-R11-1: Persist degraded_channels list per v7.32 §3.10.6.
     channel_meta = {
         "channel_degradation": degradation.get("degraded", False),
         "mean_diff": degradation.get("mean_diff", 0.0),
         "std_diff": degradation.get("std_diff", 0.0),
+        "degraded_channels": degradation.get("channels", []),
     }
     meta_path = str(Path(temp_dir) /
         f"{args.job_id}_{Path(input_name).stem}_channel_meta.json")
@@ -814,10 +1112,23 @@ def main():
         # -despeckle commands. Use real stdlib command -denoise_haar (Haar
         # wavelet denoise) as scratch/isolated-defect approximation.
         # scratch_remove_strength(0-100) → denoise_haar threshold(0.5-2.5)
-        scratch_strength = params.get("scratch_remove_strength", 20)
+        # FIX-R11-10: Validate 0-100 range per v7.32 §3.10.16.
+        try:
+            scratch_strength = int(params.get("scratch_remove_strength", 20))
+        except (TypeError, ValueError):
+            logger.error("STAGE1_SCRATCH_RANGE",
+                         f"scratch_remove_strength must be int 0-100, got "
+                         f"{params.get('scratch_remove_strength')!r}")
+            return PHOTO_ERR_OUTPUT  # 86 validation failure
+        if not 0 <= scratch_strength <= 100:
+            logger.error("STAGE1_SCRATCH_RANGE",
+                         f"scratch_remove_strength={scratch_strength} "
+                         f"out of [0,100] per v7.32 §3.10.16")
+            return PHOTO_ERR_OUTPUT  # 86 validation failure
         haar_thresh = 0.5 + (max(0, min(100, scratch_strength)) / 100.0) * 2.0
         success, stderr = run_gmic(working_path, scratch_out,
-                                   "-denoise_haar", f"{haar_thresh:.3f}")
+                                   "-denoise_haar", f"{haar_thresh:.3f}",
+                                   params=params)
         if not success:
             logger.warning("STAGE1_SCRATCH_CMD",
                           f"G'MIC -denoise_haar failed: {stderr[:200]}")
@@ -830,16 +1141,20 @@ def main():
             return PHOTO_ERR_GMIC_FAIL
 
     # Deblock (JPEG-like block artifacts)
-    if params.get("deblock_strength", 0) > 0:
+    # FIX-R11-9: Unify default — guard and value read from the SAME variable
+    # (default 25). ORIGINAL: guard used default 0, value used default 25,
+    # so absent-config silently disabled deblock while callers assumed 25.
+    deblock_strength = params.get("deblock_strength", 25)
+    if deblock_strength > 0:
         logger.info("STAGE1_DEBLOCK", "Deblocking")
         deblock_out = working_path + ".deblock.tif"
         # FIX-A1: G'MIC stdlib has no -deblock. Use real stdlib command
         # -denoise_patchpca (patch-PCA denoise) which targets block/patch
         # artifacts. deblock_strength(0-100) → threshold(0.5-3.0)
-        deblock_strength = params.get("deblock_strength", 25)
         pca_thresh = 0.5 + (max(0, min(100, deblock_strength)) / 100.0) * 2.5
         success, stderr = run_gmic(working_path, deblock_out,
-                          "-denoise_patchpca", f"{pca_thresh:.3f}")
+                          "-denoise_patchpca", f"{pca_thresh:.3f}",
+                          params=params)
         if success and Path(deblock_out).exists():
             working_path = deblock_out
         elif not success:
@@ -847,7 +1162,10 @@ def main():
             return PHOTO_ERR_GMIC_FAIL
 
     # Deband
-    if params.get("deband_threshold", 0) > 0:
+    # FIX-R11-9: Unify default — guard and value read from the SAME variable
+    # (default 1.2). ORIGINAL: guard used default 0, value used default 1.2.
+    deband_threshold = params.get("deband_threshold", 1.2)
+    if deband_threshold > 0:
         logger.info("STAGE1_DEBAND", "Debanding")
         deband_out = working_path + ".deband.tif"
         # FIX-A1: G'MIC stdlib has no -deband. Use real stdlib command
@@ -855,7 +1173,8 @@ def main():
         # (default 1.2) maps directly to denoise_haar threshold.
         success, stderr = run_gmic(working_path, deband_out,
                           "-denoise_haar",
-                          str(params.get("deband_threshold", 1.2)))
+                          str(deband_threshold),
+                          params=params)
         if success and Path(deband_out).exists():
             working_path = deband_out
         elif not success:
@@ -879,13 +1198,23 @@ def main():
     # copy2 copies metadata which causes PermissionError on WSL2 NTFS mounts
     # with metadata=disabled. copyfile only copies data content.
     # ORIGINAL: shutil.copy2(working_path, inter_path)
-    shutil.copyfile(working_path, inter_path)
-    # Verify copy integrity
-    # FIX-P10-11/P11-8: Use Path consistently per CLAUDE.md §4
-    if Path(working_path).stat().st_size != inter_path_p.stat().st_size:
-        logger.error("STAGE1_COPY_FAIL",
-                    "Intermediate file size mismatch after copy")
-        return PHOTO_ERR_COPY_FAIL
+    # FIX-R11-3: Restore black bars at final output per v7.32 §3.10.3
+    # (paste processed crop back into original frame with bit-depth black
+    # level). When no crop occurred, fall back to direct copy + size check.
+    if crop_meta and crop_meta.get("cropped"):
+        if not restore_black_bars(working_path, crop_meta, inter_path,
+                                   params, logger):
+            logger.warning("STAGE1_BLACKBAR_RESTORE_FALLBACK",
+                           "restore_black_bars failed, copying cropped output")
+            shutil.copyfile(working_path, inter_path)
+    else:
+        shutil.copyfile(working_path, inter_path)
+        # Verify copy integrity (only meaningful for the no-crop direct copy)
+        # FIX-P10-11/P11-8: Use Path consistently per CLAUDE.md §4
+        if Path(working_path).stat().st_size != inter_path_p.stat().st_size:
+            logger.error("STAGE1_COPY_FAIL",
+                        "Intermediate file size mismatch after copy")
+            return PHOTO_ERR_COPY_FAIL
     # Sync mtime/atime manually (equivalent to copy2 metadata preservation)
     # FIX-P11-10: Use Path.stat() per CLAUDE.md §4 (not os.stat)
     try:
@@ -901,7 +1230,8 @@ def main():
             for suffix in [".channel.tif", ".scratch.tif", ".deblock.tif",
                            ".deband.tif", "_grain.tif", "_rgb.tif",
                            "_16bit.tif", "_color_meta.json",
-                           "_channel_meta.json"]:
+                           "_channel_meta.json", "_crop.tif",
+                           "_rgb_crop.tif"]:
                 p = Path(temp_dir) / f"{stem}{suffix}"
                 if p.exists():
                     try:

@@ -107,7 +107,14 @@ def _check_pts_monotonic(input_path: str, max_frames: int = 200) -> bool:
             if len(pts_list) >= max_frames:
                 break
         for i in range(1, len(pts_list)):
-            if pts_list[i] < pts_list[i - 1]:
+            # FIX-WARN-6: Per v7.32 §3.8(注): validate PTS is monotonically
+            # increasing. ORIGINAL used strict `<` (only flagged decreasing
+            # PTS), so equal/duplicate PTS were treated as valid and could
+            # break frame-number extraction positioning. Use `<=` so equal
+            # PTS also fails the check -> caller falls back to PTS-based
+            # seeking (extract_preview_frames -ss path), which is still
+            # correct, just slightly slower.
+            if pts_list[i] <= pts_list[i - 1]:
                 return False
         return True
     except Exception:
@@ -544,9 +551,18 @@ def detect_motion_segments(input_path: str, num_segments: int = 3,
         for i in range(num_samples):
             t = i * sample_interval
             frame_path = temp_dir / f"sample_{i:04d}.png"
+            # FIX-WARN-7: ORIGINAL used input seeking (`-ss <t> -i input`),
+            # which is keyframe-aligned and mispositions on VFR content —
+            # inconsistent with generate_preview_clip (L357) which uses
+            # output seeking. Per v7.32 §3.8, switch to output seeking
+            # (`-i input -ss <t>`) so motion-segment sampling lands on the
+            # same frame as the static preview extraction. Cost: output
+            # seeking decodes from the start to the target, but motion
+            # detection only samples one frame every ~0.5s, so acceptable.
             subprocess.run(
                 ["ffmpeg", "-hide_banner", "-v", "error",
-                 "-ss", str(t), "-i", input_path,
+                 "-i", input_path,
+                 "-ss", str(t),          # output seek (after -i)
                  "-frames:v", "1", "-y", str(frame_path)],
                 capture_output=True, timeout=30, shell=False
             )

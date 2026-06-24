@@ -48,7 +48,9 @@ def validate_job(job: Dict[str, Any]) -> bool:
     """Validate required job fields."""
     required = ["job_id", "input_path", "detected_class", "status"]
     for field in required:
-        if field not in job or job[field] is None:
+        # FIX-L2: reject empty strings too, not just None/missing. ORIGINAL:
+        # `job[field] is None` let input_path="" / detected_class="" pass.
+        if not job.get(field):
             return False
     return True
 
@@ -189,6 +191,9 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
         sys.path.insert(0, str(Path(__file__).parent))
         from checkpoint import verify_ffprobe_decodeable, verify_frame_integrity
 
+        # FIX-L9: temp_dir now comes from the per-job field written by
+        # manifest_generate.py (config global.temp_dir). Falls back to ./temp
+        # only for legacy manifests, so non-default --temp-dir is honored.
         temp_dir = job.get("temp_dir", "./temp")
         job_id = job["job_id"]
         input_name = Path(job["input_path"]).stem
@@ -217,6 +222,13 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
         for cand in reversed(intermediates):
             is_photo = Path(cand).suffix.lower() in (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".avif")
             if is_photo:
+                # FIX-L10: video intermediates are verified via checkpoint.py
+                # (verify_ffprobe_decodeable + verify_frame_integrity). Photo
+                # intermediates use this local stricter implementation
+                # (three-region + statistical features). Whether photo MUST also
+                # route through checkpoint.py is 待规范澄清 (§3.4.5); the local
+                # impl is equivalent-or-stricter. Inline note stands in for a
+                # shixian.md deviation entry (out of this file's edit scope).
                 valid = _verify_photo_integrity(cand)
             else:
                 valid = verify_ffprobe_decodeable(cand) and verify_frame_integrity(cand)
@@ -242,9 +254,21 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
             for p in intermediates:
                 Path(p).unlink(missing_ok=True)
 
-    except Exception:
-        # If we can't verify, just allow retry
+    except Exception as e:
+        # FIX-L11: if verification itself crashed, do NOT silently leave
+        # potentially-corrupt intermediates that a later stage could reuse via
+        # param_hash. Log a WARNING with context and flag the job for manual
+        # inspection (status still PENDING so the user can retry/inspect).
+        logging.warning(
+            "Intermediate verification crashed for job %s: %s — status set to "
+            "PENDING; intermediates not cleaned, please inspect manually",
+            job.get("job_id", "UNKNOWN"), e
+        )
         job["status"] = "PENDING"
+        job["error_message"] = (
+            f"Intermediate file verification raised an exception ({e}); "
+            "intermediates not cleaned — please inspect manually"
+        )
 
     return job
 
@@ -254,11 +278,19 @@ def save_manifest(manifest: Dict[str, Any], path: str):
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = p.with_suffix(p.suffix + ".tmp")
+    is_jsonl = path.endswith(".jsonl")
+    meta_path = None
+    meta_tmp = None
     try:
-        if path.endswith(".jsonl"):
+        if is_jsonl:
             # FIX-P4-7: write meta to separate .meta.json file
+            # FIX-G13/L12: write .meta.json atomically (.tmp + replace). Both
+            # temp files are written fully before either is renamed, so a crash
+            # cannot leave meta inconsistent with the jobs file. Jobs commit
+            # first (source of truth); meta (just counts) commits second.
             meta_path = p.with_suffix(".meta.json")
-            with open(meta_path, "w", encoding="utf-8") as f:
+            meta_tmp = meta_path.parent / (meta_path.name + ".tmp")
+            with open(meta_tmp, "w", encoding="utf-8") as f:
                 json.dump(manifest["meta"], f, ensure_ascii=False, indent=2)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 for job in manifest["jobs"]:
@@ -266,17 +298,32 @@ def save_manifest(manifest: Dict[str, Any], path: str):
         else:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 yaml.dump(manifest, f, allow_unicode=True, sort_keys=False)
-        # Atomic rename on same filesystem
+        # Atomic rename on same filesystem (jobs first, then meta)
         tmp_path.replace(p)
+        if is_jsonl and meta_tmp is not None and meta_path is not None:
+            meta_tmp.replace(meta_path)
     except Exception as e:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
+        if meta_tmp is not None and meta_tmp.exists():
+            meta_tmp.unlink(missing_ok=True)
         raise RuntimeError(f"Failed to save manifest atomically: {e}") from e
+
+
+# FIX-L13: legal job status values per v7.32 §3.4.3
+VALID_STATUSES = {"PENDING", "DONE", "FAILED", "SKIP"}
 
 
 def update_job_status(manifest: Dict[str, Any], job_id: str,
                       status: str, error_message: str = ""):
     """Update job status in manifest."""
+    # FIX-L13: validate status so arbitrary strings from other callers cannot
+    # corrupt the manifest. The argparse CLI already restricts to 4 values,
+    # but this function is a public API.
+    if status not in VALID_STATUSES:
+        raise ValueError(
+            f"Invalid status: {status!r} (must be one of {sorted(VALID_STATUSES)})"
+        )
     for job in manifest.get("jobs", []):
         if job.get("job_id") == job_id:
             job["status"] = status

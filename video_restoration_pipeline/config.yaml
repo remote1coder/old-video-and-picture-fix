@@ -114,7 +114,7 @@ audio_override:
   # v7.3：各素材类型可独立覆盖全局音频参数
   # 优先级：命令行 > user_overrides > paths.audio_override > global.audio > 内置默认值
   analog_tape:
-    hum_freq: 50
+    hum_freq: null  # null=自动检测；显式 50/60 覆盖（对齐 v7.32 §3.2）
     hum_harmonics: 3
     hum_bandwidth: 2
     hum_width_type: "h"
@@ -126,7 +126,7 @@ audio_override:
     hum_fft_window_func: "hann"
     denoise: "afftdn"
   dv_digital:
-    hum_freq: 50
+    hum_freq: null  # null=自动检测；显式 50/60 覆盖（对齐 v7.32 §3.2）
     hum_harmonics: 3
     hum_bandwidth: 2
     hum_width_type: "h"
@@ -138,7 +138,7 @@ audio_override:
     hum_fft_window_func: "hann"
     denoise: "afftdn"
   hdv_avchd:
-    hum_freq: 50
+    hum_freq: null  # null=自动检测；显式 50/60 覆盖（对齐 v7.32 §3.2）
     hum_harmonics: 3
     hum_bandwidth: 2
     hum_width_type: "h"

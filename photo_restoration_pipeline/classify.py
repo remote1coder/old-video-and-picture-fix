@@ -32,6 +32,35 @@ def run_exiftool(input_path: str) -> Dict[str, str]:
     return {}
 
 
+def run_ffprobe(input_path: str) -> Dict[str, Any]:
+    """Run ffprobe and return video stream metadata.
+
+    FIX-R11-7: Per v7.32 §3.9, native_width/native_height/native_dar must
+    come from ffprobe (EXIF is only auxiliary). ffprobe is the authoritative
+    source for native dimensions; EXIF original-size tags are a fallback.
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,display_aspect_ratio",
+             "-of", "json", input_path],
+            capture_output=True, text=True, timeout=30, shell=False
+        )
+        if r.returncode == 0:
+            d = json.loads(r.stdout)
+            streams = d.get("streams", [])
+            if streams:
+                s = streams[0]
+                return {
+                    "width": s.get("width"),
+                    "height": s.get("height"),
+                    "display_aspect_ratio": s.get("display_aspect_ratio"),
+                }
+    except Exception:
+        pass
+    return {}
+
+
 def _analyze_pixel_features(input_path: str) -> Dict[str, Any]:
     """Analyze pixel-level features for better classification confidence.
     
@@ -97,10 +126,15 @@ def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
     - native_width, native_height, native_dar
     - dpi: int or None
     - ai_upscale_banned: bool (based on pixel dimensions, target resolution, and DPI)
-    - field_order: one of five valid values per v7.32 §3.9:
-        "progressive" (photos, default), "tff" (video top-field-first),
-        "bff" (video bottom-field-first), "mixed" (mixed field order),
-        "unknown" (unreadable/cannot determine)
+    - field_order: per v7.32 §3.9, five valid values exist:
+        "tt" (top-field-first), "bb" (bottom-field-first),
+        "psf" (progressive segmented frame), "progressive" (native progressive),
+        "unknown" (cannot determine).
+      # FIX-R11-4: Corrected docstring to spec values (tt/bb/psf/progressive/
+      # unknown). ORIGINAL: listed tff/bff/mixed which are NOT spec values.
+      Photo classify only emits "progressive" (photos are inherently
+      progressive) or "unknown" (unreadable file); tt/bb/psf are
+      video-classify concerns.
     """
     # FIX-P11-2: Read thresholds from config instead of hardcoding per v6.32 §7.7
     cfg = config or {}
@@ -167,6 +201,22 @@ def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
                 result["dpi"] = int(max(dpi_info))
     except Exception:
         pass
+
+    # FIX-R11-7: Per v7.32 §3.9, ffprobe is the authoritative source for
+    # native_width/native_height/native_dar (EXIF above is only auxiliary).
+    # Override with ffprobe values when available; keep EXIF as fallback.
+    fp = run_ffprobe(input_path)
+    if fp.get("width") and fp.get("height"):
+        result["native_width"] = int(fp["width"])
+        result["native_height"] = int(fp["height"])
+        if fp.get("display_aspect_ratio"):
+            result["native_dar"] = str(fp["display_aspect_ratio"])
+        else:
+            from math import gcd
+            _w, _h = int(fp["width"]), int(fp["height"])
+            if _w > 0 and _h > 0:
+                _g = gcd(_w, _h)
+                result["native_dar"] = f"{_w//_g}:{_h//_g}"
 
     # FIX-P11-2: field_order for unreadable images per v7.32 §3.9
     if result["original_width"] == 0 or result["original_height"] == 0:

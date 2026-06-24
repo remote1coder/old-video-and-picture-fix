@@ -111,6 +111,14 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
         if old_val != new_val:
             overrides_log.append({"key": key, "old": old_val, "new": new_val, "source": source})
 
+    # FIX-W1/W8: cross-domain shared keys. `denoise`/`denoise_params` are reused
+    # by BOTH video (stage1 reads bare `denoise`) and audio (`audio_denoise`).
+    # The bare<->audio_ prefix sync in _set_param must NOT fire for these,
+    # otherwise setting the video denoise (from paths[]) transiently overwrites
+    # the audio denoise (audio_denoise) and vice versa. v7.32 §3.2 reuses the
+    # key name across domains (known design flaw); this guard decouples them.
+    _CROSS_DOMAIN_KEYS = {"denoise", "denoise_params"}
+
     def _set_param(k: str, v: Any, source: str, is_dict_merge: bool = False):
         """Set param and sync ai_/audio_ prefixed variants."""
         old = params.get(k)
@@ -119,14 +127,19 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
         else:
             params[k] = v
         _log_override(k, old, v, source)
-        # Sync prefixed variants so both forms reflect the override
-        for prefix in ("ai_", "audio_"):
-            pk = f"{prefix}{k}"
-            if pk in params and pk != k:
-                old_p = params[pk]
-                params[pk] = v
-                if old_p != v:
-                    _log_override(pk, old_p, v, source)
+        # Sync prefixed variants so both forms reflect the override.
+        # ORIGINAL: synced audio_ prefix unconditionally, polluting audio_denoise
+        # when paths[] set the video denoise. FIX-W1/W8: skip cross-domain keys
+        # whose bare/prefixed forms refer to DIFFERENT params (video vs audio
+        # denoise) — syncing them would corrupt the other domain's value.
+        if k not in _CROSS_DOMAIN_KEYS:
+            for prefix in ("ai_", "audio_"):
+                pk = f"{prefix}{k}"
+                if pk in params and pk != k:
+                    old_p = params[pk]
+                    params[pk] = v
+                    if old_p != v:
+                        _log_override(pk, old_p, v, source)
 
     # 1. Start with global
     base = config.get("global", {})
@@ -138,6 +151,15 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     #    overwriting higher-priority values. Now conditional.
     audio_config = config.get("audio", {})
     for k, v in audio_config.items():
+        # FIX-W1/W8: `denoise`/`denoise_params` are cross-domain (video stage1
+        # reads bare `denoise`). Route audio's denoise to the audio_ namespace
+        # ONLY, so the global audio value cannot masquerade as the video denoise
+        # method. Other audio keys (hum_freq, arnndn_model, ...) stay bare
+        # because stage7 reads them bare and they do not conflict with video.
+        if k in ("denoise", "denoise_params"):
+            if f"audio_{k}" not in params:
+                params[f"audio_{k}"] = v
+            continue
         if k not in params:
             params[k] = v
         if f"audio_{k}" not in params:
@@ -164,7 +186,14 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     audio_override = config.get("audio_override", {})
     if path_key in audio_override:
         for k, v in audio_override[path_key].items():
-            _set_param(k, v, "audio_override")
+            # FIX-W1/W8: route cross-domain `denoise`/`denoise_params` into the
+            # audio_ namespace so audio_override (higher priority than paths)
+            # cannot clobber the video `denoise` set by paths[]. stage1 reads
+            # bare `denoise` for video; audio reads `audio_denoise`.
+            if k in ("denoise", "denoise_params"):
+                _set_param(f"audio_{k}", v, "audio_override")
+            else:
+                _set_param(k, v, "audio_override")
 
     # 5. Override with job recommended_params
     rec_params = job.get("recommended_params", {})
@@ -197,6 +226,9 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     params["field_order"] = job.get("field_order", "unknown")
     params["needs_ivtc"] = job.get("needs_ivtc", False)
     params["is_psf"] = job.get("is_psf", False)
+    # FIX-W2: propagate psf_tff (original TFF/BFF for PSF material) so stage1's
+    # SeparateFields+Weave uses the correct field order per v7.32 §3.10.1.
+    params["psf_tff"] = job.get("psf_tff", False)
     params["original_width"] = job.get("original_width", 0)
     params["original_height"] = job.get("original_height", 0)
     params["ai_upscale_banned"] = job.get("ai_upscale_banned", False)
@@ -316,6 +348,41 @@ def _get_video_duration(video_path: str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _verify_stage2_output(job_id: str, input_path: str,
+                          temp_dir: str, job_logger) -> Tuple[bool, str]:
+    """FIX-W2: validate stage2 traditional-restoration output.
+
+    Checks the three §3.10.8 requirements: file exists, non-empty, and
+    ffprobe-decodeable. Extracted from the inline exit-0 check so the exit-3
+    (skip) path re-uses the same validations.
+
+    FIX-W2(pattern): ORIGINAL used Path(input_path).name (WITH extension) in
+    the glob pattern, but stage2 writes `{job_id}_{stem}_step2_traditional*.mkv`
+    using Path.stem (NO extension) — see stage2_traditional_check.py:146 and
+    stage3_ai_upscale.py:605. The old pattern never matched, so the gate
+    always falsely reported "missing". Use .stem to align with stage2/stage3.
+
+    Returns (True, path) on success or (False, reason) on failure.
+    """
+    import glob
+    input_stem = Path(input_path).stem
+    pattern = f"{temp_dir}/{job_id}_{input_stem}_step2*"
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return False, "Stage 2 output file missing"
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    step2_output = candidates[0]
+    if os.path.getsize(step2_output) == 0:
+        return False, "Stage 2 output file is empty"
+    try:
+        from checkpoint import verify_ffprobe_decodeable
+        if not verify_ffprobe_decodeable(step2_output):
+            return False, "Stage 2 output not decodeable by ffprobe"
+    except Exception as e:
+        return False, f"Stage 2 output verification failed: {e}"
+    return True, step2_output
 
 
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
@@ -456,34 +523,29 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                         "PREVIEW_FORCED_UPSCALE_FAIL",
                         f"Comparison frame generation failed: {e}")
             if stage_num == 2:
-                # FIX-P5-5: 校验 stage2 输出文件存在、非空、可解码
+                # FIX-W2: validate stage2 output via shared helper (exists +
+                # non-empty + ffprobe-decodeable per v7.32 §3.10.8).
                 temp_dir = params.get("temp_dir", "./temp")
-                input_name = Path(input_path).name
-                pattern = f"{temp_dir}/{job_id}_{input_name}_step2*"
-                import glob
-                candidates = glob.glob(pattern)
-                if not candidates:
-                    job_logger.error("TRADITIONAL_GATE_BLOCK", "Stage 2 output file missing")
-                    return 86, "Traditional restoration output missing"
-                candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                step2_output = candidates[0]
-                if os.path.getsize(step2_output) == 0:
-                    job_logger.error("TRADITIONAL_GATE_BLOCK", "Stage 2 output file is empty")
-                    return 86, "Traditional restoration output empty"
-                try:
-                    from checkpoint import verify_ffprobe_decodeable
-                    if not verify_ffprobe_decodeable(step2_output):
-                        job_logger.error("TRADITIONAL_GATE_BLOCK", "Stage 2 output not decodeable by ffprobe")
-                        return 86, "Traditional restoration output not decodeable"
-                except Exception as e:
-                    job_logger.error("TRADITIONAL_GATE_BLOCK", f"Stage 2 output verification failed: {e}")
-                    return 86, f"Traditional restoration verification failed: {e}"
+                ok, msg = _verify_stage2_output(job_id, input_path, temp_dir, job_logger)
+                if not ok:
+                    job_logger.error("TRADITIONAL_GATE_BLOCK", msg)
+                    return 86, msg
                 traditional_stage_completed = True
                 job_logger.info("TRADITIONAL_GATE",
                                "Traditional restoration completed, proceeding to AI stages")
         elif exit_code == 3:
             job_logger.info("STAGE_SKIP", f"Stage {stage_num} skipped")
             if stage_num == 2:
+                # FIX-W2: exit-3 (skip) path must still re-validate the stage2
+                # intermediate per v7.32 §3.10.8. stage3 requires a
+                # step2_traditional file; if stage2 skipped without producing
+                # one, block here with a clear message (86) rather than letting
+                # stage3 fail opaquely.
+                temp_dir = params.get("temp_dir", "./temp")
+                ok, msg = _verify_stage2_output(job_id, input_path, temp_dir, job_logger)
+                if not ok:
+                    job_logger.error("TRADITIONAL_GATE_BLOCK", msg)
+                    return 86, msg
                 traditional_stage_completed = True
                 job_logger.info("TRADITIONAL_GATE",
                                "Traditional restoration skipped (already done), proceeding to AI stages")
@@ -509,6 +571,17 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                         if exit_code2 == 0:
                             job_logger.info("STAGE_DONE",
                                            f"Stage {stage_num} complete (sRestore)")
+                        # FIX-W9: the `continue` below skips the loop-bottom
+                        # cleanup_old_intermediates call, leaving stale VFM
+                        # step1 intermediates on disk. Run cleanup here so the
+                        # pre-sRestore VFM intermediates are removed before
+                        # proceeding. (continue is still needed to avoid
+                        # falling through to `return exit_code, stderr` which
+                        # still holds the original exit_code=86.)
+                        if params.get("cleanup_intermediates", True):
+                            temp_dir = params.get("temp_dir", "./temp")
+                            keep_steps = params.get("keep_steps", 2)
+                            cleanup_old_intermediates(temp_dir, job_id, keep_steps)
                         continue
                     else:
                         job_logger.error("IVTC_SRESTORE_FAIL",
@@ -573,7 +646,11 @@ def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
             break
         else:
             from checkpoint import is_retryable_error
-            if is_retryable_error(exit_code, stderr):
+            # FIX-W10: do not sleep after the final attempt. ORIGINAL slept 15s
+            # even on the last retryable failure (attempt == retry_count) before
+            # the loop ended and marked FAILED. Per v7.32 §3.10.18 the intervals
+            # are 5s then 15s BETWEEN attempts only.
+            if is_retryable_error(exit_code, stderr) and attempt < retry_count:
                 wait = 5 if attempt == 0 else 15
                 logger.warning("JOB_RETRY", f"Retrying job {job_id} in {wait}s")
                 time.sleep(wait)
@@ -644,17 +721,21 @@ def main():
         manifest_path = str(SCRIPT_DIR / "batch_manifest_quick.yaml")
         from manifest_generate import generate_manifest
         generate_manifest(args.input, manifest_path, config, "video")
-        manifest = load_manifest(manifest_path)
-        jobs = filter_jobs(manifest, ["PENDING"])
-        logger.info("QUICK_START", f"Quick mode: {len(jobs)} jobs")
-        print(f"Quick mode: scanning done, executing {len(jobs)} jobs...")
-        for job in jobs:
-            _run_single_job(job, config, args, logger, manifest, manifest_path)
-        # Clean up temporary manifest
+        # FIX-W7: wrap execution in try/finally so the temporary quick manifest
+        # is removed even if a job crashes mid-batch. ORIGINAL only unlinked on
+        # the happy path, leaving batch_manifest_quick.yaml behind on crash.
         try:
-            Path(manifest_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+            manifest = load_manifest(manifest_path)
+            jobs = filter_jobs(manifest, ["PENDING"])
+            logger.info("QUICK_START", f"Quick mode: {len(jobs)} jobs")
+            print(f"Quick mode: scanning done, executing {len(jobs)} jobs...")
+            for job in jobs:
+                _run_single_job(job, config, args, logger, manifest, manifest_path)
+        finally:
+            try:
+                Path(manifest_path).unlink(missing_ok=True)
+            except Exception:
+                pass
         logger.info("PIPELINE_DONE", "Video pipeline complete (quick mode)")
         print("Done.")
         return
@@ -681,6 +762,26 @@ def main():
         print(f"  Detected class: {job.get('detected_class', 'unknown')}")
         print(f"  Field order: {job.get('field_order', 'unknown')}")
         print(f"  Recommended params: {job.get('recommended_params', {})}")
+        # FIX-W7: low-confidence classification requires explicit manual
+        # confirmation per v7.32 §3.9 ("<80% 时交互模式强制人工确认").
+        _conf = job.get("confidence", 0.0)
+        if job.get("needs_confirmation", False) or (isinstance(_conf, (int, float)) and _conf < 0.80):
+            logger.info("LOW_CONFIDENCE_CONFIRM",
+                       f"Confidence {_conf:.2f} < 0.80, requires manual confirmation",
+                       detected=job.get("detected_class", "unknown"))
+            try:
+                lc_resp = input(
+                    f"低置信度({_conf:.2f}),检测为{job.get('detected_class', 'unknown')}。"
+                    "继续处理? [y/N]: ").strip().lower()
+            except EOFError:
+                logger.warning("INTERACTIVE_SKIP",
+                              "Non-interactive env, skipping low-confidence file")
+                print("Skipped (non-interactive).")
+                return
+            if lc_resp not in ("y", "yes"):
+                logger.info("USER_SKIP", "User declined low-confidence file")
+                print("Skipped.")
+                return
         confirm = input("Proceed with recommended parameters? [Y/n/edit]: ").strip().lower()
         if confirm in ("n", "no", "skip"):
             print("Skipped.")

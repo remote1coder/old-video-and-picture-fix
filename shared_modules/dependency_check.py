@@ -14,6 +14,7 @@ v7.3 Compliance:
 
 import sys
 import ast
+import os
 import shutil
 import subprocess
 import importlib.util
@@ -102,7 +103,7 @@ def check_avifenc_version() -> Tuple[bool, str, str]:
         return True, version, ""  # --jobs not supported
     elif vt < (1, 1, 0):
         # Numeric jobs required
-        import os
+        # FIX-P3-7: os now imported at module top per CLAUDE.md §4 (import order)
         nproc = os.cpu_count() or 1
         return True, version, str(min(nproc, 32))
     else:
@@ -239,6 +240,45 @@ def check_ffmpeg_filters_minimal_calls(pipeline_type: str = "photo") -> List[str
     return errors
 
 
+# FIX-P2-4: Minimum VS plugin versions keyed by namespace/name alias per
+# v7.32 §3.6. NOTE: VapourSynth's get_plugins() exposes an integer API
+# "version" for most plugins, which cannot be reliably compared to a semver
+# minimum. The comparison therefore ONLY fires when the plugin exposes a
+# dotted version string (semver-like); bare integer versions are skipped to
+# avoid false positives. Full enforcement awaits confirmation of the version
+# field semantics (tracked as 待用户确认).
+MIN_PLUGIN_VERSIONS: Dict[str, str] = {
+    "mvtools2": "23",
+    "nnedi3": "0.5",
+    "tcanny": "1.2",
+}
+
+
+def _parse_version(v) -> Optional[Tuple[int, ...]]:
+    """Parse a dotted version string into an int tuple. Returns None if not a
+    dotted semver-like string. Bare integers (e.g. VS API version "3") are
+    rejected to avoid confusing API version with release version."""
+    if not isinstance(v, str):
+        return None
+    m = re.match(r'^\D*(\d+\.\d+(?:\.\d+)*)', v.strip())
+    if not m:
+        return None
+    return tuple(int(p) for p in m.group(1).split("."))
+
+
+def _ver_lt(a, b) -> bool:
+    """True if dotted version a < dotted version b. Returns False if either
+    side is not a dotted version string (conservative: never flags)."""
+    pa = _parse_version(a)
+    pb = _parse_version(b)
+    if pa is None or pb is None:
+        return False
+    n = max(len(pa), len(pb))
+    pa = pa + (0,) * (n - len(pa))
+    pb = pb + (0,) * (n - len(pb))
+    return pa < pb
+
+
 def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
     """Check VapourSynth plugins. Skipped for photo pipeline."""
     if pipeline_type == "photo":
@@ -249,11 +289,17 @@ def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
         core = vs.core
         plugins = core.get_plugins()
         loaded = set()
+        # FIX-P2-4: capture version strings (best-effort) for min-version check
+        plugin_versions: Dict[str, str] = {}
         for pid, pinfo in plugins.items():
             name = pinfo.get("name", "").lower()
             namespace = pinfo.get("namespace", "").lower()
             loaded.add(name)
             loaded.add(namespace)
+            ver = pinfo.get("version")
+            if ver is not None:
+                plugin_versions[name] = str(ver)
+                plugin_versions[namespace] = str(ver)
 
         required = {
             "QTGMC": ["qtgmc"],
@@ -277,9 +323,19 @@ def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
         }
 
         for plugin, aliases in required.items():
-            found = any(a in loaded for a in aliases)
-            if not found:
+            found_alias = next((a for a in aliases if a in loaded), None)
+            if not found_alias:
                 missing.append(f"  - VS Plugin '{plugin}' (tried: {aliases})")
+                continue
+            # FIX-P2-4: best-effort minimum-version check (semver only).
+            min_ver = next((MIN_PLUGIN_VERSIONS[a] for a in aliases
+                            if a in MIN_PLUGIN_VERSIONS), None)
+            if min_ver is not None:
+                actual = plugin_versions.get(found_alias)
+                if actual is not None and _ver_lt(actual, min_ver):
+                    missing.append(
+                        f"  - VS Plugin '{plugin}' version {actual} < {min_ver}"
+                    )
     except ImportError:
         missing.append("  - vapoursynth Python package not installed")
     except Exception as e:
@@ -331,9 +387,17 @@ def check_havsfunc_version() -> Tuple[bool, str]:
     return True, "havsfunc r33 (verified via function presence; __version__ absent in r33)"
 
 
-def check_vs_minimal_calls() -> List[str]:
-    """Execute minimal parameter set test calls for core filters."""
+def check_vs_minimal_calls() -> Tuple[List[str], List[str]]:
+    """Execute minimal parameter set test calls for core filters.
+
+    FIX-P1-1: Returns (errors, warnings). sRestore is an OPTIONAL dependency
+    per v7.32 §3.6 — its absence only disables IVTC auto-fallback and must
+    NOT block startup. sRestore failures are therefore routed to warnings
+    instead of errors. Core filters (QTGMC/TemporalDegrain/GrainFactory3/
+    DepanStabilize) remain blocking errors.
+    """
     errors = []
+    warnings = []
     try:
         import vapoursynth as vs
         import havsfunc as haf
@@ -401,20 +465,24 @@ def check_vs_minimal_calls() -> List[str]:
             errors.append(f"  - GrainFactory3 test failed: {e}")
 
         # Test 5: sRestore
+        # FIX-P1-1: sRestore is OPTIONAL per v7.32 §3.6. Failure only disables
+        # IVTC auto-fallback; it must NOT block startup. Route to warnings.
         try:
             clip5 = core.std.BlankClip(format=vs.YUV420P16, width=720, height=480, length=60)
             result5 = haf.srestore(clip5, frate=23.976)
             if result5 is None:
-                errors.append("  - sRestore returned None")
+                warnings.append("  - sRestore returned None — IVTC auto-fallback disabled")
         except Exception as e:
-            errors.append(f"  - sRestore test failed (optional): {e}")
+            warnings.append(
+                f"  - sRestore unavailable ({e}) — IVTC auto-fallback disabled per v7.32 §3.6"
+            )
 
     except ImportError as e:
         errors.append(f"  - Cannot import for minimal calls: {e}")
     except Exception as e:
         errors.append(f"  - Unexpected error in minimal calls: {e}")
 
-    return errors
+    return errors, warnings
 
 
 def check_python_packages(pipeline_type: str = "photo") -> List[str]:
@@ -523,6 +591,111 @@ def check_ai_cli_tools() -> List[str]:
     return missing
 
 
+# FIX-P2-5: AI model registry extracted to module level so both check_ai_models
+# and download_missing_models share one source of truth. Per v7.32 §3.6: model
+# validation is file existence + size>0 (no MD5/SHA256 — spec deprecated hash
+# checks). Auto-download validates the same way after fetching.
+_AI_MODELS_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "realesr-general-x4v3.pth": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0",
+        "aliases": ["RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"],  # optional alternates
+        "optional_alt": True,
+    },
+    "GFPGANv1.4.pth": {
+        "url": "https://github.com/TencentARC/GFPGAN/releases",
+    },
+    "DAT_2_x2.pth": {
+        "url": "https://github.com/zhengchen1999/DAT (Google Drive)",
+        "aliases": ["DAT_x2.pth"],  # optional alternates
+        "optional_alt": True,
+    },
+    "DAT_2_x4.pth": {
+        "url": "https://github.com/zhengchen1999/DAT (Google Drive)",
+        "aliases": ["DAT_x4.pth"],
+        "optional_alt": True,
+    },
+    "codeformer.pth": {
+        "url": "https://github.com/sczhou/CodeFormer (Google Drive)",
+        "aliases": ["CodeFormer.pth", "codeformer_v0.1.pth",
+                    "weights/CodeFormer/codeformer.pth"],
+    },
+    "detection_Resnet50_Final.pth": {
+        "url": "facexlib weights (place in facexlib/weights/ or models/)",
+        "optional": True,  # RetinaFace auto-downloads if absent
+    },
+}
+
+
+def _is_direct_download_url(url: str) -> bool:
+    """Heuristic: True if url looks like a direct file download (not a web page)."""
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return False
+    low = url.lower()
+    if "releases/download/" in low or "raw.githubusercontent.com" in low:
+        return True
+    return low.endswith((".pth", ".pt", ".onnx", ".bin", ".rnnn", ".caffemodel"))
+
+
+def download_model(name: str, url: str, dest_dir: str = "./models") -> bool:
+    """Download a model file. Per v7.32 §3.6: validate presence + size>0
+    after download (no MD5/SHA256 checksum — spec deprecated hash checks).
+
+    FIX-P2-5: Returns True only if the file exists and is non-zero after
+    download. Uses requests (lazy import — only required when auto-download
+    is actually used).
+    """
+    try:
+        import requests  # type: ignore[import-untyped]
+    except ImportError:
+        print(f"  - Cannot auto-download {name}: 'requests' not installed")
+        return False
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    target = dest / name
+    try:
+        r = requests.get(url, stream=True, timeout=300)
+        r.raise_for_status()
+        with open(target, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+    except Exception as e:
+        print(f"  - Failed to download {name} from {url}: {e}")
+        return False
+    # Presence + size>0 validation only (no checksum per spec)
+    return target.exists() and target.stat().st_size > 0
+
+
+def download_missing_models(models_dir: str = "./models") -> Tuple[int, List[str]]:
+    """Download missing required AI models whose URL is a direct download link.
+
+    FIX-P2-5: Per v7.32 §3.6 (auto-download support). Only attempts models
+    with a direct file URL; GitHub release *page* URLs / Google Drive links
+    are skipped (cannot be fetched programmatically) and reported as still
+    missing. Returns (count_downloaded, still_missing_names).
+    """
+    models_path = Path(models_dir).resolve()
+    downloaded = 0
+    still_missing: List[str] = []
+    for name, info in _AI_MODELS_REGISTRY.items():
+        if info.get("optional") or info.get("optional_alt"):
+            continue
+        primary = models_path / name
+        aliases = info.get("aliases", [])
+        if primary.exists() and primary.stat().st_size > 0:
+            continue
+        if any((models_path / a).exists() and (models_path / a).stat().st_size > 0
+               for a in aliases):
+            continue
+        url = info.get("url", "")
+        if _is_direct_download_url(url):
+            print(f"  - Auto-downloading {name} from {url} ...")
+            if download_model(name, url, str(models_path)):
+                downloaded += 1
+                continue
+        still_missing.append(name)
+    return downloaded, still_missing
+
+
 def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) -> Tuple[List[str], List[str]]:
     """Check AI model weights exist (file presence + size>0).
 
@@ -535,38 +708,9 @@ def check_ai_models(models_dir: str = "./models", skip_md5_check: bool = False) 
     models_path = Path(models_dir).resolve()
     del skip_md5_check  # retained in signature for CLI backward compat
 
-    # Default models (primary) + optional alternates.
-    # Per v7.32 §3.6: realesr-general-x4v3 (default), DAT_2 (default),
-    # GFPGANv1.4, codeformer.pth, detection_Resnet50_Final.pth (RetinaFace).
-    required_models = {
-        "realesr-general-x4v3.pth": {
-            "url": "https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0",
-            "aliases": ["RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"],  # optional alternates
-            "optional_alt": True,
-        },
-        "GFPGANv1.4.pth": {
-            "url": "https://github.com/TencentARC/GFPGAN/releases",
-        },
-        "DAT_2_x2.pth": {
-            "url": "https://github.com/zhengchen1999/DAT (Google Drive)",
-            "aliases": ["DAT_x2.pth"],  # optional alternates
-            "optional_alt": True,
-        },
-        "DAT_2_x4.pth": {
-            "url": "https://github.com/zhengchen1999/DAT (Google Drive)",
-            "aliases": ["DAT_x4.pth"],
-            "optional_alt": True,
-        },
-        "codeformer.pth": {
-            "url": "https://github.com/sczhou/CodeFormer (Google Drive)",
-            "aliases": ["CodeFormer.pth", "codeformer_v0.1.pth",
-                        "weights/CodeFormer/codeformer.pth"],
-        },
-        "detection_Resnet50_Final.pth": {
-            "url": "facexlib weights (place in facexlib/weights/ or models/)",
-            "optional": True,  # RetinaFace auto-downloads if absent
-        },
-    }
+    # FIX-P2-5: registry now module-level (_AI_MODELS_REGISTRY) so
+    # download_missing_models shares it.
+    required_models = _AI_MODELS_REGISTRY
     missing = []
     warnings = []
 
@@ -866,32 +1010,52 @@ def check_spawn_compliance(target_script: Optional[str] = None,
         content = Path(path).read_text(encoding="utf-8")
         lines = content.splitlines()
         in_main = False
+        # FIX-P4-2: Track triple-quoted string state instead of the old
+        # `if i > 20` guard (which skipped the first 20 lines and missed
+        # executable code appearing after a long module docstring, while
+        # also falsely flagging docstring interior lines). Per v7.32 §3.10.18.
+        in_triple = False
+        triple_tok = ""
         for i, line in enumerate(lines):
             stripped = line.strip()
             if stripped.startswith("if __name__"):
                 in_main = True
-            elif in_main:
                 continue
-            elif stripped and not stripped.startswith(_VALID_TOP_LEVEL_PREFIXES):
+            if in_main:
+                continue
+            # Skip lines inside a multi-line triple-quoted string
+            if in_triple:
+                if triple_tok in line:
+                    in_triple = False
+                continue
+            # Detect a triple-quoted string opening that does not close on
+            # the same line (module docstring / multi-line constant).
+            for tok in ('"""', "'''"):
+                if tok in stripped:
+                    if stripped.count(tok) < 2:
+                        in_triple = True
+                        triple_tok = tok
+                    break
+            if in_triple:
+                continue
+            if stripped and not stripped.startswith(_VALID_TOP_LEVEL_PREFIXES):
                 # Allow top-level constant assignments (X = ...)
                 # FIX-P2-3: But flag executable assignments (X = func()) per
                 # v7.32 §3.10.18 constraint 2
                 if _TOP_LEVEL_ASSIGNMENT.match(stripped):
                     # Flag executable assignments (X = func())
                     if _TOP_LEVEL_EXECUTABLE.match(stripped):
-                        if i > 20:
-                            issues.append(
-                                f"  - {label}: top-level executable assignment "
-                                f"at line {i+1}: {stripped[:60]}"
-                            )
-                            break
+                        issues.append(
+                            f"  - {label}: top-level executable assignment "
+                            f"at line {i+1}: {stripped[:60]}"
+                        )
+                        break
                     continue
-                if i > 20:  # Skip header comments
-                    issues.append(
-                        f"  - {label}: potential top-level executable code "
-                        f"at line {i+1}: {stripped[:60]}"
-                    )
-                    break
+                issues.append(
+                    f"  - {label}: potential top-level executable code "
+                    f"at line {i+1}: {stripped[:60]}"
+                )
+                break
 
     def _check_file_full(path: str, label: str) -> None:
         """Run both line-based (constraint 1+2) and AST-based (constraint 3) checks."""
@@ -913,9 +1077,15 @@ def check_spawn_compliance(target_script: Optional[str] = None,
         # Default: discover project Python files adjacent to the main script
         if target_script:
             base_dir = Path(target_script).parent
+            # FIX-P3-5: Exclude virtualenv / site-packages / test dirs so the
+            # spawn scan does not flag third-party or test code as project
+            # spawn targets per v7.32 §3.10.18.
+            _EXCLUDE_DIRS = {"__pycache__", ".venv", "venv", "env",
+                             "site-packages", "test"}
             for py_file in base_dir.rglob("*.py"):
-                # Skip __pycache__ and virtualenv paths
-                if "__pycache__" in str(py_file):
+                if any(part in _EXCLUDE_DIRS for part in py_file.parts):
+                    continue
+                if py_file.name.startswith("test_"):
                     continue
                 if py_file.resolve() == Path(target_script).resolve():
                     continue
@@ -1007,10 +1177,14 @@ def run_all_checks(config: Optional[Dict] = None,
             issues.append(f"havsfunc: {msg}")
 
         # 5. VS minimal calls (video only)
-        calls = check_vs_minimal_calls()
+        # FIX-P1-1: sRestore failures now non-blocking warnings per v7.32 §3.6
+        calls, vs_warnings = check_vs_minimal_calls()
         if calls:
             issues.append("VapourSynth filter test failures:")
             issues.extend(calls)
+        if vs_warnings:
+            warnings.append("VapourSynth optional dependencies (non-blocking):")
+            warnings.extend(vs_warnings)
 
     # 6. Python packages
     py = check_python_packages(pipeline_type)
@@ -1056,16 +1230,35 @@ def run_all_checks(config: Optional[Dict] = None,
         issues.extend(arnndn)
 
     # 11. G'MIC filters (all pipelines)
+    # FIX-P3-9: Label was "G'MIC filter warnings:" while the result was routed
+    # to blocking issues — label/destination mismatch per v7.32 §3.6. G'MIC
+    # filters (denoise_haar/denoise_patchpca/transfer_histogram) are required,
+    # so this stays blocking with an accurate "Missing G'MIC filters:" label.
     gmic = check_gmic_filters()
     if gmic:
-        issues.append("G'MIC filter warnings:")
+        issues.append("Missing G'MIC filters:")
         issues.extend(gmic)
 
     # 12. GPU backends
+    # FIX-P1-2 / FIX-P3-8: GPU absence is non-blocking — CPU fallback is
+    # allowed per v7.32 §3.5 (CUDA → ROCm → MPS → CPU auto-degrade). Only
+    # block when AI is enabled AND PyTorch itself is missing (no backend at
+    # all). AI disabled → pure WARNING.
+    ai_enabled = bool(config and config.get("ai", {}).get("enabled", False))
     has_gpu, gpu_msgs = check_gpu_backends()
     if not has_gpu:
-        issues.append("GPU backend check:")
-        issues.extend(gpu_msgs)
+        if ai_enabled:
+            # AI enabled: need at least CPU PyTorch to fall back to
+            try:
+                import torch  # noqa: F401
+                warnings.append("GPU backend check (AI will run on CPU):")
+                warnings.extend(gpu_msgs)
+            except ImportError:
+                issues.append("GPU backend check (AI enabled but PyTorch missing):")
+                issues.extend(gpu_msgs)
+        else:
+            warnings.append("GPU backend check (AI disabled, not required):")
+            warnings.extend(gpu_msgs)
 
     # 13. FFmpeg filter minimal calls (video only)
     if pipeline_type != "photo":
@@ -1077,9 +1270,14 @@ def run_all_checks(config: Optional[Dict] = None,
     # 14. Spawn compliance (all pipelines, when multiprocessing used)
     # ISSUE-SHARED-DC-002 fix: Removed pipeline_type != "photo" restriction.
     # Photo pipeline also uses multiprocessing (--workers) and must comply.
+    # FIX-P4-3: Label was "Spawn compliance warnings:" while routed to blocking
+    # issues. Spawn violations are blocking (per v7.32 §3.10.18 they cause
+    # runtime deadlocks), so the label is corrected to "violations". The
+    # exit-code semantics (80 vs a dedicated 86) is a design decision tracked
+    # as 待用户确认 (86=validation failure per §3.5 is the spec-aligned option).
     spawn_issues = check_spawn_compliance()
     if spawn_issues:
-        issues.append("Spawn compliance warnings:")
+        issues.append("Spawn compliance violations:")
         issues.extend(spawn_issues)
 
     return len(issues) == 0, issues, warnings
@@ -1095,7 +1293,10 @@ def main():
     parser.add_argument("--pipeline-type", choices=["photo", "video", "auto"],
                        default="auto", help="Pipeline type (auto-detect by default)")
     parser.add_argument("--skip-md5-check", action="store_true",
-                        help="Skip AI model MD5 verification (not recommended)")
+                        help="Skip AI model MD5 verification (no-op; MD5 checks removed per spec)")
+    # FIX-P2-5: auto-download missing AI models per v7.32 §3.6
+    parser.add_argument("--auto-download", action="store_true",
+                        help="Auto-download missing AI models with direct URLs (per v7.32 §3.6)")
     args = parser.parse_args()
 
     config = None
@@ -1110,6 +1311,16 @@ def main():
                 break
 
     pipeline_type = None if args.pipeline_type == "auto" else args.pipeline_type
+
+    # FIX-P2-5: attempt auto-download of missing AI models before the check.
+    # Only acts when AI is enabled; GitHub release *page* / Google Drive URLs
+    # are skipped (not direct files) and surface as still-missing in the check.
+    if args.auto_download and config and config.get("ai", {}).get("enabled", False):
+        models_dir = config.get("model_dir", "./models")
+        print("Auto-downloading missing AI models...")
+        dl_count, still_missing = download_missing_models(models_dir)
+        print(f"  Downloaded {dl_count} model(s); {len(still_missing)} still "
+              f"missing (need manual download): {still_missing}")
 
     ok, issues, warnings = run_all_checks(config, pipeline_type=pipeline_type, skip_md5_check=args.skip_md5_check)
 

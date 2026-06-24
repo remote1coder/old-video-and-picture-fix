@@ -119,8 +119,15 @@ def correct_channel(ch_linear: np.ndarray, params: dict,
             )
 
     # Step 4: Soft compression if configured
+    # FIX-M12-08: Per v7.32 §3.10.6, soft compression (Reinhard) only applies
+    # to channels with out-of-range pixels (e.g. severely faded channels).
+    # ORIGINAL: applied unconditionally to every corrected channel, darkening
+    # in-range channels that needed no compression.
     if params.get("channel_correction_soft_compress", True):
-        ch_corrected = _reinhard_tone_map(ch_corrected)
+        out_of_range = bool(
+            (ch_corrected < 0).any() or (ch_corrected > 1).any())
+        if out_of_range:
+            ch_corrected = _reinhard_tone_map(ch_corrected)
 
     return ch_corrected
 
@@ -182,8 +189,43 @@ def run_stage2_ai_pre(input_path: str, output_path: str,
     Returns:
         0 = success, 3 = skip, 82 = IO error, 86 = validation failure
     """
-    # Step 1: Detect channel degradation
-    degradation = detect_channel_degradation(input_path, params)
+    # Step 1: Determine channel degradation.
+    # FIX-L12-13: Prefer stage1's flag (params or channel_meta.json sidecar)
+    # over re-detecting from pixels, per round_12 L-12-13. stage1 already
+    # computed & persisted this; re-detecting on the (possibly corrected)
+    # stage1 output is wasteful and can disagree with stage1's mark.
+    degradation = None
+    if params.get("channel_degradation") is not None:
+        degradation = {
+            "degraded": bool(params.get("channel_degradation")),
+            "channels": params.get("degraded_channels", []),
+            "mean_diff": params.get("mean_diff", 0.0),
+            "std_diff": params.get("std_diff", 0.0),
+        }
+    if degradation is None:
+        try:
+            _job_id = params.get("job_id", "")
+            _orig = params.get("input_path", "")
+            _stem = Path(_orig).stem if _orig else ""
+            _meta = Path(params.get("temp_dir", "./temp")) / (
+                f"{_job_id}_{_stem}_channel_meta.json")
+            if _meta.exists():
+                with open(_meta, "r", encoding="utf-8") as f:
+                    cm = json.load(f)
+                degradation = {
+                    "degraded": cm.get("channel_degradation", False),
+                    "channels": cm.get("degraded_channels", []),
+                    "mean_diff": cm.get("mean_diff", 0.0),
+                    "std_diff": cm.get("std_diff", 0.0),
+                }
+                if logger:
+                    logger.info("STAGE2_CHANNEL_FLAG",
+                                f"Read stage1 channel_degradation="
+                                f"{degradation['degraded']} from {_meta.name}")
+        except Exception:
+            degradation = None
+    if degradation is None:
+        degradation = detect_channel_degradation(input_path, params)
     if not degradation.get("degraded"):
         if logger:
             logger.info("STAGE2_CHANNEL_SKIP",
@@ -222,11 +264,18 @@ def run_stage2_ai_pre(input_path: str, output_path: str,
         return 82
 
     # Step 3: IEC 61966-2-1 sRGB → linear conversion
+    # FIX-M12-07: Only IEC 61966-2-1 is allowed per v6.32 §7.16 ("严禁使用
+    # 简单 pow(x, 2.2) 代替标准分段函数"). Non-IEC formula is rejected with
+    # exit 81 (parameter error) rather than falling back to forbidden pow(2.2).
+    # ORIGINAL: fell back to np.power(arr, 2.2) for non-IEC formula.
     formula = params.get("channel_correction_formula", "iec61966-2-1")
-    if formula == "iec61966-2-1":
-        linear = _sRGB_to_linear(arr)
-    else:
-        linear = np.power(np.clip(arr, 0.0, 1.0), 2.2)
+    if formula != "iec61966-2-1":
+        if logger:
+            logger.error("STAGE2_BAD_FORMULA",
+                         f"Unsupported channel_correction_formula={formula}, "
+                         f"only 'iec61966-2-1' allowed per v6.32 §7.16")
+        return 81
+    linear = _sRGB_to_linear(arr)
 
     # Step 4: Per-channel correction
     means_linear = [linear[:, :, c].mean() for c in range(3)]
@@ -252,10 +301,9 @@ def run_stage2_ai_pre(input_path: str, output_path: str,
     corrected = np.clip(corrected, 0.0, 1.0)
 
     # Step 6: IEC 61966-2-1 linear → sRGB conversion
-    if formula == "iec61966-2-1":
-        srgb = _linear_to_sRGB(corrected)
-    else:
-        srgb = np.power(np.clip(corrected, 0.0, 1.0), 1.0 / 2.2)
+    # FIX-M12-07: IEC only (formula guaranteed == "iec61966-2-1"; non-IEC was
+    # rejected at Step 3). No pow(1/2.2) fallback per v6.32 §7.16.
+    srgb = _linear_to_sRGB(corrected)
     srgb = np.clip(srgb, 0.0, 1.0)
 
     # Step 7: Round (not truncate) and denormalize per v6.32 §7.16
