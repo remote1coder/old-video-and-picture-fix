@@ -252,6 +252,27 @@ def build_hum_filters(freq: int, dual_hum: bool = False,
     return filters
 
 
+def _build_afftdn_filter(num_channels: int, nr: int = 12) -> str:
+    """Build a spec-compliant afftdn filter string.
+
+    FIX-WARN-1: Per v7.32 §3.10.22 (afftdn 参数语义):
+      - nf (noise_floor): default -50 dB. Aggressive values like -25/-20
+        damage speech and are explicitly forbidden by spec. ORIGINAL code
+        used nf=-25 / nf=-20 (forbidden).
+      - nr (noise_reduction): default 12 dB (caller may pass a gentler
+        value for hum-removal fallback).
+      - noise_link: default 'min' couples noise estimation across channels.
+        For multi-channel independent per-channel processing, spec requires
+        explicit noise_link=none. Added when num_channels > 1.
+    afftdn is a generic denoiser (NOT a hum remover); hum removal stays
+    the responsibility of bandreject.
+    """
+    filt = f"afftdn=nf=-50:nr={nr}"
+    if num_channels > 1:
+        filt += ":noise_link=none"
+    return filt
+
+
 def _get_ffmpeg_version() -> Tuple[bool, str]:
     """Check if FFmpeg version >= 4.4. Returns (ok, version_str)."""
     try:
@@ -390,9 +411,18 @@ def process_audio(audio_path: str, output_path: str,
                               f"Using auto-detected {primary_freq}Hz")
 
         # FIX-P3-4: Log warning when no low-frequency content detected
+        # FIX-R7-S7-3a: ORIGINAL wording "defaulting hum_freq to 50Hz"
+        # contradicted the revised spec (v7.32 §3.10.22 / v6.32 §7.12:
+        # hum_freq defaults to null = auto-detect). When auto-detect finds
+        # no low-frequency content, hum_freq stays null (auto) and
+        # bandreject is skipped — de-humming falls back to afftdn/arnndn
+        # broadband denoise. Wording corrected to match the null default;
+        # detect_hum_frequency still sets primary_freq=50 as an internal
+        # placeholder, but skip_bandreject=True so no bandreject runs.
         if hum_result.get("primary_freq") == 50 and hum_result.get("hum_ratio", 0) == 0.0:
             logger.warning("AUDIO_HUM_DEFAULT",
-                          "No low-frequency content detected, defaulting hum_freq to 50Hz")
+                          "No low-frequency content detected; hum_freq stays "
+                          "null (auto), bandreject skipped per v7.32 §3.10.22")
         
         if hum_result["skip_bandreject"]:
             logger.info("AUDIO_HUM_SKIP",
@@ -404,7 +434,25 @@ def process_audio(audio_path: str, output_path: str,
                 logger.warning("AUDIO_DUAL_HUM",
                               f"Dual hum detected (50Hz+60Hz). Processing primary frequency {primary_freq}Hz only. "
                               f"Set hum_dual=true to process both.")
-            
+
+            # FIX-FAIL-1: Per v7.32 §3.10.9-2 / §3.10.22 (and v6.32 §7.12):
+            # when the user explicitly configures hum_dual=true AND dual hum
+            # is detected, both 50/100/150 + 60/120/180Hz bandreject groups
+            # are chained. This is an audio-quality risk, so a CRITICAL log
+            # is mandatory. ORIGINAL only logged INFO (AUDIO_HUM_FILTERS) and
+            # a WARNING for the single-group default case — no CRITICAL
+            # anywhere in the file. Added here per spec.
+            if is_dual and hum_dual_config:
+                logger.critical(
+                    "AUDIO_HUM_DUAL_ENABLED",
+                    f"Dual hum processing ENABLED (hum_dual=true): chaining "
+                    f"50/100/150 + 60/120/180Hz bandreject groups. Audio "
+                    f"quality risk: may damage low-frequency content near "
+                    f"50/60Hz; recommended only for confirmed cross-region "
+                    f"material with dual mains hum.",
+                    primary_freq=primary_freq,
+                )
+
             if ffmpeg_ok:
                 hum_filters = build_hum_filters(primary_freq, is_dual and hum_dual_config, audio_config)
                 filters.extend(hum_filters)
@@ -466,7 +514,10 @@ def process_audio(audio_path: str, output_path: str,
                                   f"arnndn model not found for "
                                   f"{primary_freq}Hz, falling back to afftdn "
                                   "for hum removal (FFmpeg <4.4)")
-                    filters.append("afftdn=nr=6:nf=-25")
+                    # FIX-WARN-1: spec-compliant afftdn (nf=-50, not -25;
+                    # noise_link=none for multi-channel per v7.32 §3.10.22).
+                    # nr kept gentle (6) for the hum-removal fallback.
+                    filters.append(_build_afftdn_filter(num_channels, nr=6))
 
         # Step 2: Noise reduction (AFTER bandreject)
         if denoise:
@@ -581,7 +632,10 @@ def process_audio(audio_path: str, output_path: str,
                     logger.warning("AUDIO_ARNNDN_MISSING",
                                   f"arnndn model not found for "
                                   f"{primary_freq}Hz, using afftdn fallback")
-                filters.append("afftdn=nr=10:nf=-20")
+                # FIX-WARN-1: spec-compliant afftdn (nf=-50, not -20;
+                # noise_link=none for multi-channel per v7.32 §3.10.22).
+                # nr=12 is the spec default for broad-spectrum denoise.
+                filters.append(_build_afftdn_filter(num_channels, nr=12))
                 logger.info("AUDIO_DENOISE", "Using afftdn noise reduction")
 
         # Step 3: Optional compand dynamic range compression
@@ -642,9 +696,21 @@ def process_audio(audio_path: str, output_path: str,
         else:
             cmd.extend(["-c:a", codec])
 
-        # Preserve channel layout for multi-channel
+        # Preserve channel layout for multi-channel per v7.32 §3.10.9
+        # (read via ffprobe and retained; "严禁混缩为立体声").
+        # FIX-WARN-2: ORIGINAL only passed `-ac <num_channels>`, leaving the
+        # output channel_layout to ffmpeg's inference. After a per-channel
+        # pan/amerge chain the layout can come out as "unknown", which some
+        # muxers/players then mis-handle. When the source layout is a known
+        # non-stereo layout, explicitly pass `-channel_layout` so the output
+        # carries the correct label (e.g. "5.1"). The pan-filter rebuild
+        # (needed only if amerge's default layout disagrees with the source
+        # label) is deferred pending confirmation of amerge's output-layout
+        # behavior — see round_3 WARN-2 / "需联网确认" item 6.
         if num_channels > 2:
             cmd.extend(["-ac", str(num_channels)])
+            if channel_layout and channel_layout != "stereo":
+                cmd.extend(["-channel_layout", channel_layout])
 
         cmd.append(output_path)
 
@@ -793,14 +859,29 @@ def check_av_sync(video_path: str, audio_path: str,
 
     diff_ms = abs((v_dur - a_dur) * 1000)
     action = "ok"
+    # FIX-WARN-3: Per v7.32 §3.10.9 thresholds: >100ms WARNING, >300ms sync
+    # required, >500ms ERROR + FAILED. ORIGINAL set the action correctly but
+    # logged every branch at INFO, so >500ms failures produced no ERROR-level
+    # log and 100-500ms produced no WARNING. Emit the spec-mandated log level
+    # for each band (the FAILED status flag is still applied by the stage7
+    # caller; here we only align the shared-layer log level to spec).
     if diff_ms > 500:
         action = "failed"
+        logger.error("AV_SYNC_FAILED",
+                     f"A/V sync diff {diff_ms:.1f}ms > 500ms, marking FAILED",
+                     video_dur=v_dur, audio_dur=a_dur, diff_ms=diff_ms)
     elif diff_ms > 300:
         action = "sync_required"
+        logger.warning("AV_SYNC_SYNC_REQUIRED",
+                       f"A/V sync diff {diff_ms:.1f}ms > 300ms, sync required",
+                       diff_ms=diff_ms)
     elif diff_ms > 100:
         action = "warning"
-
-    logger.info("AV_SYNC_CHECK",
-               f"Video={v_dur:.3f}s, Audio={a_dur:.3f}s, Diff={diff_ms:.1f}ms",
-               action=action)
+        logger.warning("AV_SYNC_WARNING",
+                       f"A/V sync diff {diff_ms:.1f}ms > 100ms",
+                       diff_ms=diff_ms)
+    else:
+        logger.info("AV_SYNC_CHECK",
+                   f"Video={v_dur:.3f}s, Audio={a_dur:.3f}s, Diff={diff_ms:.1f}ms",
+                   action=action)
     return action in ("ok", "warning"), diff_ms, action

@@ -64,12 +64,18 @@ def merge_params(config: Dict[str, Any],
                  detected_class: str,
                  cli_overrides: Dict[str, Any],
                  logger=None) -> Dict[str, Any]:
-    """6-layer parameter cascading per v7.3 §3.1.
+    """8-layer parameter cascading per v7.32 §3.2 + §3.10.12.
 
-    Priority: CLI > user_overrides > paths > global > defaults
-    Uses deep merge for nested dicts.
+    # FIX-R10-W8: Updated docstring to document all merge layers
+    # (audio_override + recommended_params were previously undocumented).
+    # ORIGINAL: docstring omitted audio_override and recommended_params layers.
+    Priority (low -> high):
+      global -> photo -> paths[type] -> audio_override[type]
+      -> ai/grain_factory3/audio (flattened) -> recommended_params
+      -> user_overrides -> CLI
+
+    Note: ai config flattened with both ai_{k} and {k} keys.
     Records PARAM_OVERRIDE events per v7.32 §3.10.12.
-    Also merges ai, grain_factory3, and audio config sections.
     """
     # Layer 1: global
     params: Dict[str, Any] = {}
@@ -650,6 +656,12 @@ def _run_single_job(job: Dict[str, Any],
         stage_name = stage_script.replace(".py", "")
         retry_count = 0
 
+        # FIX-R10-M1: --stage single-stage mode per CLAUDE.md §0
+        # When set, run only the requested stage (1-6); skip all others.
+        cli_stage = cli_params.get("_stage")
+        if cli_stage is not None and (stage_idx + 1) != cli_stage:
+            continue
+
         # Conditional stages per v7.32 §3.1
         # FIX-P10-4: stage5_postprocess NOT bound to AI switch
         if stage_name == "stage3_ai_upscale":
@@ -667,16 +679,24 @@ def _run_single_job(job: Dict[str, Any],
 
         # FIX-P10-10: force_traditional_first gate bound to stage1
         # Block AI stages if stage1 failed
+        # FIX-R10-W7: Include stage5_postprocess in the gate per v7.32 §3.10.8
+        # (spec literally lists stage3/4/5). Defensive assertion only: when
+        # stage1 fails, _verify_stage_output already returns 86 above, so
+        # this branch is an invariant guard, not the primary gate.
+        # ORIGINAL: gate covered only stage2/3/4, omitted stage5.
         force_traditional_first = params.get(
             "force_traditional_first", True)
-        if (force_traditional_first
+        # FIX-R10-M1: In --stage single-stage mode the gate is bypassed — the
+        # user explicitly requested one stage, so the traditional-first
+        # invariant (which assumes a full run) must not block it.
+        if (cli_stage is None and force_traditional_first
                 and stage_name in ("stage2_ai_pre", "stage3_ai_upscale",
-                                   "stage4_ai_face")):
+                                   "stage4_ai_face", "stage5_postprocess")):
             if not traditional_stage_completed:
                 logger.error("TRADITIONAL_GATE_BLOCK",
                             "force_traditional_first=true but "
                             "traditional stage not completed, "
-                            "blocking AI stages")
+                            "blocking AI/post stages")
                 print(f"[{job_id}] Traditional restoration gate "
                       f"blocked {stage_name}", file=sys.stderr)
                 return 86
@@ -810,6 +830,10 @@ def main():
     parser.add_argument("--input-dir", default=None,
                        help="Directory of photos for batch processing")
     parser.add_argument("--job-id", default=None)
+    # FIX-R10-M1: --stage single-stage mode per CLAUDE.md §0
+    parser.add_argument("--stage", type=int, default=None,
+                       help="Run only the specified stage (1-6); "
+                            "skips other stages")
     parser.add_argument("--output", "-o", default=None)
     parser.add_argument("--log-dir", default="./logs")
     parser.add_argument("--temp-dir", default="./temp")
@@ -821,6 +845,10 @@ def main():
                        help="Keep intermediate files (default: cleanup)")
 
     parser.add_argument("--preview", action="store_true")
+    # FIX-R10-M3: --preview-only per v7.32 §3.3 mode C (preview, no execution)
+    parser.add_argument("--preview-only", action="store_true",
+                       help="Preview mode only (no execution); "
+                            "per v7.32 §3.3 mode C")
     parser.add_argument("--force-allow-banned-upscale", action="store_true")
     # FIX-P10-1: Use BooleanOptionalAction per v7.32 §3.2
     # ORIGINAL: store_true + default=True = always True (cannot disable)
@@ -842,10 +870,18 @@ def main():
     parser.add_argument("--aq-mode", type=int, default=None)
     # AI params
     parser.add_argument("--ai-enabled", action="store_true")
-    parser.add_argument("--ai-upscale-factor", type=int, default=None)
+    # FIX-R10-W6: Constrain upscale factor to 2 or 4 per v6.32 §4.2.5
+    # (integer scales only). ORIGINAL: no choices, allowed 3 etc.
+    parser.add_argument("--ai-upscale-factor", type=int, default=None,
+                       choices=[2, 4],
+                       help="AI upscale factor (2 or 4 only)")
     parser.add_argument("--ai-model", default=None)
     parser.add_argument("--ai-denoise-strength", type=float, default=None)
     parser.add_argument("--ai-pre-upscale-lanczos", action="store_true")
+    # FIX-R10-M2: --gpu backend override per CLAUDE.md §0
+    parser.add_argument("--gpu", choices=["auto", "cuda", "cpu"],
+                       default=None,
+                       help="Force GPU backend (auto/cuda/cpu)")
     # BUG-054 fix: parallel batch processing
     parser.add_argument("--workers", type=int, default=1,
                        help="Number of parallel workers")
@@ -923,6 +959,20 @@ def main():
     cli_params["temp_dir"] = args.temp_dir
     cli_params["log_dir"] = args.log_dir
     cli_params["force_traditional_first"] = force_traditional
+
+    # FIX-R10-M1: Inject --stage into cli_params (consumed in _run_single_job
+    # stage loop via cli_params["_stage"]). Only set when explicitly provided.
+    if args.stage is not None:
+        if not 1 <= args.stage <= 6:
+            parser.error("--stage must be in 1..6")
+        cli_params["_stage"] = args.stage
+    # FIX-R10-M2: Inject --gpu backend override per CLAUDE.md §0
+    if args.gpu is not None:
+        cli_params["gpu"] = args.gpu
+        if args.gpu == "cpu":
+            cli_params["gpu_priority"] = ["cpu"]
+        elif args.gpu == "cuda":
+            cli_params["gpu_priority"] = ["cuda", "cpu"]
 
     # FIX-P10-2: Propagate --no-wsl-redirect to cli_params per v7.32 §3.10.10
     if args.no_wsl_redirect:
@@ -1065,7 +1115,8 @@ def main():
         # Continue to single-file execution (fall through)
 
     # Preview mode
-    if args.preview:
+    # FIX-R10-M3: --preview-only per v7.32 §3.3 mode C (strictly no execution)
+    if args.preview or args.preview_only:
         # FIX-P10-12: Support --input-dir in preview mode
         preview_input = args.input or args.input_dir
         print(f"Preview mode: showing job plan for {preview_input}")
@@ -1123,6 +1174,9 @@ def main():
                     except Exception as e:
                         print(f"Preview for {p} skipped: {e}",
                               file=sys.stderr)
+        # FIX-R10-M3: Both --preview and --preview-only return here without
+        # entering the execution branches below. --preview-only is strictly
+        # no-execution per v7.32 §3.3 mode C.
         return 0
 
     # ISSUE-P-MAIN-001 fix: Manifest mode

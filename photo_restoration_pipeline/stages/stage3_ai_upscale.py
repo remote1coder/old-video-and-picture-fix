@@ -663,7 +663,11 @@ def main():
     # FIX-P0-2: gpu_memory_check expects MiB (converts available VRAM bytes
     # to MiB internally for comparison). Passing raw bytes inflated the
     # requirement ~1048576x, forcing every 1080p image to CPU. Convert here.
-    vram_required_mb = vram_required // (1024 * 1024)
+    # FIX-H12-03: Apply 1.2 safety margin per v7.32 §3.10.23 ("可用显存 <
+    # 动态预估需求 × 1.2 触发分级降级"). Applied at the call site because
+    # gpu_memory_check's contract is MiB (C-12-01 fix approach B) and
+    # shared_modules/checkpoint.py is outside this fix scope.
+    vram_required_mb = int(vram_required * 1.2) // (1024 * 1024)
     sufficient, backend = gpu_memory_check(vram_required_mb)
 
     use_gpu = True
@@ -678,7 +682,8 @@ def main():
             actual_scale = 2
             actual_model = _get_model_for_scale(model, 2)
             vram_required = int(img_w * img_h * 3 * 4 * (2 + actual_scale * actual_scale))
-            vram_required_mb = vram_required // (1024 * 1024)
+            # FIX-H12-03: 1.2 safety margin on the 4×→2× downgrade re-check too.
+            vram_required_mb = int(vram_required * 1.2) // (1024 * 1024)
             sufficient, backend = gpu_memory_check(vram_required_mb)
             if sufficient:
                 logger.warning("STAGE3_DOWNSCALE", f"Downgraded from 4x to 2x ({actual_model}) due to VRAM limit")
@@ -759,8 +764,22 @@ def main():
                 logger.warning("STAGE3_PREVIEW_FAIL", f"Preview generation failed: {e}")
         return 0
 
-    logger.error("STAGE3_FAILED", "AI upscaling failed")
-    return 83
+    # FIX-M12-10: Per v7.32 §3.10.23, when all AI backends fail (including
+    # CPU), skip AI and emit the traditional (stage1) result rather than
+    # failing the job with exit 83. Return 3 (skip) so the main loop treats
+    # this stage as skipped and downstream stages consume the traditional
+    # output. Only fall back to 83 if even the traditional copy fails.
+    logger.warning("STAGE3_AI_SKIP_TRADITIONAL",
+                   "All AI backends failed (incl. CPU); emitting traditional "
+                   "stage1 output and skipping AI per v7.32 §3.10.23")
+    try:
+        shutil.copyfile(stage1_output, output_path)
+        return 3
+    except Exception as e:
+        logger.error("STAGE3_FAILED",
+                     f"AI upscaling failed and traditional fallback copy "
+                     f"failed: {e}")
+        return 83
 
 
 if __name__ == "__main__":

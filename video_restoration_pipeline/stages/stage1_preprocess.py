@@ -195,6 +195,28 @@ def _get_matrix_in_from_meta(video_path: str, color_meta: dict,
     return "170m"  # NTSC BT.601 (480-line NTSC SD and all other resolutions)
 
 
+def _fps_to_rational(fps):
+    """Convert a framerate float to (numerator, denominator) for AssumeFPS.
+
+    FIX-W11: used to rebuild PTS after std.Splice of per-segment QTGMC output
+    per v7.32 §3.10.1/§3.10.13. Maps common NTSC/PAL rates exactly; falls back
+    to a limited-denominator rational approximation for unusual rates.
+    """
+    if not fps or fps <= 0:
+        return 25, 1  # safe PAL default; caller ensures fps>0 in normal flow
+    common = {
+        23.976: (24000, 1001), 23.98: (24000, 1001), 24.0: (24, 1),
+        25.0: (25, 1), 29.97: (30000, 1001), 30.0: (30, 1),
+        50.0: (50, 1), 59.94: (60000, 1001), 60.0: (60, 1),
+    }
+    for v, nd in common.items():
+        if abs(fps - v) < 0.02:
+            return nd
+    from fractions import Fraction
+    f = Fraction(fps).limit_denominator(1001)
+    return f.numerator, f.denominator
+
+
 def generate_vs_script(input_path: str, params: dict, job_id: str,
                        crop_info: Optional[dict] = None,
                        ivtc_stats: Optional[dict] = None) -> str:
@@ -205,14 +227,23 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
 
     ivtc = params.get("ivtc", "VIVTC")
     deinterlace = params.get("deinterlace", "QTGMC")
-    denoise = params.get("denoise", "TemporalDegrain2")
+    # FIX-spec: havsfunc VS function is TemporalDegrain (no "2" suffix) per
+    # v7.32 §3.10.15; default fallback name aligned to revised spec.
+    denoise = params.get("denoise", "TemporalDegrain")
     denoise_params = params.get("denoise_params", {})
     stabilize = params.get("stabilize", "DepanStabilize")
     stabilize_params = params.get("stabilize_params", {})
     chroma_shift = params.get("chroma_shift", False)
     deblock = params.get("deblock", "")
     target_res = params.get("target_resolution", "720x480")
-    vs_bit_depth = params.get("vs_bit_depth", 16)
+    # FIX-W10: force 16bit processing space per v7.32 §3.10.1 ("强制 16bit 处理空间").
+    # ORIGINAL allowed 8/10bit via config; sub-16bit violates the 16bit rule.
+    _requested_bd = params.get("vs_bit_depth", 16)
+    if _requested_bd < 16:
+        params["_vs_bit_depth_upgraded"] = (_requested_bd, 16)
+        vs_bit_depth = 16
+    else:
+        vs_bit_depth = 16
 
     # FIX-P6-7: Fetch color metadata ONCE, cache for _get_matrix_in to reuse
     # ORIGINAL: _get_video_color_metadata called twice (in _get_matrix_in + here)
@@ -225,13 +256,8 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     # Clean up cache (don't leak into downstream params)
     params.pop("_color_meta_cache", None)
 
-    # VapourSynth format based on bit depth
-    if vs_bit_depth == 16:
-        vs_format = "vs.YUV420P16"
-    elif vs_bit_depth == 10:
-        vs_format = "vs.YUV420P10"
-    else:
-        vs_format = "vs.YUV420P8"
+    # VapourSynth format based on bit depth (FIX-W10: always 16bit)
+    vs_format = "vs.YUV420P16"
 
     # Determine range from pre-fetched color metadata (FIX-P6-2 / FIX-P6-7)
     detected_range = color_meta.get("color_range", "")
@@ -312,8 +338,15 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
 
     # PSF handling
     if is_psf:
+        # FIX-W2: use the preserved original TFF/BFF for SeparateFields per
+        # v7.32 §3.10.1. ORIGINAL used tff_bool (computed from field_order=="tt"),
+        # which is always False for PSF (field_order=="psf"), causing a 1-row
+        # vertical offset on TFF PSF material after Weave. psf_tff is propagated
+        # from classify.py via main.py (job -> params).
+        psf_tff = params.get("psf_tff", False)
+        psf_tff_str = "True" if psf_tff else "False"
         lines.append("# PSF handling: SeparateFields + Weave")
-        lines.append(f"clip = core.std.SeparateFields(clip, tff={tff_bool})")
+        lines.append(f"clip = core.std.SeparateFields(clip, tff={psf_tff_str})")
         lines.append("clip = core.std.Weave(clip)")
         # FIX-P6-11: Optional progressive repair for PSF
         if params.get("psf_use_input_type1", False):
@@ -385,6 +418,12 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     use_segmented = bool(field_segments) and not is_psf and deinterlace == "QTGMC"
 
     if use_segmented:
+        # FIX-W15: force InputType=0 for true interlaced (tt/bb) segments per
+        # v7.32 §3.10.1. config may set qtgmc_input_type=1/2 (progressive/residual),
+        # which is wrong for true interlaced and would cause deinterlace errors.
+        if qtgmc_input_type != 0:
+            params["_qtgmc_input_type_override"] = (qtgmc_input_type, 0)
+            qtgmc_input_type = 0
         lines.append("# Mixed field order: per-segment QTGMC deinterlacing")
         segment_vars = []
         for idx, seg in enumerate(field_segments):
@@ -412,11 +451,26 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
             splice_args = ", ".join(segment_vars)
             lines.append(f"clip = core.std.Splice([{splice_args}], mismatch=False)")
             lines.append("clip = core.std.SetFieldBased(clip, 0)")  # FIX-P6-6
+            # FIX-W11: enforce PTS continuity after Splice per v7.32 §3.10.1/§3.10.13
+            # ("std.Splice() 拼接,同步修正 PTS"). AssumeFPS rebuilds PTS from the
+            # source frame rate (QTGMC doubles; FpsDivisor=2 restores original rate,
+            # FpsDivisor=1 keeps 2x). CFR assumption — VFR sources need fuller handling.
+            _seg_fps = params.get("original_fps", params.get("fps", 0)) or 0
+            if _seg_fps > 0 and fps_divisor != 2:
+                _seg_fps = _seg_fps * 2  # QTGMC bob doubles; FpsDivisor!=2 keeps double
+            _fps_num, _fps_den = _fps_to_rational(_seg_fps)
+            lines.append(f"clip = core.std.AssumeFPS(clip, fpsnum={_fps_num}, fpsden={_fps_den})")
             lines.append("")
         else:
             use_segmented = False
 
     if not use_segmented and not is_psf and field_order in ("tt", "bb") and deinterlace == "QTGMC":
+        # FIX-W15: force InputType=0 for true interlaced (tt/bb) per v7.32 §3.10.1.
+        # config may set qtgmc_input_type=1/2 (progressive/residual), which is wrong
+        # for true interlaced and would cause deinterlace errors.
+        if qtgmc_input_type != 0:
+            params["_qtgmc_input_type_override"] = (qtgmc_input_type, 0)
+            qtgmc_input_type = 0
         lines.append("# Deinterlace with QTGMC")
         if qtgmc_input_type == 0 and qtgmc_clear_fieldbased:
             field_based_val = 2 if field_order == "tt" else 1
@@ -489,10 +543,18 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("")
 
     # Color space conversion: BT.601 -> BT.709
-    # FIX-P6-2: Skip conversion if source is already BT.709 per v7.32 §3.10.3
-    # ORIGINAL: Always applied BT.601→BT.709 conversion even for BT.709 sources
-    if matrix_in == "709":
-        lines.append("# Source is already BT.709, no color conversion needed")
+    # FIX-W14: BT.709 source still needs range conversion if source is full range
+    # per v7.32 §3.10.3 / v6.32 §7.19 ("严禁忽略 range 转换"). ORIGINAL skipped ALL
+    # conversion for matrix_in=="709", leaving full-range BT.709 sources as full
+    # range (output must be limited), causing black-level misalignment downstream.
+    if matrix_in == "709" and color_range != "full":
+        lines.append("# Source is already BT.709 limited range, no color conversion needed")
+    elif matrix_in == "709" and color_range == "full":
+        # BT.709 full range -> limited range (matrix identity, range conversion only)
+        lines.append("# BT.709 source: range-only conversion (full -> limited)")
+        lines.append(f"clip = core.resize.Bicubic(clip, "
+                    f"matrix_in_s='709', matrix_s='709', "
+                    f"range_in={range_in_str}, range={range_out_str})")
     else:
         lines.append("# BT.601 -> BT.709 color space conversion")
         lines.append(f"clip = core.resize.Bicubic(clip, "
@@ -745,6 +807,22 @@ def main():
                       "defaulting to limited per v6.32 §7.19")
         params.pop("_color_range_unknown", None)
 
+    # FIX-W10: log when vs_bit_depth was upgraded to 16 per v7.32 §3.10.1
+    if params.get("_vs_bit_depth_upgraded"):
+        _req_bd, _act_bd = params["_vs_bit_depth_upgraded"]
+        logger.warning("STAGE1_BITDEPTH_UPGRADED",
+                      f"vs_bit_depth {_req_bd} < 16, upgraded to {_act_bd} "
+                      "per v7.32 §3.10.1 (16bit processing space mandatory)")
+        params.pop("_vs_bit_depth_upgraded", None)
+
+    # FIX-W15: log when qtgmc_input_type was forced to 0 for tt/bb per v7.32 §3.10.1
+    if params.get("_qtgmc_input_type_override"):
+        _req_it, _act_it = params["_qtgmc_input_type_override"]
+        logger.warning("STAGE1_INPUTTYPE_OVERRIDE",
+                      f"qtgmc_input_type {_req_it} invalid for tt/bb true interlaced, "
+                      f"forced to {_act_it} per v7.32 §3.10.1")
+        params.pop("_qtgmc_input_type_override", None)
+
     # FIX-P6-8: Log warning for unknown field_order
     if params.get("field_order") == "unknown":
         logger.warning("STAGE1_UNKNOWN_FIELD_ORDER",
@@ -809,8 +887,18 @@ def main():
                 ivtc_threshold = params.get("ivtc_fallback_threshold", {})
                 is_good, stats = check_ivtc_quality(inter_path, logger, ivtc_threshold)
                 if not is_good:
-                    logger.warning("STAGE1_IVTC_FALLBACK",
-                                  f"IVTC quality check failed (stats={stats}), regenerating with sRestore")
+                    # FIX-W9: use the canonical IVTC_AUTO_FALLBACK event name per
+                    # v7.32 §3.10.13 / v6.32 §7.13 ("日志记录 IVTC_AUTO_FALLBACK 事件,
+                    # 包含残留率与回退原因"). ORIGINAL used STAGE1_IVTC_FALLBACK, which
+                    # audit filters for IVTC_AUTO_FALLBACK would miss (the pre-check
+                    # path already used IVTC_AUTO_FALLBACK via main.py).
+                    _tff_bff_residual = stats.get("tff", 0) + stats.get("bff", 0)
+                    _ivtc_total = sum(stats.values()) or 1
+                    logger.warning("IVTC_AUTO_FALLBACK",
+                                  "IVTC quality check failed, regenerating with sRestore",
+                                  tff_bff_residual_pct=round(_tff_bff_residual / _ivtc_total * 100, 1),
+                                  progressive_pct=round(stats.get("progressive", 0) / _ivtc_total * 100, 1),
+                                  reason="VFM output idet TFF+BFF>10% or Progressive<90%")
                     # Regenerate with sRestore
                     srestore_params = dict(params)
                     srestore_params["ivtc"] = "sRestore"

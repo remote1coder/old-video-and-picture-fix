@@ -35,11 +35,17 @@ from logger import get_logger  # noqa: E402
 
 
 def feather_blend(original_path: str, restored_path: str, output_path: str,
-                  feather_width: int = 8) -> bool:
+                  feather_width: int = 8, bit_depth: int = 8) -> bool:
     """Blend restored face region back into original image with feathering.
 
     Uses per-pixel absolute difference to detect modified regions,
     then applies Gaussian blur to the mask edge for smooth transition.
+
+    FIX-M12-11: When bit_depth==16, the blended result is saved as a 16-bit
+    TIFF container (8bit value × 257 → 16bit) to preserve the 16bit chain
+    through stage1-stage5 per the photo-pipeline bit-depth rule. GFPGAN/
+    CodeFormer outputs are 8bit; upconverting at save avoids downstream
+    re-read downgrading.
     """
     try:
         import numpy as np
@@ -82,8 +88,21 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
         blended = mask_smooth * rest_arr + (1.0 - mask_smooth) * orig_arr
         blended = np.clip(blended, 0, 255).astype(np.uint8)
 
-        result = Image.fromarray(blended)
-        result.save(output_path)
+        # FIX-M12-11: Save as 16-bit TIFF container when bit_depth==16 to
+        # preserve the 16bit chain (8bit × 257 → 16bit). ORIGINAL: always
+        # saved 8bit PNG, breaking the 16bit chain at stage4.
+        if bit_depth == 16:
+            blended_16 = (blended.astype(np.uint16) * 257).astype(np.uint16)
+            try:
+                import tifffile
+                tifffile.imwrite(output_path, blended_16)
+            except Exception:
+                # Fallback: per-channel I;16 via PIL (single channel only)
+                Image.fromarray(blended_16[:, :, 0], mode='I;16').save(
+                    output_path)
+        else:
+            result = Image.fromarray(blended)
+            result.save(output_path)
         return True
     except Exception:
         # Fallback: direct copy if blending fails
@@ -461,8 +480,12 @@ def main():
         return 82
 
     # FIX-P10-1: step number is now 4
+    # FIX-M12-11: Use .tif extension when photo_bit_depth==16 to preserve the
+    # 16bit chain (stage1-stage5). ORIGINAL: hardcoded .png (8bit only).
+    bit_depth = params.get("photo_bit_depth", 8)
+    out_ext = "tif" if bit_depth == 16 else "png"
     output_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step4_face.png")
+        f"{job_id}_{Path(input_name).stem}_step4_face.{out_ext}")
 
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return 3
@@ -503,8 +526,9 @@ def main():
 
     face_dir = os.path.join(temp_dir, f"{job_id}_face")
     os.makedirs(face_dir, exist_ok=True)
+    # FIX-M12-11: blended intermediate also uses .tif for 16bit chain.
     blended_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step4_face_blended.png")
+        f"{job_id}_{Path(input_name).stem}_step4_face_blended.{out_ext}")
 
     success = False
     if face_restore == "GFPGAN":
@@ -514,7 +538,8 @@ def main():
                 key=lambda p: p.stat().st_mtime, reverse=True)
             if face_files:
                 if feather_blend(input_source, str(face_files[0]),
-                                 blended_path, feather_width=8):
+                                 blended_path, feather_width=8,
+                                 bit_depth=bit_depth):
                     success = True
                 else:
                     logger.error("STAGE4_BLEND_FAIL",
@@ -528,7 +553,8 @@ def main():
                 key=lambda p: p.stat().st_mtime, reverse=True)
             if face_files:
                 if feather_blend(input_source, str(face_files[0]),
-                                 blended_path, feather_width=8):
+                                 blended_path, feather_width=8,
+                                 bit_depth=bit_depth):
                     success = True
                 else:
                     logger.error("STAGE4_BLEND_FAIL",

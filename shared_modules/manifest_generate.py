@@ -157,6 +157,50 @@ def _get_duration(input_path: str, classification: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _truncate_jsonl_line(job: Dict[str, Any]) -> str:
+    """Truncate oversized fields so a JSONL line stays <= 1MB.
+
+    FIX-G16: per v7.32 §3.10.19, when a JSONL line exceeds 1MB, replace the
+    largest offending top-level field (by serialized footprint — covers
+    dict/list/string values like recommended_params or field_segments) with a
+    ``<truncated_field name=... len=... sha=...>`` placeholder preserving the
+    field name, original byte length, and a SHA-256 prefix-8 fingerprint, and
+    append a ``_truncated_meta`` record. Repeats until under the limit or no
+    large field remains.
+    """
+    import hashlib
+    MAX = 1024 * 1024
+    job = dict(job)  # shallow copy; only top-level values are swapped
+    truncated_meta: List[Dict[str, Any]] = []
+
+    def _serialize() -> str:
+        return json.dumps(job, ensure_ascii=False)
+
+    while len(_serialize().encode("utf-8")) > MAX:
+        candidate = None  # (key, value, size, serialized)
+        for k, v in job.items():
+            if k == "_truncated_meta":
+                continue
+            try:
+                serialized = json.dumps(v, ensure_ascii=False)
+            except (TypeError, ValueError):
+                continue
+            size = len(serialized.encode("utf-8"))
+            if candidate is None or size > candidate[2]:
+                candidate = (k, v, size, serialized)
+        # Stop if nothing left to truncate (or remaining fields are tiny)
+        if candidate is None or candidate[2] < 256:
+            break
+        k, _v, size, serialized = candidate
+        h = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:8]
+        job[k] = f"<truncated_field name={k} len={size} sha={h}>"
+        truncated_meta.append({"field": k, "orig_bytes": size, "sha256_prefix8": h})
+
+    if truncated_meta:
+        job["_truncated_meta"] = truncated_meta
+    return _serialize()
+
+
 def generate_manifest(input_dirs: List[str], output_path: str,
                       config: Dict[str, Any],
                       pipeline_type: str = "video",
@@ -219,6 +263,10 @@ def generate_manifest(input_dirs: List[str], output_path: str,
 
     output_dir = config.get("global", {}).get("output_dir", "./output")
     log_dir = config.get("global", {}).get("log_dir", "./logs")
+    # FIX-L9: record temp_dir on each job so manifest_loader can locate
+    # intermediates when the user used --temp-dir or a non-default config
+    # (otherwise loader falls back to ./temp and silently misses them).
+    temp_dir = config.get("global", {}).get("temp_dir", "./temp")
 
     job_id = 0
     for inp_dir in input_dirs:
@@ -300,6 +348,7 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                     "recommended_params": path_params,
                     "user_overrides": {},
                     "output_path": job_out_path,
+                    "temp_dir": temp_dir,  # FIX-L9: per-job temp_dir for loader
                     "log_path": str(Path(log_dir) / f"job_{job_id:03d}.log"),
                     "error_message": "",
                     "skip_reason": skip_reason,  # FIX-P4-13: v7.32 §3.4.3
@@ -344,12 +393,20 @@ def generate_manifest(input_dirs: List[str], output_path: str,
     try:
         if output_path.endswith(".jsonl"):
             # FIX-P4-7: JSONL stores only job lines; meta goes to separate .meta.json
-            meta_path = str(out_path.with_suffix(".meta.json"))
-            with open(meta_path, "w", encoding="utf-8") as fh:
+            # FIX-G13/L12: write .meta.json atomically (.tmp + replace) so a crash
+            # mid-write cannot leave meta inconsistent with the jobs file.
+            meta_path = out_path.with_suffix(".meta.json")
+            meta_tmp = meta_path.parent / (meta_path.name + ".tmp")
+            with open(meta_tmp, "w", encoding="utf-8") as fh:
                 json.dump(manifest["meta"], fh, ensure_ascii=False, indent=2)
+            meta_tmp.replace(meta_path)
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 for job in manifest["jobs"]:
-                    fh.write(json.dumps(job, ensure_ascii=False) + "\n")
+                    line = json.dumps(job, ensure_ascii=False)
+                    # FIX-G16: enforce 1MB JSONL line limit per v7.32 §3.10.19
+                    if len(line.encode("utf-8")) > 1024 * 1024:
+                        line = _truncate_jsonl_line(job)
+                    fh.write(line + "\n")
         else:
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 yaml.dump(manifest, fh, allow_unicode=True, sort_keys=False)

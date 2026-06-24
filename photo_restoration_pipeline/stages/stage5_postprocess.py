@@ -297,16 +297,19 @@ def _match_portrait_color(image_path: str, face_boxes: list,
                 continue
 
             # Convert to LAB using OpenCV
+            # FIX-M12-11: Do LAB conversion on float32 (not uint8) to avoid
+            # truncation per round_12 M-12-11. cv2 float32 LAB uses ranges
+            # L∈[0,100], a/b∈[-128,127] (uint8 LAB offsets a/b to [0,255]).
+            # ORIGINAL: astype(np.uint8) truncated before LAB + clamped all
+            # channels to [0,255] (wrong for float a/b which can be negative).
             face_bgr = cv2.cvtColor(
-                face_roi.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                face_roi.astype(np.float32), cv2.COLOR_RGB2BGR)
             neck_bgr = cv2.cvtColor(
-                neck_roi.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            face_lab = cv2.cvtColor(
-                face_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-            neck_lab = cv2.cvtColor(
-                neck_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+                neck_roi.astype(np.float32), cv2.COLOR_RGB2BGR)
+            face_lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB)
+            neck_lab = cv2.cvtColor(neck_bgr, cv2.COLOR_BGR2LAB)
 
-            # Mean/std matching per channel
+            # Mean/std matching per channel (range-agnostic)
             matched_lab = face_lab.copy()
             for c in range(3):
                 f_mean = face_lab[:, :, c].mean()
@@ -317,16 +320,14 @@ def _match_portrait_color(image_path: str, face_boxes: list,
                     (matched_lab[:, :, c] - f_mean) * (n_std / f_std)
                     + n_mean)
 
-            # Clamp LAB valid ranges
-            matched_lab[:, :, 0] = np.clip(matched_lab[:, :, 0], 0, 255)
-            matched_lab[:, :, 1] = np.clip(matched_lab[:, :, 1], 0, 255)
-            matched_lab[:, :, 2] = np.clip(matched_lab[:, :, 2], 0, 255)
+            # Clamp LAB valid ranges (float32 convention)
+            matched_lab[:, :, 0] = np.clip(matched_lab[:, :, 0], 0, 100)
+            matched_lab[:, :, 1] = np.clip(matched_lab[:, :, 1], -128, 127)
+            matched_lab[:, :, 2] = np.clip(matched_lab[:, :, 2], -128, 127)
 
-            # Convert back to RGB
-            matched_bgr = cv2.cvtColor(
-                matched_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-            matched_rgb = cv2.cvtColor(
-                matched_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+            # Convert back to RGB (float32, no uint8 cast)
+            matched_bgr = cv2.cvtColor(matched_lab, cv2.COLOR_LAB2BGR)
+            matched_rgb = cv2.cvtColor(matched_bgr, cv2.COLOR_BGR2RGB)
 
             corrected[y1:y2, x1:x2] = matched_rgb
             face_mask[y1:y2, x1:x2] = 1.0
@@ -352,7 +353,20 @@ def _match_portrait_color(image_path: str, face_boxes: list,
         if logger:
             logger.warning("STAGE5_COLOR_MATCH_FAIL",
                           f"Portrait color matching failed: {e}")
+        # FIX-H12-04: Scheme C half-automatic fallback per v7.32 §3.10.7.
+        # Output the face-restored image as _face_restored.tif so the user
+        # can manually Match Color in GIMP/PS and drop it back. The main
+        # flow continues using the original (uncolor-matched) image.
+        # ORIGINAL: silently copied the original to output_path with no
+        # handoff artifact, giving the user no way to finish color matching.
         try:
+            fallback_tif = output_path.rsplit(".", 1)[0] + "_face_restored.tif"
+            shutil.copyfile(image_path, fallback_tif)
+            if logger:
+                logger.warning("STAGE5_FACE_RESTORED_TIF",
+                               f"半自动兜底：已输出 {fallback_tif}，请在 "
+                               f"GIMP/PS 手工 Match Color 后放回继续流程 "
+                               f"(v7.32 §3.10.7 方案C)")
             # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
             shutil.copyfile(image_path, output_path)
             return True

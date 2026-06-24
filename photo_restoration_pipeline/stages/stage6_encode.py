@@ -168,20 +168,31 @@ def main():
     # Bug 11.21 fix: pre-check avifenc existence
     if not shutil.which("avifenc"):
         logger.error("STAGE6_AVIFENC_MISSING", "avifenc not found in PATH")
-        # Try fallback to PNG immediately
-        output_path = params.get("output_path", "")
-        if not output_path:
-            output_dir = params.get("output_dir", "./output")
-            os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir,
-                f"{Path(input_name).stem}_restored.png")
-        try:
-            shutil.copyfile(args.input, output_path)
-            logger.warning("STAGE6_FALLBACK", f"avifenc missing, saved PNG: {output_path}")
-            return 0
-        except Exception as e:
-            logger.error("STAGE6_FAILED", f"Encoding failed: {e}")
-            return 80
+        # FIX-H12-05: avifenc missing is a dependency-missing failure → exit 80
+        # per v7.32 §3.10.18. ORIGINAL: silently saved a PNG fallback and
+        # returned 0, masking the missing dependency from the upper layer.
+        return 80
+
+    # FIX-L12-16: WSL2 redirect for temp_dir per v7.32 §3.10.10. stage6 reads
+    # its input intermediate from temp_dir; if temp_dir is under /mnt/ it must
+    # be redirected to a Linux native partition (matching stage1-5) so the
+    # glob below finds files written by prior stages. ORIGINAL: only
+    # output_path was redirected, so temp_dir globs could miss redirected
+    # intermediates and return 82 (NO_INPUT).
+    no_wsl_redirect = params.get("no_wsl_redirect", False)
+    _platform = params.get("platform", "auto")
+    try:
+        _redir_temp, _orig_temp, _, _ = wsl_redirect_path(
+            temp_dir, no_wsl_redirect=no_wsl_redirect,
+            target_platform=_platform
+        )
+        if _redir_temp != temp_dir:
+            logger.info("STAGE6_WSL_REDIRECT_TEMP",
+                        f"temp_dir: {temp_dir} -> {_redir_temp}")
+            temp_dir = _redir_temp
+            params["temp_dir"] = temp_dir
+    except Exception:
+        pass  # wsl_redirect_path may be unavailable on native Windows
 
     # FIX-P10-1: Updated search order for new stage numbering
     # Find input: stage5_postprocess > stage4_face > stage3_upscale > stage2_ai_pre > stage1_preprocess
@@ -300,29 +311,14 @@ def main():
         logger.info("STAGE6_DONE", "Photo encoding complete", output=output_path)
         return 0
     else:
-        # Fallback if avifenc fails
-        # ISSUE-P-S6-002: Use TIFF fallback for 16-bit sources to preserve bit depth
-        try:
-            from PIL import Image
-            img = Image.open(working_path)
-            is_16bit = (img.mode == "I;16") or (img.mode in ("RGB", "RGBA") and img.bits >= 16)
-            if is_16bit:
-                fallback_path = output_path.rsplit(".", 1)[0] + ".tif"
-                img.save(fallback_path, format="TIFF", compression="tiff_lzw")
-                logger.warning("STAGE6_FALLBACK", f"avifenc failed, saved 16-bit TIFF fallback: {fallback_path}")
-            else:
-                fallback_path = output_path.rsplit(".", 1)[0] + ".png"
-                import shutil
-                shutil.copyfile(working_path, fallback_path)
-                logger.warning("STAGE6_FALLBACK", f"avifenc failed, saved PNG fallback: {fallback_path}")
-            # WSL copyback for fallback too (Bug P-29 fix)
-            if original_output_path:
-                orig_fallback = original_output_path.rsplit(".", 1)[0] + Path(fallback_path).suffix
-                wsl_copy_back(fallback_path, orig_fallback)
-            return 0
-        except Exception as e:
-            logger.error("STAGE6_FAILED", f"Encoding failed: {e}")
-            return 84
+        # FIX-H12-05: avifenc encoding failure must return 84 (encoding error)
+        # per v7.32 §3.10.18, NOT silently fall back to TIFF/PNG and return 0.
+        # ORIGINAL: saved a TIFF/PNG fallback and returned 0, masking the
+        # encoding failure from the upper layer (which could never tell the
+        # AVIF was not produced). The 16bit TIFF archive (if any) is already
+        # generated above before avifenc runs, so archival output survives.
+        logger.error("STAGE6_AVIF_FAIL", "avifenc encoding failed")
+        return 84
 
 
 if __name__ == "__main__":

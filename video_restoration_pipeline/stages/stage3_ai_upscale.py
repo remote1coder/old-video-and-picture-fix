@@ -37,6 +37,8 @@ import subprocess
 import re
 import shutil
 import time
+import errno
+import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Union
 
@@ -63,26 +65,88 @@ def estimate_gpu_memory(width: int, height: int, scale: int,
     return base + weight
 
 
-def check_gpu_memory(required_bytes: int, logger=None) -> tuple:
-    """Check GPU availability. Returns (sufficient: bool, backend: str).
+def _query_nvidia_smi_free_bytes(logger=None):
+    """FIX-R8-F1: Three-tier nvidia-smi fallback per v7.32 §3.10.23 / v6.32 §7.14.
 
-    Backend priority: cuda > rocm > mps > cpu.
-    Bug 13.30/13.31 fix: Detect PyTorch version, ROCm, and MPS.
+    Unit contract (baseline §G): nvidia-smi returns MiB → ×1024×1024 to bytes;
+    pynvml returns bytes. Returns bytes (matching check_gpu_memory's byte
+    contract). Never mix MiB/bytes — a mismatch inflates 1048576×.
+      1) --query-gpu=memory.free --format=csv,noheader,nounits (MiB)
+      2) Full-table MiB field parse
+      3) pynvml library
+    Returns None if all three fail.
     """
-    # 1. nvidia-smi (native CUDA)
+    # Level 1: --query-gpu
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10, shell=False
         )
-        if r.returncode == 0:
+        if r.returncode == 0 and r.stdout.strip():
             free_mib = float(r.stdout.strip().split("\n")[0].strip())
-            free_bytes = int(free_mib * 1024 * 1024)
-            if free_bytes >= required_bytes * 1.2:
-                return True, "cuda"
-    except Exception:
-        pass
+            return int(free_mib * 1024 * 1024)  # MiB → bytes
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE3_NVSMI_QUERY_FAIL",
+                           f"nvidia-smi --query-gpu failed: {e}")
+    # Level 2: full-table MiB field
+    try:
+        r = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True, text=True, timeout=10, shell=False
+        )
+        if r.returncode == 0:
+            mib_match = re.search(r"(\d+)\s*MiB", r.stdout)
+            if mib_match:
+                free_mib = float(mib_match.group(1))
+                if logger:
+                    logger.warning("STAGE3_NVSMI_TABLE_FALLBACK",
+                                   "Falling back to full table MiB parse")
+                return int(free_mib * 1024 * 1024)
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE3_NVSMI_TABLE_FAIL",
+                           f"nvidia-smi table parse failed: {e}")
+    # Level 3: pynvml
+    try:
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        if logger:
+            logger.warning("STAGE3_NVSMI_PYNVML_FALLBACK",
+                           "Falling back to pynvml")
+        return int(info.free)
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE3_NVSMI_PYNVML_FAIL",
+                           f"pynvml failed: {e}")
+    return None
+
+
+def check_gpu_memory(required_bytes: int, logger=None) -> tuple:
+    """Check GPU availability. Returns (sufficient: bool, backend: str).
+
+    Backend priority: cuda > rocm > mps > cpu.
+    FIX-R8-F1: three-tier nvidia-smi fallback (query-gpu → table MiB → pynvml).
+    FIX-R8-F2: each backend downgrade logs WARNING per v7.32 §3.5 / §3.10.23.
+    Bug 13.30/13.31 fix: Detect PyTorch version, ROCm, and MPS.
+    """
+    # 1. nvidia-smi (native CUDA) — three-tier fallback
+    free_bytes = _query_nvidia_smi_free_bytes(logger)
+    if free_bytes is not None:
+        if free_bytes >= required_bytes * 1.2:
+            return True, "cuda"
+        if logger:
+            logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                           "nvidia-smi reports insufficient VRAM, trying PyTorch backends",
+                           target="torch.cuda")
+    else:
+        if logger:
+            logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                           "nvidia-smi unavailable (all 3 tiers failed), trying PyTorch backends",
+                           target="torch.cuda")
 
     # 2. PyTorch backends (cuda / rocm / mps)
     try:
@@ -102,8 +166,15 @@ def check_gpu_memory(required_bytes: int, logger=None) -> tuple:
                     free, total = torch.cuda.mem_get_info()
                     if free >= required_bytes * 1.2:
                         return True, "cuda"
-                except Exception:
-                    pass
+                    if logger:
+                        logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                                       "torch.cuda mem_get_info reports insufficient VRAM, trying ROCm",
+                                       target="rocm")
+                except Exception as e:
+                    if logger:
+                        logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                                       f"torch.cuda mem_get_info failed ({e}), trying ROCm",
+                                       target="rocm")
             else:
                 if logger:
                     logger.warning("STAGE3_PYTORCH_OLD",
@@ -111,14 +182,21 @@ def check_gpu_memory(required_bytes: int, logger=None) -> tuple:
                                    "skipping torch.cuda.mem_get_info()")
 
         # ROCm (AMD GPU)
-        if hasattr(torch.version, "hip") and torch.version.hip is not None:
+        if getattr(torch.version, "hip", None) is not None:
             if has_mem_get_info:
                 try:
                     free, total = torch.cuda.mem_get_info()
                     if free >= required_bytes * 1.2:
                         return True, "rocm"
-                except Exception:
-                    pass
+                    if logger:
+                        logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                                       "ROCm insufficient, trying MPS",
+                                       target="mps")
+                except Exception as e:
+                    if logger:
+                        logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                                       f"ROCm mem_get_info failed ({e}), trying MPS",
+                                       target="mps")
 
         # Apple Metal (MPS)
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -132,19 +210,41 @@ def check_gpu_memory(required_bytes: int, logger=None) -> tuple:
                                  * _os.sysconf('SC_PHYS_PAGES'))
                     if total_mem * 0.7 >= required_bytes * 1.2:
                         return True, "mps"
+                    if logger:
+                        logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                                       "MPS unified memory insufficient, falling back to CPU",
+                                       target="cpu")
                 else:
                     # Windows/other: assume sufficient (no API available)
                     return True, "mps"
-            except Exception:
-                pass
+            except Exception as e:
+                if logger:
+                    logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                                   f"MPS check failed ({e}), falling back to CPU",
+                                   target="cpu")
+            if logger:
+                logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                               "MPS unavailable or insufficient, falling back to CPU",
+                               target="cpu")
             return False, "cpu"
 
         # CPU-only PyTorch detection
         if "cpu" in torch_ver.lower():
+            if logger:
+                logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                               "CPU-only PyTorch, no GPU backend available",
+                               target="cpu")
             return False, "cpu"
-    except Exception:
-        pass
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                           f"PyTorch backend detection failed ({e}), falling back to CPU",
+                           target="cpu")
 
+    if logger:
+        logger.warning("STAGE3_BACKEND_DOWNGRADE",
+                       "No GPU backend available, using CPU",
+                       target="cpu")
     return False, "cpu"
 
 
@@ -241,6 +341,20 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 "    gc.collect()\n"
                 "    if torch.cuda.is_available():\n"
                 "        torch.cuda.empty_cache()\n"
+                # FIX-R8-W2: prefer torch.cuda.OutOfMemoryError (RuntimeError
+                # subclass) so non-English OOM messages aren't missed; keep
+                # RuntimeError string match as <1.13 fallback. Per baseline §G,
+                # OOM must NOT be swallowed by `except Exception`.
+                "except torch.cuda.OutOfMemoryError:\n"
+                "    try:\n"
+                "        del upsampler\n"
+                "    except NameError:\n"
+                "        pass\n"
+                "    gc.collect()\n"
+                "    if torch.cuda.is_available():\n"
+                "        torch.cuda.empty_cache()\n"
+                "    import time as _t; _t.sleep(0.1)\n"
+                "    sys.exit(83)  # FIX-P8-1: GPU OOM per v6.32 §7.14\n"
                 "except RuntimeError as e:\n"
                 "    if 'out of memory' in str(e).lower():\n"
                 "        try:\n"
@@ -250,6 +364,7 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 "        gc.collect()\n"
                 "        if torch.cuda.is_available():\n"
                 "            torch.cuda.empty_cache()\n"
+                "        import time as _t; _t.sleep(0.1)\n"
                 "        sys.exit(83)  # FIX-P8-1: GPU OOM per v6.32 §7.14\n"
                 "    raise\n"
             )
@@ -354,6 +469,18 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "    gc.collect()\n"
                 "    if torch.cuda.is_available():\n"
                 "        torch.cuda.empty_cache()\n"
+                # FIX-R8-W2: prefer torch.cuda.OutOfMemoryError; RuntimeError
+                # string match as <1.13 fallback (baseline §G, no swallow).
+                "except torch.cuda.OutOfMemoryError:\n"
+                "    try:\n"
+                "        del upsampler\n"
+                "    except NameError:\n"
+                "        pass\n"
+                "    gc.collect()\n"
+                "    if torch.cuda.is_available():\n"
+                "        torch.cuda.empty_cache()\n"
+                "    import time as _t; _t.sleep(0.1)\n"
+                "    sys.exit(83)  # FIX-P8-1: GPU OOM exit code\n"
                 "except RuntimeError as e:\n"
                 "    if 'out of memory' in str(e).lower():\n"
                 "        try:\n"
@@ -363,6 +490,7 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "        gc.collect()\n"
                 "        if torch.cuda.is_available():\n"
                 "            torch.cuda.empty_cache()\n"
+                "        import time as _t; _t.sleep(0.1)\n"
                 "        sys.exit(83)  # FIX-P8-1: GPU OOM exit code\n"
                 "    raise\n"
             )
@@ -684,9 +812,25 @@ def main():
         if not force_allow:
             return 81  # Parameter error
 
+    # FIX-R8-W4: anime model ban per v6.32 Part 4 — anime models strictly
+    # prohibited for non-anime video sources (real-person content).
+    model_requested = params.get("upscale_model", "realesr-general-x4v3")
+    is_anime_source = detected_class in ("ANIME", "ILLUSTRATION", "CELL_ANIMATION")
+    if "anime" in model_requested.lower() and not is_anime_source:
+        logger.error("STAGE3_ANIME_MODEL_BANNED",
+                    f"Anime model '{model_requested}' is strictly prohibited "
+                    "for non-anime video sources per v6.32 Part 4. "
+                    "Use realesr-general-x4v3 (default) for real-person content; "
+                    "RealESRGAN_x2plus/x4plus as optional backup.")
+        return 81  # parameter error (non-retryable)
+
     # Dual-basis ban: manifest flag OR original dims OR intermediate dims
     # Per v7.32 §3.10.2: either original or intermediate triggers ban
-    intermediate_banned = (target_w > 1920 or target_h > 1080)
+    # FIX-R8-W1 (方案A): intermediate_banned uses the AI-stage INPUT file
+    # pixel dims (width/height), NOT the upscaled target dims — per spec
+    # "以AI超分步骤的输入中间文件的像素尺寸为基准". Analogue-tape 4x is already
+    # hard-banned above; this catches a >1080p intermediate fed to AI.
+    intermediate_banned = (width > 1920 or height > 1080)
     combined_banned = ai_banned or original_banned or intermediate_banned
 
     # Layer 2 (default guard): skip when banned and not forced
@@ -700,18 +844,54 @@ def main():
     # FIX-P8-3: Layer 3 (force override): CRITICAL + WARNING dual log
     # Per v7.32 §3.10.2 L3: must emit CRITICAL + WARNING
     # ORIGINAL: Only had CRITICAL log, missing WARNING for quality risk
+    # FIX-R8-W3: explicit operation_time field per §3.10.2 L3 "永久记录操作时间"
+    # FIX-R8-M3: permanent audit archive (independent file, survives job log rotation)
+    #             per §3.10.2 L3 "所有强制覆盖操作日志永久归档"
     if combined_banned and force_allow:
+        op_time = datetime.datetime.now().isoformat()
         logger.critical("STAGE3_FORCE",
                        "Force-allowing banned upscale per user override",
+                       operation_time=op_time,
                        original_width=params.get("original_width"),
                        original_height=params.get("original_height"),
                        intermediate_width=width,
                        intermediate_height=height,
-                       upscale_scale=scale)
+                       upscale_scale=scale,
+                       job_id=job_id,
+                       input_name=input_name)
         logger.warning("STAGE3_FORCE_RISK",
                       "Quality risk: forced upscale may produce AI "
                       "artifacts, plastic textures, temporal flickering, "
                       "or loss of historical authenticity")
+        # R8-M3: permanent audit archive
+        try:
+            audit_dir = Path("logs/forced_upscale_audit")
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            audit_record = {
+                "operation_time": op_time,
+                "job_id": job_id,
+                "input_name": input_name,
+                "detected_class": detected_class,
+                "original_width": params.get("original_width"),
+                "original_height": params.get("original_height"),
+                "intermediate_width": width,
+                "intermediate_height": height,
+                "upscale_scale": scale,
+                "upscale_model": model_requested,
+                "combined_banned_reason": {
+                    "ai_banned": ai_banned,
+                    "original_banned": original_banned,
+                    "intermediate_banned": intermediate_banned,
+                },
+            }
+            audit_file = audit_dir / f"{job_id}_forced_upscale_audit.json"
+            with open(audit_file, "w", encoding="utf-8") as af:
+                json.dump(audit_record, af, ensure_ascii=False, indent=2)
+            logger.info("STAGE3_FORCE_ARCHIVED",
+                        f"Forced upscale audit archived to {audit_file}")
+        except Exception as ae:
+            logger.warning("STAGE3_FORCE_ARCHIVE_FAIL",
+                           f"Failed to archive forced upscale audit: {ae}")
 
     # GPU memory check
     mem_required = estimate_gpu_memory(width, height, scale, model)
@@ -892,8 +1072,15 @@ def main():
             shutil.rmtree(win_output_dir, ignore_errors=True)
 
     if not all_success:
-        logger.error("STAGE3_PARTIAL_FAIL",
-                     "Some windows failed to upscale")
+        # FIX-R8-W2: partial window failure (e.g. CPU OOM after downgrade)
+        # must mark FAILED per v7.32 §3.10.18, not return 0 with incomplete
+        # output. ORIGINAL: only logged error and continued to encode,
+        # producing incomplete results treated as success.
+        logger.error("STAGE3_PARTIAL_FAIL_FAILED",
+                     "AI upscale produced incomplete output (some windows "
+                     "failed/OOM after CPU downgrade). Marking FAILED per "
+                     "v7.32 §3.10.18.")
+        return 83  # GPU error (incl. OOM failure)
 
     # Verify we have output frames
     output_frames = sorted(Path(output_dir).glob("*.png"))
@@ -1024,6 +1211,12 @@ def main():
                          f"Failed to encode MKV: {r.stderr[:300]}")
             return 84
     except Exception as e:
+        # FIX-R8-M2: disk-full (errno 28) is non-retryable per v7.32 §3.10.18
+        if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+            logger.error("STAGE3_DISK_FULL",
+                         "Disk full (errno 28) during encode. Non-retryable "
+                         "per v7.32 §3.10.18.")
+            return 87  # resource exhausted (non-retryable)
         logger.error("STAGE3_ENCODE_ERROR", str(e))
         return 82
 

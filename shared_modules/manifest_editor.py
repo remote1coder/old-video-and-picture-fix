@@ -153,7 +153,10 @@ def interactive_tui(manifest_path: str):
                         title="Interactive Review"))
     
     for i, job in enumerate(jobs):
-        if job.get("status") not in ("PENDING", "FAILED"):
+        # FIX-E8: include SKIP jobs so users can review and re-queue them per
+        # v7.32 §3.4.3.10 (the TUI is the spec-defined core review entry point;
+        # pressing 'y' on a SKIP job resets it to PENDING via existing logic).
+        if job.get("status") not in ("PENDING", "FAILED", "SKIP"):
             continue
         
         table = Table(title=f"Job {i+1}/{len(jobs)}: {job.get('job_id')}")
@@ -255,6 +258,22 @@ def interactive_tui(manifest_path: str):
                     job["updated_at"] = datetime.now().astimezone().isoformat()
                     console.print(f"[green]Class changed from {old_class} to {new_class}[/green]")
                     console.print(f"[yellow]ai_upscale_banned = {job['ai_upscale_banned']}[/yellow]")
+                    # FIX-E11: re-derive field_order/needs_ivtc/is_psf/field_segments
+                    # from the input file so they match the new class (e.g.
+                    # DV_DIGITAL => needs_ivtc recomputed). Reuses
+                    # manifest_generate.classify_item but keeps the user's chosen
+                    # detected_class/confidence. Falls back to a prompt on failure.
+                    try:
+                        from manifest_generate import classify_item
+                        ptype = "photo" if new_class in ("SCAN_PRINT", "DIGITAL_PHOTO") else "video"
+                        reclass = classify_item(job.get("input_path", ""), ptype)
+                        job["field_order"] = reclass.get("field_order", job.get("field_order", "unknown"))
+                        job["needs_ivtc"] = reclass.get("needs_ivtc", job.get("needs_ivtc", False))
+                        job["is_psf"] = reclass.get("is_psf", job.get("is_psf", False))
+                        job["field_segments"] = reclass.get("field_segments", job.get("field_segments", []))
+                        console.print(f"[cyan]field_order={job['field_order']} needs_ivtc={job['needs_ivtc']} is_psf={job['is_psf']}[/cyan]")
+                    except Exception as ce:
+                        console.print(f"[yellow]Could not auto-refresh field_order/needs_ivtc/is_psf ({ce}); please verify manually.[/yellow]")
                 else:
                     console.print("[red]Invalid class[/red]")
                 break
@@ -279,7 +298,10 @@ def _interactive_basic(manifest_path: str):
     print("Commands: y=accept e=edit s=skip p=priority c=class q=quit")
     
     for i, job in enumerate(jobs):
-        if job.get("status") not in ("PENDING", "FAILED"):
+        # FIX-E8: include SKIP jobs so users can review and re-queue them per
+        # v7.32 §3.4.3.10 (the TUI is the spec-defined core review entry point;
+        # pressing 'y' on a SKIP job resets it to PENDING via existing logic).
+        if job.get("status") not in ("PENDING", "FAILED", "SKIP"):
             continue
         
         print(f"\n--- Job {i+1}/{len(jobs)}: {job.get('job_id')} ---")
@@ -370,6 +392,21 @@ def _interactive_basic(manifest_path: str):
                     job["updated_at"] = datetime.now().astimezone().isoformat()
                     print(f"Class changed from {old_class} to {new_class}")
                     print(f"ai_upscale_banned = {job['ai_upscale_banned']}")
+                    # FIX-E11: re-derive field_order/needs_ivtc/is_psf/field_segments
+                    # from the input file so they match the new class. Reuses
+                    # manifest_generate.classify_item but keeps the user's chosen
+                    # detected_class/confidence. Falls back to a prompt on failure.
+                    try:
+                        from manifest_generate import classify_item
+                        ptype = "photo" if new_class in ("SCAN_PRINT", "DIGITAL_PHOTO") else "video"
+                        reclass = classify_item(job.get("input_path", ""), ptype)
+                        job["field_order"] = reclass.get("field_order", job.get("field_order", "unknown"))
+                        job["needs_ivtc"] = reclass.get("needs_ivtc", job.get("needs_ivtc", False))
+                        job["is_psf"] = reclass.get("is_psf", job.get("is_psf", False))
+                        job["field_segments"] = reclass.get("field_segments", job.get("field_segments", []))
+                        print(f"field_order={job['field_order']} needs_ivtc={job['needs_ivtc']} is_psf={job['is_psf']}")
+                    except Exception as ce:
+                        print(f"Could not auto-refresh field_order/needs_ivtc/is_psf ({ce}); please verify manually.")
                 else:
                     print("Invalid class")
                 break

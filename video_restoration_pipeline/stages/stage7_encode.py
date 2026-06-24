@@ -18,6 +18,7 @@ import json
 import argparse
 import subprocess
 import datetime
+import re
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
@@ -130,6 +131,13 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
             hum_result = detect_hum_frequency(audio_path, config=params)
             if hum_result.get("skip_bandreject", False):
                 logger.info("STAGE7_HUM_SKIP", "Hum energy below threshold, skipping bandreject")
+                # FIX-R7-S7-3a: explicit WARNING when no low-frequency content is
+                # detected (hum_ratio==0.0) per v7.32 §3.10.22 — hum_freq stays
+                # null (auto), bandreject skipped, hum removal deferred to afftdn.
+                if float(hum_result.get("hum_ratio", 0.0)) == 0.0:
+                    logger.warning("STAGE7_HUM_NO_LOWFREQ",
+                                   "No low-frequency content detected; hum_freq stays "
+                                   "null (auto), bandreject skipped per v7.32 §3.10.22")
                 detected_freq = None
             else:
                 detected_freq = hum_result.get("primary_freq", 50)
@@ -198,7 +206,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                            f"FFmpeg <4.4 and arnndn model not found at '{arnndn_model}', "
                            f"hum at {detected_freq}Hz will NOT be removed. "
                            f"afftdn will provide general noise reduction only. "
-                           f"Download arnndn models from https://github.com/NullModel/arnndn-models")
+                           f"Download arnndn models from https://github.com/richardpl/arnndn-models (std.rnnn)")
 
     # Noise reduction AFTER bandreject
     noise_reduction = params.get("noise_reduction", True)
@@ -222,7 +230,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                                f"arnndn requires mono input, would downmix "
                                f"{num_channels}ch audio. Using afftdn instead "
                                f"per v7.32 §3.10.9 (no downmix allowed).")
-                audio_filters.append("afftdn=nr=10:nf=-20")
+                audio_filters.append("afftdn=nr=12:nf=-50")
             elif num_channels == 2:
                 # Stereo: arnndn mono limitation, restore after processing
                 audio_filters.append("aformat=channel_layouts=mono")
@@ -234,7 +242,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                 # Mono: use arnndn directly
                 audio_filters.append(f"arnndn=m={arnndn_model}")
         else:
-            audio_filters.append("afftdn=nr=10:nf=-20")
+            audio_filters.append("afftdn=nr=12:nf=-50")
 
     # V-P-053 fix: compand dynamic range compression
     # FIX-P7-8: Default changed to False per v7.32 §3.10.9 (not mandatory)
@@ -290,16 +298,91 @@ def _get_stream_duration(path: str, stream_type: str = "v") -> float:
     return 0.0
 
 
+def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
+    """Detect black bars on the stage7 input for crop/restore around color
+    conversion per v7.32 §3.10.3 ("色域转换前应先自动检测并裁剪黑边,转换完成后
+    还原黑边"). Bit-depth-aware cropdetect limit (limited-range black level
+    scales with bit depth: 16 * 2^(bd-8)).
+    """
+    info = {"left": 0, "right": 0, "top": 0, "bottom": 0,
+            "cropped_w": 0, "cropped_h": 0, "orig_w": 0, "orig_h": 0,
+            "has_bars": False}
+    try:
+        pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,pix_fmt,bits_per_raw_sample",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=30, shell=False)
+        ow = oh = 0
+        bd = 8
+        if pr.returncode == 0:
+            data = json.loads(pr.stdout)
+            streams = data.get("streams", [])
+            if streams:
+                ow = int(streams[0].get("width", 0) or 0)
+                oh = int(streams[0].get("height", 0) or 0)
+                bpr = streams[0].get("bits_per_raw_sample", 0)
+                pf = streams[0].get("pix_fmt", "")
+                try:
+                    bd = int(bpr) if bpr else 8
+                except (ValueError, TypeError):
+                    bd = 8
+                if bd < 8:
+                    bd = 8
+                if not bpr:
+                    if "p16" in pf or "16le" in pf or "16be" in pf:
+                        bd = 16
+                    elif "p10" in pf:
+                        bd = 10
+        info["orig_w"] = ow
+        info["orig_h"] = oh
+        if ow == 0 or oh == 0:
+            return info
+        # Bit-depth-aware cropdetect limit (limited-range black = 16 * 2^(bd-8))
+        limit = 16 * (2 ** (bd - 8))
+        cmd = [
+            "ffmpeg", "-hide_banner", "-v", "info",
+            "-i", video_path,
+            "-vf", f"cropdetect=limit={limit}:round=2:reset=0",
+            "-frames:v", "100", "-f", "null", "-"
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=120, shell=False)
+        crop_match = None
+        for line in r.stderr.split("\n"):
+            m = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", line)
+            if m:
+                crop_match = m
+        if crop_match:
+            cw, ch, cx, cy = map(int, crop_match.groups())
+            if cw < ow or ch < oh:
+                info.update({
+                    "left": cx, "right": ow - cx - cw,
+                    "top": cy, "bottom": oh - cy - ch,
+                    "cropped_w": cw, "cropped_h": ch,
+                    "has_bars": True,
+                })
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE7_CROP_FAIL", f"cropdetect failed: {e}")
+    return info
+
+
 def _get_source_color_info(video_path: str) -> tuple:
     """Probe source color_range and color_primaries via ffprobe.
 
-    Returns (source_color_range, color_standard) where:
+    Returns (source_color_range, color_standard, range_known, primaries_known)
+    where:
     - source_color_range: 'limited' or 'full'
     - color_standard: 'PAL', 'NTSC', or 'BT709'
+    - range_known: True if ffprobe reported color_range
+    - primaries_known: True if ffprobe reported recognizable primaries
 
     FIX-P7-2/P7-7: Added BT.709 recognition per v7.32 §3.10.3.
-    ORIGINAL: only recognized PAL/NTSC, defaulted unknown to NTSC,
-    causing BT.709 sources to get unwanted BT.601→BT.709 conversion.
+    FIX-R7-S7-A1: return range_known/primaries_known flags so the caller can
+    log WARNING for unknown range/primaries per v6.32 §7.19 ("若无法读取源 range
+    属性,默认假设老影像为 limited range,但记录 WARNING").
+    ORIGINAL: only recognized PAL/NTSC, defaulted unknown to NTSC silently.
     """
     try:
         r = subprocess.run(
@@ -314,23 +397,26 @@ def _get_source_color_info(video_path: str) -> tuple:
             if streams:
                 cr = streams[0].get("color_range", "")
                 cp = streams[0].get("color_primaries", "")
+                range_known = bool(cr)
                 source_range = "full" if cr == "pc" else "limited"
+                primaries_known = False
                 # FIX-P7-2/P7-7: Add BT.709 recognition per v7.32 §3.10.3
                 if cp in ("bt709", "1", "9"):
                     color_std = "BT709"
+                    primaries_known = True
                 elif cp in ("bt470bg", "5"):
                     color_std = "PAL"
+                    primaries_known = True
                 elif cp in ("smpte170m", "bt470m", "6", "4"):
                     color_std = "NTSC"
+                    primaries_known = True
                 else:
-                    # Unknown primaries — default NTSC for old footage,
-                    # but log WARNING so user knows this is a guess
+                    # Unknown primaries — default NTSC for old footage
                     color_std = "NTSC"
-                    # Log via caller (cannot access logger here)
-                return source_range, color_std
+                return source_range, color_std, range_known, primaries_known
     except Exception:
         pass
-    return "limited", "NTSC"
+    return "limited", "NTSC", False, False
 
 
 def _validate_av_sync(muxed_path: str, logger) -> int:
@@ -361,9 +447,11 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
                       video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
         return 0  # Continue but warn
     elif diff_ms > 100:
-        logger.info("STAGE7_SYNC_INFO",
-                   f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
-                   video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
+        # FIX-R7-S7-11: >100ms must be WARNING per v7.32 §3.10.9 ("音视频时长
+        # 差值 > 100ms 触发 WARNING"). ORIGINAL logged INFO.
+        logger.warning("STAGE7_SYNC_WARN_100",
+                      f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
+                      video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
         return 0  # Continue
 
     return 0
@@ -516,9 +604,11 @@ def main():
 
     # Video encoding with audio sync flags
     # BUG-041 fix: defer svtav1-params construction until all parameters are known
+    # FIX-R7-S7-A4: -fflags +genpts is an OUTPUT option ("封装时使用 -fflags +genpts"
+    # per v7.32 §3.10.9). ORIGINAL placed it before -i (input side). It is now
+    # added on the output side below, before the output path.
     video_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
-        "-fflags", "+genpts",  # Generate missing presentation timestamps
         "-i", input_source,
         "-c:v", "libsvtav1",
         "-crf", str(crf),
@@ -530,12 +620,50 @@ def main():
     # FIX-P7-3: Probe stage output (input_source), not original input (args.input)
     # per v7.32 §3.10.3: conversion should be based on the video being encoded
     # ORIGINAL: _get_source_color_info(args.input) probed original input
-    source_color_range, color_standard = _get_source_color_info(input_source)
+    source_color_range, color_standard, range_known, primaries_known = _get_source_color_info(input_source)
+
+    # FIX-R7-S7-A1: log WARNING for unknown source range/primaries per v6.32 §7.19
+    if not range_known:
+        logger.warning("STAGE7_COLOR_RANGE_UNKNOWN",
+                      "Cannot read source color_range from ffprobe, assuming "
+                      "limited range per v6.32 §7.19")
+    if not primaries_known:
+        logger.warning("STAGE7_COLOR_PRIMARIES_UNKNOWN",
+                      "Cannot recognize source color_primaries from ffprobe, "
+                      "defaulting to NTSC (BT.601) per v7.32 §3.10.3")
+
+    # FIX-R7-S7-16: detect black bars to wrap color conversion with crop/restore
+    # per v7.32 §3.10.3 ("色域转换前应先自动检测并裁剪黑边,转换完成后还原黑边").
+    # ORIGINAL vf_parts only had zscale+dither, no crop/restore — black bars got
+    # color-converted and ended up at the wrong black level.
+    bar_info = _detect_black_bars_stage7(input_source, logger)
+    _crop_filter = None
+    _pad_filter = None
+    if bar_info["has_bars"]:
+        cw = bar_info["cropped_w"]
+        ch = bar_info["cropped_h"]
+        ow = bar_info["orig_w"]
+        oh = bar_info["orig_h"]
+        # §3.10.3 / §7.26: effective area <50% original OR either dim <240 -> FAILED
+        if (cw * ch) < (ow * oh) * 0.5 or cw < 240 or ch < 240:
+            logger.error("STAGE7_CROP_FAILED",
+                        f"Black-bar crop {cw}x{ch} invalid (orig {ow}x{oh}); "
+                        f"effective area <50% or dim <240px per v7.32 §3.10.3")
+            return 86
+        _crop_filter = f"crop={cw}:{ch}:{bar_info['left']}:{bar_info['top']}"
+        # pad restores black bars at the OUTPUT format's limited-range black level
+        # (ffmpeg pad default 'black' = 16/64/4096 for 8/10/16bit limited YUV).
+        _pad_filter = f"pad={ow}:{oh}:{bar_info['left']}:{bar_info['top']}:black"
+        logger.info("STAGE7_CROP_RESTORE",
+                   f"Black bars detected: crop {cw}x{ch}, restore to {ow}x{oh}")
 
     # FIX-P7-2: Skip colorspace conversion if source is already BT.709
     # per v7.32 §3.10.3: only BT.601 sources need conversion
     # ORIGINAL: always applied zscale, causing BT.709 sources to get color shift
     vf_parts = []
+    # FIX-R7-S7-16: crop black bars BEFORE color conversion
+    if _crop_filter:
+        vf_parts.append(_crop_filter)
     if color_standard == "BT709":
         logger.info("STAGE7_COLORSPACE_SKIP",
                     "Source already BT.709, skipping colorspace conversion")
@@ -552,6 +680,11 @@ def main():
     # ORIGINAL: used simple scale without proper dithering
     input_depth = params.get("input_bit_depth", 16)
     if input_depth > 10:
+        # FIX-R7-S7-18: 16bit limited range (black=4096/white=60160) is industry
+        # convention, NOT ITU standard — must log WARNING per v7.32 §3.10.26.
+        logger.warning("STAGE7_16BIT_QUANT",
+                       "16bit limited range (black=4096/white=60160) is industry "
+                       "convention, NOT ITU standard (per v7.32 §3.10.26)")
         # Check if zscale supports error_diffusion dithering
         _zscale_ed_available = False
         try:
@@ -578,6 +711,11 @@ def main():
             logger.warning("STAGE7_DITHER_FALLBACK",
                           "error_diffusion not available in zscale, "
                           "using ordered dithering (16bit->10bit)")
+
+    # FIX-R7-S7-16: restore black bars AFTER color conversion + dither so they
+    # use the target bit-depth/range black level per v7.32 §3.10.3.
+    if _pad_filter:
+        vf_parts.append(_pad_filter)
 
     if vf_parts:
         video_cmd.extend(["-vf", ",".join(vf_parts)])
@@ -695,6 +833,10 @@ def main():
         # FIX-P7-12: Use proper datetime import per CLAUDE.md §4
         # ORIGINAL: __import__('datetime').datetime.now().isoformat()
         "-metadata", f"restored_at={datetime.datetime.now().isoformat()}",
+        # FIX-R7-S7-A4: -fflags +genpts is an OUTPUT option ("封装时使用 -fflags
+        # +genpts" per v7.32 §3.10.9) — placed here before the output path so
+        # FFmpeg regenerates container PTS at mux time without modifying samples.
+        "-fflags", "+genpts",
         "-y", output_path,
     ])
 

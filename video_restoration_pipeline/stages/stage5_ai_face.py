@@ -659,7 +659,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                                     accept = False
                                     if conf >= threshold:
                                         accept = True
-                                    elif (is_lowres and conf >= 0.6
+                                    elif (is_lowres and conf >= threshold_lowres
                                           and vw * vh > 0
                                           and (fw_r * fh_r) / (vw * vh) > 0.10):
                                         accept = True
@@ -693,7 +693,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                                 accept = False
                                 if conf >= threshold:
                                     accept = True
-                                elif (is_lowres and conf >= 0.6
+                                elif (is_lowres and conf >= threshold_lowres
                                       and vw * vh > 0
                                       and (fw_y * fh_y) / (vw * vh) > 0.10):
                                     accept = True
@@ -725,7 +725,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                                 accept = False
                                 if conf >= threshold:
                                     accept = True
-                                elif (is_lowres and conf >= 0.6
+                                elif (is_lowres and conf >= threshold_lowres
                                       and vw * vh > 0
                                       and (w * h) / (vw * vh) > 0.10):
                                     accept = True
@@ -882,7 +882,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
             duration_sec = (end_frame - start_frame) / 25.0
 
         if duration_sec < static_duration:
-            logger.info("STAGE5_SHORT_SEGMENT",
+            logger.warning("STAGE5_SHORT_SEGMENT",
                        f"Segment frames {start_frame}-{end_frame} duration {duration_sec:.2f}s < {static_duration}s, skipping")
             continue
 
@@ -890,7 +890,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
         # Per v7.3 §3.10.5: compute global optical flow for motion exclusion
         motion = _estimate_motion_optical_flow(seg_frame_paths, logger)
         if motion > 0.03:
-            logger.info("STAGE5_MOTION_SEGMENT",
+            logger.warning("STAGE5_MOTION_SEGMENT",
                        f"Segment frames {start_frame}-{end_frame} motion {motion:.4f} > 0.03, skipping (dynamic scene)")
             continue
 
@@ -920,7 +920,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                         break
                 prev_box = (cx, cy, fw, fh)
             if not valid_stability:
-                logger.info("STAGE5_UNSTABLE_FACE",
+                logger.warning("STAGE5_UNSTABLE_FACE",
                            f"Segment frames {start_frame}-{end_frame}: face movement exceeds stability threshold")
                 continue
 
@@ -936,14 +936,16 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
             if valid_area:
                 break
         if not valid_area:
-            logger.info("STAGE5_SMALL_FACE",
+            logger.warning("STAGE5_SMALL_FACE",
                        f"Segment frames {start_frame}-{end_frame}: no face >15% area, skipping")
             continue
 
         # Segment passed all checks
         face_segments.append((start_frame, duration_sec))
+        # FIX-W9-04: reuse the `motion` value already computed at L891 instead
+        # of re-running the expensive optical-flow estimation just for logging.
         logger.info("STAGE5_STATIC_SEGMENT",
-                   f"Accepted static segment: frames {start_frame}-{end_frame}, duration={duration_sec:.2f}s, motion={_estimate_motion_optical_flow(seg_frame_paths, logger):.4f}")
+                   f"Accepted static segment: frames {start_frame}-{end_frame}, duration={duration_sec:.2f}s, motion={motion:.4f}")
 
     # Cleanup samples
     shutil.rmtree(sample_dir, ignore_errors=True)
@@ -1377,6 +1379,18 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
         logger.info("STAGE5_SKIP", "Face restore not enabled")
         return 3
 
+    # FIX-F9-03: short-circuit when AI upscaling is banned and not force-
+    # allowed. stage3/4 are skipped in that case (main.py), so stage5 would
+    # find no step4 input → return 82. Per v7.32 §3.10.5 (face restore must
+    # run AFTER upscale) + checkproject rule E, skip with exit 3.
+    ai_banned = params.get("ai_upscale_banned", False)
+    force_allow = params.get("force_allow_banned_upscale", False)
+    if ai_banned and not force_allow:
+        logger.info("STAGE5_SKIP_BANNED",
+                    "AI upscale banned (and not force-allowed); skipping face "
+                    "restore per v7.32 §3.10.5 (face restore requires upscale first)")
+        return 3
+
     # FIX-P9-3: WSL2 temp_dir redirect per v7.32 §3.10.10 / v6.32 §7.3
     temp_dir_raw = params.get("temp_dir", "./temp")
     no_wsl_redirect = params.get("no_wsl_redirect", False)
@@ -1504,6 +1518,15 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                 use_streaming = True
         except Exception:
             pass
+
+    # FIX-W9-02: temporal-risk warning per v7.32 §3.10.5 last bullet —
+    # "不强制光流对齐，但必须在日志中标注时域风险". GFPGAN/CodeFormer are
+    # single-frame models; per-frame processing risks facial jitter/flicker,
+    # so we only process static segments and must log this risk.
+    if face_segments:
+        logger.warning("STAGE5_TEMPORAL_RISK",
+                       "GFPGAN/CodeFormer 是单帧模型，逐帧处理存在五官抖动/闪烁"
+                       "时域风险，仅处理静态段落 (per v7.32 §3.10.5)")
 
     if use_streaming:
         logger.info("STAGE5_STREAM_MODE",

@@ -55,7 +55,14 @@ class StructuredLogger:
         if job_id:
             self.log_file = self.log_dir / f"job_{job_id}.log"
         else:
-            self.log_file = self.log_dir / f"general_{int(time.time())}.log"
+            # FIX-P4-1: Use a stable "general.log" instead of timestamped
+            # "general_{ts}.log". ORIGINAL created a new file per
+            # instantiation (general_{int(time.time())}.log), which produced
+            # an unbounded number of files across runs and defeated rotation.
+            # Per v7.32 §3.10.12 / v6.32 §7.4: one stable general log file,
+            # rotated by line count. A single shared file is safe here
+            # because all writes go through the cross-process lock below.
+            self.log_file = self.log_dir / "general.log"
 
     def _get_current_line_count(self) -> int:
         """Count current lines in log file (called before each write)."""
@@ -68,10 +75,16 @@ class StructuredLogger:
             return 0
 
     def _rotate_if_needed(self):
-        """Rotate log file if line count exceeds limit.
-        
+        """Rotate log file if line count exceeds limit (no-lock fallback path).
+
         Uses timestamp-based backup names to avoid rename race conditions
         in multi-process environments.
+        FIX-P2-6: ORIGINAL used self.log_file.rename(backup), which is
+        inconsistent with the locked path (_rotate_locked uses
+        copyfile+truncate). rename also invalidates any open fd held by
+        another process mid-write. Per v7.32 §3.10.12, the fallback path
+        now mirrors the locked path: shutil.copyfile -> truncate(0), so
+        the live log file keeps its inode and continues to receive writes.
         """
         line_count = self._get_current_line_count()
         if line_count >= self.log_max_lines:
@@ -79,7 +92,11 @@ class StructuredLogger:
             ts = int(time.time() * 1000)
             backup = self.log_file.parent / f"{self.log_file.name}.{ts}"
             try:
-                self.log_file.rename(backup)
+                import shutil
+                shutil.copyfile(str(self.log_file), str(backup))
+                # Truncate the live file in place (keeps inode / open fds valid)
+                with open(self.log_file, "r+b") as f:
+                    f.truncate(0)
                 # Clean up old backups if exceeding log_backup_count
                 backups = sorted(
                     self.log_file.parent.glob(f"{self.log_file.name}.*"),
@@ -106,8 +123,27 @@ class StructuredLogger:
         avoids the issue entirely. Per v6.32 §7.3, os.rename is forbidden
         across filesystems; for log rotation, copyfile+truncate is always
         safe under lock regardless of filesystem.
+        FIX-P2-2: ORIGINAL rotated based on self._line_count, an in-process
+        variable. With N processes each writing to the same job log, each
+        process counts only its own lines, so rotation never triggered
+        (per-process count never reaches log_max_lines). Per v7.32 §3.10.12,
+        rotation must reflect the ACTUAL file line count. We now read the
+        true line count from disk while holding the cross-process lock, and
+        fall back to the in-memory estimate only if the read fails.
         """
-        if self._line_count >= self.log_max_lines:
+        # FIX-P2-2: Read the true on-disk line count under the lock so that
+        # multi-process writers rotate based on the shared file size, not a
+        # per-process counter that never reaches the threshold.
+        true_count = self._line_count
+        try:
+            pos = f.tell()
+            f.seek(0, 0)
+            true_count = sum(1 for _ in f)
+            f.seek(pos, 0)
+        except Exception:
+            true_count = self._line_count  # fallback to in-memory estimate
+
+        if true_count >= self.log_max_lines:
             ts = int(time.time() * 1000)
             backup = self.log_file.parent / f"{self.log_file.name}.{ts}"
             try:
@@ -182,19 +218,37 @@ class StructuredLogger:
                     # FIX-P1-2: Windows rotation under cross-process lock
                     # ORIGINAL: rotation was done outside the lock via _rotate_if_needed()
                     # FIX-P2-2: Removed redundant _rotate_if_needed() outside lock.
+                    # FIX-P1-4: ORIGINAL locked [old_EOF, old_EOF+MAX_LOCK_BYTES)
+                    # (lock_start = f.tell() after seek(0,2)). After
+                    # _rotate_locked() calls truncate(0), the write moves to
+                    # offset 0 — OUTSIDE that locked region — leaving the
+                    # post-rotation write unprotected. A naive fix locking only
+                    # [0, MAX_LOCK_BYTES) is also wrong: in the non-rotating
+                    # case the write appends at old_EOF, which for a grown log
+                    # file is far beyond MAX_LOCK_BYTES and would be unlocked.
+                    # Correct approach per v7.32 §3.10.12 / v6.32 §7.4: lock a
+                    # single contiguous range [0, file_size + MAX_LOCK_BYTES)
+                    # from offset 0. This covers BOTH write positions — the
+                    # post-truncate write at 0 AND the normal append at
+                    # old_EOF (file_size). Windows permits locking byte ranges
+                    # beyond EOF, so the over-length tail is harmless. The
+                    # same length is reused for unlock.
                     MAX_LOCK_BYTES = self.log_max_line_bytes + 1024  # safety margin
                     f.seek(0, 2)  # EOF
-                    lock_start = f.tell()
-                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, MAX_LOCK_BYTES)
+                    file_size = f.tell()
+                    lock_len = file_size + MAX_LOCK_BYTES
+                    f.seek(0, 0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, lock_len)
                     try:
                         # Rotate under cross-process lock per v7.32 §3.10.12
                         self._rotate_locked(f)
-                        f.seek(0, 2)
+                        f.seek(0, 2)  # EOF (offset 0 after truncate, else appended)
                         f.write(line_bytes)
                         f.flush()
                     finally:
-                        f.seek(lock_start)
-                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, MAX_LOCK_BYTES)
+                        # Unlock the exact [0, lock_len) range we locked.
+                        f.seek(0, 0)
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, lock_len)
                 else:
                     # Fallback: no locking (single-process only)
                     self._rotate_if_needed()

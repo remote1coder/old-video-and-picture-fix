@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -82,7 +83,9 @@ def _hash_dict(d: Dict[str, Any]) -> str:
 # Must match v7.32 §3.7 / §3.10.19 specification.
 CORE_QUALITY_PARAMS = frozenset([
     # Denoising
-    "degrainTR", "grainLevel",
+    # FIX-P1-9: havsfunc VS TemporalDegrain (no "2") r33 params are
+    # sigma/blockWidth (NOT degrainTR/grainLevel which are AviSynth names).
+    "sigma", "blockWidth", "EZDenoise",
     # Deblocking
     "deblock_quant", "deblock_strength",
     # QTGMC
@@ -148,6 +151,7 @@ def compute_param_hash(input_path: str, params: Dict[str, Any]) -> str:
     file_size = 0
     file_mtime = 0
     file_hash_prefix = ""
+    stat_ok = False  # FIX-CK-R2-05: distinguish readable vs unreadable inputs
     try:
         p = Path(input_path)
         if p.exists():
@@ -155,13 +159,19 @@ def compute_param_hash(input_path: str, params: Dict[str, Any]) -> str:
             file_size = st.st_size
             file_mtime = int(st.st_mtime)
             file_hash_prefix = get_file_xxhash(input_path)
+            stat_ok = True
     except Exception:
         pass
 
+    # FIX-CK-R2-05: include stat_ok + input basename so two distinct failing
+    # paths (or a failing path vs a real file) no longer collide into the same
+    # param_hash. Per v7.32 §3.10.19 the input identity must be robust.
     identity = {
         "file_size": file_size,
         "file_mtime": file_mtime,
         "file_hash_prefix": file_hash_prefix,
+        "stat_ok": stat_ok,
+        "input_name": Path(input_path).name,
     }
 
     # Extract only quality-related params (recursive nested traversal)
@@ -227,7 +237,8 @@ def cleanup_old_intermediates(temp_dir: str,
                               job_id: str,
                               keep_steps: int = 2,
                               current_step: Optional[int] = None,
-                              cleanup_intermediates: bool = True) -> None:
+                              cleanup_intermediates: bool = True,
+                              current_param_hash: Optional[str] = None) -> None:
     """Remove old intermediate files, keeping the most recent keep_steps stages.
 
     Per v6.32 §7.5: cleanup_intermediates option (default True).
@@ -238,6 +249,9 @@ def cleanup_old_intermediates(temp_dir: str,
         current_step: The current stage number. If None, keeps the most recent
             keep_steps files and deletes all others (useful at job start).
             If specified, deletes files whose step < current_step - keep_steps.
+        current_param_hash: FIX-CK-R2-04 — when set, intermediate files whose
+            param_hash does not match are treated as orphans (input file was
+            replaced/modified) and deleted per v7.32 §3.10.19.
     """
     # FIX-R2-P1-1: Respect cleanup_intermediates config option per v6.32 §7.5
     if not cleanup_intermediates:
@@ -251,16 +265,28 @@ def cleanup_old_intermediates(temp_dir: str,
     intermediates = []
     for f in temp.iterdir():
         if f.is_file() and f.name.startswith(f"{job_id}_"):
-            # Parse step number from filename
-            parts = f.name.split("_")
-            for p in parts:
-                if p.startswith("step"):
+            # FIX-CK-R2-01: Use anchored regex for step number, consistent with
+            # manifest_loader.py. ORIGINAL: split("_") + p.startswith("step")
+            # mis-parsed input_names containing "step" (e.g. "step3_ceremony"
+            # → falsely parsed step=3).
+            m_step = re.search(r'_step(\d+)_', f.name)
+            if not m_step:
+                continue
+            step = int(m_step.group(1))
+
+            # FIX-CK-R2-04: delete orphan-hash intermediates (input changed)
+            # per v7.32 §3.10.19 before considering them for keep_steps.
+            if current_param_hash:
+                m_hash = re.search(r'_p([0-9a-f]+)\.', f.name)
+                f_hash = m_hash.group(1) if m_hash else None
+                if f_hash and f_hash != current_param_hash:
                     try:
-                        step = int(p[4:])
-                        intermediates.append((step, f))
-                    except ValueError:
+                        f.unlink()
+                    except OSError:
                         pass
-                    break
+                    continue
+
+            intermediates.append((step, f))
 
     if not intermediates:
         return
@@ -284,6 +310,25 @@ def cleanup_old_intermediates(temp_dir: str,
                     f.unlink()
                 except OSError:
                     pass
+
+
+def cleanup_all_intermediates(temp_dir: str, job_id: str) -> None:
+    """Remove ALL intermediate files for a job after the final output succeeds.
+
+    FIX-CK-R2-13: Per v7.32 §3.10.17 / v6.32 §7.5, the pipeline removes every
+    intermediate for a job once the final output is produced, unless
+    --keep-intermediates is set (in which case the caller simply does not call
+    this). Best-effort: ignores missing files / permission errors.
+    """
+    temp = Path(temp_dir)
+    if not temp.exists():
+        return
+    for f in temp.iterdir():
+        if f.is_file() and f.name.startswith(f"{job_id}_"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 def _read_frame_info(filepath: str, position: float) -> Optional[Dict[str, Any]]:
@@ -404,11 +449,14 @@ def _probe_bit_depth_from_pixfmt(filepath: str) -> int:
 
 def verify_frame_integrity(filepath: str,
                            is_retry: bool = False,
-                           samples: int = 4,
                            bit_depth: int = 8,
-                           color_range: str = "limited",
-                           inter_frame_threshold: int = 80,
-                           inter_frame_threshold_retry: int = 60) -> bool:
+                           color_range: str = "limited") -> bool:
+    # FIX-CK-R2-08: removed unused `samples` param (no caller passed it).
+    # FIX-CK-R2-02: removed `inter_frame_threshold`/`inter_frame_threshold_retry`
+    # params and the inter-frame mean-consistency check — it rejected legitimate
+    # dark-open/bright-content videos. Per v7.32 §3.10.19, frame validation only
+    # requires: decodes without error / not all-0 or all-max / luminance mean in
+    # legal range (no inter-frame consistency requirement).
     """Verify video/photo file integrity by checking multiple positions.
 
     Per v6.3 §3.7 / §3.10.19:
@@ -472,8 +520,14 @@ def verify_frame_integrity(filepath: str,
     if duration > 600:
         extra = int(duration // 600)
         for i in range(1, extra + 1):
-            pos = min(i * 600 / duration, 0.99)
-            if pos not in positions:
+            pos = i * 600 / duration
+            # FIX-CK-R2-07: avoid the mandatory-sample neighborhoods (±0.02 of
+            # 0.025/0.5/0.975) so the per-10min samples add coverage instead of
+            # duplicating mandatory points per v7.32 §3.10.19.
+            if any(abs(pos - m) < 0.02 for m in positions):
+                pos = pos + 0.05 if pos < 0.5 else pos - 0.05
+            pos = min(max(pos, 0.02), 0.98)
+            if not any(abs(pos - m) < 0.01 for m in positions):
                 positions.append(pos)
 
     if is_retry:
@@ -521,10 +575,17 @@ def verify_frame_integrity(filepath: str,
     if mean_of_means < y_min + 1 and all(m < y_min + 5 for m in frame_means):
         return False
 
-    # FIX-R2-P3-4: Use configurable thresholds instead of hardcoded values
-    threshold = inter_frame_threshold_retry if is_retry else inter_frame_threshold
-    if any(abs(m - mean_of_means) > threshold for m in frame_means):
+    # FIX-CK-R2-03: symmetric all-white (all-max) detection per v7.32 §3.10.19
+    # ("像素值非全 0/全 255 或对应位深最大值"). ORIGINAL: only all-black was
+    # caught, so a full-range all-255 (or all-max) frame slipped through.
+    # Limited-range all-white is already caught by the mean-out-of-range +
+    # std<1 checks above; this closes the full-range gap.
+    if mean_of_means > y_max - 1 and all(m > y_max - 5 for m in frame_means):
         return False
+
+    # FIX-CK-R2-02: inter-frame mean-consistency check REMOVED — it rejected
+    # legitimate dark-open/bright-content videos. Per §3.10.19 there is no
+    # inter-frame consistency requirement.
 
     return True
 
@@ -713,6 +774,17 @@ def is_retryable_error(exit_code: int, stderr: str = "") -> bool:
     - 80 (deps), 81 (params), 85 (perms), 86 (verify) are NOT retryable
     - Cross-platform signal codes (Linux/Windows) are also retryable
     """
+    # FIX-CK-R2-12: disk-full (errno 28 / ENOSPC) is NEVER retryable per
+    # v7.32 §3.10.18 / v6.32 §7.6. Short-circuit BEFORE the 82/83/87 retryable
+    # codes so that a 87 (resource exhausted) whose stderr actually means
+    # "disk full" is not retried — retrying only re-fills the disk. Aligns
+    # with photo main.py disk-full handling.
+    if stderr:
+        stderr_lower = stderr.lower()
+        if any(k in stderr_lower for k in
+               ("no space", "errno 28", "enospc", "disk full",
+                "not enough space", "disk full")):
+            return False
     if exit_code in (82, 83, 87):
         return True
     if exit_code == 84 and stderr:

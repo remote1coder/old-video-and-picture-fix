@@ -182,6 +182,15 @@ def main() -> int:
     # Use args.input stem for pattern matching (consistent with other stages)
     input_name = Path(args.input).stem
 
+    # FIX-W9-09: log ai_upscale_banned flag per checkproject rule F. Grain
+    # synthesis is not AI so the flag doesn't change grain behavior; logged
+    # for traceability. When banned, F9-02 fallback ensures stage4 input.
+    ai_banned = params.get("ai_upscale_banned", False)
+    if ai_banned:
+        logger.info("STAGE6_BAN_FLAG",
+                    "ai_upscale_banned=true noted (grain synthesis unaffected; "
+                    "input sourced from stage4 per F9-02 fallback)")
+
     # Determine if face restore was enabled
     # Fix: ai_enabled is passed as flat key "ai_enabled" in params, not as nested "ai" dict
     face_restore_enabled = bool(params.get("face_restore", ""))
@@ -195,19 +204,34 @@ def main() -> int:
     expected_stage = None
 
     if ai_enabled and face_restore_enabled:
-        # Face restore enabled: MUST use stage5 output
+        # FIX-F9-02: face_restore enabled but stage5 may have produced no
+        # output (stage5 exits 3 when no static face segments — a common
+        # case). Per v7.32 §3.10.24, fall back to stage4 output instead of
+        # aborting the whole pipeline with return 82.
         expected_stage = "step5_face"
-        pattern = f"{job_id}_{input_name}_step5_face*"
-        candidates = glob.glob(os.path.join(temp_dir, pattern))
+        pattern5 = f"{job_id}_{input_name}_step5_face*"
+        candidates = glob.glob(os.path.join(temp_dir, pattern5))
         if candidates:
             candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             input_source = candidates[0]
         if not input_source:
-            logger.error("STAGE6_INPUT_ERROR",
-                        f"Face restore enabled but no stage5 output found. "
-                        f"Expected pattern: {pattern}",
-                        temp_dir=temp_dir)
-            return 82
+            # Fallback to stage4 output
+            pattern4 = f"{job_id}_{input_name}_step4_postprocess*"
+            candidates4 = glob.glob(os.path.join(temp_dir, pattern4))
+            if candidates4:
+                candidates4.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                input_source = candidates4[0]
+                expected_stage = "step4_postprocess(fallback)"
+                logger.warning("STAGE6_FALLBACK_STEP4",
+                               "face_restore enabled but no stage5 output "
+                               "(stage5 likely skipped — no static face segments), "
+                               "falling back to stage4 output per v7.32 §3.10.24")
+            else:
+                logger.error("STAGE6_INPUT_ERROR",
+                            f"Neither stage5 nor stage4 output found. "
+                            f"Patterns: {pattern5} / {pattern4}",
+                            temp_dir=temp_dir)
+                return 82
     else:
         # Face restore disabled: MUST use stage4 output
         expected_stage = "step4_postprocess"
