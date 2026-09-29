@@ -112,7 +112,9 @@ paths:
 
 audio_override:
   # v7.3：各素材类型可独立覆盖全局音频参数
-  # 优先级：命令行 > user_overrides > paths.audio_override > global.audio > 内置默认值
+  # 优先级：命令行 > user_overrides > recommended_params > audio_override > paths > global.audio > 内置默认值
+  # FIX-W注释: ORIGINAL omitted recommended_params and paths layers and merged
+  # audio_override with paths, misrepresenting the v7.32 §3.2 6-layer cascade.
   analog_tape:
     hum_freq: null  # null=自动检测；显式 50/60 覆盖（对齐 v7.32 §3.2）
     hum_harmonics: 3

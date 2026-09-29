@@ -438,27 +438,31 @@ def cleanup_old_intermediates(temp_dir: str, job_id: str) -> None:
 def _is_retryable_error(returncode: int, stderr: str = "") -> bool:
     """Check if error is retryable (transient).
 
-    Per v6.3 §3.7:
-    - 82 (IO), 83 (GPU/OOM), 87 (resource/timeout) are retryable
-    - 84 (encoding) only retryable if OOM/no space in stderr
-    - 80 (deps), 81 (params), 85 (perms), 86 (verify) are NOT retryable
+    FIX-CK-R2-X1: Per round_2 CK-R2-X1, photo main.py kept a local duplicate of
+    is_retryable_error that drifted from the checkpoint.py canonical version
+    (which has the full disk-full short-circuit, signal-code handling, and 84
+    OOM logic per v7.32 §3.10.18 / §3.7). Delegate to checkpoint.is_retryable_error
+    so both pipelines share one implementation. The local stub is kept only as a
+    thin wrapper for backward-compat with the existing call site (rc, stderr).
     """
-    retryable_codes = {82, 83, 87}
-    if returncode in retryable_codes:
-        return True
-    # Encoding error (84) only retryable for GPU OOM, NOT disk full
-    # FIX-P10-4: Per v7.32 §3.10.18: disk full is NOT retryable
-    if returncode == 84:
-        stderr_lower = (stderr or "").lower()
-        # Disk full is NOT retryable (resource exhausted = terminal)
-        if any(k in stderr_lower for k in (
-                "no space", "errno 28", "enospc")):
-            return False
-        # GPU OOM IS retryable
-        if any(k in stderr_lower for k in (
-                "out of memory", "oom", "cuda")):
+    try:
+        from checkpoint import is_retryable_error
+        return is_retryable_error(returncode, stderr)
+    except Exception:
+        # Fallback to a conservative local impl if checkpoint import fails
+        # (should not happen in normal operation - checkpoint is a hard dep).
+        retryable_codes = {82, 83, 87}
+        if returncode in retryable_codes:
             return True
-    return False
+        if returncode == 84:
+            stderr_lower = (stderr or "").lower()
+            if any(k in stderr_lower for k in (
+                    "no space", "errno 28", "enospc")):
+                return False
+            if any(k in stderr_lower for k in (
+                    "out of memory", "oom", "cuda")):
+                return True
+        return False
 
 
 def _verify_stage_output(job_id: str, input_path: str,

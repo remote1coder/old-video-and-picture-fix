@@ -20,7 +20,7 @@ import subprocess
 import importlib.util
 import re
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 
 def run_cmd(cmd: List[str], capture: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
@@ -493,6 +493,12 @@ def check_python_packages(pipeline_type: str = "photo") -> List[str]:
             ("yaml", "PyYAML"),
             ("PIL", "Pillow"),
             ("scipy", "SciPy (for Stage 5 region separation + Laplacian pyramid grain)"),
+            # FIX-R11R-12: imageio + tifffile are imported by photo stage1/3/4/5
+            # (16bit RGB TIFF I/O) per v6.32 §4.2.1 / §7.16. They must be in the
+            # §3.6 dependency list so their absence is caught at startup, not at
+            # runtime mid-pipeline. ORIGINAL: only scipy was listed.
+            ("imageio", "imageio (16bit RGB TIFF fallback I/O per v6.32 §4.2.1)"),
+            ("tifffile", "tifffile (16bit RGB TIFF read/write per v6.32 §4.2.1)"),
             ("xxhash", "xxhash (FIX-P2-9: required for checkpoint hash per v7.32 §3.10.19)"),
         ]
     else:
@@ -1333,12 +1339,25 @@ def main():
             print(w)
     if ok:
         print("All required dependencies are satisfied.")
-    else:
-        print(f"Found {len(issues)} issue(s):")
-        for issue in issues:
-            print(issue)
-        print("\nInstall missing dependencies and retry.")
-        sys.exit(80)
+        return
+
+    print(f"Found {len(issues)} issue(s):")
+    for issue in issues:
+        print(issue)
+    print("\nInstall missing dependencies and retry.")
+
+    # FIX-P4-3: Per v7.32 §3.5, spawn-compliance violations are validation
+    # failures (exit 86), distinct from missing dependencies (exit 80). Spawn
+    # violations cause runtime deadlocks (§3.10.18) and must be fixed in source,
+    # not by installing packages. ORIGINAL: all issues mapped to exit 80, which
+    # masked spawn violations as "install deps" misdiagnosis.
+    has_spawn_violation = any(
+        isinstance(i, str) and i.startswith("Spawn compliance violations:")
+        for i in issues
+    )
+    if has_spawn_violation:
+        sys.exit(86)
+    sys.exit(80)
 
 
 if __name__ == "__main__":

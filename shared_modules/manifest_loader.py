@@ -261,14 +261,30 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
         # inspection (status still PENDING so the user can retry/inspect).
         logging.warning(
             "Intermediate verification crashed for job %s: %s — status set to "
-            "PENDING; intermediates not cleaned, please inspect manually",
+            "PENDING; attempting best-effort cleanup of collected intermediates",
             job.get("job_id", "UNKNOWN"), e
         )
         job["status"] = "PENDING"
         job["error_message"] = (
             f"Intermediate file verification raised an exception ({e}); "
-            "intermediates not cleaned — please inspect manually"
+            "best-effort cleanup attempted — please inspect temp_dir manually"
         )
+        # FIX-L11: best-effort cleanup of any intermediates already collected
+        # before the crash. A corrupt intermediate that survives here can be
+        # reused via param_hash by a later stage, producing silent corruption.
+        # If `intermediates` was bound before the crash, unlink each (missing_ok
+        # so files already gone don't re-raise). On any cleanup failure, leave
+        # the file in place and let the manual-inspection error_message stand.
+        try:
+            for p in intermediates:  # type: ignore[name-defined]
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except (NameError, UnboundLocalError):
+            # `intermediates` never got bound (crash happened before collection)
+            # - nothing to clean, manual inspection message already set.
+            pass
 
     return job
 

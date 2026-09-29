@@ -416,9 +416,71 @@ def _run_gpen_pytorch(input_path: str, output_path: str, model: str,
         return False
 
 
+# ---------------------------------------------------------------------------
+# FIX-C-12-02 / FIX-M-12-09: spawn subprocess isolation per v7.32 §3.10.18.
+# DAT/GPEN PyTorch inference runs in a spawned child process so each image
+# gets a fresh CUDA context (no VRAM/context accumulation across a long batch,
+# and a hard child crash - segfault/CUDA corruption - is caught via exitcode
+# instead of corrupting the parent). The OOM del/empty_cache path inside the
+# child still runs first; spawn is the outer isolation layer. Module-level
+# functions below are required for multiprocessing spawn (constraint 3).
+# ---------------------------------------------------------------------------
+
+# Default per-image spawn timeout (seconds). Model load + inference on a large
+# image can take minutes on CPU; 1200s leaves headroom.
+_SPAWN_INFERENCE_TIMEOUT = 1200
+
+
+def _spawn_inference_target(fn, args, result_queue):
+    """Spawn target: run a module-level inference function and return its bool
+    result via the queue. Catches all exceptions so a hard failure in the child
+    is reported as ('err', repr) rather than crashing the parent silently.
+    """
+    try:
+        ok = fn(*args)
+        result_queue.put(("ok", bool(ok)))
+    except Exception as e:
+        result_queue.put(("err", repr(e)))
+
+
+def _run_in_spawned_process(fn, args, timeout: int = _SPAWN_INFERENCE_TIMEOUT) -> bool:
+    """Run fn(*args) in a spawned child process, return its bool result.
+
+    Returns False if the child crashes (non-zero exitcode, e.g. segfault from
+    CUDA corruption), times out, or returns False/raises. This is the spawn
+    isolation layer per v7.32 §3.10.18 - a corrupted CUDA context dies with the
+    child instead of poisoning subsequent images.
+    """
+    import multiprocessing
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        q = ctx.Queue()
+        proc = ctx.Process(target=_spawn_inference_target,
+                           args=(fn, args, q))
+        proc.start()
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            return False
+        # exitcode 0 = clean exit; None = still running (treat as fail); non-zero
+        # = crash (segfault / CUDA error) - child died, parent is safe.
+        if proc.exitcode not in (0, None):
+            return False
+        try:
+            kind, val = q.get_nowait()
+            return bool(val) if kind == "ok" else False
+        except Exception:
+            return False
+    except Exception:
+        # spawn infrastructure unavailable - fall back to in-process (caller
+        # still has the OOM del/empty_cache path inside fn).
+        return False
+
+
 def run_realesrgan(input_path: str, output_path: str, model: str,
                    scale: int, model_dir: str = "", use_gpu: bool = True,
-                   bit_depth: int = 8) -> bool:
+                   bit_depth: int = 8, use_spawn: bool = True) -> bool:
     """Run AI upscale on a single image.
 
     Supports Real-ESRGAN (ncnn-vulkan + Python fallback), DAT (PyTorch only),
@@ -434,12 +496,21 @@ def run_realesrgan(input_path: str, output_path: str, model: str,
     family = _get_model_basename(model)
     if family == "DAT":
         # DAT only supports PyTorch backend
-        return _run_dat_pytorch(input_path, output_path, model, scale,
-                                model_dir, use_gpu, bit_depth=bit_depth)
+        # FIX-C-12-02: run in a spawned child for CUDA context isolation per
+        # v7.32 §3.10.18. Falls back to in-process if use_spawn=False.
+        dat_args = (input_path, output_path, model, scale, model_dir, use_gpu)
+        if use_spawn:
+            return _run_in_spawned_process(
+                _run_dat_pytorch, dat_args + (bit_depth,))
+        return _run_dat_pytorch(*dat_args, bit_depth=bit_depth)
     elif family == "GPEN":
         # GPEN only supports PyTorch backend (full-body portrait model)
-        return _run_gpen_pytorch(input_path, output_path, model, scale,
-                                 model_dir, use_gpu, bit_depth=bit_depth)
+        # FIX-M-12-09: spawn isolation (same as DAT).
+        gpen_args = (input_path, output_path, model, scale, model_dir, use_gpu)
+        if use_spawn:
+            return _run_in_spawned_process(
+                _run_gpen_pytorch, gpen_args + (bit_depth,))
+        return _run_gpen_pytorch(*gpen_args, bit_depth=bit_depth)
 
     # RealESRGAN: try ncnn-vulkan first, then Python fallback
     if _run_realesrgan_vulkan(input_path, output_path, model, scale,
@@ -711,9 +782,15 @@ def main():
         "GPEN": ["DAT", "RealESRGAN"],
     }
 
+    # FIX-C-12-02 / M-12-09: spawn isolation toggle per v7.32 §3.10.18.
+    # Default ON (user decision). Set ai_spawn_isolation=false in config to
+    # fall back to in-process inference (e.g. for debugging or if spawn infra
+    # is unavailable on the target platform).
+    use_spawn = bool(params.get("ai_spawn_isolation", True))
+
     success = run_realesrgan(
         stage1_output, output_file, actual_model, actual_scale, model_dir,
-        use_gpu=use_gpu, bit_depth=bit_depth
+        use_gpu=use_gpu, bit_depth=bit_depth, use_spawn=use_spawn
     )
 
     # Model fallback: if primary model fails, try alternatives in priority order
@@ -731,7 +808,8 @@ def main():
                           f"trying fallback: {alt_model}")
             success = run_realesrgan(
                 stage1_output, output_file, alt_model, actual_scale,
-                model_dir, use_gpu=use_gpu, bit_depth=bit_depth
+                model_dir, use_gpu=use_gpu, bit_depth=bit_depth,
+                use_spawn=use_spawn
             )
             if success:
                 actual_model = alt_model

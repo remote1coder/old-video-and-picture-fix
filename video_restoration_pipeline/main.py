@@ -38,6 +38,12 @@ def parse_args():
     parser.add_argument("--output-manifest", help="Output manifest path for --scan")
     parser.add_argument("--preview-only", action="store_true",
                         help="Preview mode (generate preview frames/clips without full processing)")
+    # FIX-M1: --preview alias for --preview-only per CLAUDE.md §0 (lists both
+    # --preview and --preview-only as shared flags). v7.32 §3.3 mode C uses
+    # --preview-only; --preview is an alias so users can use either name.
+    # --mode preview remains the canonical entry.
+    parser.add_argument("--preview", action="store_true",
+                        help="Alias for --preview-only (preview mode, no execution)")
     parser.add_argument("--keep-intermediates", action="store_true",
                         help="Keep intermediate files")
     parser.add_argument("--no-wsl-redirect", action="store_true",
@@ -140,6 +146,22 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
                     params[pk] = v
                     if old_p != v:
                         _log_override(pk, old_p, v, source)
+        # FIX-F1: reverse sync - when k itself is a prefixed form (e.g. ai_enabled,
+        # audio_denoise) and the corresponding bare key (enabled, denoise) already
+        # exists in params, sync the bare key too. ORIGINAL only synced bare->prefix,
+        # so CLI overrides setting `ai_enabled=True` left `enabled=False` (stale),
+        # and stages reading the bare key saw the CLI override as no-op. Cross-domain
+        # keys are exempt for the same reason as the forward sync (video vs audio
+        # denoise refer to different params).
+        if k not in _CROSS_DOMAIN_KEYS:
+            for prefix in ("ai_", "audio_"):
+                if k.startswith(prefix) and len(k) > len(prefix):
+                    bare = k[len(prefix):]
+                    if bare in params and bare != k:
+                        old_b = params[bare]
+                        params[bare] = v
+                        if old_b != v:
+                            _log_override(bare, old_b, v, source)
 
     # 1. Start with global
     base = config.get("global", {})
@@ -431,6 +453,12 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     params = merge_params(job, config, cli_overrides, logger)
     params["output_path"] = job.get("output_path", "")
 
+    # FIX-W19: if the startup dependency check found sRestore unavailable, force
+    # ivtc_auto_fallback=False so the VFM _Combed failure path does not request
+    # a sRestore fallback that will fail (plugin missing). Per v7.32 §3.6.
+    if config.get("_srestore_unavailable"):
+        params["ivtc_auto_fallback"] = False
+
     # FIX-P2-6/§3.10.10: Combined WSL2 redirect + disk space pre-check with fallback chain
     # Replaces separate WSL redirect block and _check_disk_space().
     # Per v7.32 §3.10.10: native partition → /mnt/ fallback → FAILED
@@ -555,7 +583,15 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             # per v7.32 §3.10.13
             if stage_num == 1 and exit_code == 86:
                 combed_fallback = params.get("ivtc_auto_fallback", True)
-                if combed_fallback and params.get("ivtc", "VIVTC") == "VIVTC":
+                # FIX-W12: Distinguish IVTC-combed 86 from deint-quality 86.
+                # stage1 returns 86 for BOTH: (a) VFM _Combed pre-check failure
+                # (needs_ivtc + VIVTC path) and (b) post-render deinterlace
+                # quality <95% (field_segments path). The IVTC sRestore path is
+                # taken only when ivtc=="VIVTC" AND needs_ivtc AND combed_fallback;
+                # otherwise a 86 with field_segments present is a deint-quality
+                # failure -> clear field_segments and re-run conservative.
+                if (combed_fallback and params.get("ivtc", "VIVTC") == "VIVTC"
+                        and params.get("needs_ivtc", False)):
                     job_logger.warning("IVTC_AUTO_FALLBACK",
                                       "VFM _Combed check failed, switching to sRestore",
                                       job_id=job_id)
@@ -586,6 +622,31 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                     else:
                         job_logger.error("IVTC_SRESTORE_FAIL",
                                         "sRestore fallback also failed")
+                        return exit_code2, stderr2
+                elif params.get("field_segments"):
+                    # FIX-W12: deinterlace quality <95% on segmented field order.
+                    # Clear field_segments and re-run stage1 with global
+                    # conservative (non-segmented) processing per v7.32 §3.10.13.
+                    job_logger.warning("DEINT_QUALITY_FALLBACK",
+                                      "Deinterlace quality <95% on field_segments; "
+                                      "re-running stage1 with global conservative "
+                                      "processing (field_segments cleared)",
+                                      job_id=job_id)
+                    params["field_segments"] = []
+                    if params.get("cleanup_intermediates", True):
+                        temp_dir = params.get("temp_dir", "./temp")
+                        keep_steps = params.get("keep_steps", 2)
+                        cleanup_old_intermediates(temp_dir, job_id, keep_steps)
+                    exit_code2, stderr2 = run_stage(
+                        script_name, job, params, args.get("config"))
+                    if exit_code2 in (0, 3):
+                        if exit_code2 == 0:
+                            job_logger.info("STAGE_DONE",
+                                           f"Stage {stage_num} complete (conservative)")
+                        continue
+                    else:
+                        job_logger.error("DEINT_QUALITY_FALLBACK_FAIL",
+                                        "Conservative re-run also failed")
                         return exit_code2, stderr2
             # V-P-007/V-P-028 fix: force_traditional_first gate
             force_traditional_first = params.get("force_traditional_first", True)
@@ -676,6 +737,24 @@ def main():
         if dep_warnings:
             for w in dep_warnings:
                 logger.warn("DEP_CHECK", w)
+        # FIX-W19: Per v7.32 §3.6, sRestore is an OPTIONAL dependency - its
+        # absence must NOT block startup but MUST disable the IVTC auto-fallback
+        # path (which depends on sRestore). detect_hum_frequency-style: scan the
+        # non-blocking warnings for sRestore unavailability and set a config
+        # flag that process_job reads to force ivtc_auto_fallback=False. ORIGINAL
+        # made sRestore non-blocking (good) but never propagated the availability
+        # to the fallback gate, so a job could still request sRestore fallback and
+        # fail opaquely when the plugin was missing.
+        srestore_unavailable = any(
+            "srestore unavailable" in str(w).lower()
+            or "srestore returned none" in str(w).lower()
+            for w in (dep_warnings or [])
+        )
+        if srestore_unavailable:
+            config["_srestore_unavailable"] = True
+            logger.warning("IVTC_AUTO_FALLBACK_DISABLED",
+                          "sRestore optional dependency unavailable - "
+                          "IVTC auto-fallback disabled per v7.32 §3.6")
         if not ok:
             for issue in issues:
                 logger.error("DEP_CHECK", issue)
@@ -938,7 +1017,8 @@ def main():
 
     # V-P-009 fix: enhanced preview mode with motion segments
     # Also handle mode == "preview"
-    if args.preview_only or (mode == "preview"):
+    # FIX-M1: --preview is an alias for --preview-only (CLAUDE.md §0).
+    if args.preview_only or args.preview or (mode == "preview"):
         from preview import extract_preview_frames, generate_preview_clip, generate_comparison_frames
         for job in jobs[:3]:
             try:

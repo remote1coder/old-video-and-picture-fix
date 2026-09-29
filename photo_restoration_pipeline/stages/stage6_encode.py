@@ -233,6 +233,42 @@ def main():
 
     working_path = input_source
 
+    # FIX-M-12-12: Per v7.32 §3.10.3, color-space conversion is a mandatory step
+    # before encoding. stage1 detects and records the input color space in a
+    # _color_meta.json sidecar (and optionally user_overrides via input_color_space).
+    # If the input is Adobe RGB / ProPhoto (non-sRGB), convert to sRGB here so
+    # avifenc encodes in the standard sRGB space. sRGB/unknown inputs pass through
+    # unchanged (stage1 already normalized most via PIL convert). Photo sources
+    # are predominantly sRGB, so this is a safety net for wide-gamut scans.
+    try:
+        _stem = Path(input_name).stem
+        _color_meta_path = Path(temp_dir) / f"{job_id}_{_stem}_color_meta.json"
+        if _color_meta_path.exists():
+            with open(_color_meta_path, "r", encoding="utf-8") as _cmf:
+                _cm = json.load(_cmf)
+            _input_cs = (_cm.get("input_color_space") or "").lower()
+            if _input_cs in ("adobergb", "prophoto"):
+                logger.warning("STAGE6_COLOR_CONVERT",
+                               f"Input is {_input_cs}; converting to sRGB before "
+                               f"encode per v7.32 §3.10.3")
+                from PIL import Image as _PILImg, ImageCms as _ImageCms
+                _img = _PILImg.open(working_path)
+                if _img.mode != "RGB":
+                    _img = _img.convert("RGB")
+                _srgb_profile = _ImageCms.createProfile("sRGB")
+                _src_profile = _ImageCms.ImageCmsProfile(
+                    _ImageCms.createProfile(
+                        "ADBE" if _input_cs == "adobergb" else "ROMM"))
+                _converted = _ImageCms.profileToProfile(
+                    _img, _src_profile, _srgb_profile, outputMode="RGB")
+                _conv_path = str(Path(temp_dir) / f"{job_id}_{_stem}_srgb.tif")
+                _converted.save(_conv_path)
+                working_path = _conv_path
+    except Exception as e:
+        logger.warning("STAGE6_COLOR_CONVERT_FAIL",
+                       f"Color conversion to sRGB failed ({e}); "
+                       f"proceeding with original input")
+
     # Determine archival mode
     archival_mode = params.get("archival_mode", False)
     use_rgb444 = archival_mode

@@ -119,15 +119,24 @@ def _detect_faces(input_path: str, params: dict, logger=None) -> bool:
 
     Returns True if faces detected, False otherwise.
     """
-    return len(_detect_face_boxes(input_path, params, logger)) > 0
+    # FIX-H-12-06: _detect_face_boxes now returns (boxes, landmarks); only the
+    # box count is needed here. Index [0] gets the boxes list.
+    return len(_detect_face_boxes(input_path, params, logger)[0]) > 0
 
 
 def _detect_face_boxes(input_path: str, params: dict,
-                       logger=None) -> list:
-    """Detect faces and return list of bounding boxes [(x, y, w, h), ...].
+                       logger=None) -> tuple:
+    """Detect faces and return (boxes, landmarks).
 
+    boxes: list of [(x, y, w, h), ...] in input-image coordinates.
+    landmarks: list aligned with boxes; each entry is a 5-point dict
+    {left_eye, right_eye, nose, mouth_left, mouth_right} as (x,y) tuples, or
+    None when the detector does not expose keypoints (YOLOv8-face).
+
+    FIX-H-12-06: Per v7.32 §3.10.7, color matching must use face landmarks to
+    locate face/neck/hand ROI. RetinaFace and MTCNN return 5-point landmarks;
+    YOLOv8-face standard boxes do not (None -> geometric fallback in stage5).
     Each detector is tried in fallback order until at least one face is found.
-    Boxes are returned in the coordinate space of the input image.
     """
     face_detect_fallback = params.get(
         "face_detect_fallback", ["RetinaFace", "YOLOv8-face", "MTCNN"])
@@ -155,19 +164,24 @@ def _detect_face_boxes(input_path: str, params: dict,
                     faces = RetinaFace.detect_faces(input_path)
                     if faces and len(faces) > 0:
                         valid_boxes = []
+                        valid_landmarks = []
                         for key, face in faces.items():
                             score = face.get("score", 0)
                             if score >= actual_threshold:
                                 fa = face.get("facial_area", [0, 0, 0, 0])
                                 valid_boxes.append(
                                     (fa[0], fa[1], fa[2] - fa[0], fa[3] - fa[1]))
+                                # FIX-H-12-06: capture 5-point landmarks
+                                lm = face.get("landmarks")
+                                valid_landmarks.append(
+                                    dict(lm) if isinstance(lm, dict) else None)
                         if valid_boxes:
                             if logger:
                                 logger.info("STAGE4_FACE_DETECT",
                                             f"Faces found via RetinaFace: "
                                             f"{len(valid_boxes)} "
                                             f"(threshold={actual_threshold})")
-                            return valid_boxes
+                            return valid_boxes, valid_landmarks
                 except Exception:
                     pass
             elif detector == "YOLOv8-face":
@@ -177,16 +191,19 @@ def _detect_face_boxes(input_path: str, params: dict,
                     results = model(input_path, conf=actual_threshold)
                     if results and len(results[0].boxes) > 0:
                         boxes = []
+                        lms = []
                         for box in results[0].boxes.xyxy.cpu().numpy():
                             x1, y1, x2, y2 = map(int, box)
                             boxes.append((x1, y1, x2 - x1, y2 - y1))
+                            # YOLOv8-face standard boxes: no landmarks
+                            lms.append(None)
                         if boxes:
                             if logger:
                                 logger.info("STAGE4_FACE_DETECT",
                                             f"Faces found via YOLOv8: "
                                             f"{len(boxes)} "
                                             f"(threshold={actual_threshold})")
-                            return boxes
+                            return boxes, lms
                 except Exception:
                     pass
             elif detector == "MTCNN":
@@ -199,19 +216,32 @@ def _detect_face_boxes(input_path: str, params: dict,
                     faces = detector_obj.detect_faces(img)
                     if faces and len(faces) > 0:
                         valid_boxes = []
+                        valid_landmarks = []
                         for face in faces:
                             confidence = face.get("confidence", 0)
                             if confidence >= actual_threshold:
                                 box = face.get("box", [0, 0, 0, 0])
                                 valid_boxes.append(
                                     (box[0], box[1], box[2], box[3]))
+                                # FIX-H-12-06: MTCNN keypoints -> normalized names
+                                kp = face.get("keypoints")
+                                if isinstance(kp, dict):
+                                    valid_landmarks.append({
+                                        "left_eye": kp.get("left_eye"),
+                                        "right_eye": kp.get("right_eye"),
+                                        "nose": kp.get("nose"),
+                                        "mouth_left": kp.get("mouth_left"),
+                                        "mouth_right": kp.get("mouth_right"),
+                                    })
+                                else:
+                                    valid_landmarks.append(None)
                         if valid_boxes:
                             if logger:
                                 logger.info("STAGE4_FACE_DETECT",
                                             f"Faces found via MTCNN: "
                                             f"{len(valid_boxes)} "
                                             f"(threshold={actual_threshold})")
-                            return valid_boxes
+                            return valid_boxes, valid_landmarks
                 except Exception:
                     pass
         except Exception:
@@ -223,7 +253,7 @@ def _detect_face_boxes(input_path: str, params: dict,
     # NOTE: FIX-P12-2 lowres area filter is applied in main() after
     # _detect_face_boxes returns, since this function returns early
     # from each detector.
-    return []
+    return [], []
 
 
 # NOTE: _match_portrait_color was moved to stage5_postprocess.py in FIX-P12-6.
@@ -494,7 +524,8 @@ def main():
 
     # Pre-detect faces using configured fallback list;
     # also get boxes for color matching
-    face_boxes = _detect_face_boxes(input_source, params, logger)
+    # FIX-H-12-06: capture landmarks alongside boxes for stage5 neck/hand ROI.
+    face_boxes, face_landmarks = _detect_face_boxes(input_source, params, logger)
 
     # FIX-P12-2: Low-res area filter per v7.32 §3.10.5
     # Low-res images: only allow face restore if face box > 10% of image area
@@ -507,15 +538,21 @@ def main():
         if is_lowres and face_boxes:
             img_area = _w * _h
             filtered = []
-            for (bx, by, bw, bh) in face_boxes:
+            filtered_lms = []
+            # FIX-H-12-06: keep landmarks list aligned with filtered boxes.
+            for idx, (bx, by, bw, bh) in enumerate(face_boxes):
                 if (bw * bh) > 0.10 * img_area:
                     filtered.append((bx, by, bw, bh))
+                    filtered_lms.append(
+                        face_landmarks[idx]
+                        if idx < len(face_landmarks) else None)
             if not filtered:
                 logger.warning("STAGE4_LOWRES_AREA_SKIP",
                     f"Low-res faces < 10% area, skipping face restore "
                     f"per v7.32 §3.10.5")
                 return 3
             face_boxes = filtered
+            face_landmarks = filtered_lms
     except Exception:
         pass
 
@@ -568,12 +605,31 @@ def main():
     # P-26 fix: half-body portrait color matching per v7.32 §3.10.7
     # FIX-P12-6: Color matching MOVED to stage5_postprocess.py per spec order.
     # Stage4 now only persists face_boxes metadata for stage5 to consume.
-    # Save face_boxes to metadata file for stage5 color matching
+    # FIX-H-12-06: also persist face landmarks (5-point, RetinaFace/MTCNN) so
+    # stage5 can locate chin (neck ROI) and seed hand skin-tone ROI per §3.10.7.
+    # Landmarks are serialized as {left_eye:[x,y], ...} or None per box.
+    # Convert numpy/int landmark coords to plain lists for JSON.
+    _landmarks_ser = []
+    for lm in face_landmarks:
+        if isinstance(lm, dict):
+            _lm_out = {}
+            for k, v in lm.items():
+                if v is None:
+                    _lm_out[k] = None
+                else:
+                    try:
+                        _lm_out[k] = [float(v[0]), float(v[1])]
+                    except Exception:
+                        _lm_out[k] = None
+            _landmarks_ser.append(_lm_out)
+        else:
+            _landmarks_ser.append(None)
     face_meta_path = os.path.join(
         temp_dir, f"{job_id}_{Path(input_name).stem}_face_boxes.json")
     try:
         with open(face_meta_path, "w", encoding="utf-8") as f:
-            json.dump({"face_boxes": face_boxes}, f)
+            json.dump({"face_boxes": face_boxes,
+                      "face_landmarks": _landmarks_ser}, f)
         logger.info("STAGE4_FACE_META", f"Saved face_boxes metadata: {face_meta_path}")
     except Exception as e:
         logger.warning("STAGE4_FACE_META_FAIL", f"Failed to save face_boxes: {e}")

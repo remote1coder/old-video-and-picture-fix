@@ -341,22 +341,24 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 "    gc.collect()\n"
                 "    if torch.cuda.is_available():\n"
                 "        torch.cuda.empty_cache()\n"
-                # FIX-R8-W2: prefer torch.cuda.OutOfMemoryError (RuntimeError
-                # subclass) so non-English OOM messages aren't missed; keep
-                # RuntimeError string match as <1.13 fallback. Per baseline §G,
-                # OOM must NOT be swallowed by `except Exception`.
-                "except torch.cuda.OutOfMemoryError:\n"
-                "    try:\n"
-                "        del upsampler\n"
-                "    except NameError:\n"
-                "        pass\n"
-                "    gc.collect()\n"
-                "    if torch.cuda.is_available():\n"
-                "        torch.cuda.empty_cache()\n"
-                "    import time as _t; _t.sleep(0.1)\n"
-                "    sys.exit(83)  # FIX-P8-1: GPU OOM per v6.32 §7.14\n"
-                "except RuntimeError as e:\n"
-                "    if 'out of memory' in str(e).lower():\n"
+                # FIX-N+1-4 (N+1 轮核验): merge OOM except clauses into one
+                # version-safe RuntimeError handler. ORIGINAL used
+                # `except torch.cuda.OutOfMemoryError:` as a sibling clause; on
+                # PyTorch<1.13 that class doesn't exist, so evaluating the except
+                # expression raised AttributeError, losing the original OOM and
+                # skipping the RuntimeError string-match fallback (the subprocess
+                # then exited non-83, breaking OOM downgrade). Now a single
+                # except RuntimeError (OutOfMemoryError is a RuntimeError
+                # subclass) detects OOM via hasattr-guarded isinstance
+                # (non-English OOM on >=1.13) OR English string match
+                # (<1.13 fallback); non-OOM RuntimeErrors re-raise. Per baseline
+                # §G, OOM must NOT be swallowed by `except Exception`.
+                "except RuntimeError as _e:\n"
+                "    _is_oom = (hasattr(torch.cuda, 'OutOfMemoryError')\n"
+                "               and isinstance(_e, torch.cuda.OutOfMemoryError))\n"
+                "    if (not _is_oom) and ('out of memory' in str(_e).lower()):\n"
+                "        _is_oom = True\n"
+                "    if _is_oom:\n"
                 "        try:\n"
                 "            del upsampler\n"
                 "        except NameError:\n"
@@ -469,20 +471,20 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "    gc.collect()\n"
                 "    if torch.cuda.is_available():\n"
                 "        torch.cuda.empty_cache()\n"
-                # FIX-R8-W2: prefer torch.cuda.OutOfMemoryError; RuntimeError
-                # string match as <1.13 fallback (baseline §G, no swallow).
-                "except torch.cuda.OutOfMemoryError:\n"
-                "    try:\n"
-                "        del upsampler\n"
-                "    except NameError:\n"
-                "        pass\n"
-                "    gc.collect()\n"
-                "    if torch.cuda.is_available():\n"
-                "        torch.cuda.empty_cache()\n"
-                "    import time as _t; _t.sleep(0.1)\n"
-                "    sys.exit(83)  # FIX-P8-1: GPU OOM exit code\n"
-                "except RuntimeError as e:\n"
-                "    if 'out of memory' in str(e).lower():\n"
+                # FIX-N+1-4 (N+1 轮核验): merge OOM except clauses into one
+                # version-safe RuntimeError handler (see run_realesrgan for
+                # full rationale). ORIGINAL `except torch.cuda.OutOfMemoryError:`
+                # raised AttributeError on PyTorch<1.13, losing the OOM and
+                # skipping the RuntimeError fallback (subprocess exited non-83,
+                # breaking OOM downgrade). Single except RuntimeError now
+                # detects OOM via hasattr-guarded isinstance (>=1.13, non-English)
+                # OR English string match (<1.13); non-OOM re-raises. Per §G.
+                "except RuntimeError as _e:\n"
+                "    _is_oom = (hasattr(torch.cuda, 'OutOfMemoryError')\n"
+                "               and isinstance(_e, torch.cuda.OutOfMemoryError))\n"
+                "    if (not _is_oom) and ('out of memory' in str(_e).lower()):\n"
+                "        _is_oom = True\n"
+                "    if _is_oom:\n"
                 "        try:\n"
                 "            del upsampler\n"
                 "        except NameError:\n"
@@ -908,6 +910,54 @@ def main():
             sufficient, backend = check_gpu_memory(mem_required, logger)
 
         if not sufficient:
+            # FIX-R8-W5: Per v7.32 §3.10.23 "CPU 也不可用 -> 跳过 AI 阶段,直接
+            # 输出传统修复结果". CPU inference is always possible WHEN torch is
+            # importable; the only "CPU unavailable" case is torch entirely missing
+            # (no GPU backend and no CPU PyTorch). require_cuda=True already exits
+            # 83 upstream (L702-715); this branch catches require_cuda=False + no
+            # torch. Mirror photo M-12-10: copy stage2 traditional output as stage3
+            # output and return 3 (skip AI) so downstream stages consume traditional.
+            try:
+                import torch  # noqa: F401
+                _has_cpu_torch = True
+            except ImportError:
+                _has_cpu_torch = False
+            if not _has_cpu_torch:
+                logger.warning("STAGE3_SKIP_AI_NO_TORCH",
+                               "No GPU and no CPU PyTorch backend; skipping AI stage, "
+                               "emitting traditional (stage2) output directly per "
+                               "v7.32 §3.10.23")
+                # FIX-R8-W5-REGRESSION (N+1 轮核验): 原代码 shutil.copyfile(stage2_output,
+                # output_path) 中的 output_path 在此处未定义 (首次定义于 L1188, 依赖
+                # L953 的 param_hash, 均在本分支之后), 必抛 NameError, 被 except 捕获
+                # 后返回 83 而非预期的 3, 导致 "跳过 AI 输出传统结果" 降级路径失效。
+                # 就地计算 param_hash 与 step3 输出路径 (镜像正常路径 L946-988 的
+                # core_params 与 L1178-1188 的命名逻辑), 使副本文件名与下游 stage4
+                # 期望的 param_hash 一致。
+                try:
+                    from checkpoint import compute_param_hash
+                    _skip_core_params = {
+                        "upscale_scale": scale,
+                        "upscale_model": model,
+                        "lanczos_target": params.get("lanczos_target", "auto"),
+                        "ai_enabled": ai_enabled,
+                        "vs_bit_depth": params.get("vs_bit_depth", 16),  # FIX-P8-5
+                    }
+                    _skip_hash = compute_param_hash(stage2_output, _skip_core_params)
+                    _skip_inter = (f"{job_id}_{Path(input_name).stem}"
+                                   f"_step3_upscale_p{_skip_hash}")
+                    if combined_banned and force_allow:
+                        _skip_inter = (f"{job_id}_{Path(input_name).stem}"
+                                       f"_step3_forced_upscale_p{_skip_hash}")
+                    _skip_output = str(Path(temp_dir) / f"{_skip_inter}.mkv")
+                    shutil.copyfile(stage2_output, _skip_output)
+                    logger.info("STAGE3_SKIP_AI_DONE",
+                                f"Traditional output copied to {_skip_output}")
+                    return 3
+                except Exception as _e:
+                    logger.error("STAGE3_SKIP_AI_COPY_FAIL",
+                                 f"Traditional fallback copy failed: {_e}")
+                    return 83
             logger.warning("STAGE3_CPU",
                            "GPU unavailable, using CPU (very slow)")
             backend = "cpu"
@@ -1058,7 +1108,20 @@ def main():
                 continue
             global_idx = win_start + int(match.group()) - 1
             dst = Path(output_dir) / f"frame_{global_idx:08d}.png"
-            shutil.copyfile(str(src), str(dst))
+            # FIX-R8-M2: detect disk-full (errno 28 / ENOSPC) on frame copy and
+            # return 87 (non-retryable resource exhausted) per v7.32 §3.10.18.
+            # ORIGINAL: bare shutil.copyfile would raise OSError that fell through
+            # to a generic 82 (IO error), which is_retryable_error treats as
+            # retryable - retrying disk-full only re-fills the disk.
+            try:
+                shutil.copyfile(str(src), str(dst))
+            except OSError as _e:
+                if getattr(_e, "errno", None) == errno.ENOSPC:
+                    logger.error("STAGE3_DISK_FULL",
+                                 f"Disk full (errno 28) writing {dst}. "
+                                 f"Non-retryable per v7.32 §3.10.18.")
+                    return 87
+                raise
             try:
                 st = src.stat()
                 os.utime(str(dst), (st.st_atime, st.st_mtime))

@@ -66,7 +66,11 @@ def main():
     # V-P-018 fix: use consistent extension with stage7 lookup
     # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
     # ORIGINAL: output_audio = os.path.join(temp_dir, f"...") / os.path.exists()
-    output_audio_obj = Path(temp_dir) / f"{args.job_id}_{input_name}.audio"
+    # FIX-R7-S0-OBS: Use .mka (Matroska Audio) instead of the non-standard .audio
+    # extension. .audio is not a recognized container, so ffmpeg could not
+    # infer the muxer and stage7's ffprobe could fail to read channel_layout/
+    # duration. .mka accepts any codec with -c:a copy per v7.32 §3.10.9.
+    output_audio_obj = Path(temp_dir) / f"{args.job_id}_{input_name}.mka"
 
     # Check if already exists
     if output_audio_obj.exists() and output_audio_obj.stat().st_size > 0:
