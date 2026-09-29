@@ -180,7 +180,7 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list, floa
     # FIX-P6-10: Frame-based sliding window per v7.32 §3.10.13
     # ORIGINAL: Time-based (2.0s window, 1.0s step) — wrong for low-fps (10fps) content
     # where 2s = only 20 frames, below the ≥30-frame minimum per spec
-    min_window_frames = 30  # v7.32 §3.10.13: ≥30 frames
+    min_window_frames = 30  # v7.32 §3.10.13: ≥30 frames (detection window; spec segment floor=5 — FIX-W3: 30 chosen for vote stability)
     step_frames = 15        # half-window step
     window_duration = min_window_frames / fps if fps > 0 else 2.0
     step = step_frames / fps if fps > 0 else 1.0
@@ -510,6 +510,9 @@ def _check_psf_ssim_consecutive(input_path: str) -> bool:
             return False
 
         consec_avg = float(np.mean(ssim_values))
+        # FIX-W4: threshold 0.95 per v7.32 §3.9 (PSF = progressive segmented
+        # frame; field pairs are near-identical). 0.95 is the spec value; lower
+        # would false-positive on gentle motion, higher would miss soft PSF.
         return consec_avg > 0.95
 
     except Exception:
@@ -887,7 +890,17 @@ def classify_video(input_path: str) -> Dict[str, Any]:
         # Skip IVTC for mixed field order; per-segment QTGMC handles deinterlacing
         result["needs_ivtc"] = False
     elif is_ntsc and field_order in interlaced_orders:
-        if result["detected_class"] in ("ANALOG_TAPE", "DV_DIGITAL"):
+        # FIX-W13: HDV_AVCHD is excluded from IVTC by default (its 3:2 pulldown
+        # is telecine, not native interlace; IVTC would over-comb). A config
+        # switch `hdv_ivtc` (under classify section) overrides this to force IVTC
+        # for HDV/AVCHD sources when the user knows the material is true interlace.
+        # ORIGINAL: HDV_AVCHD was simply absent from the needs_ivtc set, with no
+        # documented opt-in. Per v6.32 Part 4 HDV/AVCHD handling.
+        hdv_ivtc = bool((config or {}).get("classify", {}).get("hdv_ivtc", False))
+        ivtc_classes = ("ANALOG_TAPE", "DV_DIGITAL")
+        if hdv_ivtc:
+            ivtc_classes = ivtc_classes + ("HDV_AVCHD",)
+        if result["detected_class"] in ivtc_classes:
             result["needs_ivtc"] = True
 
     # V-P-014 fix: pixel feature analysis enhancement

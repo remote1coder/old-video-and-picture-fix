@@ -52,6 +52,15 @@ def detect_hum_frequency(audio_path: str, sample_rate: int = 48000,
         "hum_ratio": 0.0,
         "is_dual_hum": False,
         "skip_bandreject": True,
+        # FIX-WARN-4: low_freq_absent flag per v7.32 §3.10.22 ("无低频内容
+        # (峰值低于阈值),默认回退至 50Hz 并记录 WARNING"). Set when there is
+        # signal but the 45-65Hz hum band energy is negligible (absolute or
+        # relative). ORIGINAL: only the total_power<1e-12 (truly silent) path
+        # tripped the WARNING via primary_freq==50 & hum_ratio==0.0; a tiny
+        # but non-zero hum_ratio (<0.5%) returned skip_bandreject=True without
+        # setting low_freq_absent, so the WARNING never fired for "near-silent
+        # low-freq" material. process_audio keys off this flag for the WARNING.
+        "low_freq_absent": False,
     }
     
     try:
@@ -119,21 +128,28 @@ def detect_hum_frequency(audio_path: str, sample_rate: int = 48000,
         total_power = np.sum(power_spectrum)
         if total_power < 1e-12:
             # FIX-P3-4: Default to 50Hz when no low-frequency content per v7.32 §3.10.22
+            # FIX-WARN-4: mark low_freq_absent so process_audio emits WARNING.
             result["primary_freq"] = 50
             result["has_hum"] = False
             result["skip_bandreject"] = True
+            result["low_freq_absent"] = True
             return result
-        
+
         # 45-65Hz band power
         hum_mask = (freqs >= 45) & (freqs <= 65)
         hum_power = np.sum(power_spectrum[hum_mask])
         hum_ratio = hum_power / total_power
         result["hum_ratio"] = hum_ratio
-        
+
         # Energy threshold: < 0.5% means no significant hum -> skip bandreject
+        # FIX-WARN-4: also mark low_freq_absent so process_audio emits the
+        # "no low-frequency content" WARNING per v7.32 §3.10.22. ORIGINAL
+        # only set skip_bandreject and returned, so a tiny non-zero hum_ratio
+        # fell through to the INFO skip log and never produced a WARNING.
         if hum_ratio < 0.005:
             result["skip_bandreject"] = True
             result["has_hum"] = False
+            result["low_freq_absent"] = True
             return result
         
         result["has_hum"] = True
@@ -419,7 +435,12 @@ def process_audio(audio_path: str, output_path: str,
         # broadband denoise. Wording corrected to match the null default;
         # detect_hum_frequency still sets primary_freq=50 as an internal
         # placeholder, but skip_bandreject=True so no bandreject runs.
-        if hum_result.get("primary_freq") == 50 and hum_result.get("hum_ratio", 0) == 0.0:
+        # FIX-WARN-4: Use the low_freq_absent flag (set for both the
+        # total_power<1e-12 and hum_ratio<0.5% cases) so a tiny non-zero
+        # hum_ratio also triggers the WARNING per v7.32 §3.10.22. ORIGINAL
+        # keyed off `primary_freq==50 and hum_ratio==0.0`, which missed the
+        # near-silent-but-non-zero case (hum_ratio in (0, 0.005)).
+        if hum_result.get("low_freq_absent"):
             logger.warning("AUDIO_HUM_DEFAULT",
                           "No low-frequency content detected; hum_freq stays "
                           "null (auto), bandreject skipped per v7.32 §3.10.22")

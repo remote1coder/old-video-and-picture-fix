@@ -509,7 +509,7 @@ def _estimate_motion_optical_flow(frame_paths: List[str],
         return _estimate_motion(frame_paths)
 
 
-def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tuple[int, float]], dict]:
+def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tuple[int, float]], dict, dict]:
     """Detect static face segments in video.
 
     Per v7.3 §3.10.5:
@@ -633,6 +633,14 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
     # Detect face presence per sample frame
     face_present = [False] * len(sample_frames)
     face_boxes = [[] for _ in range(len(sample_frames))]  # List of (x,y,w,h,conf) per frame
+    # FIX-W9-06: parallel landmarks list per v7.32 §3.10.7. RetinaFace returns
+    # 5-point landmarks (eye_l, eye_r, nose, mouth_l, mouth_r); MTCNN returns
+    # keypoints similarly. Used by color match to locate chin (neck ROI upper
+    # boundary) and seed the hand skin-tone ROI. None entries = no landmarks
+    # (geometric fallback). Aligned index-for-index with face_boxes[i].
+    face_landmarks: List[List[Optional[dict]]] = [
+        [] for _ in range(len(sample_frames))
+    ]
 
     for detector_name in face_detect_fallback:
         detector_name_lower = detector_name.lower()
@@ -670,6 +678,13 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                                     if accept:
                                         face_present[i] = True
                                         face_boxes[i].append((bbox[0], bbox[1], fw_r, fh_r, conf))
+                                        # FIX-W9-06: capture 5-point landmarks
+                                        # (RetinaFace dict: eye_r, eye_l, nose,
+                                        # mouth_r, mouth_l as (x,y)). Used for
+                                        # chin/neck ROI per v7.32 §3.10.7.
+                                        lm = face.get("landmarks")
+                                        face_landmarks[i].append(
+                                            dict(lm) if isinstance(lm, dict) else None)
                 except ImportError:
                     if logger:
                         logger.warning("STAGE5_FACE_IMPORT", "retinaface not installed")
@@ -704,6 +719,11 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                                 if accept:
                                     face_present[i] = True
                                     face_boxes[i].append((float(xywh[0]), float(xywh[1]), fw_y, fh_y, conf))
+                                    # FIX-W9-06: YOLOv8-face standard boxes do not
+                                    # include landmarks (needs a separate landmark
+                                    # head). Append None -> color match falls back
+                                    # to geometric neck ROI per v7.32 §3.10.7.
+                                    face_landmarks[i].append(None)
                 except ImportError:
                     if logger:
                         logger.warning("STAGE5_FACE_IMPORT", "ultralytics not installed")
@@ -736,6 +756,22 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                                 if accept:
                                     face_present[i] = True
                                     face_boxes[i].append((x, y, w, h, conf))
+                                    # FIX-W9-06: MTCNN keypoints dict has
+                                    # 'left_eye','right_eye','nose','mouth_left',
+                                    # 'mouth_right' as (x,y). Normalize to RetinaFace
+                                    # key names so color match is detector-agnostic.
+                                    kp = face.get("keypoints")
+                                    if isinstance(kp, dict):
+                                        lm_norm = {
+                                            "left_eye": kp.get("left_eye"),
+                                            "right_eye": kp.get("right_eye"),
+                                            "nose": kp.get("nose"),
+                                            "mouth_left": kp.get("mouth_left"),
+                                            "mouth_right": kp.get("mouth_right"),
+                                        }
+                                        face_landmarks[i].append(lm_norm)
+                                    else:
+                                        face_landmarks[i].append(None)
                 except ImportError:
                     if logger:
                         logger.warning("STAGE5_FACE_IMPORT", "mtcnn not installed")
@@ -952,26 +988,100 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
 
     # Build face_boxes_for_color_match dict: frame_name -> [(x,y,w,h,conf), ...]
     face_boxes_for_color = {}
+    # FIX-W9-06: parallel landmarks dict (frame_name -> [lm_or_None, ...]),
+    # index-aligned with the boxes list for each frame.
+    face_landmarks_for_color: dict = {}
     for idx in range(len(face_boxes)):
         if face_boxes[idx]:
             frame_num = sample_to_frame.get(idx, idx * sample_interval)
             frame_name = f"frame_{frame_num:08d}.png"
             face_boxes_for_color[frame_name] = face_boxes[idx]
+            face_landmarks_for_color[frame_name] = face_landmarks[idx]
 
-    return face_segments, face_boxes_for_color
+    return face_segments, face_boxes_for_color, face_landmarks_for_color
+
+
+def _chin_y_from_landmarks(landmarks: Optional[dict],
+                            face_box: tuple) -> int:
+    """Estimate the chin y-coordinate from 5-point face landmarks.
+
+    FIX-W9-06: Per v7.32 §3.10.7, use landmark keypoints (not the face-box
+    lower edge) to locate the neck ROI upper boundary. The chin sits below the
+    mouth; we take max(mouth_l_y, mouth_r_y) + a small margin proportional to
+    face height. Returns -1 when landmarks are unavailable (caller falls back
+    to geometric face-box lower edge).
+    """
+    if not isinstance(landmarks, dict):
+        return -1
+    try:
+        ml = landmarks.get("mouth_left") or landmarks.get("mouth_right")
+        mr = landmarks.get("mouth_right") or landmarks.get("mouth_left")
+        ys = []
+        for pt in (ml, mr):
+            if pt and len(pt) >= 2:
+                ys.append(float(pt[1]))
+        if not ys:
+            return -1
+        mouth_y = max(ys)
+        fh = float(face_box[3]) if face_box and len(face_box) > 3 else 0.0
+        margin = max(4.0, fh * 0.12)  # chin is ~below mouth by a small margin
+        return int(mouth_y + margin)
+    except Exception:
+        return -1
+
+
+def _hand_skin_roi(img: np.ndarray, face_box: tuple) -> np.ndarray:
+    """Sample a hand skin-tone ROI below the face for color reference.
+
+    FIX-W9-06: Per v7.32 §3.10.7, color matching should reference hand ROI (in
+    addition to neck) so the restored face matches body skin tone. Hands are
+    not directly detected (no hand model); instead sample skin-tone pixels in
+    the region below the face box (where hands typically appear in portraits).
+    Returns the skin-pixel array (N×3) or an empty array if no skin found.
+    """
+    try:
+        if img is None or img.size == 0:
+            return np.empty((0, 3), dtype=img.dtype if img is not None else np.uint8)
+        h, w = img.shape[:2]
+        fx, fy, fw, fh = (int(face_box[0]), int(face_box[1]),
+                          int(face_box[2]), int(face_box[3]))
+        # Region below face, lower half of frame, within face width ±50%
+        x1 = max(0, fx - fw // 2)
+        x2 = min(w, fx + fw + fw // 2)
+        y1 = min(h, fy + fh + fh // 4)
+        y2 = min(h, y1 + fh * 2)
+        if y2 <= y1 or x2 <= x1:
+            return np.empty((0, 3), dtype=img.dtype)
+        region = img[y1:y2, x1:x2]
+        if region.size == 0:
+            return np.empty((0, 3), dtype=img.dtype)
+        # Skin-tone in BGR (approx): R>95, G>40, B>20, max-min>15, |R-G|>15
+        # Works on uint8 BGR or RGB; tolerant of either channel order.
+        r = region[:, :, 2].astype(np.int32) if region.shape[-1] >= 3 else np.zeros_like(region[:,:,0])
+        g = region[:, :, 1].astype(np.int32)
+        b = region[:, :, 0].astype(np.int32)
+        mx = np.maximum(np.maximum(r, g), b)
+        mn = np.minimum(np.minimum(r, g), b)
+        skin_mask = (r > 95) & (g > 40) & (b > 20) & (mx - mn > 15) & (np.abs(r - g) > 15)
+        return region[skin_mask]
+    except Exception:
+        return np.empty((0, 3), dtype=np.uint8)
 
 
 def _match_face_color(frame_dir: str, face_boxes_dict: dict,
-                      logger_obj=None):
+                      logger_obj=None, landmarks_dict: Optional[dict] = None):
     """Align face region color to neck region using LAB histogram matching.
 
     FIX-P9-7: Three-tier color matching per v7.32 §3.10.7:
     - Plan A (OpenCV LAB histogram matching)
     - Plan B (G'MIC match_histogram fallback)
     - Plan C (save intermediate for manual correction)
+    FIX-W9-06: landmarks_dict (frame_name -> [lm_or_None]) threaded through to
+    Plan A for chin-based neck ROI + hand skin-tone reference per §3.10.7.
     """
     try:
-        _match_face_color_opencv(frame_dir, face_boxes_dict, logger_obj)
+        _match_face_color_opencv(frame_dir, face_boxes_dict, logger_obj,
+                                  landmarks_dict=landmarks_dict)
         return
     except Exception as e:
         if logger_obj:
@@ -989,7 +1099,7 @@ def _match_face_color(frame_dir: str, face_boxes_dict: dict,
 
 
 def _match_face_color_opencv(frame_dir: str, face_boxes_dict: dict,
-                              logger_obj=None):
+                              logger_obj=None, landmarks_dict: Optional[dict] = None):
     """Plan A: OpenCV LAB histogram matching per v7.32 §3.10.7.
 
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
@@ -1006,8 +1116,16 @@ def _match_face_color_opencv(frame_dir: str, face_boxes_dict: dict,
             continue
         # Use largest face box
         boxes_sorted = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-        fx, fy, fw, fh = int(boxes_sorted[0][0]), int(boxes_sorted[0][1]), \
-            int(boxes_sorted[0][2]), int(boxes_sorted[0][3])
+        best_box = boxes_sorted[0]
+        fx, fy, fw, fh = int(best_box[0]), int(best_box[1]), \
+            int(best_box[2]), int(best_box[3])
+        # FIX-W9-06: pick the aligned landmark dict for the largest face. Boxes
+        # and landmarks lists are index-aligned per frame; find the largest-box
+        # index to fetch its landmark.
+        best_idx = boxes.index(best_box)
+        frame_landmarks = (landmarks_dict or {}).get(frame_key) or []
+        best_lm = (frame_landmarks[best_idx]
+                   if best_idx < len(frame_landmarks) else None)
         # Expand face ROI by 1.2× as facial region
         cx, cy = fx + fw // 2, fy + fh // 2
         expand = 1.2
@@ -1016,8 +1134,13 @@ def _match_face_color_opencv(frame_dir: str, face_boxes_dict: dict,
         face_y1 = max(0, cy - new_h // 2)
         face_x2 = min(img.shape[1], cx + new_w // 2)
         face_y2 = min(img.shape[0], cy + new_h // 2)
-        # Neck ROI: directly below face, same width
-        neck_y1 = face_y2
+        # Neck ROI: directly below face, same width.
+        # FIX-W9-06: when landmarks are available, start the neck ROI at the
+        # chin (mouth_y + margin) rather than the face-box lower edge - the box
+        # lower edge often cuts into the chin/jaw, biasing the reference. Falls
+        # back to face_y2 (geometric) when landmarks are None.
+        chin_y = _chin_y_from_landmarks(best_lm, best_box)
+        neck_y1 = max(face_y2, chin_y) if chin_y > 0 else face_y2
         neck_y2 = min(img.shape[0], neck_y1 + new_h // 2)
         if neck_y2 <= neck_y1:
             continue
@@ -1025,16 +1148,34 @@ def _match_face_color_opencv(frame_dir: str, face_boxes_dict: dict,
         neck_roi = img[neck_y1:neck_y2, face_x1:face_x2]
         if face_roi.size == 0 or neck_roi.size == 0:
             continue
+        # FIX-W9-06: sample hand skin-tone ROI below the face and merge into the
+        # neck reference so the restored face matches body skin, not just neck.
+        # hand_skin is an N×3 pixel array; concatenate into neck_lab statistics.
+        hand_skin = _hand_skin_roi(img, best_box)
         # Convert to LAB and match histograms
         face_lab = cv2.cvtColor(face_roi, cv2.COLOR_BGR2LAB)
         neck_lab = cv2.cvtColor(neck_roi, cv2.COLOR_BGR2LAB)
+        # If hand skin pixels were found, fold them into the reference so the
+        # match target reflects neck + hand skin tone (per §3.10.7 hand ROI).
+        if hand_skin.size > 0:
+            try:
+                hand_lab = cv2.cvtColor(hand_skin.reshape(-1, 1, 3),
+                                        cv2.COLOR_BGR2LAB).reshape(-1, 3)
+                # Concatenate neck + hand pixels for reference statistics
+                neck_pixels = neck_lab.reshape(-1, 3)
+                ref_pixels = np.concatenate([neck_pixels, hand_lab], axis=0)
+            except Exception:
+                ref_pixels = neck_lab.reshape(-1, 3)
+        else:
+            ref_pixels = neck_lab.reshape(-1, 3)
         matched_lab = face_lab.copy()
         for ch in range(3):
             src_mean, src_std = face_lab[:, :, ch].mean(), face_lab[:, :, ch].std()
-            ref_mean, ref_std = neck_lab[:, :, ch].mean(), neck_lab[:, :, ch].std()
+            ref_mean = float(ref_pixels[:, ch].mean())
+            ref_std = float(ref_pixels[:, ch].std())
             if src_std < 1e-6:
                 continue
-            # Scale and shift to match neck distribution
+            # Scale and shift to match neck+hand distribution
             matched_lab[:, :, ch] = np.clip(
                 (face_lab[:, :, ch] - src_mean) * (ref_std / src_std) + ref_mean,
                 0, 255
@@ -1104,8 +1245,13 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                                 face_restore: str,
                                 temp_dir: str, job_id: str,
                                 params: dict, logger,
-                                fps_val: float) -> int:
+                                fps_val: float,
+                                landmarks_for_color: Optional[dict] = None) -> int:
     """Streaming face restoration pipeline per P9-ARCH.
+
+    FIX-W9-06: landmarks_for_color (frame_name -> [lm_or_None]) threaded to the
+    streaming color-match step for chin-based neck ROI + hand skin-tone ref per
+    v7.32 §3.10.7.
 
     Only extract frames within detected face segments, then stream-encode
     the output with selective frame replacement. Avoids extracting the
@@ -1163,16 +1309,25 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                             boxes_sorted = sorted(boxes,
                                                   key=lambda b: b[2] * b[3],
                                                   reverse=True)
-                            bx, by, bw, bh = (int(boxes_sorted[0][0]),
-                                               int(boxes_sorted[0][1]),
-                                               int(boxes_sorted[0][2]),
-                                               int(boxes_sorted[0][3]))
+                            _best_box_c = boxes_sorted[0]
+                            bx, by, bw, bh = (int(_best_box_c[0]),
+                                               int(_best_box_c[1]),
+                                               int(_best_box_c[2]),
+                                               int(_best_box_c[3]))
                             cx, cy = bx + bw // 2, by + bh // 2
                             expand = 1.2
                             new_w, new_h = int(bw * expand), int(bh * expand)
                             fy1 = max(0, cy - new_h // 2)
                             fy2 = min(frame.shape[0], cy + new_h // 2)
-                            ny1 = fy2
+                            # FIX-W9-06: cache the chin-aligned neck ROI so the
+                            # later color match (step 6) reads an original ROI
+                            # that already starts at the chin, not the box edge.
+                            _best_idx_c = boxes.index(_best_box_c)
+                            _flm_c = (landmarks_for_color or {}).get(frame_name) or []
+                            _lm_c = (_flm_c[_best_idx_c]
+                                     if _best_idx_c < len(_flm_c) else None)
+                            _chin_c = _chin_y_from_landmarks(_lm_c, _best_box_c)
+                            ny1 = max(fy2, _chin_c) if _chin_c > 0 else fy2
                             ny2 = min(frame.shape[0], ny1 + new_h // 2)
                             fx1 = max(0, cx - new_w // 2)
                             fx2 = min(frame.shape[1], cx + new_w // 2)
@@ -1231,21 +1386,38 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                       f"Error loading restored frames: {e}")
 
     # 6. Apply color matching to restored frames (in memory)
+    # FIX-W9-05: Per v7.32 §3.10.7, the streaming color-match path must have a
+    # fallback chain (Plan A OpenCV LAB -> Plan C manual intermediate), matching
+    # the legacy _match_face_color path. ORIGINAL wrapped the whole loop in one
+    # try/except, so a single frame's failure aborted color matching for ALL
+    # remaining frames. Now each frame is matched independently; on Plan A
+    # failure the frame is left uncolor-matched (safe) and saved as a
+    # _face_restored.tif intermediate (Plan C) so the user can manually match.
+    # FIX-W9-06: Per v7.32 §3.10.7, color matching should use face landmarks to
+    # locate face/neck/HAND ROI. Landmark-based hand detection is not yet wired
+    # in (needs RetinaFace/MTCNN keypoints passed from _detect_faces); the
+    # current geometric neck ROI (face-box lower edge) is the documented
+    # fallback. Emit a WARNING so operators know hand ROI is not detected.
     if face_boxes_for_color:
-        try:
-            import cv2
-            for fidx, rimg in list(restored_frames.items()):
-                frame_name = f"frame_{fidx:08d}.png"
-                boxes = face_boxes_for_color.get(frame_name, [])
-                if not boxes:
-                    continue
+        logger.warning("STAGE5_HAND_ROI_FALLBACK",
+                       "Color matching uses geometric neck ROI fallback; "
+                       "landmark-based hand ROI not detected per v7.32 §3.10.7 "
+                       "(needs face keypoint model)")
+        import cv2
+        for fidx, rimg in list(restored_frames.items()):
+            frame_name = f"frame_{fidx:08d}.png"
+            boxes = face_boxes_for_color.get(frame_name, [])
+            if not boxes:
+                continue
+            try:
                 boxes_sorted = sorted(boxes,
                                       key=lambda b: b[2] * b[3],
                                       reverse=True)
-                bx, by, bw, bh = (int(boxes_sorted[0][0]),
-                                   int(boxes_sorted[0][1]),
-                                   int(boxes_sorted[0][2]),
-                                   int(boxes_sorted[0][3]))
+                best_box_s = boxes_sorted[0]
+                bx, by, bw, bh = (int(best_box_s[0]),
+                                   int(best_box_s[1]),
+                                   int(best_box_s[2]),
+                                   int(best_box_s[3]))
                 cx, cy = bx + bw // 2, by + bh // 2
                 expand = 1.2
                 new_w, new_h = int(bw * expand), int(bh * expand)
@@ -1253,7 +1425,13 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                 fy1 = max(0, cy - new_h // 2)
                 fx2 = min(rimg.shape[1], cx + new_w // 2)
                 fy2 = min(rimg.shape[0], cy + new_h // 2)
-                ny1 = fy2
+                # FIX-W9-06: landmark-based chin for neck ROI upper boundary.
+                best_idx_s = boxes.index(best_box_s)
+                _frame_lms = (landmarks_for_color or {}).get(frame_name) or []
+                _best_lm_s = (_frame_lms[best_idx_s]
+                              if best_idx_s < len(_frame_lms) else None)
+                _chin_y_s = _chin_y_from_landmarks(_best_lm_s, best_box_s)
+                ny1 = max(fy2, _chin_y_s) if _chin_y_s > 0 else fy2
                 ny2 = min(rimg.shape[0], ny1 + new_h // 2)
                 if ny2 > ny1 and fx2 > fx1:
                     face_roi = rimg[fy1:fy2, fx1:fx2]
@@ -1264,12 +1442,27 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                                                 cv2.COLOR_BGR2LAB)
                         neck_lab = cv2.cvtColor(neck_roi,
                                                 cv2.COLOR_BGR2LAB)
+                        # FIX-W9-06: fold hand skin-tone into reference so the
+                        # restored face matches body skin, not just neck.
+                        hand_skin_s = _hand_skin_roi(rimg, best_box_s)
+                        if hand_skin_s.size > 0:
+                            try:
+                                hand_lab_s = cv2.cvtColor(
+                                    hand_skin_s.reshape(-1, 1, 3),
+                                    cv2.COLOR_BGR2LAB).reshape(-1, 3)
+                                ref_pix_s = np.concatenate(
+                                    [neck_lab.reshape(-1, 3), hand_lab_s],
+                                    axis=0)
+                            except Exception:
+                                ref_pix_s = neck_lab.reshape(-1, 3)
+                        else:
+                            ref_pix_s = neck_lab.reshape(-1, 3)
                         matched_lab = face_lab.copy()
                         for ch in range(3):
                             s_mean = face_lab[:, :, ch].mean()
                             s_std = face_lab[:, :, ch].std()
-                            r_mean = neck_lab[:, :, ch].mean()
-                            r_std = neck_lab[:, :, ch].std()
+                            r_mean = float(ref_pix_s[:, ch].mean())
+                            r_std = float(ref_pix_s[:, ch].std())
                             if s_std < 1e-6:
                                 continue
                             matched_lab[:, :, ch] = np.clip(
@@ -1281,9 +1474,23 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                             matched_lab, cv2.COLOR_LAB2BGR)
                         rimg[fy1:fy2, fx1:fx2] = matched_bgr
                         restored_frames[fidx] = rimg
-        except Exception as e:
-            logger.warning("STAGE5_STREAM_COLOR",
-                          f"Color matching in streaming mode failed: {e}")
+            except Exception as e:
+                # FIX-W9-05: Plan A failed for this frame - leave it uncolor-
+                # matched (frame still has the restored face, just not color-
+                # adjusted to neck) and save a Plan C manual intermediate so the
+                # user can finish color matching externally. Other frames
+                # continue independently.
+                logger.warning("STAGE5_STREAM_COLOR_FRAME_FAIL",
+                               f"Color match failed for frame {fidx}: {e}; "
+                               f"left uncolor-matched, saved Plan C intermediate")
+                try:
+                    seg_png = os.path.join(temp_segments_dir, frame_name)
+                    if os.path.exists(seg_png):
+                        import shutil as _shutil
+                        _shutil.copyfile(
+                            seg_png, seg_png + "_face_restored.tif")
+                except Exception:
+                    pass
 
     # 7. Stream-encode: passthrough non-segment frames,
     #    feather-blend restored segment frames
@@ -1295,18 +1502,53 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
     else:
         pix_fmt_out = "yuv420p"
 
+    # FIX-W9-07: Per v7.32 §3.10.5, preserve 16bit precision through the
+    # streaming face-restore path for passthrough (non-face) frames. ORIGINAL
+    # hardcoded rgb24 decode/encode, so a 16bit source was downsampled to 8bit
+    # on every passthrough frame even though the encoder output is yuv420p16le.
+    # Now probe the source pixel format; if it carries >8bit precision, decode
+    # as rgb48 and encode rgb48, and upsample 8bit model output (GFPGAN/
+    # CodeFormer are 8bit models) to 16bit before blending so the blend math
+    # stays in the same range as the passthrough frame.
+    source_is_16bit = False
+    try:
+        _pf_r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt",
+             "-of", "default=noprint_wrappers=1:nokey=1", input_source],
+            capture_output=True, text=True, timeout=10, shell=False)
+        if _pf_r.returncode == 0:
+            _pf = (_pf_r.stdout or "").strip().lower()
+            if any(t in _pf for t in ("p16", "16le", "16be", "rgb48", "rgba64")):
+                source_is_16bit = True
+    except Exception:
+        pass
+    stream_pix_fmt_in = "rgb48" if source_is_16bit else "rgb24"
+
     try:
         import cv2
         with StreamingEncoder(output_path, width, height, fps_val,
-                              pix_fmt_in="rgb24",
+                              pix_fmt_in=stream_pix_fmt_in,
                               pix_fmt_out=pix_fmt_out) as encoder:
-            with StreamingDecoder(input_source) as decoder:
+            with StreamingDecoder(input_source,
+                                   pix_fmt=stream_pix_fmt_in) as decoder:
                 for frame_idx, frame, pts in decoder.frames():
                     if frame_idx in restored_frames:
                         # Convert BGR restored → RGB for encoder
                         restored_rgb = cv2.cvtColor(
                             restored_frames[frame_idx],
                             cv2.COLOR_BGR2RGB)
+                        # FIX-W9-07: if decoding 16bit, upsample the 8bit model
+                        # output (GFPGAN/CodeFormer produce uint8) to uint16
+                        # (x257) so the feather-blend math operates in the same
+                        # range as the 16bit passthrough frame. Without this,
+                        # _feather_blend_in_memory would cast uint8 values
+                        # directly to uint16 (255 -> 255, not 65535), darkening
+                        # the restored region.
+                        if source_is_16bit and restored_rgb.dtype == np.uint8:
+                            restored_rgb = (
+                                restored_rgb.astype(np.uint16) * 257
+                            ).astype(np.uint16)
                         # Get face bbox for feathered blending
                         frame_name = f"frame_{frame_idx:08d}.png"
                         boxes = face_boxes_for_color.get(
@@ -1431,12 +1673,24 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     logger.info("STAGE5_START", f"Face restore: {face_restore}", input=input_source)
 
     # Face detection
-    face_segments, face_boxes_for_color = _detect_faces(input_source, params, logger)
+    face_segments, face_boxes_for_color, face_landmarks_for_color = _detect_faces(input_source, params, logger)
     if not face_segments:
         logger.info("STAGE5_NO_FACE", "No faces detected, skipping face restore")
         return 3
 
     logger.info("STAGE5_FACE_SEGMENTS", f"Found {len(face_segments)} face segments")
+
+    # FIX-W9-02: Per v7.32 §3.10.7, GFPGAN/CodeFormer are per-frame (temporal)
+    # restorers - they process each face independently with no motion-compensation,
+    # which risks temporal flicker on moving faces. Emit a WARNING so operators
+    # understand the per-frame restoration may introduce temporal instability,
+    # especially on motion-heavy segments. ORIGINAL had no such warning, so the
+    # temporal risk was silent.
+    if face_segments:
+        logger.warning("STAGE5_TEMPORAL_RISK",
+                       "GFPGAN/CodeFormer per-frame face restore has no temporal "
+                       "compensation; motion-heavy segments may show temporal "
+                       "flicker per v7.32 §3.10.7")
 
     # BUG-038 fix: detect actual frame rate instead of hardcoding 25fps
     fps_str = "25"
@@ -1536,7 +1790,8 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
             input_source, output_path,
             face_segments, face_boxes_for_color,
             face_restore, temp_dir, job_id,
-            params, logger, fps_val)
+            params, logger, fps_val,
+            landmarks_for_color=face_landmarks_for_color)
 
     # --- LEGACY PATH: extract all frames → blend → encode ---
     logger.info("STAGE5_LEGACY_MODE",
@@ -1672,8 +1927,10 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
 
     # Auto color matching after face restoration
     # Per v7.3 §3.10.7: align face region color to neck region
+    # FIX-W9-06: thread landmarks for chin-based neck ROI + hand skin-tone ref.
     if face_boxes_for_color:
-        _match_face_color(all_frames_dir, face_boxes_for_color, logger)
+        _match_face_color(all_frames_dir, face_boxes_for_color, logger,
+                          landmarks_dict=face_landmarks_for_color)
 
     # Encode to FFV1 intermediate
     vs_bit_depth = params.get("vs_bit_depth", 16)

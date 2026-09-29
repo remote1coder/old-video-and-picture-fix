@@ -191,8 +191,18 @@ def main():
         "geq=lum='if(between(cb(X,Y),77,127)*between(cr(X,Y),133,173)"
         "*gt(lum(X,Y),80),255,0)',"
         "cb='128',cr='128'[skinmask];"
-        # Invert: skin=0 (protect), non-skin=255 (allow processing)
-        "[skinmask]negate[noskin];"
+        # FIX-R8-W8 (方案A): explicit hair mask per v6.32 §3 ("人物主体、皮肤、
+        # 头发区域完全排除"). Hair is typically dark (Y 16-80) but not pure black
+        # (avoid protecting black borders). Blended with skin mask via screen
+        # (union) so the person mask covers both skin and hair. ORIGINAL
+        # (方案B) relied on edgedetect classifying hair as textured -> copy
+        # branch, which protects it implicitly but fails on low-edge dark hair.
+        "[main]format=yuv420p,"
+        "geq=lum='if(gt(lum(X,Y),16)*lt(lum(X,Y),80),255,0)',"
+        "cb='128',cr='128'[hairmask];"
+        "[skinmask][hairmask]blend=all_mode=screen[personmask];"
+        # Invert: person(=skin+hair)=0 (protect), non-person=255 (allow)
+        "[personmask]negate[noskin];"
         # Combine: flat non-skin areas only
         "[maskraw][noskin]blend=all_mode=multiply[combinedmask];"
         # Feathered mask via gaussian blur (sigma=6 -> ~12px, >=8px per spec)

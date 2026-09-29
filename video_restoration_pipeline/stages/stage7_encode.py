@@ -144,11 +144,18 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                 # FIX-P7-9: Per v7.32 §3.10.22: save is_dual_hum from detection
                 is_dual_hum = hum_result.get("is_dual_hum", False)
         except Exception as e:
-            # FIX-P7-11: Per v7.32 §3.10.22: default to 50Hz with WARNING
-            detected_freq = 50
+            # FIX-R7-S7-3a (N+1 轮核验): Per round_7 fix doc item 3, a detection
+            # FAILURE (exception) must NOT default to 50Hz and apply bandreject --
+            # guessing a frequency on a crashed analysis risks cutting legitimate
+            # low-freq content. Keep hum_freq null (auto-detect inconclusive),
+            # skip bandreject, defer hum removal to afftdn general denoise. This
+            # mirrors the skip_bandreject path (L137-141) for internal consistency.
+            # (Spec §3.10.22's 50Hz fallback applies to the successful-detection
+            # "no low-freq content" case, not to a detection exception.)
+            detected_freq = None
             logger.warning("STAGE7_HUM_DETECT_FAIL",
                            f"Hum frequency detection failed: {e}. "
-                           "Defaulting to 50Hz per v7.32 §3.10.22")
+                           "hum_freq stays null (auto), bandreject skipped per v7.32 §3.10.22")
     
     if detected_freq and ffmpeg_version_ok:
         # Fundamental + 2nd + 3rd harmonic, all width=2Hz
@@ -178,7 +185,14 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
         # FIX-P7-1: Per v6.32 §7.12 / v7.32 §3.10.22:
         # FFmpeg <4.4: arnndn replaces bandreject for hum removal
         # ORIGINAL: only logged, arnndn filter not inserted into audio_filters
-        arnndn_model = params.get("arnndn_model", "")
+        # FIX-R7-S7-A2: resolve arnndn path via audio_utils._get_arnndn_model_path
+        # (single source of truth) instead of bare params.get("arnndn_model").
+        # Falls back to the raw config value if resolution returns None, matching
+        # the audio_utils.process_audio pattern (L487-489).
+        from audio_utils import _get_arnndn_model_path
+        arnndn_model = _get_arnndn_model_path(params, detected_freq or 0)
+        if not arnndn_model:
+            arnndn_model = params.get("arnndn_model", "")
         if arnndn_model and Path(arnndn_model).exists():
             if audio_layout is None:
                 audio_layout = _get_audio_layout(audio_path)
@@ -211,7 +225,12 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
     # Noise reduction AFTER bandreject
     noise_reduction = params.get("noise_reduction", True)
     if noise_reduction:
-        arnndn_model = params.get("arnndn_model", "")
+        # FIX-R7-S7-A2: reuse audio_utils._get_arnndn_model_path (consistent with
+        # hum branch and audio_utils.process_audio L545-548).
+        from audio_utils import _get_arnndn_model_path
+        arnndn_model = _get_arnndn_model_path(params, detected_freq or 0)
+        if not arnndn_model:
+            arnndn_model = params.get("arnndn_model", "")
         if audio_layout is None:
             audio_layout = _get_audio_layout(audio_path)
         num_channels = audio_layout.get("channels", 2)
@@ -607,14 +626,28 @@ def main():
     # FIX-R7-S7-A4: -fflags +genpts is an OUTPUT option ("封装时使用 -fflags +genpts"
     # per v7.32 §3.10.9). ORIGINAL placed it before -i (input side). It is now
     # added on the output side below, before the output path.
+    # FIX-R7-S7-13: support libx265 (HEVC) as an alternative encoder per v6.32
+    # Part 3 ("libsvtav1 或 libx265"). config video_encoder selects the codec;
+    # libsvtav1 remains the default. libx265 uses -preset slow -crf 18.
+    video_encoder = params.get("video_encoder", "libsvtav1")
     video_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-i", input_source,
-        "-c:v", "libsvtav1",
+        "-c:v", video_encoder,
         "-crf", str(crf),
         "-preset", str(preset),
         "-pix_fmt", pix_fmt,
     ]
+    if video_encoder == "libx265":
+        # x265 CRF 18 ≈ visually lossless; preset slow per v6.32 Part 3.
+        video_cmd = [
+            "ffmpeg", "-hide_banner", "-v", "error", "-y",
+            "-i", input_source,
+            "-c:v", "libx265",
+            "-crf", str(params.get("libx265_crf", 18)),
+            "-preset", str(params.get("libx265_preset", "slow")),
+            "-pix_fmt", pix_fmt,
+        ]
 
     # FIX-P7-1: BT.601→BT.709 color space conversion with range handling
     # FIX-P7-3: Probe stage output (input_source), not original input (args.input)
@@ -741,7 +774,12 @@ def main():
     # Audio (extract from original if available)
     # V-P-049 fix: match stage0 output naming convention
     # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
-    audio_path_obj = Path(temp_dir) / f"{job_id}_{input_name}.audio"
+    # FIX-R7-S0-OBS: stage0 now writes .mka (Matroska Audio) instead of the
+    # non-standard .audio extension. Check .mka first, then fall back to the
+    # legacy .audio name for intermediates produced by older stage0 runs.
+    audio_path_obj = Path(temp_dir) / f"{job_id}_{input_name}.mka"
+    if not audio_path_obj.exists() or audio_path_obj.stat().st_size == 0:
+        audio_path_obj = Path(temp_dir) / f"{job_id}_{input_name}.audio"
     # Fallback: also check the old naming for backward compatibility
     if not audio_path_obj.exists() or audio_path_obj.stat().st_size == 0:
         audio_path_fallback = Path(temp_dir) / f"{job_id}_{input_name}_audio_raw.wav"
@@ -822,10 +860,14 @@ def main():
     ])
     
     # BUG-041 fix: build svtav1-params once after all parameters are known
-    svt_params = f"tile-rows={tile_rows}:tile-columns={tile_cols}"
-    svt_params += f":color-primaries={svt_primaries}:transfer-characteristics={svt_trc}"
-    svt_params += f":matrix-coefficients={svt_matrix}:color-range={svt_range}"
-    video_cmd.extend(["-svtav1-params", svt_params])
+    # FIX-R7-S7-13: -svtav1-params is libsvtav1-specific; skip for libx265
+    # (x265 has no equivalent private-options key; color metadata is already
+    # set via -color_primaries/-color_trc/-colorspace above).
+    if video_encoder != "libx265":
+        svt_params = f"tile-rows={tile_rows}:tile-columns={tile_cols}"
+        svt_params += f":color-primaries={svt_primaries}:transfer-characteristics={svt_trc}"
+        svt_params += f":matrix-coefficients={svt_matrix}:color-range={svt_range}"
+        video_cmd.extend(["-svtav1-params", svt_params])
 
     # Metadata and output
     video_cmd.extend([

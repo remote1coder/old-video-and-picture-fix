@@ -241,24 +241,79 @@ def _apply_selective_processing(img: "Image.Image", params: dict,
         return Image.fromarray(result_arr), 8
 
 
+def _chin_y_from_landmarks_photo(landmarks, face_box) -> int:
+    """Estimate chin y from 5-point landmarks (photo pipeline, RGB float32).
+
+    FIX-H-12-06: Per v7.32 §3.10.7, use landmark keypoints (not the face-box
+    lower edge) to locate the neck ROI upper boundary. Returns -1 when
+    landmarks are unavailable (caller falls back to geometric face-box edge).
+    """
+    if not isinstance(landmarks, dict):
+        return -1
+    try:
+        ys = []
+        for k in ("mouth_left", "mouth_right"):
+            pt = landmarks.get(k)
+            if pt and len(pt) >= 2:
+                ys.append(float(pt[1]))
+        if not ys:
+            return -1
+        mouth_y = max(ys)
+        fh = float(face_box[3]) if face_box and len(face_box) > 3 else 0.0
+        margin = max(4.0, fh * 0.12)
+        return int(mouth_y + margin)
+    except Exception:
+        return -1
+
+
+def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
+    """Sample hand skin-tone pixels below the face (photo pipeline, RGB float32).
+
+    FIX-H-12-06: Per v7.32 §3.10.7, color matching should reference hand ROI in
+    addition to neck. Hands are not directly detected (no hand model); sample
+    skin-tone pixels in the region below the face box. img_arr is RGB float32
+    in [0,255]. Returns N×3 float32 array (possibly empty).
+    """
+    try:
+        if img_arr is None or img_arr.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        h, w = img_arr.shape[:2]
+        fx, fy, fw, fh = (int(face_box[0]), int(face_box[1]),
+                          int(face_box[2]), int(face_box[3]))
+        x1 = max(0, fx - fw // 2)
+        x2 = min(w, fx + fw + fw // 2)
+        y1 = min(h, fy + fh + fh // 4)
+        y2 = min(h, y1 + fh * 2)
+        if y2 <= y1 or x2 <= x1:
+            return np.empty((0, 3), dtype=np.float32)
+        region = img_arr[y1:y2, x1:x2]
+        if region.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        r = region[:, :, 0]
+        g = region[:, :, 1]
+        b = region[:, :, 2]
+        mx = np.maximum(np.maximum(r, g), b)
+        mn = np.minimum(np.minimum(r, g), b)
+        skin_mask = (r > 95) & (g > 40) & (b > 20) & (mx - mn > 15) & (np.abs(r - g) > 15)
+        return region[skin_mask]
+    except Exception:
+        return np.empty((0, 3), dtype=np.float32)
+
+
 def _match_portrait_color(image_path: str, face_boxes: list,
-                          output_path: str, logger=None) -> bool:
+                          output_path: str, logger=None,
+                          landmarks: list = None) -> bool:
     """Automated half-body portrait color matching per v7.32 §3.10.7.
 
     FIX-P12-6: Migrated from stage4_ai_face.py to stage5_postprocess.py.
     Color matching must execute after all AI processing (face restore + upscale)
     and before grain synthesis, per spec order.
 
-    After face restoration (GFPGAN/CodeFormer), the restored face often has
-    different white-balance/color from the original neck/hands. This function
-    aligns the face's LAB distribution to the neck region using mean/std
-    matching (histogram specification simplified).
-
-    Steps:
-      1. Estimate neck ROI below each face box.
-      2. Convert face and neck regions to LAB.
-      3. For each LAB channel, match face mean/std to neck mean/std.
-      4. Feather-blend corrected face back into the image.
+    FIX-H-12-06: When stage4 persisted face landmarks (RetinaFace/MTCNN), use
+    the chin point to locate the neck ROI upper boundary (instead of the
+    face-box lower edge) and fold hand skin-tone pixels into the reference so
+    the restored face matches body skin, not just neck. Falls back to geometric
+    ROI when landmarks are None (YOLOv8-face).
     """
     try:
         import numpy as np
@@ -273,7 +328,7 @@ def _match_portrait_color(image_path: str, face_boxes: list,
         face_mask = np.zeros((h_img, w_img), dtype=np.float32)
         corrected = img_arr.copy()
 
-        for (fx, fy, fw, fh) in face_boxes:
+        for box_idx, (fx, fy, fw, fh) in enumerate(face_boxes):
             # Clamp box to image bounds
             x1 = max(0, fx)
             y1 = max(0, fy)
@@ -283,9 +338,15 @@ def _match_portrait_color(image_path: str, face_boxes: list,
                 continue
 
             # Estimate neck region: directly below face,
-            # same width, 0.4x face height
-            ny1 = y2
-            ny2 = min(h_img, y2 + int(fh * 0.4))
+            # same width, 0.4x face height.
+            # FIX-H-12-06: when landmarks available, start neck ROI at the chin
+            # (mouth_y + margin) instead of the face-box lower edge - the box
+            # edge often cuts into the jaw, biasing the reference.
+            _lm = (landmarks[box_idx]
+                   if landmarks and box_idx < len(landmarks) else None)
+            _chin = _chin_y_from_landmarks_photo(_lm, (fx, fy, fw, fh))
+            ny1 = max(y2, _chin) if _chin > 0 else y2
+            ny2 = min(h_img, ny1 + int(fh * 0.4))
             nx1 = x1
             nx2 = x2
             if ny2 <= ny1:
@@ -295,6 +356,10 @@ def _match_portrait_color(image_path: str, face_boxes: list,
             neck_roi = img_arr[ny1:ny2, nx1:nx2]
             if neck_roi.size == 0:
                 continue
+
+            # FIX-H-12-06: sample hand skin-tone below the face and fold into
+            # the neck reference so the match target reflects body skin.
+            hand_skin = _hand_skin_roi_photo(img_arr, (fx, fy, fw, fh))
 
             # Convert to LAB using OpenCV
             # FIX-M12-11: Do LAB conversion on float32 (not uint8) to avoid
@@ -309,13 +374,29 @@ def _match_portrait_color(image_path: str, face_boxes: list,
             face_lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB)
             neck_lab = cv2.cvtColor(neck_bgr, cv2.COLOR_BGR2LAB)
 
+            # FIX-H-12-06: combine neck + hand skin pixels for reference stats
+            # so the restored face matches body skin, not just neck. Convert
+            # hand skin (RGB float32) -> BGR -> LAB and concatenate.
+            if hand_skin.size > 0:
+                try:
+                    hand_bgr = cv2.cvtColor(
+                        hand_skin.reshape(-1, 1, 3), cv2.COLOR_RGB2BGR)
+                    hand_lab = cv2.cvtColor(hand_bgr, cv2.COLOR_BGR2LAB)
+                    ref_pix = np.concatenate(
+                        [neck_lab.reshape(-1, 3), hand_lab.reshape(-1, 3)],
+                        axis=0)
+                except Exception:
+                    ref_pix = neck_lab.reshape(-1, 3)
+            else:
+                ref_pix = neck_lab.reshape(-1, 3)
+
             # Mean/std matching per channel (range-agnostic)
             matched_lab = face_lab.copy()
             for c in range(3):
                 f_mean = face_lab[:, :, c].mean()
                 f_std = face_lab[:, :, c].std() + 1e-6
-                n_mean = neck_lab[:, :, c].mean()
-                n_std = neck_lab[:, :, c].std() + 1e-6
+                n_mean = float(ref_pix[:, c].mean())
+                n_std = float(ref_pix[:, c].std()) + 1e-6
                 matched_lab[:, :, c] = (
                     (matched_lab[:, :, c] - f_mean) * (n_std / f_std)
                     + n_mean)
@@ -842,6 +923,7 @@ def main():
         # Must run after face restore (stage4) and before grain synthesis
         enable_color_match = params.get("portrait_color_match", True)
         face_boxes = []
+        face_landmarks = []  # FIX-H-12-06: parallel to face_boxes
         # Read face_boxes from stage4 metadata file
         face_meta_path = os.path.join(
             temp_dir, f"{job_id}_{Path(input_name).stem}_face_boxes.json")
@@ -850,8 +932,14 @@ def main():
                 with open(face_meta_path, "r", encoding="utf-8") as f:
                     face_meta = json.load(f)
                 face_boxes = face_meta.get("face_boxes", [])
+                # FIX-H-12-06: read landmarks written by stage4 for chin-based
+                # neck ROI + hand skin-tone reference per v7.32 §3.10.7.
+                face_landmarks = face_meta.get("face_landmarks", [])
             except Exception:
                 face_boxes = []
+                face_landmarks = []
+        else:
+            face_landmarks = []
 
         if enable_color_match and face_boxes:
             # Save current state before color matching
@@ -872,7 +960,8 @@ def main():
             else:
                 current_img.save(color_match_temp)
             if _match_portrait_color(color_match_temp, face_boxes,
-                                     output_path + ".color_matched", logger):
+                                     output_path + ".color_matched", logger,
+                                     landmarks=face_landmarks):
                 # Reload the color-matched image
                 # FIX-R13-2: For 16-bit path, load directly as numpy array
                 # to avoid PIL I;16 3-channel data loss

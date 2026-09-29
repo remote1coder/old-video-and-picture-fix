@@ -541,6 +541,18 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("# Temporal stabilization")
         lines.append(f"clip = haf.DepanStabilize(clip, dxmax={dxmax}, dymax={dymax})")
         lines.append("")
+    elif stabilize == "Stab":
+        # FIX-W16: Provide Stab as a lightweight stabilization alternative per
+        # v6.32 Part 4. DepanStabilize (mvtools) is the default and generally
+        # superior, but Stab (havsfunc wrapper around core.std / internal) has
+        # no motion-vector dependency and is useful when mvtools is unavailable
+        # or for sources where DepanStabilize over-crops. Parameters mirror
+        # haf.Stab defaults; amplify/dxmax override via stabilize_params.
+        _amp = stabilize_params.get("amp", 10)
+        _dxmax = max(0, min(stabilize_params.get("dxmax", 10), 20))
+        lines.append("# Temporal stabilization (Stab lightweight alternative)")
+        lines.append(f"clip = haf.Stab(clip, amp={_amp}, dxmax={_dxmax})")
+        lines.append("")
 
     # Color space conversion: BT.601 -> BT.709
     # FIX-W14: BT.709 source still needs range conversion if source is full range
@@ -977,7 +989,13 @@ def main():
                 if not is_good:
                     logger.warning("STAGE1_DEINT_FALLBACK",
                                   f"Deinterlace quality {prog_pct:.1f}% < 95%, progressive ratio too low")
-                    # Conservative fallback: result is usable but flagged
+                    # FIX-W12: Per v7.32 §3.10.13, deinterlace quality <95% must
+                    # trigger a conservative fallback (return 86 so main.py can
+                    # re-run with global conservative processing / drop
+                    # field_segments), not merely log a warning. ORIGINAL only
+                    # logged WARNING and continued, producing a low-quality
+                    # interlace artifact as if it were a clean progressive output.
+                    return 86
 
             # V-P-024 fix: PSF frame rate verification
             is_psf = params.get("is_psf", False)

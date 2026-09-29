@@ -85,11 +85,17 @@ CORE_QUALITY_PARAMS = frozenset([
     # Denoising
     # FIX-P1-9: havsfunc VS TemporalDegrain (no "2") r33 params are
     # sigma/blockWidth (NOT degrainTR/grainLevel which are AviSynth names).
-    "sigma", "blockWidth", "EZDenoise",
+    # FIX-N+1-5 (N+1 轮核验): removed dead "EZDenoise" entry. The real config
+    # key is "qtgmc_ezdenoise" (see QTGMC section below + stage1_preprocess.py
+    # `params.get("qtgmc_ezdenoise", 2)` + config.yaml). Bare "EZDenoise" is
+    # only the QTGMC call kwarg name in the generated .vpy script string, never
+    # a params-dict key, so it never matched here (per shixian.md P-69). The
+    # surviving "qtgmc_ezdenoise" entry covers EZDenoise changes for hash.
+    "sigma", "blockWidth",
     # Deblocking
     "deblock_quant", "deblock_strength",
     # QTGMC
-    "qtgmc_preset", "qtgmc_ezdenoise", "EZDenoise", "qtgmc_sharpness",
+    "qtgmc_preset", "qtgmc_ezdenoise", "qtgmc_sharpness",
     "qtgmc_chromamotion", "qtgmc_sourcematch", "qtgmc_fps_divisor",
     # IVTC
     "ivtc",
@@ -616,6 +622,20 @@ def _check_nvidia_smi_vram() -> Optional[int]:
                 if m:
                     mib = float(m.group(1))
                     return int(mib * 1024 * 1024)
+    except Exception:
+        pass
+    # FIX-L-12-15: Third-tier fallback via pynvml per v7.32 §3.10.23. When both
+    # nvidia-smi CLI forms fail (e.g. WSL2 where nvidia-smi isn't on PATH, or
+    # parsing format drifts), pynvml queries the NVML library directly and
+    # returns bytes. ORIGINAL: only two tiers; pynvml was missing, so on WSL2
+    # with a working GPU but no nvidia-smi CLI the check returned None and the
+    # pipeline fell back to CPU.
+    try:
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return int(info.free)
     except Exception:
         pass
     return None
