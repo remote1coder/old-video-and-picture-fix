@@ -21,6 +21,7 @@ v6.3/v7.3 Compliance:
   # Film Grain / Adobe Camera Raw Grain core approach.
 """
 
+import hashlib
 import os
 import sys
 import json
@@ -29,7 +30,7 @@ import glob
 import subprocess
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 
@@ -40,6 +41,43 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
+
+try:  # NEW-V-03: 独立于 Pillow 的真实位深读取通道
+    import media_io as _media_io
+except Exception:  # pragma: no cover - 缺失时退回旧行为并留痕
+    _media_io = None
+
+try:  # NEW-V-06: 取消/中断守卫（抓 KeyboardInterrupt，except Exception 抓不到）
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
+
+def read_true_input_array(path: str):
+    """Return the input's real uint16 array, or None when it is not 16-bit.
+
+    NEW-V-03: ``PIL.Image.open()`` on a 16-bit **RGB** TIFF returns mode
+    ``'RGB'`` backed by **uint8** data truncated to the high byte
+    (实测: 257 -> 1)。stage5 原本据此走 ``convert("RGB")``，
+    于是 16-bit RGB 素材在 stage5 就被静默压成 8-bit，
+    后面的 "16-bit 归档" 只剩容器是 16-bit、内容只有 8-bit 的信息量。
+    这里改用 tifffile（media_io.read_image_array）判定真实位深。
+    """
+    if _media_io is None:
+        return None
+    try:
+        arr, _meta = _media_io.read_image_array(path)
+    except Exception:
+        return None
+    if arr is None:
+        return None
+    if getattr(arr, "dtype", None) != np.uint16:
+        return None
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=2)
+    if arr.ndim != 3 or arr.shape[2] not in (3, 4):
+        return None
+    return arr
 
 
 def _detect_text_regions(gray: np.ndarray, min_aspect_ratio: float = 2.0) -> np.ndarray:
@@ -148,22 +186,35 @@ def _separate_regions(img_arr: np.ndarray, edge_threshold: float = 0.05,
 
 
 def _apply_selective_processing(img: "Image.Image", params: dict,
-                                 logger=None) -> "Image.Image":
+                                 logger=None,
+                                 src_array=None) -> "Image.Image":
     """Apply selective local processing with region separation.
 
     - Flat areas: mild denoise
     - Edges: sharpening/enhancement
     - Textures: subtle enhancement
     - Text regions: fully protected (no modification)
+
+    NEW-V-03: ``src_array`` 允许调用方直接喂入 **真实 uint16** 数组，
+    绕开 Pillow 把 16-bit RGB TIFF 读成 8-bit 的缺陷。
     """
     import numpy as np
     from PIL import Image
 
     # Handle I;16 input with full precision (Bug 11.9 fix)
-    is_16bit_input = img.mode == "I;16"
+    is_16bit_input = img.mode == "I;16" if img is not None else False
     bit_depth = params.get("photo_bit_depth", 16)
 
-    if is_16bit_input and bit_depth == 16:
+    if src_array is not None:
+        # NEW-V-03: 真实 16-bit 素材（Pillow 无法表达的三通道 uint16）
+        raw_arr = src_array.astype(np.float32) / 65535.0
+        if raw_arr.ndim == 2:
+            raw_arr = np.stack([raw_arr, raw_arr, raw_arr], axis=2)
+        if raw_arr.shape[2] == 4:  # 丢弃 alpha，后续流程按 3 通道处理
+            raw_arr = raw_arr[:, :, :3]
+        orig_arr = raw_arr
+        max_val = 1.0
+    elif is_16bit_input and bit_depth == 16:
         # Preserve 16-bit precision: load as uint16, normalize to [0,1]
         orig = img  # Keep I;16
         raw_arr = np.array(orig, dtype=np.float32) / 65535.0
@@ -773,6 +824,167 @@ def _extract_flif_chrominance(img: "Image.Image", output_dir: str,
         return False
 
 
+# --- FIX-V06/V07: stage result contract + cache identity -------------------
+# 阶段结果状态（写入产物同名的 .status.json 旁车，供调度器/恢复逻辑读取）
+STAGE_STATUS_SUCCESS = "SUCCESS"
+STAGE_STATUS_DEGRADED = "DEGRADED"   # 明确策略接受的降级完成
+STAGE_STATUS_FAILED = "FAILED"       # 必需步骤失败：绝不允许写成 DONE/成功
+
+# FIX-V07: 影响本阶段像素输出的参数集合（不在此集合内的配置变化不应使缓存失效）
+STAGE5_CACHE_PARAM_KEYS = (
+    "photo_bit_depth", "archival_mode", "local_mask_denoise",
+    "lanczos_target", "portrait_color_match", "grain_synthesis",
+    "grain_strength", "grain_size", "grain_roughness",
+    "scratch_remove", "scratch_remove_strength", "deband_threshold",
+    "channel_correction_formula", "channel_correction_normalize",
+    "channel_correction_round", "channel_correction_clamp",
+    "channel_degradation_mean_threshold", "channel_degradation_std_threshold",
+    "channel_degradation_mean_threshold_severe",
+    "channel_degradation_std_threshold_severe",
+    "channel_correction_linear_space", "channel_correction_soft_compress",
+    "channel_correction_float_precision",
+)
+
+# FIX-V07: 实现/模型版本。任何会改变本阶段像素输出的实现调整都应递增，
+# 否则旧产物会被当成"同一实现"而错误复用。
+STAGE5_IMPL_VERSION = "photo-stage5-postprocess/2.0-cache-identity"
+
+
+def _json_sidecar_path(artifact_path: str, kind: str) -> str:
+    """Return sidecar path for an artifact (e.g. `.cache.json`)."""
+    return f"{artifact_path}.{kind}.json"
+
+
+def _write_json_sidecar(path: str, payload: dict) -> bool:
+    """Write a JSON sidecar next to an artifact. Never raises."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _read_json_sidecar(path: str) -> Optional[dict]:
+    """Read a JSON sidecar. Returns None when absent/unparseable/not an object."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _content_digest(path: str, chunk: int = 1 << 20) -> Optional[str]:
+    """Dependency-free content fingerprint (head + tail + size).
+
+    FIX-V07: checkpoint.get_file_xxhash needs the optional `xxhash` package and
+    is unavailable in some environments; without a content fingerprint the
+    identity degenerates to (size, mtime-int) and two different files written
+    in the same second with equal size collide.
+    """
+    try:
+        size = os.path.getsize(path)
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            h.update(f.read(chunk))
+            if size > chunk:
+                f.seek(-chunk, os.SEEK_END)
+                h.update(f.read(chunk))
+        h.update(str(size).encode("ascii"))
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _file_identity(path: str) -> dict:
+    """Identity of an input artifact: size + ns mtime + content fingerprint.
+
+    FIX-V07: cache reuse must not be decided by "a non-empty file exists";
+    it must be tied to the actual upstream bytes.
+    """
+    ident: Dict[str, Any] = {"size": None, "mtime_ns": None,
+                             "xxhash": None, "digest": None}
+    try:
+        st = os.stat(path)
+        ident["size"] = st.st_size
+        ident["mtime_ns"] = st.st_mtime_ns
+    except Exception:
+        pass
+    try:
+        from checkpoint import get_file_xxhash  # type: ignore
+        ident["xxhash"] = get_file_xxhash(path)
+    except Exception:
+        ident["xxhash"] = None
+    ident["digest"] = _content_digest(path)
+    return ident
+
+
+def compute_stage5_cache_identity(input_source: str, params: dict,
+                                  bit_depth: int) -> dict:
+    """FIX-V07: canonical cache identity for stage5.
+
+    Covers (a) upstream artifact identity, (b) params that affect this stage's
+    pixels, (c) implementation version and (d) the bit-depth contract.
+    """
+    ident = _file_identity(input_source)
+    # 只有内容相关的字段参与身份计算：mtime 被任何复制/重写改变，会导致永久失效，
+    # 而只看 mtime 又会在"同一秒同尺寸"时误判命中。这里用 size + 内容指纹。
+    content_ident = {k: ident.get(k) for k in ("size", "digest", "xxhash")}
+    selected = {k: params.get(k) for k in STAGE5_CACHE_PARAM_KEYS
+                if k in params}
+    payload = {
+        "impl": STAGE5_IMPL_VERSION,
+        "bit_depth": bit_depth,
+        "input": content_ident,
+        "params": selected,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return {"cache_id": digest, "input_mtime_ns": ident.get("mtime_ns"),
+            **payload}
+
+
+def _verify_output_readable(path: str) -> bool:
+    """Lightweight product validation before a cache hit may be accepted.
+
+    Existence + non-empty is NOT sufficient (a V06 failure copy or a truncated
+    write can satisfy both). Deliberately dependency-light: tifffile when
+    available, else Pillow.
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+    except Exception:
+        return False
+    try:
+        import tifffile  # type: ignore
+        arr = tifffile.imread(path)
+        return bool(getattr(arr, "size", 0)) and arr.ndim >= 2
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _discard_partial_output(output_path: str,
+                            sidecars: Optional[list] = None) -> None:
+    """Remove a partial/failed artifact so it can never be reused as a cache."""
+    for p in [output_path] + (sidecars or []):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -791,6 +1003,12 @@ def main():
         params = json.loads(args.params) if args.params else {}
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+
+    # NEW-V-06: 注册取消守卫。KeyboardInterrupt 继承 BaseException，
+    # 本文件所有 `except Exception` 都抓不到它 —— 不装守卫时 Ctrl+C 会把
+    # 半成品留在最终产物路径上且不留任何 FAILED 记录。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=5, logger=logger)
 
     temp_dir = params.get("temp_dir", "./temp")
     # FIX-P12-3: WSL2 redirect for temp_dir per v7.32 §3.10.10
@@ -819,6 +1037,14 @@ def main():
                 "step1_preprocess*"]:
         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
+        # NEW-V-04: 过滤掉 .status.json / .cache.json 之类的侧车文件
+        candidates = [
+            p for p in candidates
+            if Path(p).suffix.lower() in set(
+                getattr(_media_io, "IMAGE_EXTS", ()) or
+                {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+            )
+        ]
         if candidates:
             candidates.sort(
                 key=lambda p: os.path.getmtime(p), reverse=True)
@@ -841,25 +1067,78 @@ def main():
         output_path = os.path.join(temp_dir,
             f"{job_id}_{Path(input_name).stem}_step5_postprocess.png")
 
+    # FIX-V07: 缓存命中必须比对身份，不再只判断"文件存在且非空"。
+    # ORIGINAL: `if exists(output_path) and size>0: return 3` —— 改了颗粒/位深等
+    # 参数仍会复用旧产物，且 V06 的失败副本也会命中。
+    cache_identity = compute_stage5_cache_identity(input_source, params,
+                                                   bit_depth)
+    cache_meta_path = _json_sidecar_path(output_path, "cache")
+    # NEW-V-06: 必须在写入任何字节**之前**登记产物，否则首次运行被中断时
+    # 守卫无东西可清理，半成品会留在最终产物路径上。
+    if _cancel_guard is not None:
+        _cancel_guard.watch_outputs(output_path,
+                                    extra_paths=[cache_meta_path],
+                                    logger=logger, stage=5)
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        return 3
+        cached_meta = _read_json_sidecar(cache_meta_path)
+        if cached_meta is None:
+            logger.info("STAGE5_CACHE_UNTRUSTED",
+                        "Existing output has no cache identity sidecar "
+                        "(legacy or failed run); recomputing")
+        elif cached_meta.get("cache_id") != cache_identity["cache_id"]:
+            changed = sorted(
+                k for k in STAGE5_CACHE_PARAM_KEYS
+                if cached_meta.get("params", {}).get(k) !=
+                cache_identity["params"].get(k))
+            logger.info("STAGE5_CACHE_INVALIDATED",
+                        "Cached output does not match current identity; "
+                        "recomputing",
+                        changed_params=changed,
+                        cached_impl=cached_meta.get("impl"),
+                        current_impl=cache_identity["impl"])
+        elif not _verify_output_readable(output_path):
+            logger.info("STAGE5_CACHE_UNREADABLE",
+                        "Cached output failed validation; recomputing")
+        else:
+            logger.info("STAGE5_CACHE_HIT",
+                        "Reusing verified stage5 output",
+                        cache_id=cache_identity["cache_id"])
+            return 3
+        # 复用失败：清掉旧产物与旧缓存元数据，避免半成品混入
+        _discard_partial_output(output_path, [cache_meta_path])
 
     try:
         from PIL import Image
 
         img = Image.open(input_source)
 
+        # NEW-V-03: Pillow 对 16-bit RGB TIFF 报的是 mode='RGB'（uint8 截断），
+        # 直接 convert("RGB") 会让 16-bit 素材在 stage5 静默塌成 8-bit。
+        true_arr16 = None
+        if bit_depth == 16:
+            true_arr16 = read_true_input_array(input_source)
+            if true_arr16 is not None and logger is not None:
+                logger.info(
+                    "STAGE5_TRUE_16BIT_INPUT",
+                    "Input is genuinely 16-bit; Pillow reports mode "
+                    f"'{img.mode}'. Using the array path to keep precision.",
+                    dtype=str(true_arr16.dtype),
+                    shape=list(true_arr16.shape))
+
         # Preserve 16-bit if input is 16-bit
         if img.mode == "I;16" and bit_depth == 16:
             # Process in 16-bit space
             img_16bit = img
+        elif true_arr16 is not None:
+            # 真实 16-bit 多通道：PIL 无法承载，走纯数组路径
+            img_16bit = None
         else:
             # Convert to RGB for processing
             img_16bit = img.convert("RGB")
 
         # Lanczos resize to target resolution if explicitly specified
         lanczos_target = params.get("lanczos_target", "auto")
-        if lanczos_target and lanczos_target != "auto":
+        if lanczos_target and lanczos_target != "auto" and img_16bit is not None:
             try:
                 target_w, target_h = lanczos_target.split("x")
                 target_w, target_h = int(target_w), int(target_h)
@@ -872,6 +1151,10 @@ def main():
             except Exception as e:
                 logger.warning("STAGE5_LANCZOS_WARN",
                               f"Lanczos resize skipped: {e}")
+        elif lanczos_target and lanczos_target != "auto" and true_arr16 is not None:
+            logger.warning("STAGE5_LANCZOS_WARN",
+                           "Lanczos resize not supported on the 16-bit array "
+                           "path; skipped")
 
         # Selective local processing with region separation
         # FIX-R13-2: Track image data as numpy array for 16-bit path
@@ -879,8 +1162,15 @@ def main():
         current_arr = None  # numpy float32 [0,1] when 16-bit path active
         current_img = img_16bit  # PIL Image for 8-bit path
         local_process = params.get("local_mask_denoise", True)
-        if local_process and img_16bit.mode in ("RGB", "RGBA", "L", "I;16"):
-            result = _apply_selective_processing(img_16bit, params, logger)
+        if local_process and (true_arr16 is not None or
+                              (img_16bit is not None and
+                               img_16bit.mode in ("RGB", "RGBA", "L", "I;16"))):
+            if true_arr16 is not None:
+                result = _apply_selective_processing(
+                    img_16bit, params, logger, src_array=true_arr16)
+            else:
+                # 保持 3 参数调用签名，兼容既有的 3 参数实现/测试替身
+                result = _apply_selective_processing(img_16bit, params, logger)
             # FIX-P12-6: Handle tuple return (array, bit_depth) for 16-bit
             if isinstance(result, tuple):
                 arr_result, result_depth = result
@@ -896,6 +1186,12 @@ def main():
                 current_img = result  # Legacy PIL Image return
             logger.info("STAGE5_MASK",
                         "Applied selective local processing with region separation")
+        elif true_arr16 is not None:
+            # NEW-V-03: 未启用局部处理时也必须保住真实 16-bit
+            current_arr = true_arr16.astype(np.float32) / 65535.0
+            if current_arr.shape[2] == 4:
+                current_arr = current_arr[:, :, :3]
+            current_img = None
 
         # FLIF chrominance extraction (for archival pipeline)
         archival_mode = params.get("archival_mode", False)
@@ -1094,26 +1390,109 @@ def main():
                 except Exception:
                     pass
             else:
-                logger.warning("STAGE5_GRAIN_FAIL",
-                              "Grain synthesis failed, using ungrained output")
+                # FIX-V06: 颗粒合成是配置要求的必要步骤（grain_synthesis=True）。
+                # ORIGINAL 直接 shutil.move 未加颗粒的中间图并继续写 STAGE5_DONE 返回 0，
+                # 属于"必要处理没执行但报成功"。仅当显式允许降级时才接受，且必须留痕。
+                if not params.get("allow_stage5_degrade", False):
+                    logger.error("STAGE5_GRAIN_FAIL",
+                                 "Grain synthesis failed and degrade is not "
+                                 "authorized; failing stage5 "
+                                 "(set allow_stage5_degrade=true to accept an "
+                                 "explicit degraded result)")
+                    _discard_partial_output(output_path, [cache_meta_path])
+                    _write_json_sidecar(
+                        _json_sidecar_path(output_path, "status"), {
+                            "status": STAGE_STATUS_FAILED,
+                            "stage": 5,
+                            "failed_operation": "grain_synthesis",
+                            "reason": "grain_synthesis failed",
+                            "impl": STAGE5_IMPL_VERSION,
+                        })
+                    try:
+                        os.remove(grain_temp)
+                    except Exception:
+                        pass
+                    return 86
+                logger.warning("STAGE5_DEGRADED",
+                               "Grain synthesis failed; DEGRADED result "
+                               "accepted via allow_stage5_degrade",
+                               skipped_operations=["grain_synthesis"])
                 shutil.move(grain_temp, output_path)
+                # 降级结果不写缓存身份：下次运行必须重跑完整处理，不能被复用
+                _write_json_sidecar(
+                    _json_sidecar_path(output_path, "status"), {
+                        "status": STAGE_STATUS_DEGRADED,
+                        "stage": 5,
+                        "skipped_operations": ["grain_synthesis"],
+                        "impl": STAGE5_IMPL_VERSION,
+                    })
+                logger.info("STAGE5_DONE",
+                            "Post-processing complete (DEGRADED)",
+                            output=output_path)
+                return 0
         else:
             shutil.move(grain_temp, output_path)
 
+        # FIX-V07: 只在完全成功后提交缓存身份（先验证产物可读）
+        if not _verify_output_readable(output_path):
+            logger.error("STAGE5_OUTPUT_INVALID",
+                         "Stage5 output failed validation; failing stage")
+            _discard_partial_output(output_path, [cache_meta_path])
+            _write_json_sidecar(
+                _json_sidecar_path(output_path, "status"), {
+                    "status": STAGE_STATUS_FAILED,
+                    "stage": 5,
+                    "failed_operation": "output_validation",
+                    "impl": STAGE5_IMPL_VERSION,
+                })
+            return 86
+        _write_json_sidecar(cache_meta_path, cache_identity)
+        _write_json_sidecar(
+            _json_sidecar_path(output_path, "status"), {
+                "status": STAGE_STATUS_SUCCESS,
+                "stage": 5,
+                "skipped_operations": [],
+                "impl": STAGE5_IMPL_VERSION,
+            })
         logger.info("STAGE5_DONE", "Post-processing complete",
                     output=output_path)
         return 0
 
     except Exception as e:
+        # FIX-V06: 必需处理失败必须传播给调度器。
+        # ORIGINAL: 捕获异常 → 复制输入到最终产物路径 → 写 STAGE5_DONE → return 0。
+        # 孤立复现显示输出与输入逐字节相同且返回成功，调度器无法区分。
+        # 现在：不留最终产物、状态写 FAILED、诊断副本使用独立名称、按异常类型返回码。
         logger.error("STAGE5_ERROR", f"Post-process failed: {e}")
-        # Fallback: direct copy
-        if input_source:
-            # FIX-P12-11: Use copyfile (not copy2) per v7.32 §3.10.10
-            shutil.copyfile(input_source, output_path)
-            logger.info("STAGE5_DONE",
-                        "Post-processing complete (fallback copy)",
-                        output=output_path)
-        return 0
+        if isinstance(e, MemoryError):
+            exit_code = 87      # resource exhausted
+        elif isinstance(e, (OSError, IOError)):
+            exit_code = 82      # I/O error
+        else:
+            exit_code = 86      # validation/processing failure
+        _discard_partial_output(output_path, [cache_meta_path])
+        _write_json_sidecar(
+            _json_sidecar_path(output_path, "status"), {
+                "status": STAGE_STATUS_FAILED,
+                "stage": 5,
+                "failed_operation": "postprocess",
+                "reason": f"{type(e).__name__}: {e}",
+                "exit_code": exit_code,
+                "impl": STAGE5_IMPL_VERSION,
+            })
+        # 诊断用副本：独立名称，绝不占用最终成功产物路径
+        if input_source and os.path.exists(input_source):
+            diag_path = output_path + ".failed_input_copy"
+            try:
+                # FIX-P12-11: Use copyfile (not copy2) per v7.32 §3.10.10
+                shutil.copyfile(input_source, diag_path)
+                logger.info("STAGE5_DIAG_COPY",
+                            "Input kept as diagnostic copy (NOT a stage5 "
+                            "result)", input=input_source, output=diag_path)
+            except Exception as copy_err:
+                logger.warning("STAGE5_DIAG_COPY_FAIL",
+                               f"Diagnostic copy failed: {copy_err}")
+        return exit_code
 
 
 if __name__ == "__main__":

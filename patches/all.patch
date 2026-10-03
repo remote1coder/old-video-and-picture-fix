@@ -1,0 +1,4478 @@
+diff --git a/.gitignore b/.gitignore
+index 2de8679..f9e90d8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -19,6 +19,14 @@ shixian.md
+ .claude/
+ agents.md
+ CLAUDE.md
++# 修复台账（本地工作记录，不入库）
++修复清单.md
++# 回归测试产物
++/tests/_out/
+ /models/
+ *.rnnn
+-*.pth
+\ No newline at end of file
++*.pth
++# 文档：只保留 README.md 入库，其余 md 一律忽略（用户要求 2026-10-03）
++*.md
++!README.md
++!readme.md
+\ No newline at end of file
+diff --git a/photo_restoration_pipeline/classify.py b/photo_restoration_pipeline/classify.py
+index 929d062..6701c57 100644
+--- a/photo_restoration_pipeline/classify.py
++++ b/photo_restoration_pipeline/classify.py
+@@ -10,10 +10,10 @@ v6.3 Compliance:
+ - Computes file hash prefix for deduplication
+ """
+ 
++import json
++import logging
+ import subprocess
+ from pathlib import Path
+-from typing import Dict, Any
+-import json
+ 
+ 
+ def run_exiftool(input_path: str) -> Dict[str, str]:
+@@ -332,8 +332,15 @@ def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
+         sys.path.insert(0, str(Path(__file__).parent.parent / "shared_modules"))
+         from checkpoint import get_file_xxhash
+         result["file_hash_prefix"] = get_file_xxhash(input_path)
+-    except Exception:
+-        pass
++    except ImportError:
++        # NEW-V-01: 同 video/classify.py —— xxhash 缺失必须快速失败，
++        # 否则 file_hash_prefix 恒为 ""，manifest_generate 的变更检测保护被静默绕过。
++        raise
++    except Exception as exc:
++        logging.getLogger(__name__).warning(
++            "file_hash_prefix degraded for %s (%s: %s)",
++            input_path, type(exc).__name__, exc,
++        )
+ 
+     # FIX-P11-3: v7.32 §3.9: Confidence threshold handling
+     # Confidence < 80%: interactive mode requires manual confirmation,
+diff --git a/photo_restoration_pipeline/main.py b/photo_restoration_pipeline/main.py
+index 6775b35..11766a9 100644
+--- a/photo_restoration_pipeline/main.py
++++ b/photo_restoration_pipeline/main.py
+@@ -1188,7 +1188,7 @@ def main():
+         sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+         from manifest_loader import (
+             load_manifest, filter_jobs,
+-            update_job_status, save_manifest
++            update_job_status, save_manifest, save_manifest_job_result
+         )
+         try:
+             manifest = load_manifest(args.manifest)
+@@ -1251,13 +1251,18 @@ def main():
+                           f"with exit code {rc}", file=sys.stderr)
+ 
+         # Update manifest with results
++        # FIX-V08: 每完成一个 job 就用锁定单任务更新落盘，避免父进程中断时
++        # 丢失整批进度（父进程仍是唯一写者，不会与 worker 抢写）。
+         for job, rc in results:
+             if rc == 0:
+                 update_job_status(manifest, job["job_id"], "DONE")
++                save_manifest_job_result(args.manifest, job["job_id"], "DONE")
+             else:
+                 update_job_status(
+                     manifest, job["job_id"], "FAILED",
+                     error_message=f"Exit code {rc}")
++                save_manifest_job_result(args.manifest, job["job_id"], "FAILED",
++                                         error_message=f"Exit code {rc}")
+         save_manifest(manifest, args.manifest)
+ 
+         success_count = sum(1 for _, rc in results if rc == 0)
+diff --git a/photo_restoration_pipeline/stages/stage5_postprocess.py b/photo_restoration_pipeline/stages/stage5_postprocess.py
+index 0a70485..208e752 100644
+--- a/photo_restoration_pipeline/stages/stage5_postprocess.py
++++ b/photo_restoration_pipeline/stages/stage5_postprocess.py
+@@ -21,6 +21,7 @@ v6.3/v7.3 Compliance:
+   # Film Grain / Adobe Camera Raw Grain core approach.
+ """
+ 
++import hashlib
+ import os
+ import sys
+ import json
+@@ -29,7 +30,7 @@ import glob
+ import subprocess
+ import shutil
+ from pathlib import Path
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Any, Dict, Optional
+ 
+ import numpy as np
+ 
+@@ -41,6 +42,43 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+ 
+ from logger import get_logger  # noqa: E402
+ 
++try:  # NEW-V-03: 独立于 Pillow 的真实位深读取通道
++    import media_io as _media_io
++except Exception:  # pragma: no cover - 缺失时退回旧行为并留痕
++    _media_io = None
++
++try:  # NEW-V-06: 取消/中断守卫（抓 KeyboardInterrupt，except Exception 抓不到）
++    import cancel_guard as _cancel_guard
++except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
++    _cancel_guard = None
++
++
++def read_true_input_array(path: str):
++    """Return the input's real uint16 array, or None when it is not 16-bit.
++
++    NEW-V-03: ``PIL.Image.open()`` on a 16-bit **RGB** TIFF returns mode
++    ``'RGB'`` backed by **uint8** data truncated to the high byte
++    (实测: 257 -> 1)。stage5 原本据此走 ``convert("RGB")``，
++    于是 16-bit RGB 素材在 stage5 就被静默压成 8-bit，
++    后面的 "16-bit 归档" 只剩容器是 16-bit、内容只有 8-bit 的信息量。
++    这里改用 tifffile（media_io.read_image_array）判定真实位深。
++    """
++    if _media_io is None:
++        return None
++    try:
++        arr, _meta = _media_io.read_image_array(path)
++    except Exception:
++        return None
++    if arr is None:
++        return None
++    if getattr(arr, "dtype", None) != np.uint16:
++        return None
++    if arr.ndim == 2:
++        arr = np.stack([arr, arr, arr], axis=2)
++    if arr.ndim != 3 or arr.shape[2] not in (3, 4):
++        return None
++    return arr
++
+ 
+ def _detect_text_regions(gray: np.ndarray, min_aspect_ratio: float = 2.0) -> np.ndarray:
+     """Detect text-like regions using stroke width approximation.
+@@ -148,22 +186,35 @@ def _separate_regions(img_arr: np.ndarray, edge_threshold: float = 0.05,
+ 
+ 
+ def _apply_selective_processing(img: "Image.Image", params: dict,
+-                                 logger=None) -> "Image.Image":
++                                 logger=None,
++                                 src_array=None) -> "Image.Image":
+     """Apply selective local processing with region separation.
+ 
+     - Flat areas: mild denoise
+     - Edges: sharpening/enhancement
+     - Textures: subtle enhancement
+     - Text regions: fully protected (no modification)
++
++    NEW-V-03: ``src_array`` 允许调用方直接喂入 **真实 uint16** 数组，
++    绕开 Pillow 把 16-bit RGB TIFF 读成 8-bit 的缺陷。
+     """
+     import numpy as np
+     from PIL import Image
+ 
+     # Handle I;16 input with full precision (Bug 11.9 fix)
+-    is_16bit_input = img.mode == "I;16"
++    is_16bit_input = img.mode == "I;16" if img is not None else False
+     bit_depth = params.get("photo_bit_depth", 16)
+ 
+-    if is_16bit_input and bit_depth == 16:
++    if src_array is not None:
++        # NEW-V-03: 真实 16-bit 素材（Pillow 无法表达的三通道 uint16）
++        raw_arr = src_array.astype(np.float32) / 65535.0
++        if raw_arr.ndim == 2:
++            raw_arr = np.stack([raw_arr, raw_arr, raw_arr], axis=2)
++        if raw_arr.shape[2] == 4:  # 丢弃 alpha，后续流程按 3 通道处理
++            raw_arr = raw_arr[:, :, :3]
++        orig_arr = raw_arr
++        max_val = 1.0
++    elif is_16bit_input and bit_depth == 16:
+         # Preserve 16-bit precision: load as uint16, normalize to [0,1]
+         orig = img  # Keep I;16
+         raw_arr = np.array(orig, dtype=np.float32) / 65535.0
+@@ -773,6 +824,167 @@ def _extract_flif_chrominance(img: "Image.Image", output_dir: str,
+         return False
+ 
+ 
++# --- FIX-V06/V07: stage result contract + cache identity -------------------
++# 阶段结果状态（写入产物同名的 .status.json 旁车，供调度器/恢复逻辑读取）
++STAGE_STATUS_SUCCESS = "SUCCESS"
++STAGE_STATUS_DEGRADED = "DEGRADED"   # 明确策略接受的降级完成
++STAGE_STATUS_FAILED = "FAILED"       # 必需步骤失败：绝不允许写成 DONE/成功
++
++# FIX-V07: 影响本阶段像素输出的参数集合（不在此集合内的配置变化不应使缓存失效）
++STAGE5_CACHE_PARAM_KEYS = (
++    "photo_bit_depth", "archival_mode", "local_mask_denoise",
++    "lanczos_target", "portrait_color_match", "grain_synthesis",
++    "grain_strength", "grain_size", "grain_roughness",
++    "scratch_remove", "scratch_remove_strength", "deband_threshold",
++    "channel_correction_formula", "channel_correction_normalize",
++    "channel_correction_round", "channel_correction_clamp",
++    "channel_degradation_mean_threshold", "channel_degradation_std_threshold",
++    "channel_degradation_mean_threshold_severe",
++    "channel_degradation_std_threshold_severe",
++    "channel_correction_linear_space", "channel_correction_soft_compress",
++    "channel_correction_float_precision",
++)
++
++# FIX-V07: 实现/模型版本。任何会改变本阶段像素输出的实现调整都应递增，
++# 否则旧产物会被当成"同一实现"而错误复用。
++STAGE5_IMPL_VERSION = "photo-stage5-postprocess/2.0-cache-identity"
++
++
++def _json_sidecar_path(artifact_path: str, kind: str) -> str:
++    """Return sidecar path for an artifact (e.g. `.cache.json`)."""
++    return f"{artifact_path}.{kind}.json"
++
++
++def _write_json_sidecar(path: str, payload: dict) -> bool:
++    """Write a JSON sidecar next to an artifact. Never raises."""
++    try:
++        with open(path, "w", encoding="utf-8") as f:
++            json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
++        return True
++    except Exception:
++        return False
++
++
++def _read_json_sidecar(path: str) -> Optional[dict]:
++    """Read a JSON sidecar. Returns None when absent/unparseable/not an object."""
++    try:
++        with open(path, "r", encoding="utf-8") as f:
++            data = json.load(f)
++        return data if isinstance(data, dict) else None
++    except Exception:
++        return None
++
++
++def _content_digest(path: str, chunk: int = 1 << 20) -> Optional[str]:
++    """Dependency-free content fingerprint (head + tail + size).
++
++    FIX-V07: checkpoint.get_file_xxhash needs the optional `xxhash` package and
++    is unavailable in some environments; without a content fingerprint the
++    identity degenerates to (size, mtime-int) and two different files written
++    in the same second with equal size collide.
++    """
++    try:
++        size = os.path.getsize(path)
++        h = hashlib.sha256()
++        with open(path, "rb") as f:
++            h.update(f.read(chunk))
++            if size > chunk:
++                f.seek(-chunk, os.SEEK_END)
++                h.update(f.read(chunk))
++        h.update(str(size).encode("ascii"))
++        return h.hexdigest()
++    except Exception:
++        return None
++
++
++def _file_identity(path: str) -> dict:
++    """Identity of an input artifact: size + ns mtime + content fingerprint.
++
++    FIX-V07: cache reuse must not be decided by "a non-empty file exists";
++    it must be tied to the actual upstream bytes.
++    """
++    ident: Dict[str, Any] = {"size": None, "mtime_ns": None,
++                             "xxhash": None, "digest": None}
++    try:
++        st = os.stat(path)
++        ident["size"] = st.st_size
++        ident["mtime_ns"] = st.st_mtime_ns
++    except Exception:
++        pass
++    try:
++        from checkpoint import get_file_xxhash  # type: ignore
++        ident["xxhash"] = get_file_xxhash(path)
++    except Exception:
++        ident["xxhash"] = None
++    ident["digest"] = _content_digest(path)
++    return ident
++
++
++def compute_stage5_cache_identity(input_source: str, params: dict,
++                                  bit_depth: int) -> dict:
++    """FIX-V07: canonical cache identity for stage5.
++
++    Covers (a) upstream artifact identity, (b) params that affect this stage's
++    pixels, (c) implementation version and (d) the bit-depth contract.
++    """
++    ident = _file_identity(input_source)
++    # 只有内容相关的字段参与身份计算：mtime 被任何复制/重写改变，会导致永久失效，
++    # 而只看 mtime 又会在"同一秒同尺寸"时误判命中。这里用 size + 内容指纹。
++    content_ident = {k: ident.get(k) for k in ("size", "digest", "xxhash")}
++    selected = {k: params.get(k) for k in STAGE5_CACHE_PARAM_KEYS
++                if k in params}
++    payload = {
++        "impl": STAGE5_IMPL_VERSION,
++        "bit_depth": bit_depth,
++        "input": content_ident,
++        "params": selected,
++    }
++    digest = hashlib.sha256(
++        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
++    ).hexdigest()
++    return {"cache_id": digest, "input_mtime_ns": ident.get("mtime_ns"),
++            **payload}
++
++
++def _verify_output_readable(path: str) -> bool:
++    """Lightweight product validation before a cache hit may be accepted.
++
++    Existence + non-empty is NOT sufficient (a V06 failure copy or a truncated
++    write can satisfy both). Deliberately dependency-light: tifffile when
++    available, else Pillow.
++    """
++    try:
++        if not os.path.exists(path) or os.path.getsize(path) == 0:
++            return False
++    except Exception:
++        return False
++    try:
++        import tifffile  # type: ignore
++        arr = tifffile.imread(path)
++        return bool(getattr(arr, "size", 0)) and arr.ndim >= 2
++    except Exception:
++        pass
++    try:
++        from PIL import Image
++        with Image.open(path) as im:
++            im.verify()
++        return True
++    except Exception:
++        return False
++    return False
++
++
++def _discard_partial_output(output_path: str,
++                            sidecars: Optional[list] = None) -> None:
++    """Remove a partial/failed artifact so it can never be reused as a cache."""
++    for p in [output_path] + (sidecars or []):
++        try:
++            if os.path.exists(p):
++                os.remove(p)
++        except Exception:
++            pass
++
++
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--input", required=True)
+@@ -792,6 +1004,12 @@ def main():
+     log_dir = params.get("log_dir", "./logs")
+     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+ 
++    # NEW-V-06: 注册取消守卫。KeyboardInterrupt 继承 BaseException，
++    # 本文件所有 `except Exception` 都抓不到它 —— 不装守卫时 Ctrl+C 会把
++    # 半成品留在最终产物路径上且不留任何 FAILED 记录。
++    if _cancel_guard is not None:
++        _cancel_guard.install_cancel_guard(stage=5, logger=logger)
++
+     temp_dir = params.get("temp_dir", "./temp")
+     # FIX-P12-3: WSL2 redirect for temp_dir per v7.32 §3.10.10
+     no_wsl_redirect = params.get("no_wsl_redirect", False)
+@@ -819,6 +1037,14 @@ def main():
+                 "step1_preprocess*"]:
+         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
+         candidates = glob.glob(os.path.join(temp_dir, pattern))
++        # NEW-V-04: 过滤掉 .status.json / .cache.json 之类的侧车文件
++        candidates = [
++            p for p in candidates
++            if Path(p).suffix.lower() in set(
++                getattr(_media_io, "IMAGE_EXTS", ()) or
++                {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
++            )
++        ]
+         if candidates:
+             candidates.sort(
+                 key=lambda p: os.path.getmtime(p), reverse=True)
+@@ -841,25 +1067,78 @@ def main():
+         output_path = os.path.join(temp_dir,
+             f"{job_id}_{Path(input_name).stem}_step5_postprocess.png")
+ 
++    # FIX-V07: 缓存命中必须比对身份，不再只判断"文件存在且非空"。
++    # ORIGINAL: `if exists(output_path) and size>0: return 3` —— 改了颗粒/位深等
++    # 参数仍会复用旧产物，且 V06 的失败副本也会命中。
++    cache_identity = compute_stage5_cache_identity(input_source, params,
++                                                   bit_depth)
++    cache_meta_path = _json_sidecar_path(output_path, "cache")
++    # NEW-V-06: 必须在写入任何字节**之前**登记产物，否则首次运行被中断时
++    # 守卫无东西可清理，半成品会留在最终产物路径上。
++    if _cancel_guard is not None:
++        _cancel_guard.watch_outputs(output_path,
++                                    extra_paths=[cache_meta_path],
++                                    logger=logger, stage=5)
+     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+-        return 3
++        cached_meta = _read_json_sidecar(cache_meta_path)
++        if cached_meta is None:
++            logger.info("STAGE5_CACHE_UNTRUSTED",
++                        "Existing output has no cache identity sidecar "
++                        "(legacy or failed run); recomputing")
++        elif cached_meta.get("cache_id") != cache_identity["cache_id"]:
++            changed = sorted(
++                k for k in STAGE5_CACHE_PARAM_KEYS
++                if cached_meta.get("params", {}).get(k) !=
++                cache_identity["params"].get(k))
++            logger.info("STAGE5_CACHE_INVALIDATED",
++                        "Cached output does not match current identity; "
++                        "recomputing",
++                        changed_params=changed,
++                        cached_impl=cached_meta.get("impl"),
++                        current_impl=cache_identity["impl"])
++        elif not _verify_output_readable(output_path):
++            logger.info("STAGE5_CACHE_UNREADABLE",
++                        "Cached output failed validation; recomputing")
++        else:
++            logger.info("STAGE5_CACHE_HIT",
++                        "Reusing verified stage5 output",
++                        cache_id=cache_identity["cache_id"])
++            return 3
++        # 复用失败：清掉旧产物与旧缓存元数据，避免半成品混入
++        _discard_partial_output(output_path, [cache_meta_path])
+ 
+     try:
+         from PIL import Image
+ 
+         img = Image.open(input_source)
+ 
++        # NEW-V-03: Pillow 对 16-bit RGB TIFF 报的是 mode='RGB'（uint8 截断），
++        # 直接 convert("RGB") 会让 16-bit 素材在 stage5 静默塌成 8-bit。
++        true_arr16 = None
++        if bit_depth == 16:
++            true_arr16 = read_true_input_array(input_source)
++            if true_arr16 is not None and logger is not None:
++                logger.info(
++                    "STAGE5_TRUE_16BIT_INPUT",
++                    "Input is genuinely 16-bit; Pillow reports mode "
++                    f"'{img.mode}'. Using the array path to keep precision.",
++                    dtype=str(true_arr16.dtype),
++                    shape=list(true_arr16.shape))
++
+         # Preserve 16-bit if input is 16-bit
+         if img.mode == "I;16" and bit_depth == 16:
+             # Process in 16-bit space
+             img_16bit = img
++        elif true_arr16 is not None:
++            # 真实 16-bit 多通道：PIL 无法承载，走纯数组路径
++            img_16bit = None
+         else:
+             # Convert to RGB for processing
+             img_16bit = img.convert("RGB")
+ 
+         # Lanczos resize to target resolution if explicitly specified
+         lanczos_target = params.get("lanczos_target", "auto")
+-        if lanczos_target and lanczos_target != "auto":
++        if lanczos_target and lanczos_target != "auto" and img_16bit is not None:
+             try:
+                 target_w, target_h = lanczos_target.split("x")
+                 target_w, target_h = int(target_w), int(target_h)
+@@ -872,6 +1151,10 @@ def main():
+             except Exception as e:
+                 logger.warning("STAGE5_LANCZOS_WARN",
+                               f"Lanczos resize skipped: {e}")
++        elif lanczos_target and lanczos_target != "auto" and true_arr16 is not None:
++            logger.warning("STAGE5_LANCZOS_WARN",
++                           "Lanczos resize not supported on the 16-bit array "
++                           "path; skipped")
+ 
+         # Selective local processing with region separation
+         # FIX-R13-2: Track image data as numpy array for 16-bit path
+@@ -879,8 +1162,15 @@ def main():
+         current_arr = None  # numpy float32 [0,1] when 16-bit path active
+         current_img = img_16bit  # PIL Image for 8-bit path
+         local_process = params.get("local_mask_denoise", True)
+-        if local_process and img_16bit.mode in ("RGB", "RGBA", "L", "I;16"):
+-            result = _apply_selective_processing(img_16bit, params, logger)
++        if local_process and (true_arr16 is not None or
++                              (img_16bit is not None and
++                               img_16bit.mode in ("RGB", "RGBA", "L", "I;16"))):
++            if true_arr16 is not None:
++                result = _apply_selective_processing(
++                    img_16bit, params, logger, src_array=true_arr16)
++            else:
++                # 保持 3 参数调用签名，兼容既有的 3 参数实现/测试替身
++                result = _apply_selective_processing(img_16bit, params, logger)
+             # FIX-P12-6: Handle tuple return (array, bit_depth) for 16-bit
+             if isinstance(result, tuple):
+                 arr_result, result_depth = result
+@@ -896,6 +1186,12 @@ def main():
+                 current_img = result  # Legacy PIL Image return
+             logger.info("STAGE5_MASK",
+                         "Applied selective local processing with region separation")
++        elif true_arr16 is not None:
++            # NEW-V-03: 未启用局部处理时也必须保住真实 16-bit
++            current_arr = true_arr16.astype(np.float32) / 65535.0
++            if current_arr.shape[2] == 4:
++                current_arr = current_arr[:, :, :3]
++            current_img = None
+ 
+         # FLIF chrominance extraction (for archival pipeline)
+         archival_mode = params.get("archival_mode", False)
+@@ -1094,26 +1390,109 @@ def main():
+                 except Exception:
+                     pass
+             else:
+-                logger.warning("STAGE5_GRAIN_FAIL",
+-                              "Grain synthesis failed, using ungrained output")
++                # FIX-V06: 颗粒合成是配置要求的必要步骤（grain_synthesis=True）。
++                # ORIGINAL 直接 shutil.move 未加颗粒的中间图并继续写 STAGE5_DONE 返回 0，
++                # 属于"必要处理没执行但报成功"。仅当显式允许降级时才接受，且必须留痕。
++                if not params.get("allow_stage5_degrade", False):
++                    logger.error("STAGE5_GRAIN_FAIL",
++                                 "Grain synthesis failed and degrade is not "
++                                 "authorized; failing stage5 "
++                                 "(set allow_stage5_degrade=true to accept an "
++                                 "explicit degraded result)")
++                    _discard_partial_output(output_path, [cache_meta_path])
++                    _write_json_sidecar(
++                        _json_sidecar_path(output_path, "status"), {
++                            "status": STAGE_STATUS_FAILED,
++                            "stage": 5,
++                            "failed_operation": "grain_synthesis",
++                            "reason": "grain_synthesis failed",
++                            "impl": STAGE5_IMPL_VERSION,
++                        })
++                    try:
++                        os.remove(grain_temp)
++                    except Exception:
++                        pass
++                    return 86
++                logger.warning("STAGE5_DEGRADED",
++                               "Grain synthesis failed; DEGRADED result "
++                               "accepted via allow_stage5_degrade",
++                               skipped_operations=["grain_synthesis"])
+                 shutil.move(grain_temp, output_path)
++                # 降级结果不写缓存身份：下次运行必须重跑完整处理，不能被复用
++                _write_json_sidecar(
++                    _json_sidecar_path(output_path, "status"), {
++                        "status": STAGE_STATUS_DEGRADED,
++                        "stage": 5,
++                        "skipped_operations": ["grain_synthesis"],
++                        "impl": STAGE5_IMPL_VERSION,
++                    })
++                logger.info("STAGE5_DONE",
++                            "Post-processing complete (DEGRADED)",
++                            output=output_path)
++                return 0
+         else:
+             shutil.move(grain_temp, output_path)
+ 
++        # FIX-V07: 只在完全成功后提交缓存身份（先验证产物可读）
++        if not _verify_output_readable(output_path):
++            logger.error("STAGE5_OUTPUT_INVALID",
++                         "Stage5 output failed validation; failing stage")
++            _discard_partial_output(output_path, [cache_meta_path])
++            _write_json_sidecar(
++                _json_sidecar_path(output_path, "status"), {
++                    "status": STAGE_STATUS_FAILED,
++                    "stage": 5,
++                    "failed_operation": "output_validation",
++                    "impl": STAGE5_IMPL_VERSION,
++                })
++            return 86
++        _write_json_sidecar(cache_meta_path, cache_identity)
++        _write_json_sidecar(
++            _json_sidecar_path(output_path, "status"), {
++                "status": STAGE_STATUS_SUCCESS,
++                "stage": 5,
++                "skipped_operations": [],
++                "impl": STAGE5_IMPL_VERSION,
++            })
+         logger.info("STAGE5_DONE", "Post-processing complete",
+                     output=output_path)
+         return 0
+ 
+     except Exception as e:
++        # FIX-V06: 必需处理失败必须传播给调度器。
++        # ORIGINAL: 捕获异常 → 复制输入到最终产物路径 → 写 STAGE5_DONE → return 0。
++        # 孤立复现显示输出与输入逐字节相同且返回成功，调度器无法区分。
++        # 现在：不留最终产物、状态写 FAILED、诊断副本使用独立名称、按异常类型返回码。
+         logger.error("STAGE5_ERROR", f"Post-process failed: {e}")
+-        # Fallback: direct copy
+-        if input_source:
+-            # FIX-P12-11: Use copyfile (not copy2) per v7.32 §3.10.10
+-            shutil.copyfile(input_source, output_path)
+-            logger.info("STAGE5_DONE",
+-                        "Post-processing complete (fallback copy)",
+-                        output=output_path)
+-        return 0
++        if isinstance(e, MemoryError):
++            exit_code = 87      # resource exhausted
++        elif isinstance(e, (OSError, IOError)):
++            exit_code = 82      # I/O error
++        else:
++            exit_code = 86      # validation/processing failure
++        _discard_partial_output(output_path, [cache_meta_path])
++        _write_json_sidecar(
++            _json_sidecar_path(output_path, "status"), {
++                "status": STAGE_STATUS_FAILED,
++                "stage": 5,
++                "failed_operation": "postprocess",
++                "reason": f"{type(e).__name__}: {e}",
++                "exit_code": exit_code,
++                "impl": STAGE5_IMPL_VERSION,
++            })
++        # 诊断用副本：独立名称，绝不占用最终成功产物路径
++        if input_source and os.path.exists(input_source):
++            diag_path = output_path + ".failed_input_copy"
++            try:
++                # FIX-P12-11: Use copyfile (not copy2) per v7.32 §3.10.10
++                shutil.copyfile(input_source, diag_path)
++                logger.info("STAGE5_DIAG_COPY",
++                            "Input kept as diagnostic copy (NOT a stage5 "
++                            "result)", input=input_source, output=diag_path)
++            except Exception as copy_err:
++                logger.warning("STAGE5_DIAG_COPY_FAIL",
++                               f"Diagnostic copy failed: {copy_err}")
++        return exit_code
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/photo_restoration_pipeline/stages/stage6_encode.py b/photo_restoration_pipeline/stages/stage6_encode.py
+index e40197c..9942ea6 100644
+--- a/photo_restoration_pipeline/stages/stage6_encode.py
++++ b/photo_restoration_pipeline/stages/stage6_encode.py
+@@ -1,14 +1,27 @@
+ #!/usr/bin/env python3
+ """
+ Stage 6: Photo Final Encoding
+-- AVIF encoding with avifenc (10bit YUV420 or 16bit RGB444)
++- AVIF encoding with avifenc (10bit YUV420 or RGB444)
+ - CICP metadata
+ - Archival mode: RGB444 lossless when archival_mode=true
+ 
+ v6.3/v7.3 Compliance:
+-- Supports both avif_params (YUV420 10-bit) and avif_rgb444_params (RGB444 16-bit lossless)
++- Supports both avif_params (YUV420 10-bit) and avif_rgb444_params (RGB444)
+ - Grain synthesis moved to stage5_postprocess.py per v7.32 §3.1
+ - Proper CICP tagging
++
++FIX-V01/V02/V04/V05 (2026-10-02): the encode boundary now follows the
++documented avifenc contract instead of assumptions:
++  * input must be jpg/jpeg/png/y4m — TIFF intermediates are converted
++    losslessly (16-bit preserved) in an explicit adapter (V05);
++  * `--depth` only accepts 8/10/12; a 16-bit result requires the documented
++    depth extension (e.g. `12,8`) on libavif >= 1.4.0 (V01);
++  * the TIFF master is written at the *actual* pixel precision and only ever
++    carries an ICC profile that matches the pixels it labels (V02);
++  * wide-gamut conversion needs a real source profile and fails loudly instead
++    of warning and continuing (V04).
++Every run writes an `*.encode_contract.json` sidecar describing what was
++actually encoded — not what was requested.
+ """
+ 
+ import os
+@@ -19,7 +32,7 @@ import glob
+ import subprocess
+ import shutil
+ from pathlib import Path
+-from typing import Optional
++from typing import Any, Dict, Optional, Tuple
+ 
+ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+@@ -27,34 +40,40 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+ from logger import get_logger  # noqa: E402
+ from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
+ 
++try:  # FIX-V01/V05: encode-boundary contracts
++    sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
++    import media_io  # noqa: E402
++except Exception:  # pragma: no cover - defensive; stage must fail loudly later
++    media_io = None  # type: ignore[assignment]
++
++try:  # NEW-V-06: 取消/中断守卫（except Exception 抓不到 KeyboardInterrupt）
++    import cancel_guard  # noqa: E402
++except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
++    cancel_guard = None  # type: ignore[assignment]
++
++
++# FIX-V04: colour-space handling outcomes
++COLOR_NOT_NEEDED = "not-needed"      # source already sRGB / no conversion required
++COLOR_CONVERTED = "converted"        # real profile → real pixel transform → sRGB
++COLOR_UNKNOWN = "unknown-source"     # source space not established
++COLOR_DEGRADED = "degraded"          # conversion impossible, explicitly accepted
++COLOR_FAILED = "failed"              # required conversion impossible → stage fails
++
++WIDE_GAMUT_SPACES = ("adobergb", "prophoto", "displayp3", "p3")
++
+ 
+ def _get_avifenc_version() -> tuple:
+     """Parse avifenc version. Returns (major, minor, patch) or (0, 0, 0)."""
+-    try:
+-        r = subprocess.run(["avifenc", "--version"],
+-                           capture_output=True, text=True, timeout=10, shell=False)
+-        if r.returncode == 0:
+-            import re
+-            # PHOTO-AUDIT-019: Support both X.Y.Z and X.Y version formats
+-            m = re.search(r'(\d+)\.(\d+)(?:\.(\d+))?', r.stdout)
+-            if m:
+-                major = int(m.group(1))
+-                minor = int(m.group(2))
+-                patch = int(m.group(3)) if m.group(3) else 0
+-                return (major, minor, patch)
+-    except Exception:
+-        pass
++    if media_io is not None:
++        cap = media_io.detect_avifenc_capability()
++        return cap.version
+     return (0, 0, 0)
+ 
+ 
+ def _resolve_jobs_value(jobs: str) -> Optional[str]:
+-    """Resolve --jobs value based on avifenc version.
+-
+-    FIX-P12-10: Per v6.32 §7.29:
+-    - <0.9.2: --jobs not supported, return None
+-    - 0.9.2–1.0.x: 'all' not supported, return cpu count
+-    - >=1.1.0: 'all' keyword supported
+-    """
++    """Resolve --jobs value based on avifenc version (FIX-P12-10)."""
++    if media_io is not None:
++        return media_io.resolve_jobs_value(jobs, media_io.detect_avifenc_capability())
+     if jobs != "all":
+         return str(jobs)
+     version = _get_avifenc_version()
+@@ -62,64 +81,25 @@ def _resolve_jobs_value(jobs: str) -> Optional[str]:
+         return "all"
+     elif version >= (0, 9, 2):
+         return str(min(os.cpu_count() or 1, 32))
+-    else:
+-        # <0.9.2 does not support --jobs at all
+-        return None
++    return None
+ 
+ 
+-def _build_avifenc_cmd(input_path: str, output_path: str, params: dict, use_rgb444: bool = False) -> list:
+-    """Build avifenc command from config parameters.
++def _build_avifenc_cmd(input_path: str, output_path: str, params: dict,
++                       use_rgb444: bool = False) -> list:
++    """Build a validated avifenc command from config parameters.
+ 
+-    When use_rgb444=True, uses avif_rgb444_params (16-bit lossless).
+-    Otherwise uses avif_params (10-bit YUV420).
++    FIX-V01: raises media_io.UnsupportedAvifConfig instead of emitting a bare
++    ``--depth 16`` that no avifenc version accepts.
+     """
+-    if use_rgb444:
+-        avif_params = params.get("avif_rgb444_params", {})
+-        # Defaults for archival RGB444
+-        depth = avif_params.get("depth", 16)
+-        yuv = avif_params.get("yuv", "444")
+-        rng = avif_params.get("range", "limited")
+-        cicp = avif_params.get("cicp", "1/13/0")
+-        speed = avif_params.get("speed", 4)
+-        jobs = avif_params.get("jobs", "all")
+-        lossless = avif_params.get("lossless", True)
+-    else:
+-        avif_params = params.get("avif_params", {})
+-        depth = avif_params.get("depth", 10)
+-        yuv = avif_params.get("yuv", "420")
+-        rng = avif_params.get("range", "limited")
+-        cicp = avif_params.get("cicp", "1/13/1")
+-        speed = avif_params.get("speed", 4)
+-        jobs = avif_params.get("jobs", "all")
+-        lossless = False
+-
+-    cmd = [
+-        "avifenc",
+-        "--depth", str(depth),
+-        "--yuv", yuv,
+-        "--range", rng,
+-        "--cicp", cicp,
+-        "--speed", str(speed),
+-    ]
+-
+-    if lossless:
+-        cmd.append("--lossless")
+-
+-    # FIX-P12-10: --jobs may be None for avifenc <0.9.2
+-    jobs_val = _resolve_jobs_value(jobs)
+-    if jobs_val is not None:
+-        cmd.extend(["--jobs", jobs_val])
+-    cmd.extend([input_path, output_path])
+-
++    if media_io is None:
++        raise RuntimeError("media_io module unavailable")
++    cmd, _contract = media_io.build_avifenc_cmd(
++        input_path, output_path, params, use_rgb444=use_rgb444)
+     return cmd
+ 
+ 
+ def _calculate_avifenc_timeout(input_path: str, base_timeout: int = 600) -> int:
+-    """BUG-057 / ISSUE-P-S6-003: Dynamic timeout based on image pixel count.
+-
+-    Estimates ~60 seconds per megapixel at speed 4.
+-    Minimum timeout is base_timeout (600s).
+-    """
++    """BUG-057 / ISSUE-P-S6-003: Dynamic timeout based on image pixel count."""
+     try:
+         from PIL import Image
+         with Image.open(input_path) as img:
+@@ -131,15 +111,307 @@ def _calculate_avifenc_timeout(input_path: str, base_timeout: int = 600) -> int:
+         return base_timeout
+ 
+ 
+-def run_avifenc(input_path: str, output_path: str, params: dict, use_rgb444: bool = False) -> bool:
+-    """Run avifenc with proper parameters."""
++def run_avifenc(input_path: str, output_path: str, params: dict,
++                use_rgb444: bool = False) -> Tuple[bool, str]:
++    """Run avifenc. Returns (ok, stderr)."""
+     cmd = _build_avifenc_cmd(input_path, output_path, params, use_rgb444)
+     timeout = _calculate_avifenc_timeout(input_path)
+     try:
+         r = subprocess.run(cmd, capture_output=True, timeout=timeout, shell=False)
+-        return r.returncode == 0
++        return r.returncode == 0, (r.stderr or b"").decode("utf-8", "replace")
++    except Exception as e:
++        return False, str(e)
++
++
++# --- FIX-V04: colour contract ----------------------------------------------
++
++def _read_color_meta(temp_dir: str, job_id: str, stem: str) -> Dict[str, Any]:
++    """Read the stage1 colour sidecar if present."""
++    path = Path(temp_dir) / f"{job_id}_{stem}_color_meta.json"
++    if not path.exists():
++        return {}
++    try:
++        with open(path, "r", encoding="utf-8") as f:
++            data = json.load(f)
++        return data if isinstance(data, dict) else {}
++    except Exception:
++        return {}
++
++
++def _extract_source_icc(working_path: str) -> Optional[bytes]:
++    """Return the ICC profile actually embedded in the working image."""
++    try:
++        from PIL import Image
++        with Image.open(working_path) as im:
++            return im.info.get("icc_profile")
+     except Exception:
+-        return False
++        return None
++
++
++def _describe_profile(icc_bytes: bytes) -> str:
++    try:
++        import io
++        from PIL import ImageCms
++        prof = ImageCms.getOpenProfile(io.BytesIO(icc_bytes))
++        return str(ImageCms.getProfileDescription(prof))
++    except Exception:
++        return ""
++
++
++def resolve_color_space(working_path: str, params: Dict[str, Any],
++                        temp_dir: str, job_id: str, stem: str,
++                        logger) -> Dict[str, Any]:
++    """Establish (and enforce) the colour contract before encoding (FIX-V04).
++
++    ORIGINAL called ``ImageCms.createProfile("ADBE"/"ROMM")`` — Pillow only
++    supports on-the-fly creation for LAB/XYZ/sRGB, so both calls raised and the
++    code only warned before encoding and reporting success. Verified on this
++    machine with Pillow 10.4.0 and 12.3.0: ``PyCMSError``.
++
++    Returns a dict with keys: status, working_path, source_space, icc_path,
++    cicp_override, precision, reason.
++    """
++    result: Dict[str, Any] = {
++        "status": COLOR_NOT_NEEDED,
++        "working_path": working_path,
++        "source_space": "unknown",
++        "icc_path": None,
++        "cicp_override": None,
++        "precision": None,
++        "reason": None,
++        "profile_description": None,
++    }
++    color_meta = _read_color_meta(temp_dir, job_id, stem)
++    declared = str(params.get("input_color_space")
++                   or color_meta.get("input_color_space") or "").lower()
++    if not declared:
++        # No sidecar/override: fall back to the profile embedded in the file.
++        icc = _extract_source_icc(working_path)
++        if icc:
++            desc = _describe_profile(icc).lower()
++            result["profile_description"] = _describe_profile(icc) or None
++            if "adobe" in desc:
++                declared = "adobergb"
++            elif "prophoto" in desc or "romm" in desc:
++                declared = "prophoto"
++            elif "display p3" in desc or "displayp3" in desc:
++                declared = "displayp3"
++            elif "srgb" in desc or "iec61966" in desc:
++                declared = "srgb"
++            else:
++                declared = "unknown"
++        else:
++            declared = "unknown"
++    result["source_space"] = declared or "unknown"
++
++    if result["source_space"] not in WIDE_GAMUT_SPACES:
++        if result["source_space"] == "unknown":
++            # FIX-V04: 未知源色彩不猜，也不假装是 sRGB
++            result["status"] = COLOR_UNKNOWN
++            result["reason"] = ("source colour space not established; no ICC "
++                                "in file and no input_color_space metadata")
++            logger.warning("STAGE6_COLOR_UNKNOWN",
++                           "Source colour space unknown; encoding with the "
++                           "configured CICP and recording it as unverified. "
++                           "Set require_known_color_space=true to fail instead.")
++            if params.get("require_known_color_space", False):
++                result["status"] = COLOR_FAILED
++                result["reason"] += " (require_known_color_space=true)"
++                logger.error("STAGE6_COLOR_FAILED",
++                             "Unknown source colour space is not accepted "
++                             "(require_known_color_space=true)")
++        return result
++
++    # --- wide-gamut source: a real transform is mandatory -------------------
++    allow_degrade = bool(params.get("allow_unconverted_colorspace", False))
++    icc_bytes = _extract_source_icc(working_path)
++    source_icc_file: Optional[str] = None
++    src_profile = None
++    try:
++        from PIL import ImageCms
++        import io as _io
++        if icc_bytes:
++            source_icc_file = str(Path(temp_dir) / f"{job_id}_{stem}_source.icc")
++            with open(source_icc_file, "wb") as f:
++                f.write(icc_bytes)
++            src_profile = ImageCms.getOpenProfile(source_icc_file)
++            result["profile_description"] = _describe_profile(icc_bytes) or None
++        elif params.get("source_icc_path"):
++            source_icc_file = str(params["source_icc_path"])
++            src_profile = ImageCms.getOpenProfile(source_icc_file)
++            result["profile_description"] = _describe_profile(
++                Path(source_icc_file).read_bytes()) or None
++    except Exception as e:
++        src_profile = None
++        result["reason"] = f"source ICC could not be opened: {e}"
++
++    if src_profile is None:
++        result["icc_path"] = source_icc_file
++        if not allow_degrade:
++            result["status"] = COLOR_FAILED
++            result["reason"] = (result["reason"] or "no usable source ICC profile")
++            logger.error("STAGE6_COLOR_FAILED",
++                         f"{result['source_space']} source needs a real ICC "
++                         "profile for conversion; none available. Refusing to "
++                         "encode pixels that would be mislabelled as sRGB.")
++            return result
++        result["status"] = COLOR_DEGRADED
++        result["cicp_override"] = "2/2/0"  # primaries+transfer unspecified
++        result["reason"] = (result["reason"] or "no usable source ICC profile")
++        logger.warning("STAGE6_COLOR_DEGRADED",
++                       "Encoding without colour conversion; CICP set to "
++                       "unspecified primaries/transfer so the sRGB label is "
++                       "not claimed",
++                       source_space=result["source_space"])
++        return result
++
++    try:
++        from PIL import Image as _PILImg, ImageCms as _ImageCms
++        img = _PILImg.open(working_path)
++        if img.mode not in ("RGB", "L"):
++            img = img.convert("RGB")
++        if img.mode == "L":
++            img = img.convert("RGB")
++        # Pillow's C-API conversion works on 8-bit data. Honest recording:
++        result["precision"] = "8-bit"
++        if params.get("require_16bit_color_conversion", False):
++            result["status"] = COLOR_FAILED
++            result["reason"] = "16-bit colour conversion not available via Pillow"
++            logger.error("STAGE6_COLOR_FAILED",
++                         "require_16bit_color_conversion=true but only 8-bit "
++                         "CMS conversion is available")
++            return result
++        srgb_profile = _ImageCms.createProfile("sRGB")  # supported on-the-fly
++        converted = _ImageCms.profileToProfile(img, src_profile, srgb_profile,
++                                               outputMode="RGB")
++        conv_path = str(Path(temp_dir) / f"{job_id}_{stem}_srgb.png")
++        converted.save(conv_path, format="PNG")
++        result["status"] = COLOR_CONVERTED
++        result["working_path"] = conv_path
++        result["cicp_override"] = None  # real sRGB pixels → configured CICP ok
++        result["icc_path"] = None
++        logger.info("STAGE6_COLOR_CONVERTED",
++                    f"Converted {result['source_space']} -> sRGB with a real "
++                    "ICC transform (8-bit CMS precision)",
++                    source_profile=result["profile_description"])
++        return result
++    except Exception as e:
++        if not allow_degrade:
++            result["status"] = COLOR_FAILED
++            result["reason"] = f"colour conversion failed: {e}"
++            logger.error("STAGE6_COLOR_FAILED",
++                         f"Mandatory colour conversion failed: {e}")
++            return result
++        result["status"] = COLOR_DEGRADED
++        result["cicp_override"] = "2/2/0"
++        result["icc_path"] = source_icc_file
++        result["reason"] = f"colour conversion failed: {e}"
++        logger.warning("STAGE6_COLOR_DEGRADED",
++                       "Colour conversion failed; degraded encode accepted "
++                       "with unspecified CICP + source ICC attached",
++                       reason=str(e))
++        return result
++
++
++# --- FIX-V02: archival TIFF master -----------------------------------------
++
++def effective_bit_depth(arr) -> int:
++    """Estimate how many bits of *information* the samples really carry.
++
++    NEW-V-03: 一个 uint16 TIFF 只说明"容器 16-bit"，不说明内容有 16-bit。
++    典型伪装：上游把 8-bit 数据乘 257 塞进 uint16（stage5 的旧行为），
++    此时所有样本都是 257 的倍数，真实信息量仍是 8 bit。
++    做法：对采样值取最大公约数 g，则可区分电平数 = 2^16 / g，
++    有效位深 = ceil(log2(电平数))。
++    """
++    import numpy as np
++    a = np.asarray(arr)
++    if a.dtype != np.uint16:
++        return 8
++    flat = a.reshape(-1)
++    if flat.size == 0:
++        return 0
++    if flat.size > 200000:  # 大图抽样，够用且快
++        idx = np.linspace(0, flat.size - 1, 200000).astype(np.int64)
++        flat = flat[idx]
++    g = int(np.gcd.reduce(flat.astype(np.uint32)))
++    if g <= 0:
++        return 0
++    levels = max(1, 65536 // g)
++    bits = int(np.ceil(np.log2(levels)))
++    return max(1, min(16, bits))
++
++
++def write_archival_master(working_path: str, tiff_path: str,
++                          params: Dict[str, Any], logger) -> Dict[str, Any]:
++    """Write the TIFF master at its *real* precision (FIX-V02).
++
++    ORIGINAL: ``img.convert("RGB")`` then ``save(tiff)`` while logging "16bit
++    TIFF"; the resulting file has BitsPerSample (8,8,8) — verified on this
++    machine. It also attached an Adobe RGB / ProPhoto profile found by scanning
++    the system colour directory, i.e. a label that does not match the pixels.
++    """
++    info: Dict[str, Any] = {
++        "written": False,
++        "requested_bit_depth": params.get("photo_bit_depth", 16),
++        "actual_bit_depth": None,
++        "precision_loss": False,
++        "icc": "none",
++        "writer": None,
++        "dtype": None,
++        "error": None,
++    }
++    if media_io is None:
++        info["error"] = "media_io unavailable"
++        return info
++    try:
++        import numpy as np
++        arr, meta = media_io.read_image_array(working_path)
++        arr = media_io._ensure_uint(arr)
++        info["dtype"] = str(arr.dtype)
++        info["actual_bit_depth"] = 16 if arr.dtype == np.uint16 else 8
++        info["precision_loss"] = (info["requested_bit_depth"] == 16 and
++                                  info["actual_bit_depth"] == 8)
++        # NEW-V-03: 容器是 16-bit 不代表内容有 16-bit 信息量。
++        # 上游若把 8-bit 数据乘 257 塞进 uint16（stage5 的老行为），
++        # 所有样本都会是 257 的倍数 —— 有效位深其实只有 8 bit。
++        info["effective_bit_depth"] = effective_bit_depth(arr)
++        info["container_mismatch"] = (info["actual_bit_depth"] == 16 and
++                                      info["effective_bit_depth"] <= 8)
++        writer = media_io.write_tiff(tiff_path, arr)
++        info["writer"] = writer
++        info["written"] = True
++        # Only an ICC that describes these very pixels may be attached.
++        icc_bytes = meta.get("icc_profile")
++        if icc_bytes:
++            info["icc"] = ("source" if media_io.embed_icc_in_tiff(tiff_path, icc_bytes)
++                           else "embed-failed")
++        if info["precision_loss"]:
++            logger.warning("STAGE6_TIFF_PRECISION_LOSS",
++                           f"Declared {info['requested_bit_depth']}-bit master but "
++                           f"the working image is {info['actual_bit_depth']}-bit; "
++                           "the master is written at the real precision and the "
++                           "loss is recorded (upstream stage dropped to 8-bit)",
++                           dtype=info["dtype"])
++        if info["container_mismatch"]:
++            logger.warning(
++                "STAGE6_TIFF_CONTAINER_MISMATCH",
++                "Master is stored in a 16-bit container but carries only "
++                f"{info['effective_bit_depth']}-bit of information (upstream "
++                "upscaled 8-bit data into uint16); the master is kept but the "
++                "real precision is recorded instead of being implied")
++        if info["icc"] == "none":
++            logger.info("STAGE6_TIFF_NO_SOURCE_ICC",
++                        "No source ICC in the working image; TIFF master "
++                        "carries no profile rather than a guessed one")
++        logger.info("STAGE6_TIFF_MASTER",
++                    f"TIFF master written ({info['actual_bit_depth']}-bit, "
++                    f"writer={writer}, icc={info['icc']})",
++                    output=tiff_path)
++    except Exception as e:
++        info["error"] = f"{type(e).__name__}: {e}"
++        logger.warning("STAGE6_TIFF_FAIL", f"TIFF master failed: {e}")
++    return info
+ 
+ 
+ def main():
+@@ -161,6 +433,10 @@ def main():
+     log_dir = params.get("log_dir", "./logs")
+     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+ 
++    # NEW-V-06: 注册取消守卫（KeyboardInterrupt 继承 BaseException）。
++    if cancel_guard is not None:
++        cancel_guard.install_cancel_guard(stage=6, logger=logger)
++
+     temp_dir = params.get("temp_dir", "./temp")
+     job_id = args.job_id
+     input_name = Path(args.input).name
+@@ -168,17 +444,19 @@ def main():
+     # Bug 11.21 fix: pre-check avifenc existence
+     if not shutil.which("avifenc"):
+         logger.error("STAGE6_AVIFENC_MISSING", "avifenc not found in PATH")
+-        # FIX-H12-05: avifenc missing is a dependency-missing failure → exit 80
+-        # per v7.32 §3.10.18. ORIGINAL: silently saved a PNG fallback and
+-        # returned 0, masking the missing dependency from the upper layer.
+         return 80
++    if media_io is None:
++        logger.error("STAGE6_MEDIA_IO_MISSING",
++                     "shared_modules/media_io.py unavailable; refusing to "
++                     "encode with unverified parameters")
++        return 80
++
++    capability = media_io.detect_avifenc_capability()
++    logger.info("STAGE6_AVIFENC_CAPABILITY",
++                f"avifenc version={'.'.join(map(str, capability.version))} "
++                f"depth_extension={capability.supports_depth_extension}")
+ 
+-    # FIX-L12-16: WSL2 redirect for temp_dir per v7.32 §3.10.10. stage6 reads
+-    # its input intermediate from temp_dir; if temp_dir is under /mnt/ it must
+-    # be redirected to a Linux native partition (matching stage1-5) so the
+-    # glob below finds files written by prior stages. ORIGINAL: only
+-    # output_path was redirected, so temp_dir globs could miss redirected
+-    # intermediates and return 82 (NO_INPUT).
++    # FIX-L12-16: WSL2 redirect for temp_dir per v7.32 §3.10.10
+     no_wsl_redirect = params.get("no_wsl_redirect", False)
+     _platform = params.get("platform", "auto")
+     try:
+@@ -194,19 +472,28 @@ def main():
+     except Exception:
+         pass  # wsl_redirect_path may be unavailable on native Windows
+ 
+-    # FIX-P10-1: Updated search order for new stage numbering
+-    # Find input: stage5_postprocess > stage4_face > stage3_upscale > stage2_ai_pre > stage1_preprocess
++    # FIX-P10-1: input search order step5 > step4 > step3 > step2 > step1
+     input_source = None
+     for pat in ["step5_postprocess*", "step4_face*", "step3_upscale*", "step2_ai_pre*", "step1_preprocess*"]:
+         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
+         candidates = glob.glob(os.path.join(temp_dir, pattern))
++        # NEW-V-04: 侧车文件（.status.json / .cache.json）也是 stepN_* 前缀，
++        # 不过滤就会被当成"最新产物"选中，随后 Pillow 抛
++        # UnidentifiedImageError。这里只保留真实图像扩展名。
++        candidates = [
++            p for p in candidates
++            if Path(p).suffix.lower() in set(
++                getattr(media_io, "IMAGE_EXTS", ()) or
++                {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
++            )
++        ]
+         if candidates:
+             candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+             input_source = candidates[0]
+             break
+ 
+     if not input_source:
+-        # BUG-023 fix: do not silently fall back to raw input; require processed intermediate
++        # BUG-023 fix: require a processed intermediate
+         logger.error("STAGE6_NO_INPUT", "No processed intermediate file found, refusing to encode raw input")
+         return 82
+ 
+@@ -231,135 +518,128 @@ def main():
+     logger.info("STAGE6_START", "Final photo encoding",
+                 input=input_source, output=output_path)
+ 
+-    working_path = input_source
+-
+-    # FIX-M-12-12: Per v7.32 §3.10.3, color-space conversion is a mandatory step
+-    # before encoding. stage1 detects and records the input color space in a
+-    # _color_meta.json sidecar (and optionally user_overrides via input_color_space).
+-    # If the input is Adobe RGB / ProPhoto (non-sRGB), convert to sRGB here so
+-    # avifenc encodes in the standard sRGB space. sRGB/unknown inputs pass through
+-    # unchanged (stage1 already normalized most via PIL convert). Photo sources
+-    # are predominantly sRGB, so this is a safety net for wide-gamut scans.
++    # NEW-V-06: 写字节之前登记产物；中断时连契约 sidecar 一起清理，
++    # 避免"半截 AVIF + 完整契约"这种互相矛盾的状态。
++    if cancel_guard is not None:
++        cancel_guard.watch_outputs(
++            output_path,
++            extra_paths=[f"{output_path}.encode_contract.json"],
++            logger=logger, stage=6)
++
++    # --- FIX-V04: 色彩契约（必需转换失败即阻断）---
++    _stem = Path(input_name).stem
++    color = resolve_color_space(input_source, params, temp_dir, job_id, _stem,
++                                logger)
++    if color["status"] == COLOR_FAILED:
++        logger.error("STAGE6_COLOR_BLOCKED",
++                     "Colour contract could not be satisfied; not writing a "
++                     "success artifact",
++                     source_space=color["source_space"], reason=color["reason"])
++        return 86
++    working_path = color["working_path"]
++
++    # --- FIX-V05: 编码输入适配（avifenc 不接受 TIFF）---
+     try:
+-        _stem = Path(input_name).stem
+-        _color_meta_path = Path(temp_dir) / f"{job_id}_{_stem}_color_meta.json"
+-        if _color_meta_path.exists():
+-            with open(_color_meta_path, "r", encoding="utf-8") as _cmf:
+-                _cm = json.load(_cmf)
+-            _input_cs = (_cm.get("input_color_space") or "").lower()
+-            if _input_cs in ("adobergb", "prophoto"):
+-                logger.warning("STAGE6_COLOR_CONVERT",
+-                               f"Input is {_input_cs}; converting to sRGB before "
+-                               f"encode per v7.32 §3.10.3")
+-                from PIL import Image as _PILImg, ImageCms as _ImageCms
+-                _img = _PILImg.open(working_path)
+-                if _img.mode != "RGB":
+-                    _img = _img.convert("RGB")
+-                _srgb_profile = _ImageCms.createProfile("sRGB")
+-                _src_profile = _ImageCms.ImageCmsProfile(
+-                    _ImageCms.createProfile(
+-                        "ADBE" if _input_cs == "adobergb" else "ROMM"))
+-                _converted = _ImageCms.profileToProfile(
+-                    _img, _src_profile, _srgb_profile, outputMode="RGB")
+-                _conv_path = str(Path(temp_dir) / f"{job_id}_{_stem}_srgb.tif")
+-                _converted.save(_conv_path)
+-                working_path = _conv_path
+-    except Exception as e:
+-        logger.warning("STAGE6_COLOR_CONVERT_FAIL",
+-                       f"Color conversion to sRGB failed ({e}); "
+-                       f"proceeding with original input")
+-
+-    # Determine archival mode
++        adapter = media_io.prepare_encoder_input(working_path, temp_dir, logger)
++    except media_io.MediaWriteError as e:
++        logger.error("STAGE6_INPUT_ADAPTER_FAIL",
++                     f"Could not produce an avifenc-acceptable input: {e}")
++        return 82
++    encode_input = adapter["path"]
++    if Path(encode_input).suffix.lower() not in media_io.AVIFENC_SUPPORTED_INPUT_EXTS:
++        logger.error("STAGE6_INPUT_FORMAT_UNSUPPORTED",
++                     f"avifenc accepts only "
++                     f"{sorted(media_io.AVIFENC_SUPPORTED_INPUT_EXTS)}; got "
++                     f"{Path(encode_input).suffix}")
++        return 86
++
++    # --- FIX-V02: 高位深母版（真实精度）---
++    tiff_info: Dict[str, Any] = {"written": False}
++    if params.get("photo_bit_depth", 16) == 16:
++        tiff_path = output_path.rsplit(".", 1)[0] + ".tif"
++        tiff_info = write_archival_master(working_path, tiff_path, params, logger)
++        if not tiff_info.get("written") and params.get("archival_tiff_required", False):
++            logger.error("STAGE6_TIFF_REQUIRED_FAIL",
++                         "Archival TIFF master is required but could not be "
++                         "written", error=tiff_info.get("error"))
++            return 86
++
++    # --- FIX-V01: 命令构造（不支持的组合在启动前失败）---
+     archival_mode = params.get("archival_mode", False)
+     use_rgb444 = archival_mode
++    try:
++        cmd, contract = media_io.build_avifenc_cmd(
++            encode_input, output_path, params, use_rgb444=use_rgb444,
++            capability=capability, icc_path=color.get("icc_path"))
++    except media_io.UnsupportedAvifConfig as e:
++        logger.error("STAGE6_AVIF_CONFIG_UNSUPPORTED", str(e))
++        return 86
++
++    # 实际编码契约：记录"实际会编出什么"，而不是"用户想要什么"
++    contract.update({
++        "color": {k: v for k, v in color.items() if k != "working_path"},
++        "encoder_input": adapter,
++        "tiff_master": tiff_info,
++        "output_path": output_path,
++    })
++    logger.info("STAGE6_ENCODE_CONTRACT",
++                f"depth_arg={contract['depth_arg']} "
++                f"effective_depth={contract['effective_decode_depth']} "
++                f"yuv={contract['yuv']} cicp={contract['cicp']} "
++                f"lossless={contract['lossless']} "
++                f"icc_attached={contract['icc_attached']}",
++                input=encode_input)
++
++    logger.info("STAGE6_ENCODE", f"Encoding AVIF (archival={use_rgb444})",
++                cmd=" ".join(cmd))
++    timeout = _calculate_avifenc_timeout(encode_input)
++    try:
++        r = subprocess.run(cmd, capture_output=True, timeout=timeout, shell=False)
++        ok = r.returncode == 0
++        stderr = (r.stderr or b"").decode("utf-8", "replace")
++    except Exception as e:
++        ok, stderr = False, str(e)
++    contract["exit_code"] = None if ok else 84
++    if not ok:
++        logger.error("STAGE6_AVIF_FAIL", "avifenc encoding failed",
++                     stderr=stderr[:2000])
++        # FIX-H12-05: encoding failure must not be masked by another format
++        return 84
++    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
++        # 退出码 0 也不代表成功：必须验证产物本身
++        logger.error("STAGE6_AVIF_OUTPUT_MISSING",
++                     "avifenc returned 0 but the output is missing/empty",
++                     output=output_path)
++        return 84
+ 
+-    def _find_icc_profile(profile_name: str) -> Optional[str]:
+-        """Search system for ICC profile file."""
+-        search_paths = []
+-        if sys.platform == "win32":
+-            search_paths.append(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "spool" / "drivers" / "color")
++    # WSL redirect: copy back to original Linux path
++    if original_output_path:
++        if wsl_copy_back(output_path, original_output_path):
++            logger.info("STAGE6_WSL_COPYBACK",
++                        f"Copied result back to {original_output_path}")
++            output_path = original_output_path
+         else:
+-            search_paths.extend([
+-                Path("/usr/share/color/icc"),
+-                Path("/usr/local/share/color/icc"),
+-                Path.home() / ".local" / "share" / "icc",
+-                Path.home() / ".color" / "icc",
+-            ])
+-        for base in search_paths:
+-            if not base.exists():
+-                continue
+-            for candidate in base.rglob("*.icc"):
+-                if profile_name.lower() in candidate.name.lower():
+-                    return str(candidate)
+-        return None
++            logger.error("STAGE6_WSL_COPYBACK_FAIL",
++                         f"Failed to copy {output_path} back to {original_output_path}")
++            return 82
++        if tiff_info.get("written"):
++            orig_tiff = original_output_path.rsplit(".", 1)[0] + ".tif"
++            wsl_copy_back(str(Path(output_path).with_suffix(".tif")), orig_tiff)
++
++    # 落盘实际编码契约，供验收与上游读取
++    try:
++        contract_path = output_path + ".encode_contract.json"
++        with open(contract_path, "w", encoding="utf-8") as f:
++            json.dump(contract, f, ensure_ascii=False, indent=2, sort_keys=True)
++    except Exception as e:
++        logger.warning("STAGE6_CONTRACT_WRITE_FAIL", f"Could not write contract sidecar: {e}")
+ 
+-    # Bug 11.25 fix: also generate 16bit TIFF archive when photo_bit_depth=16
+-    # BUG-055 fix: Embed Adobe RGB or ProPhoto RGB ICC profile per v6.32 §4.2.6
+-    bit_depth = params.get("photo_bit_depth", 16)
+-    tiff_path = None
+-    if bit_depth == 16:
+-        tiff_path = output_path.rsplit(".", 1)[0] + ".tif"
+-        try:
+-            from PIL import Image
+-            img = Image.open(working_path)
+-            if img.mode != "I;16":
+-                img = img.convert("RGB")
+-            save_kwargs = {"format": "TIFF", "compression": "tiff_lzw"}
+-            # Try to embed Adobe RGB ICC profile
+-            icc_path = _find_icc_profile("Adobe RGB")
+-            if icc_path and os.path.exists(icc_path):
+-                with open(icc_path, "rb") as f:
+-                    save_kwargs["icc_profile"] = f.read()
+-                logger.info("STAGE6_TIFF_ICC", f"Embedded Adobe RGB ICC: {icc_path}")
+-            else:
+-                # Fallback: try ProPhoto RGB
+-                icc_path = _find_icc_profile("ProPhoto")
+-                if icc_path and os.path.exists(icc_path):
+-                    with open(icc_path, "rb") as f:
+-                        save_kwargs["icc_profile"] = f.read()
+-                    logger.info("STAGE6_TIFF_ICC", f"Embedded ProPhoto RGB ICC: {icc_path}")
+-                else:
+-                    logger.warning("STAGE6_TIFF_ICC",
+-                                   "No Adobe RGB or ProPhoto RGB ICC profile found on system. "
+-                                   "TIFF will use source color space. Install ICC profiles for archival accuracy.")
+-            img.save(tiff_path, **save_kwargs)
+-            logger.info("STAGE6_TIFF", f"16bit TIFF archive saved: {tiff_path}")
+-        except Exception as e:
+-            logger.warning("STAGE6_TIFF_FAIL", f"TIFF archive failed: {e}")
+-
+-    # AVIF encoding
+-    logger.info("STAGE6_ENCODE", f"Encoding AVIF (archival={use_rgb444})")
+-    if run_avifenc(working_path, output_path, params, use_rgb444=use_rgb444):
+-        # WSL redirect: copy back to original Linux path
+-        if original_output_path:
+-            if wsl_copy_back(output_path, original_output_path):
+-                logger.info("STAGE6_WSL_COPYBACK",
+-                           f"Copied result back to {original_output_path}")
+-                output_path = original_output_path
+-            else:
+-                logger.error("STAGE6_WSL_COPYBACK_FAIL",
+-                            f"Failed to copy {output_path} back to {original_output_path}")
+-                return 82
+-            # Also copyback TIFF if generated
+-            if tiff_path and os.path.exists(tiff_path):
+-                orig_tiff = original_output_path.rsplit(".", 1)[0] + ".tif"
+-                wsl_copy_back(tiff_path, orig_tiff)
+-        logger.info("STAGE6_DONE", "Photo encoding complete", output=output_path)
+-        return 0
+-    else:
+-        # FIX-H12-05: avifenc encoding failure must return 84 (encoding error)
+-        # per v7.32 §3.10.18, NOT silently fall back to TIFF/PNG and return 0.
+-        # ORIGINAL: saved a TIFF/PNG fallback and returned 0, masking the
+-        # encoding failure from the upper layer (which could never tell the
+-        # AVIF was not produced). The 16bit TIFF archive (if any) is already
+-        # generated above before avifenc runs, so archival output survives.
+-        logger.error("STAGE6_AVIF_FAIL", "avifenc encoding failed")
+-        return 84
++    logger.info("STAGE6_DONE", "Photo encoding complete", output=output_path)
++    return 0
+ 
+ 
+ if __name__ == "__main__":
+     # FIX-P11-5: main() must return explicit int exit code per v7.32 §3.5
+-    # ORIGINAL: sys.exit(main() or 0) — "or 0" masks None returns
+     rc = main()
+     if rc is None:
+         rc = 86  # validation failure — main() must always return explicit exit code
+diff --git a/shared_modules/cancel_guard.py b/shared_modules/cancel_guard.py
+new file mode 100644
+index 0000000..afbfda0
+--- /dev/null
++++ b/shared_modules/cancel_guard.py
+@@ -0,0 +1,294 @@
++"""NEW-V-06 · 取消/中断守卫（cancel guard）。
++
++问题（本机实测，非推断）
++----------------------
++`Ctrl+C` / `SIGTERM` 触发的是 `KeyboardInterrupt`，它继承 `BaseException`
++而**不是** `Exception`。本项目所有 stage 的兜底出口写的都是
++`except Exception` —— 抓不到中断。实测 16 个 stage 脚本里
++`KeyboardInterrupt` / `BaseException` / `signal.*` 的命中数为 **0**。
++
++后果（三条，逐条对应交接的验收要求"故障和取消不会显示完成"）
++----------------------------------------------------------
++1. **半成品留在最终产物路径上**，且往往是非空的 —— 与"成功产物"在文件系统层面
++   无法区分（`V07` 修好后靠 sidecar 才能区分，但 sidecar 此时还没写）。
++2. **没有 status sidecar** —— 与"成功但缺 sidecar"、"失败残留"三者混淆。
++   下游 stage 用 glob 选产物时可能选中这半截文件。
++3. **审计与调度器看不到这个 job 被取消过** —— 既没有 DONE 也没有 FAILED，
++   任务状态悬空。
++
++修复
++----
++在 stage 主入口注册信号处理器。中断发生时：
++  1. 删除已登记的半成品（最终产物 + 缓存/契约 sidecar）；
++  2. 写 `status` sidecar = `FAILED`，`failed_operation = "cancelled"`，
++     并记下具体信号名；
++  3. 以退出码 **88（interrupted）** 结束进程 —— 落在项目约定的
++     80–113 自定义退出码区间内（AGENTS.md §4.4），不与既有 80–87 冲突。
++
++显式不做的事
++------------
++* 不追求"优雅地跑完当前步骤"：取消就是取消，宁可留 FAILED 也不留半成品。
++* 不把取消包装成 `DEGRADED` —— 那会让"降级完成"这个词失去意义。
++* 不吞掉 `SystemExit`：那是程序主动退出，不是取消。
++
++用法
++----
++```python
++from cancel_guard import install_cancel_guard, watch_outputs
++install_cancel_guard(stage=5, logger=logger)
++...
++watch_outputs(output_path, extra_paths=[cache_meta_path], logger=logger)
++```
++
++Author: repair agent (2026-10-03) — see 修复清单.md NEW-V-06.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import signal
++import sys
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Optional
++
++__all__ = [
++    "EXIT_INTERRUPTED",
++    "CANCELLED_OPERATION",
++    "CancelGuard",
++    "install_cancel_guard",
++    "watch_outputs",
++    "guard",
++]
++
++# 退出码 88：被信号中断。项目自定义区间为 80–113（AGENTS.md §4.4），
++# 既有 80 依赖缺失 / 81 参数 / 82 I/O / 83 GPU / 84 编码 / 85 权限 /
++# 86 校验 / 87 资源耗尽；88 此前未使用。
++EXIT_INTERRUPTED = 88
++
++# sidecar 里的 failed_operation 取值；与"处理失败""校验失败"区分开
++CANCELLED_OPERATION = "cancelled"
++
++# 需要挂处理器的信号；SIGBREAK 仅 Windows 有
++_SIGNAL_NAMES: List[str] = ["SIGINT", "SIGTERM", "SIGBREAK"]
++
++
++def _signal_number(name: str) -> Optional[int]:
++    """Return the numeric signal for `name`, or None when unsupported."""
++    return getattr(signal, name, None)
++
++
++class CancelGuard:
++    """Register signal handlers that leave an honest FAILED record behind.
++
++    The guard is deliberately a singleton per process: a stage script has one
++    final artifact set, and nested handlers would race on cleanup.
++    """
++
++    def __init__(self) -> None:
++        self._installed: bool = False
++        self._fired: bool = False
++        self._previous: Dict[int, Any] = {}
++        self._output_path: Optional[str] = None
++        self._extra_paths: List[str] = []
++        self._logger: Any = None
++        self._stage: Optional[int] = None
++
++    # ------------------------------------------------------------------ setup
++    def install(self, stage: Optional[int] = None, logger: Any = None) -> bool:
++        """Install signal handlers. Idempotent; safe to call more than once.
++
++        Args:
++            stage: Stage number recorded in the sidecar (e.g. ``5``).
++            logger: Optional project logger used for a ``*_CANCELLED`` event.
++
++        Returns:
++            True when at least one handler was installed.
++        """
++        if logger is not None:
++            self._logger = logger
++        if stage is not None:
++            self._stage = stage
++        if self._installed:
++            return True
++
++        installed = 0
++        for name in _SIGNAL_NAMES:
++            signum = _signal_number(name)
++            if signum is None:
++                continue
++            try:
++                self._previous[signum] = signal.signal(signum, self._fire)
++                installed += 1
++            except (ValueError, OSError, RuntimeError):
++                # 非主线程 / 平台不支持：属于可接受的降级，不阻断 stage
++                continue
++        self._installed = installed > 0
++        return self._installed
++
++    def uninstall(self) -> None:
++        """Restore previous handlers. Intended for tests."""
++        for signum, handler in self._previous.items():
++            if handler is not None:
++                try:
++                    signal.signal(signum, handler)
++                except (ValueError, OSError, RuntimeError):
++                    pass
++        self._previous.clear()
++        self._installed = False
++
++    def watch(
++        self,
++        output_path: str,
++        extra_paths: Optional[List[str]] = None,
++        logger: Any = None,
++        stage: Optional[int] = None,
++    ) -> None:
++        """Register the artifacts that must be discarded on cancellation.
++
++        Call this as soon as the final artifact path is known — before any
++        bytes are written — otherwise a first-run cancellation has nothing
++        to clean up.
++        """
++        self._output_path = str(output_path)
++        self._extra_paths = [str(p) for p in (extra_paths or [])]
++        if logger is not None:
++            self._logger = logger
++        if stage is not None:
++            self._stage = stage
++
++    # ------------------------------------------------------------- behaviour
++    def _fire(self, signum: int, frame: Any) -> None:
++        """Signal handler: record the cancellation, then leave the process.
++
++        本机实测（Windows）：**在信号处理器内部做文件 I/O 会再抛出一个
++        `KeyboardInterrupt`**（待处理的中断标志在 I/O 释放 GIL 时被处理）。
++        它是 `BaseException`，`except Exception` 抓不到 —— 结果是清理半途而废、
++        进程以退出码 1 结束，而不是我们登记的 88。
++        所以这里：清理用 `except BaseException` 兜住，退出码无条件生效。
++        """
++        if self._fired:
++            return
++        self._fired = True
++        try:
++            self.cleanup_and_record(signum)
++        except BaseException:  # noqa: BLE001 - 处理器内不允许再抛出
++            pass
++        try:
++            sys.stdout.flush()
++            sys.stderr.flush()
++        except BaseException:  # noqa: BLE001 - 管道可能已断开
++            pass
++        os._exit(EXIT_INTERRUPTED)
++
++    def cleanup_and_record(self, signum: Optional[int] = None) -> Dict[str, Any]:
++        """Discard partial artifacts and write a FAILED sidecar.
++
++        Separated from :meth:`_fire` so tests can exercise the logic without
++        killing the interpreter. Every step is individually guarded: a
++        cancellation must never leave the process in a worse state than the
++        interruption itself.
++
++        Args:
++            signum: Signal number, used only for the recorded signal name.
++
++        Returns:
++            A dict describing what was removed and which sidecar was written.
++        """
++        removed: List[str] = []
++        status_path: Optional[str] = None
++
++        for path in [self._output_path] + list(self._extra_paths):
++            if not path:
++                continue
++            try:
++                if os.path.exists(path):
++                    os.remove(path)
++                    removed.append(path)
++            except BaseException:  # noqa: BLE001 - 处理器内 I/O 会抛 KBInterrupt
++                continue
++
++        if self._output_path:
++            status_path = f"{self._output_path}.status.json"
++            payload = {
++                "status": "FAILED",
++                "failed_operation": CANCELLED_OPERATION,
++                "stage": self._stage,
++                "reason": (
++                    f"interrupted by {self._signal_name(signum)}"
++                    if signum is not None
++                    else "interrupted"
++                ),
++                "exit_code": EXIT_INTERRUPTED,
++            }
++            self._write_json(status_path, payload)
++
++        if self._logger is not None:
++            try:
++                self._logger.error(
++                    f"STAGE{self._stage if self._stage is not None else ''}_CANCELLED",
++                    "Stage cancelled by user/system signal; partial output "
++                    "discarded and a FAILED record written",
++                    output=self._output_path or "",
++                    removed=",".join(removed),
++                )
++            except BaseException:  # noqa: BLE001 - 日志失败不影响退出码
++                pass
++
++        return {
++            "removed": removed,
++            "status_path": status_path,
++            "exit_code": EXIT_INTERRUPTED,
++        }
++
++    # ----------------------------------------------------------------- helpers
++    @staticmethod
++    def _signal_name(signum: Optional[int]) -> str:
++        """Best-effort signal name for the record."""
++        if signum is None:
++            return "unknown"
++        for name in _SIGNAL_NAMES:
++            if _signal_number(name) == signum:
++                return name
++        return str(signum)
++
++    @staticmethod
++    def _write_json(path: str, payload: Dict[str, Any]) -> bool:
++        """Write JSON atomically-ish (temp file + replace). Never raises.
++
++        用 `BaseException` 兜底而不是 `Exception`：信号处理器内的 I/O 会再抛
++        `KeyboardInterrupt`（见 :meth:`_fire` 的实测说明）。
++        """
++        tmp = f"{path}.tmp"
++        try:
++            with open(tmp, "w", encoding="utf-8") as handle:
++                json.dump(payload, handle, ensure_ascii=False,
++                          sort_keys=True, indent=2)
++            os.replace(tmp, path)
++            return True
++        except BaseException:  # noqa: BLE001 - 处理器内不允许再抛出
++            try:
++                if os.path.exists(tmp):
++                    os.remove(tmp)
++            except BaseException:  # noqa: BLE001
++                pass
++            return False
++
++
++#: Process-wide guard instance.
++guard = CancelGuard()
++
++
++def install_cancel_guard(stage: Optional[int] = None,
++                         logger: Any = None) -> bool:
++    """Install the process-wide cancel guard. See :meth:`CancelGuard.install`."""
++    return guard.install(stage=stage, logger=logger)
++
++
++def watch_outputs(output_path: str,
++                  extra_paths: Optional[List[str]] = None,
++                  logger: Any = None,
++                  stage: Optional[int] = None) -> None:
++    """Register artifacts for the process-wide guard."""
++    guard.watch(output_path, extra_paths=extra_paths,
++                logger=logger, stage=stage)
+diff --git a/shared_modules/checkpoint.py b/shared_modules/checkpoint.py
+index 006fa19..8d9c7c9 100644
+--- a/shared_modules/checkpoint.py
++++ b/shared_modules/checkpoint.py
+@@ -16,6 +16,7 @@ v7.3 §4.4-4.5 Compliance:
+ 
+ import hashlib
+ import json
++import logging
+ import os
+ import platform
+ import re
+@@ -166,8 +167,21 @@ def compute_param_hash(input_path: str, params: Dict[str, Any]) -> str:
+             file_mtime = int(st.st_mtime)
+             file_hash_prefix = get_file_xxhash(input_path)
+             stat_ok = True
+-    except Exception:
+-        pass
++    except ImportError:
++        # NEW-V-01: `xxhash` 是本函数的硬依赖（requirements.txt 与
++        # dependency_check.py 两处均声明 required）。旧实现用 `except Exception: pass`
++        # 把 ImportError 一并吞掉，后果是 file_hash_prefix 为空、stat_ok 保持 False，
++        # 身份退化为「文件大小 + mtime + 文件名」三元组：
++        #   实测（同名 / 同 4096 字节 / 同 mtime / 内容不同）两个文件算出同一个
++        #   param_hash → 中间产物被错误复用（静默的假缓存命中）。
++        # 身份降级属于「谎报」，按 V06 同款原则必须快速失败，不可静默。
++        raise
++    except Exception as exc:
++        # 真实 I/O 异常（权限、文件消失等）才允许降级，但必须留痕。
++        logging.getLogger(__name__).warning(
++            "compute_param_hash: input identity degraded for %s (%s: %s)",
++            input_path, type(exc).__name__, exc,
++        )
+ 
+     # FIX-CK-R2-05: include stat_ok + input basename so two distinct failing
+     # paths (or a failing path vs a real file) no longer collide into the same
+diff --git a/shared_modules/manifest_loader.py b/shared_modules/manifest_loader.py
+index cad19d9..13b5f47 100644
+--- a/shared_modules/manifest_loader.py
++++ b/shared_modules/manifest_loader.py
+@@ -7,9 +7,250 @@ Loads manifests (YAML/JSONL), validates, filters by status, sorts by priority.
+ import yaml  # type: ignore[import-untyped]
+ import json
+ import logging
++import os
++import threading
++import time
++import uuid
++from contextlib import contextmanager
+ from datetime import datetime
+ from pathlib import Path
+-from typing import Dict, Any, List, Optional
++from typing import Any, Callable, Dict, List, Optional, Tuple
++
++try:  # POSIX
++    import fcntl  # type: ignore[import-untyped]
++except Exception:  # pragma: no cover - Windows
++    fcntl = None  # type: ignore[assignment]
++
++try:  # Windows
++    import msvcrt  # type: ignore[import-not-found]
++except Exception:  # pragma: no cover - POSIX
++    msvcrt = None  # type: ignore[assignment]
++
++
++# FIX-V08: manifest 跨进程并发保护 ------------------------------------------
++# 背景：每个 worker 各自 load_manifest 后整份 save_manifest（固定 .tmp + replace）。
++# 原子 rename 只能避免半个文件，不能避免丢更新：B 用自己的旧快照覆盖掉 A 的 DONE。
++# 方案：跨进程文件锁 + 锁内重新读取当前版本 + 合并单任务更新 + 唯一临时文件名。
++
++class ManifestLockError(RuntimeError):
++    """Raised when the cross-process manifest lock cannot be acquired."""
++
++
++@contextmanager
++def _file_lock(lock_path: Path, timeout: float = 30.0, poll: float = 0.05):
++    """Cross-process exclusive advisory lock.
++
++    POSIX: fcntl.flock(LOCK_EX|LOCK_NB). Windows: msvcrt.locking(LK_NBLCK).
++    Raises ManifestLockError on timeout instead of silently proceeding.
++    """
++    if fcntl is None and msvcrt is None:
++        # 无可用锁实现：退化为"不加锁"但必须显式记录，不能假装已保护
++        logging.warning(
++            "MANIFEST_LOCK_UNAVAILABLE: no fcntl/msvcrt; manifest updates "
++            "are NOT protected against concurrent writers")
++        yield None
++        return
++
++    lock_path.parent.mkdir(parents=True, exist_ok=True)
++
++    # NEW-V-07: 打开锁文件本身也可能失败。
++    # 实测（Windows，4 进程并发写同一 manifest）：另一个进程持有 msvcrt 锁区间时，
++    # `open(lock_path, "a+b")` 会抛 `PermissionError: [Errno 13]` ——
++    # 而它不在原来的重试循环里，worker 因此直接崩溃（exitcode=1），
++    # 既没等到锁，也没报"锁超时"。这里把 open 纳入同一套重试/超时语义：
++    # 等不到就抛 ManifestLockError（显式失败），绝不静默继续。
++    open_deadline = time.monotonic() + max(0.0, timeout)
++    fh = None
++    while True:
++        try:
++            fh = open(lock_path, "a+b")
++            break
++        except OSError as exc:
++            if time.monotonic() >= open_deadline:
++                raise ManifestLockError(
++                    f"Could not open manifest lock file within {timeout}s "
++                    f"({type(exc).__name__}: {exc}): {lock_path}") from exc
++            time.sleep(poll)
++
++    acquired = False
++    deadline = time.monotonic() + max(0.0, timeout)
++    try:
++        while True:
++            try:
++                if fcntl is not None:
++                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++                else:
++                    fh.seek(0)
++                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
++                acquired = True
++                break
++            except Exception:
++                if time.monotonic() >= deadline:
++                    break
++                time.sleep(poll)
++        if not acquired:
++            raise ManifestLockError(
++                f"Could not acquire manifest lock within {timeout}s: {lock_path}")
++        yield fh
++    finally:
++        if acquired:
++            try:
++                if fcntl is not None:
++                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
++                else:
++                    fh.seek(0)
++                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
++            except Exception:
++                pass
++        try:
++            fh.close()
++        except Exception:
++            pass
++
++
++def _unique_tmp_path(p: Path, suffix: str = ".tmp") -> Path:
++    """FIX-V08: unique temp name so concurrent writers never share one file."""
++    ident = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
++    return p.parent / f"{p.name}.{ident}{suffix}"
++
++
++def _write_manifest_locked(manifest: Dict[str, Any], path: str) -> None:
++    """Write a full manifest using a unique temp file (must hold the lock)."""
++    p = Path(path)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    tmp_path = _unique_tmp_path(p)
++    is_jsonl = path.endswith(".jsonl")
++    meta_path = None
++    meta_tmp = None
++    try:
++        if is_jsonl:
++            meta_path = p.with_suffix(".meta.json")
++            meta_tmp = _unique_tmp_path(meta_path)
++            with open(meta_tmp, "w", encoding="utf-8") as f:
++                json.dump(manifest["meta"], f, ensure_ascii=False, indent=2)
++            with open(tmp_path, "w", encoding="utf-8") as f:
++                for job in manifest["jobs"]:
++                    f.write(json.dumps(job, ensure_ascii=False) + "\n")
++        else:
++            with open(tmp_path, "w", encoding="utf-8") as f:
++                yaml.dump(manifest, f, allow_unicode=True, sort_keys=False)
++        tmp_path.replace(p)
++        if is_jsonl and meta_tmp is not None and meta_path is not None:
++            meta_tmp.replace(meta_path)
++    except Exception as e:
++        for cand in (tmp_path, meta_tmp):
++            if cand is not None:
++                try:
++                    Path(cand).unlink(missing_ok=True)
++                except Exception:
++                    pass
++        raise RuntimeError(f"Failed to save manifest atomically: {e}") from e
++
++
++def update_manifest(path: str,
++                    mutator: Callable[[Dict[str, Any]], Any],
++                    timeout: float = 30.0) -> bool:
++    """FIX-V08: locked read-merge-write of a manifest.
++
++    The mutator receives the *current on-disk* manifest (re-read inside the
++    lock) and mutates it in place. The result is written only if the mutator
++    did not raise. Returns True when written.
++
++    This is the primitive that fixes the lost-update bug: worker A's DONE is
++    visible to worker B because B re-reads after acquiring the lock.
++    """
++    p = Path(path)
++    lock_path = p.parent / (p.name + ".lock")
++    with _file_lock(lock_path, timeout=timeout):
++        try:
++            manifest = load_manifest(path)
++        except Exception as e:
++            # 读取失败不能清空所有任务：宁可不写
++            logging.error("MANIFEST_LOCKED_UPDATE_SKIP: cannot re-read %s: %s",
++                          path, e)
++            return False
++        if not isinstance(manifest, dict):
++            logging.error("MANIFEST_LOCKED_UPDATE_SKIP: %s is not a mapping",
++                          path)
++            return False
++        manifest.setdefault("jobs", [])
++        manifest.setdefault("meta", {})
++        result = mutator(manifest)
++        if result is False:
++            return False
++        _update_meta_counts(manifest)
++        _write_manifest_locked(manifest, path)
++        return True
++
++
++def _should_apply_job_result(job: Dict[str, Any], status: str,
++                             attempt: Optional[int],
++                             attempt_group: Optional[str]) -> Tuple[bool, str]:
++    """State-transition guard for a single-job result (late/stale attempts).
++
++    Rules:
++    - No attempt info (or no recorded attempt) → apply.
++    - A different attempt group (new pipeline run) → apply (newer run wins).
++    - Same group, older attempt → reject (stale late writer).
++    - Same group, same-or-newer attempt → apply.
++    """
++    recorded_attempt = job.get("result_attempt")
++    recorded_group = job.get("result_attempt_group")
++    if attempt is None or recorded_attempt is None:
++        return True, "no-attempt-info"
++    if recorded_group != attempt_group:
++        return True, "new-attempt-group"
++    try:
++        if int(attempt) < int(recorded_attempt):
++            return False, "stale-attempt"
++    except (TypeError, ValueError):
++        return True, "unparsable-attempt"
++    return True, "same-or-newer-attempt"
++
++
++def save_manifest_job_result(path: str, job_id: str, status: str,
++                             error_message: str = "",
++                             attempt: Optional[int] = None,
++                             attempt_group: Optional[str] = None,
++                             timeout: float = 30.0) -> bool:
++    """FIX-V08: report a single job's result under the cross-process lock.
++
++    Replaces "worker saves its whole stale snapshot". Only the targeted job is
++    modified, everything else is re-read from disk inside the lock.
++    """
++    if status not in VALID_STATUSES:
++        raise ValueError(
++            f"Invalid status: {status!r} (must be one of {sorted(VALID_STATUSES)})"
++        )
++    applied = {"ok": False, "reason": "not-found"}
++
++    def _mutate(manifest: Dict[str, Any]) -> bool:
++        for job in manifest.get("jobs", []):
++            if job.get("job_id") != job_id:
++                continue
++            ok, reason = _should_apply_job_result(job, status, attempt,
++                                                  attempt_group)
++            if not ok:
++                applied["reason"] = reason
++                logging.warning(
++                    "MANIFEST_RESULT_REJECTED: job %s status %s rejected (%s)",
++                    job_id, status, reason)
++                return False
++            job["status"] = status
++            if error_message:
++                job["error_message"] = error_message
++            job["updated_at"] = datetime.now().astimezone().isoformat()
++            if attempt is not None:
++                job["result_attempt"] = int(attempt)
++            if attempt_group is not None:
++                job["result_attempt_group"] = attempt_group
++            applied.update({"ok": True, "reason": reason})
++            return True
++        logging.warning("MANIFEST_RESULT_MISSING_JOB: %s not in %s", job_id, path)
++        return False
++
++    written = update_manifest(path, _mutate, timeout=timeout)
++    return bool(written and applied["ok"])
+ 
+ 
+ def load_manifest(path: str) -> Dict[str, Any]:
+@@ -289,41 +530,21 @@ def _handle_failed_job(job: Dict[str, Any]) -> Dict[str, Any]:
+     return job
+ 
+ 
+-def save_manifest(manifest: Dict[str, Any], path: str):
+-    """Save manifest back to disk atomically. FIX-P4-16: atomic write."""
++def save_manifest(manifest: Dict[str, Any], path: str,
++                  timeout: float = 30.0):
++    """Save manifest back to disk atomically. FIX-P4-16: atomic write.
++
++    FIX-V08: the write now happens under the cross-process lock and uses a
++    unique temp file (previously a fixed `.tmp` shared by all writers).
++
++    NOTE: this still writes the *caller's* snapshot. Multi-worker call sites
++    must use :func:`save_manifest_job_result` / :func:`update_manifest`, which
++    re-read the on-disk manifest inside the lock and only merge their own job.
++    """
+     p = Path(path)
+-    p.parent.mkdir(parents=True, exist_ok=True)
+-    tmp_path = p.with_suffix(p.suffix + ".tmp")
+-    is_jsonl = path.endswith(".jsonl")
+-    meta_path = None
+-    meta_tmp = None
+-    try:
+-        if is_jsonl:
+-            # FIX-P4-7: write meta to separate .meta.json file
+-            # FIX-G13/L12: write .meta.json atomically (.tmp + replace). Both
+-            # temp files are written fully before either is renamed, so a crash
+-            # cannot leave meta inconsistent with the jobs file. Jobs commit
+-            # first (source of truth); meta (just counts) commits second.
+-            meta_path = p.with_suffix(".meta.json")
+-            meta_tmp = meta_path.parent / (meta_path.name + ".tmp")
+-            with open(meta_tmp, "w", encoding="utf-8") as f:
+-                json.dump(manifest["meta"], f, ensure_ascii=False, indent=2)
+-            with open(tmp_path, "w", encoding="utf-8") as f:
+-                for job in manifest["jobs"]:
+-                    f.write(json.dumps(job, ensure_ascii=False) + "\n")
+-        else:
+-            with open(tmp_path, "w", encoding="utf-8") as f:
+-                yaml.dump(manifest, f, allow_unicode=True, sort_keys=False)
+-        # Atomic rename on same filesystem (jobs first, then meta)
+-        tmp_path.replace(p)
+-        if is_jsonl and meta_tmp is not None and meta_path is not None:
+-            meta_tmp.replace(meta_path)
+-    except Exception as e:
+-        if tmp_path.exists():
+-            tmp_path.unlink(missing_ok=True)
+-        if meta_tmp is not None and meta_tmp.exists():
+-            meta_tmp.unlink(missing_ok=True)
+-        raise RuntimeError(f"Failed to save manifest atomically: {e}") from e
++    lock_path = p.parent / (p.name + ".lock")
++    with _file_lock(lock_path, timeout=timeout):
++        _write_manifest_locked(manifest, path)
+ 
+ 
+ # FIX-L13: legal job status values per v7.32 §3.4.3
+diff --git a/shared_modules/media_io.py b/shared_modules/media_io.py
+new file mode 100644
+index 0000000..83053e2
+--- /dev/null
++++ b/shared_modules/media_io.py
+@@ -0,0 +1,639 @@
++#!/usr/bin/env python3
++"""Media I/O contracts: high-bit-depth image I/O + avifenc capability model.
++
++FIX-V01/V02/V05: the encode boundary must agree with the encoder's documented
++contract instead of relying on file extensions, exit codes or optimistic
++defaults. Facts verified against the libavif manual (doc/avifenc.1.md) and the
++libavif 1.4.0/1.4.1 changelog on 2026-10-02:
++
++* avifenc accepts **only** jpg / jpeg / png / y4m input (no TIFF).
++* ``--depth D[,EXTENSION]``: D must be 8, 10 or 12. A 16-bit result is only
++  reachable through a bit-depth *extension* image; the supported combinations
++  are (8,8), (12,4) and (12,8).
++* Bit-depth extension (AVIF v1.2 Sample Transform) requires libavif >= 1.4.0;
++  decoding the 16-bit result back requires a decoder that enables sample
++  transforms (``avifdec --sato`` / ``--depth 16``).
++* ``--icc FILENAME`` attaches an ICC payload; ``--cicp P/T/M`` uses ``2`` for
++  "unspecified".
++
++The module is dependency-optional: tifffile/imagecodecs/Pillow are used when
++importable, otherwise pure-python writers are used. Every write reports the
++method actually used, so callers record facts rather than intentions.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++import struct
++import subprocess
++import zlib
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++# --- avifenc contract constants (verified against libavif manual) -----------
++AVIFENC_SUPPORTED_INPUT_EXTS = frozenset({".jpg", ".jpeg", ".png", ".y4m"})
++
++# NEW-V-04: 中间产物目录里现在会有 .status.json / .cache.json 之类的侧车文件，
++# glob 形如 `step5_postprocess*` 会把它们一起选进来，导致"选中的输入"其实是
++# 一个 JSON 文本。候选必须先按真实图像扩展名过滤。
++IMAGE_EXTS = frozenset({
++    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".y4m",
++})
++AVIFENC_BASE_DEPTHS = frozenset({8, 10, 12})
++AVIFENC_DEPTH_EXTENSIONS = frozenset({(8, 8), (12, 4), (12, 8)})
++#: libavif version that made the --depth extension (Sample Transform) stable
++AVIFENC_DEPTH_EXTENSION_MIN_VERSION = (1, 4, 0)
++AVIFENC_VALID_YUV = frozenset({"auto", "400", "420", "422", "444"})
++AVIFENC_VALID_RANGE = frozenset({"full", "limited", "f", "l"})
++AVIFENC_DEFAULT_DEPTH_EXTENSION = (12, 8)  # keeps 12-bit compatibility + 16-bit decode
++
++PNG_COLOR_TYPE = {1: 0, 2: 4, 3: 2, 4: 6}  # channels -> PNG color type
++
++
++class UnsupportedAvifConfig(ValueError):
++    """Raised when a requested encode setting is not supported by avifenc."""
++
++
++class MediaWriteError(RuntimeError):
++    """Raised when an image cannot be written at the required precision."""
++
++
++# --- image read -------------------------------------------------------------
++
++def read_image_array(path: str) -> Tuple[Any, Dict[str, Any]]:
++    """Read an image as a numpy array, preserving uint16 when present.
++
++    Returns (array, meta). ``meta`` carries the reader actually used and any
++    embedded ICC profile. tifffile is preferred because Pillow cannot represent
++    multi-channel 16-bit data (its ``I;16`` mode is single-channel only).
++    """
++    meta: Dict[str, Any] = {"reader": None, "icc_profile": None,
++                            "mode": None, "path": str(path)}
++    try:
++        import numpy as np  # noqa: F401
++        import tifffile  # type: ignore
++        arr = tifffile.imread(path)
++        meta["reader"] = "tifffile"
++        meta["mode"] = str(getattr(arr, "dtype", ""))
++        return arr, meta
++    except Exception:
++        pass
++
++    from PIL import Image  # noqa: WPS433 (optional dependency)
++    with Image.open(path) as im:
++        meta["mode"] = im.mode
++        meta["icc_profile"] = im.info.get("icc_profile")
++        import numpy as np
++        arr = np.array(im)
++    meta["reader"] = "pillow"
++    return arr, meta
++
++
++def _ensure_uint(arr: Any) -> Any:
++    """Normalise to uint8/uint16 (float images are scaled to their range)."""
++    import numpy as np
++    if arr.dtype == np.uint8 or arr.dtype == np.uint16:
++        return arr
++    if arr.dtype.kind == "f":
++        lo = float(arr.min()) if arr.size else 0.0
++        hi = float(arr.max()) if arr.size else 1.0
++        if lo >= 0.0 and hi <= 1.0:
++            scaled = arr * 65535.0
++        else:
++            scaled = np.clip(arr, 0, 65535)
++        return np.clip(scaled, 0, 65535).astype(np.uint16)
++    if arr.dtype == np.int16 or arr.dtype == np.int32:
++        return np.clip(arr, 0, 65535).astype(np.uint16)
++    return np.clip(arr, 0, 65535).astype(np.uint16)
++
++
++def read_png(path: str) -> Any:
++    """Minimal PNG reader used to verify what we wrote (no external deps).
++
++    Supports the subset our writer emits: 8/16-bit, color type 0/2/4/6,
++    filter type 0 or adaptive filters (all 5 filter types), no interlace.
++    """
++    import numpy as np
++    data = Path(path).read_bytes()
++    if data[:8] != b"\x89PNG\r\n\x1a\n":
++        raise ValueError("not a PNG file")
++    pos = 8
++    idat = bytearray()
++    width = height = bitdepth = colortype = None
++    while pos < len(data):
++        length = struct.unpack(">I", data[pos:pos + 4])[0]
++        ctype = data[pos + 4:pos + 8]
++        body = data[pos + 8:pos + 8 + length]
++        if ctype == b"IHDR":
++            width, height, bitdepth, colortype, _comp, _filt, interlace = \
++                struct.unpack(">IIBBBBB", body)
++            if interlace != 0:
++                raise ValueError("interlaced PNG not supported")
++        elif ctype == b"IDAT":
++            idat.extend(body)
++        elif ctype == b"IEND":
++            break
++        pos += 12 + length
++    if None in (width, height, bitdepth, colortype):
++        raise ValueError("PNG header missing")
++    raw = zlib.decompress(bytes(idat))
++    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[colortype]
++    bytes_per_sample = bitdepth // 8 or 1
++    if bitdepth not in (8, 16):
++        raise ValueError(f"unsupported PNG bit depth {bitdepth}")
++    stride_bytes = width * channels * bytes_per_sample
++    # FIX-NEW-V-02: PNG 滤波是 **逐字节** 定义的（PNG 规范 §6 滤波）：
++    #   bpp = channels * bytes_per_sample（**字节**偏移），
++    #   Sub:  Recon(x) = Filt(x) + Recon(x - bpp)   —— 每一步都 mod 256，
++    #         低字节产生的进位 **丢弃**，绝不进到高字节。
++    # 旧实现按 16-bit 字（mod 65536）做反滤波，进位被传播到高字节，
++    # 于是每个「低字节相加溢出」的样本都会多出 +256。
++    # 对自家 writer（filter 0）无感，但读 libpng/avifdec 产出的图会整幅偏色。
++    bpp = channels * bytes_per_sample
++    out = np.zeros((height, stride_bytes), dtype=np.uint8)
++    prev = np.zeros(stride_bytes, dtype=np.uint8)
++    p = 0
++    for y in range(height):
++        ftype = raw[p]
++        p += 1
++        line = np.frombuffer(raw, dtype=np.uint8,
++                             count=stride_bytes, offset=p).copy()
++        p += stride_bytes
++        if ftype == 0:  # None
++            pass
++        elif ftype == 1:  # Sub —— 每条字节链独立累加，mod 256
++            for r in range(bpp):
++                line[r::bpp] = np.cumsum(line[r::bpp], dtype=np.uint8)
++        elif ftype == 2:  # Up
++            line += prev
++        elif ftype == 3:  # Average
++            for j in range(stride_bytes):
++                a = int(line[j - bpp]) if j >= bpp else 0
++                line[j] = (int(line[j]) + ((a + int(prev[j])) >> 1)) & 0xFF
++        elif ftype == 4:  # Paeth
++            for j in range(stride_bytes):
++                a = int(line[j - bpp]) if j >= bpp else 0
++                b = int(prev[j])
++                c = int(prev[j - bpp]) if j >= bpp else 0
++                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
++                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
++                line[j] = (int(line[j]) + pred) & 0xFF
++        else:
++            raise ValueError(f"unsupported PNG filter {ftype}")
++        out[y] = line
++        prev = line
++    # 采样重组：大端 16-bit 或 8-bit
++    flat = out.reshape(height, width, channels, bytes_per_sample)
++    if bitdepth == 16:
++        arr = (flat[:, :, :, 0].astype(np.uint16) << 8) | \
++            flat[:, :, :, 1].astype(np.uint16)
++    else:
++        arr = flat[:, :, :, 0]
++    if channels == 1:
++        arr = arr[:, :, 0]
++    return arr
++
++
++def write_png(path: str, arr: Any) -> str:
++    """Write a PNG preserving uint8/uint16 precision. Returns the writer name.
++
++    Pillow cannot write multi-channel 16-bit PNGs, so 16-bit arrays go through
++    an internal zlib/struct writer. 8-bit arrays use Pillow when available.
++    """
++    import numpy as np
++    arr = _ensure_uint(arr)
++    if arr.ndim == 2:
++        arr = arr[:, :, None]
++    if arr.shape[2] not in PNG_COLOR_TYPE:
++        raise MediaWriteError(f"unsupported channel count {arr.shape[2]}")
++    if arr.dtype == np.uint16:
++        return _write_png16_internal(path, arr)
++    try:
++        from PIL import Image
++        if arr.shape[2] == 1:
++            Image.fromarray(arr[:, :, 0], mode="L").save(path, format="PNG")
++        elif arr.shape[2] == 3:
++            Image.fromarray(arr, mode="RGB").save(path, format="PNG")
++        else:
++            Image.fromarray(arr, mode="RGBA").save(path, format="PNG")
++        return "pillow"
++    except Exception:
++        return _write_png16_internal(path, arr.astype(np.uint16))
++
++
++def _write_png16_internal(path: str, arr: Any) -> str:
++    """Write a 16-bit PNG (filter 0, no interlace) with stdlib zlib only."""
++    import numpy as np
++    arr = np.ascontiguousarray(arr.astype(">u2"))
++    h, w, c = arr.shape
++    raw = bytearray()
++    for y in range(h):
++        raw.append(0)
++        raw.extend(arr[y].tobytes())
++
++    def chunk(tag: bytes, payload: bytes) -> bytes:
++        return (struct.pack(">I", len(payload)) + tag + payload +
++                struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
++
++    ihdr = struct.pack(">IIBBBBB", w, h, 16, PNG_COLOR_TYPE[c], 0, 0, 0)
++    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
++           chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
++    Path(path).write_bytes(png)
++    return "internal-png16"
++
++
++# --- TIFF master ------------------------------------------------------------
++
++def write_tiff(path: str, arr: Any) -> str:
++    """Write a TIFF preserving uint8/uint16. Returns the writer actually used.
++
++    tifffile is used when importable; otherwise an internal uncompressed TIFF
++    writer is used so that a real 16-bit master is still produced (Pillow
++    cannot write multi-channel 16-bit TIFF at all).
++    """
++    import numpy as np
++    arr = _ensure_uint(arr)
++    try:
++        import tifffile  # type: ignore
++        tifffile.imwrite(path, arr, compression="zlib")
++        return "tifffile"
++    except Exception:
++        pass
++    return _write_tiff_internal(path, arr)
++
++
++def _write_tiff_internal(path: str, arr: Any) -> str:
++    """Write an uncompressed, little-endian, uncompressed TIFF (RGB/RGBA/gray)."""
++    import numpy as np
++    arr = np.ascontiguousarray(arr)
++    if arr.ndim == 2:
++        arr = arr[:, :, None]
++    h, w, c = arr.shape
++    if c not in (1, 3, 4):
++        raise MediaWriteError(f"unsupported channel count {c}")
++    if arr.dtype == np.uint8:
++        raw = arr.tobytes()
++        bits = 8
++    elif arr.dtype == np.uint16:
++        raw = arr.astype("<u2").tobytes()
++        bits = 16
++    else:
++        raise MediaWriteError(f"unsupported dtype {arr.dtype}")
++
++    entries: List[Tuple[int, int, int, bytes]] = []
++
++    def _short(v: int) -> bytes:
++        return struct.pack("<H", v)
++
++    def _long(v: int) -> bytes:
++        return struct.pack("<I", v)
++
++    photometric = 1 if c == 1 else 2  # 1=BlackIsZero, 2=RGB
++    tags: List[Tuple[int, int, int]] = [
++        (256, 3, w),            # ImageWidth
++        (257, 3, h),            # ImageLength
++        (259, 3, 1),            # Compression = none
++        (262, 3, photometric),  # PhotometricInterpretation
++        (277, 3, c),            # SamplesPerPixel
++        (278, 4, h),            # RowsPerStrip
++        (284, 3, 1),            # PlanarConfiguration = chunky
++    ]
++    if c == 4:
++        tags.append((339, 3, 2))  # ExtraSamples: unassociated alpha
++
++    ifd_size = 2 + 12 * (len(tags) + 3) + 4  # + BitsPerSample/StripOffsets/ByteCounts
++    header_size = 8
++    bits_array_offset = header_size + ifd_size
++    data_offset = bits_array_offset + (2 * c)
++    data_offset += (4 - data_offset % 4) % 4  # keep word alignment
++    byte_count = len(raw)
++
++    for tag, ttype, value in tags:
++        if ttype == 3:
++            entries.append((tag, ttype, 1, _short(value).ljust(4, b"\x00")))
++        else:
++            entries.append((tag, ttype, 1, _long(value)))
++    entries.append((258, 3, c, _long(bits_array_offset)))              # BitsPerSample
++    entries.append((273, 4, 1, _long(data_offset)))                    # StripOffsets
++    entries.append((279, 4, 1, _long(byte_count)))                     # StripByteCounts
++    entries.sort(key=lambda e: e[0])
++
++    out = bytearray()
++    out.extend(b"II" + struct.pack("<H", 42) + struct.pack("<I", header_size))
++    out.extend(struct.pack("<H", len(entries)))
++    for tag, ttype, count, value in entries:
++        out.extend(struct.pack("<HHI", tag, ttype, count) + value)
++    out.extend(struct.pack("<I", 0))  # next IFD offset
++    out.extend(b"\x00" * (bits_array_offset - len(out)))
++    for _ in range(c):
++        out.extend(_short(bits))
++    out.extend(b"\x00" * (data_offset - len(out)))
++    out.extend(raw)
++    Path(path).write_bytes(bytes(out))
++    return "internal-tiff"
++
++
++def embed_icc_in_tiff(path: str, icc_bytes: bytes) -> bool:
++    """Attach an ICC profile to an existing TIFF (tag 34675) when possible.
++
++    Returns True when the profile was embedded by a known-good writer; False
++    means the caller must record that no profile is attached.
++    """
++    try:
++        import tifffile  # type: ignore
++        import numpy as np
++        arr = tifffile.imread(path)
++        tifffile.imwrite(path, arr, compression="zlib",
++                         extratags=[(34675, 1, len(icc_bytes), icc_bytes, True)])
++        return True
++    except Exception:
++        return False
++
++
++# --- avifenc capability / command ------------------------------------------
++
++@dataclass
++class AvifencCapability:
++    """Result of probing the installed avifenc."""
++
++    available: bool = False
++    version: Tuple[int, int, int] = (0, 0, 0)
++    raw: str = ""
++    binary: str = "avifenc"
++
++    @property
++    def supports_depth_extension(self) -> bool:
++        return (self.available and
++                self.version >= AVIFENC_DEPTH_EXTENSION_MIN_VERSION)
++
++
++def detect_avifenc_capability(binary: str = "avifenc") -> AvifencCapability:
++    """Probe avifenc --version. Never raises; reports (0,0,0) when absent."""
++    try:
++        r = subprocess.run([binary, "--version"], capture_output=True,
++                           text=True, timeout=15, shell=False)
++    except Exception:
++        return AvifencCapability(binary=binary)
++    if r.returncode != 0:
++        return AvifencCapability(binary=binary, raw=(r.stdout or "")[:200])
++    out = (r.stdout or "") + (r.stderr or "")
++    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out)
++    if not m:
++        return AvifencCapability(available=True, binary=binary, raw=out[:200])
++    return AvifencCapability(
++        available=True,
++        version=(int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)),
++        raw=out.strip()[:200], binary=binary)
++
++
++def resolve_depth_spec(requested_depth: int,
++                       requested_extension: Optional[int],
++                       capability: AvifencCapability,
++                       allow_downgrade: bool = False) -> Tuple[str, int, Dict[str, Any]]:
++    """Map a requested bit depth onto an avifenc-supported ``--depth`` value.
++
++    Returns ``(depth_arg, effective_decode_depth, info)``.
++    Raises UnsupportedAvifConfig when the request is impossible and downgrade
++    is not authorised — silently truncating 16 to 12 while still labelling the
++    output "16-bit archival" is exactly the V01 defect.
++    """
++    info: Dict[str, Any] = {"requested_depth": requested_depth,
++                            "requested_extension": requested_extension}
++    try:
++        depth = int(requested_depth)
++    except (TypeError, ValueError) as exc:
++        raise UnsupportedAvifConfig(f"invalid depth {requested_depth!r}") from exc
++
++    if depth in AVIFENC_BASE_DEPTHS and requested_extension in (None, 0):
++        info.update({"mode": "base", "downgraded": False})
++        return str(depth), depth, info
++
++    # A bit-depth extension image is requested (either explicitly, or by asking
++    # for a 16-bit result): primary depth + extension bits reach 16 bits on
++    # decode — see avifSampleTransformRecipe combinations (8,8) (12,4) (12,8).
++    if depth == 16 or requested_extension not in (None, 0):
++        if depth == 16:
++            ext = int(requested_extension) if requested_extension else None
++            combo = None
++            if ext:
++                combo = next((c for c in sorted(AVIFENC_DEPTH_EXTENSIONS,
++                                                reverse=True) if c[1] == ext),
++                             None)
++            if combo is None:
++                combo = AVIFENC_DEFAULT_DEPTH_EXTENSION
++        else:
++            combo = (depth, int(requested_extension))
++        if combo not in AVIFENC_DEPTH_EXTENSIONS:
++            raise UnsupportedAvifConfig(
++                f"unsupported depth/extension combination {combo}; avifenc "
++                f"supports {sorted(AVIFENC_DEPTH_EXTENSIONS)}")
++        if not capability.supports_depth_extension:
++            if not allow_downgrade:
++                raise UnsupportedAvifConfig(
++                    "a 16-bit AVIF result requires the avifenc --depth "
++                    f"extension (libavif >= "
++                    f"{'.'.join(map(str, AVIFENC_DEPTH_EXTENSION_MIN_VERSION))}); "
++                    f"detected {capability.version or 'unknown'}. Set "
++                    "allow_depth_downgrade=true to encode the primary depth "
++                    "only (the output then IS 12-bit and must be recorded "
++                    "as such).")
++            info.update({"mode": "downgraded-primary", "downgraded": True,
++                         "reason": "avifenc lacks depth-extension support",
++                         "requested_combo": list(combo)})
++            return str(combo[0]), combo[0], info
++        info.update({"mode": "depth-extension", "downgraded": False,
++                     "primary_depth": combo[0], "extension_depth": combo[1],
++                     "decode_requires": "avifdec --sato (or --depth 16)"})
++        return f"{combo[0]},{combo[1]}", 16, info
++
++    raise UnsupportedAvifConfig(
++        f"depth {depth} is not supported by avifenc (allowed base depths: "
++        f"{sorted(AVIFENC_BASE_DEPTHS)}; 16 requires a depth extension)")
++
++
++def _validate_choice(value: str, allowed: frozenset, name: str) -> str:
++    if str(value).lower() not in allowed:
++        raise UnsupportedAvifConfig(
++            f"invalid {name}: {value!r} (allowed: {sorted(allowed)})")
++    return str(value).lower()
++
++
++def _validate_cicp(cicp: str) -> str:
++    parts = str(cicp).split("/")
++    if len(parts) != 3 or not all(p.strip().lstrip("-").isdigit() for p in parts):
++        raise UnsupportedAvifConfig(
++            f"invalid cicp: {cicp!r} (expected P/T/M, use 2 for unspecified)")
++    return "/".join(parts)
++
++
++def _validate_speed(speed: Any) -> str:
++    s = str(speed)
++    if s in ("default", "d"):
++        return s
++    try:
++        iv = int(s)
++    except (TypeError, ValueError) as exc:
++        raise UnsupportedAvifConfig(f"invalid speed {speed!r}") from exc
++    if not 0 <= iv <= 10:
++        raise UnsupportedAvifConfig(f"speed out of range 0..10: {iv}")
++    return str(iv)
++
++
++def resolve_jobs_value(jobs: str, capability: AvifencCapability) -> Optional[str]:
++    """Resolve --jobs per avifenc version (FIX-P12-10 behaviour preserved)."""
++    if jobs != "all":
++        return str(jobs)
++    if capability.version >= (1, 1, 0):
++        return "all"
++    if capability.version >= (0, 9, 2):
++        return str(min(os.cpu_count() or 1, 32))
++    return None
++
++
++def build_avifenc_cmd(input_path: str, output_path: str, params: Dict[str, Any],
++                      use_rgb444: bool = False,
++                      capability: Optional[AvifencCapability] = None,
++                      icc_path: Optional[str] = None) -> Tuple[List[str], Dict[str, Any]]:
++    """Build a validated avifenc command.
++
++    Returns (cmd, contract) where ``contract`` records what will actually be
++    encoded (not what the user hoped for). Raises UnsupportedAvifConfig for
++    unsupported/invalid combinations so the caller can fail the stage instead
++    of passing a command the encoder will reject.
++    """
++    capability = capability or detect_avifenc_capability()
++    input_ext = Path(input_path).suffix.lower()
++    if input_ext not in AVIFENC_SUPPORTED_INPUT_EXTS:
++        raise UnsupportedAvifConfig(
++            f"avifenc does not accept {input_ext or 'extension-less'} input; "
++            f"supported: {sorted(AVIFENC_SUPPORTED_INPUT_EXTS)} "
++            "(convert with prepare_encoder_input first)")
++    src = params.get("avif_rgb444_params", {}) if use_rgb444 else params.get("avif_params", {})
++    src = src or {}
++    if use_rgb444:
++        depth = src.get("depth", 16)
++        yuv = src.get("yuv", "444")
++        cicp = src.get("cicp", "1/13/0")
++        lossless = bool(src.get("lossless", True))
++    else:
++        depth = src.get("depth", 10)
++        yuv = src.get("yuv", "420")
++        cicp = src.get("cicp", "1/13/1")
++        lossless = bool(src.get("lossless", False))
++    rng = src.get("range", "limited")
++    # NEW-V-05（真机实测 avifenc 1.4.2）：lossless 模式下 `--range limited`
++    # 会被直接拒绝：stderr = "Range has to be full in lossless mode."
++    # 归档档（rgb444）默认就是 lossless，因此必须强制 full，否则整条 stage6
++    # 在真实编码器上必然 exit 84 —— 单测里的 stub 编码器永远不会暴露这一点。
++    if lossless and str(rng).lower() != "full":
++        rng = "full"
++    range_forced = lossless and str(src.get("range", "limited")).lower() != "full"
++    speed = src.get("speed", 4)
++    jobs = src.get("jobs", "all")
++    extension = src.get("depth_extension")
++    allow_downgrade = bool(params.get("allow_depth_downgrade", False))
++
++    depth_arg, effective_depth, depth_info = resolve_depth_spec(
++        depth, extension, capability, allow_downgrade=allow_downgrade)
++
++    cmd = ["avifenc",
++           "--depth", depth_arg,
++           "--yuv", _validate_choice(yuv, AVIFENC_VALID_YUV, "yuv"),
++           "--range", _validate_choice(rng, AVIFENC_VALID_RANGE, "range"),
++           "--cicp", _validate_cicp(cicp),
++           "--speed", _validate_speed(speed)]
++    if lossless:
++        cmd.append("--lossless")
++    jobs_val = resolve_jobs_value(jobs, capability)
++    if jobs_val is not None:
++        cmd.extend(["--jobs", jobs_val])
++    if icc_path:
++        cmd.extend(["--icc", str(icc_path)])
++    cmd.extend([str(input_path), str(output_path)])
++
++    contract = {
++        "input_path": str(input_path),
++        "input_ext": Path(input_path).suffix.lower(),
++        "archival_rgb444": bool(use_rgb444),
++        "depth_arg": depth_arg,
++        "requested_depth": depth,
++        "effective_decode_depth": effective_depth,
++        "depth_info": depth_info,
++        "yuv": str(yuv),
++        "range": str(rng),
++        "range_forced_full_by_lossless": range_forced,
++        "cicp": str(cicp),
++        "speed": str(speed),
++        "lossless": lossless,
++        "icc_attached": bool(icc_path),
++        "avifenc_version": ".".join(map(str, capability.version)),
++        "avifenc_available": capability.available,
++    }
++    return cmd, contract
++
++
++# --- encoder input adaptation ----------------------------------------------
++
++def prepare_encoder_input(path: str, workdir: str,
++                          logger: Any = None,
++                          forbid_lossy_input: bool = True) -> Dict[str, Any]:
++    """Return an avifenc-acceptable input path (FIX-V05).
++
++    TIFF (the photo pipeline's default stage5 output) is NOT an avifenc input
++    format. Conversion keeps the real pixel precision: 16-bit data is written
++    as a 16-bit PNG (never silently downgraded to 8-bit JPEG/PNG).
++    """
++    p = Path(path)
++    ext = p.suffix.lower()
++    result: Dict[str, Any] = {
++        "path": str(path), "converted": False, "source_ext": ext,
++        "source_dtype": None, "verification": None, "writer": None,
++        "reason": None,
++    }
++    if ext in AVIFENC_SUPPORTED_INPUT_EXTS:
++        if forbid_lossy_input and ext in (".jpg", ".jpeg"):
++            result["reason"] = "lossy input accepted by avifenc but lossy"
++        arr, meta = read_image_array(path)
++        result["source_dtype"] = str(getattr(arr, "dtype", ""))
++        result["verification"] = "passthrough"
++        return result
++
++    arr, meta = read_image_array(path)
++    result["source_dtype"] = str(getattr(arr, "dtype", ""))
++    os.makedirs(workdir, exist_ok=True)
++    out_path = str(Path(workdir) / f"{p.stem}_enc_input.png")
++    writer = write_png(out_path, arr)
++    result.update({"path": out_path, "converted": True, "writer": writer})
++
++    # Verify the converted input actually round-trips at the same precision.
++    verify_arr = None
++    verify_via = None
++    try:
++        import imagecodecs  # type: ignore  (libpng-backed, independent decoder)
++        verify_arr = imagecodecs.imread(out_path)
++        verify_via = "imagecodecs(libpng)"
++    except Exception:
++        try:
++            verify_arr = read_png(out_path)
++            verify_via = "internal-png-reader"
++        except Exception:
++            verify_arr = None
++    if verify_arr is None:
++        raise MediaWriteError(
++            f"encoder input conversion could not be verified: {out_path}")
++    ok = (tuple(verify_arr.shape) == tuple(arr.shape) and
++          verify_arr.dtype == _ensure_uint(arr).dtype and
++          bool((verify_arr == _ensure_uint(arr)).all()))
++    result["verification"] = f"{verify_via}:{'exact' if ok else 'MISMATCH'}"
++    if not ok:
++        raise MediaWriteError(
++            f"encoder input conversion changed pixel data ({result['verification']})")
++    if logger:
++        logger.info("STAGE6_INPUT_ADAPTER",
++                    f"Converted {ext or 'unknown'} -> PNG for avifenc",
++                    source=path, converted=out_path, writer=writer,
++                    dtype=result["source_dtype"],
++                    verification=result["verification"])
++    return result
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..0245ab4
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,13 @@
++"""Shared import bootstrap for the V01–V08 regression tests."""
++
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SHARED = ROOT / "shared_modules"
++VIDEO = ROOT / "video_restoration_pipeline"
++PHOTO_STAGES = ROOT / "photo_restoration_pipeline" / "stages"
++
++for _p in (str(SHARED), str(VIDEO), str(PHOTO_STAGES), str(ROOT)):
++    if _p not in sys.path:
++        sys.path.insert(0, _p)
+diff --git a/tests/test_cancel_guard.py b/tests/test_cancel_guard.py
+new file mode 100644
+index 0000000..2838ce3
+--- /dev/null
++++ b/tests/test_cancel_guard.py
+@@ -0,0 +1,216 @@
++"""NEW-V-06 · 取消/中断守卫的回归测试。
++
++交接的端到端验收要求里有"**故障和取消不会显示完成**"。
++本项目 16 个 stage 脚本对 `KeyboardInterrupt` / `BaseException` / `signal`
++的命中数为 0，而所有兜底出口都是 `except Exception` —— 抓不到中断。
++
++本文件验证三件事：
++  1. 根因成立（KeyboardInterrupt 不是 Exception）；
++  2. 守卫逻辑：清掉半成品 + 写 FAILED sidecar + 退出码 88；
++  3. 真机：真的收到 OS 信号时，进程以 88 退出且不留半成品。
++"""
++
++import json
++import os
++import signal
++import subprocess
++import sys
++import textwrap
++import time
++
++import pytest
++
++import conftest  # noqa: F401  (sys.path bootstrap)
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++SHARED = os.path.join(ROOT, "shared_modules")
++if SHARED not in sys.path:
++    sys.path.insert(0, SHARED)
++
++import cancel_guard  # noqa: E402
++from cancel_guard import CancelGuard, EXIT_INTERRUPTED  # noqa: E402
++
++
++def test_new_v06_keyboard_interrupt_is_not_caught_by_except_exception():
++    """根因证据：KeyboardInterrupt 继承 BaseException，不是 Exception。"""
++    assert issubclass(KeyboardInterrupt, BaseException)
++    assert not issubclass(KeyboardInterrupt, Exception)
++
++    def raises():
++        raise KeyboardInterrupt()
++
++    with pytest.raises(KeyboardInterrupt):
++        try:
++            raises()
++        except Exception:  # noqa: BLE001 —— 正是 stage 里写的兜底形式
++            pytest.fail("except Exception 竟然抓到了 KeyboardInterrupt")
++
++
++def test_new_v06_exit_code_is_inside_the_project_range():
++    """88 必须落在项目约定的 80–113 自定义区间，且不与 80–87 冲突。"""
++    assert 80 <= EXIT_INTERRUPTED <= 113
++    assert EXIT_INTERRUPTED not in range(80, 88)
++
++
++def test_new_v06_guard_removes_partial_and_writes_failed_sidecar(tmp_path):
++    """守卫逻辑（确定性）：删半成品 + 写 FAILED(cancelled) + 退出码 88。"""
++    out = tmp_path / "job1_img_step5_postprocess.tif"
++    cache = tmp_path / "job1_img_step5_postprocess.tif.cache.json"
++    out.write_bytes(b"\x00" * 4096)          # 模拟写到一半的产物
++    cache.write_text("{}", encoding="utf-8")  # 模拟已写的缓存 sidecar
++    assert out.exists() and cache.exists()
++
++    g = CancelGuard()
++    g.watch(str(out), extra_paths=[str(cache)], stage=5)
++    result = g.cleanup_and_record(signal.SIGINT)
++
++    assert not out.exists(), "半成品必须被清掉，否则与成功产物无法区分"
++    assert not cache.exists(), "缓存 sidecar 也必须清掉"
++    assert result["exit_code"] == EXIT_INTERRUPTED
++
++    status_path = str(out) + ".status.json"
++    assert os.path.exists(status_path)
++    with open(status_path, encoding="utf-8") as handle:
++        status = json.load(handle)
++    assert status["status"] == "FAILED", status
++    assert status["failed_operation"] == "cancelled", status
++    assert status["stage"] == 5
++    assert "SIGINT" in status["reason"], status
++
++
++def test_new_v06_guard_is_idempotent_and_safe_without_artifacts(tmp_path):
++    """没登记产物时不得抛错；重复清理也不得抛错。"""
++    g = CancelGuard()
++    first = g.cleanup_and_record(signal.SIGTERM)
++    assert first["removed"] == []
++    assert first["status_path"] is None
++
++    out = tmp_path / "nothing.tif"
++    g.watch(str(out))
++    assert g.cleanup_and_record(signal.SIGTERM)["removed"] == []
++    assert g.cleanup_and_record(signal.SIGTERM)["removed"] == []
++
++
++def test_new_v06_stage5_registers_its_artifacts(tmp_path, monkeypatch):
++    """stage5 主流程必须在写字节前把产物登记给守卫。"""
++    sys.path.insert(0, os.path.join(ROOT, "photo_restoration_pipeline", "stages"))
++    try:
++        import stage5_postprocess as s5
++    except Exception as exc:  # pragma: no cover - 依赖缺失时跳过
++        pytest.skip(f"stage5 无法导入: {exc}")
++
++    calls = []
++
++    class _StubGuard:
++        @staticmethod
++        def install_cancel_guard(stage=None, logger=None):
++            calls.append(("install", stage))
++            return True
++
++        @staticmethod
++        def watch_outputs(output_path, extra_paths=None, logger=None, stage=None):
++            calls.append(("watch", output_path, list(extra_paths or []), stage))
++
++    monkeypatch.setattr(s5, "_cancel_guard", _StubGuard, raising=False)
++
++    temp = tmp_path / "temp"
++    logs = tmp_path / "logs"
++    temp.mkdir()
++    logs.mkdir()
++
++    sys.path.insert(0, SHARED)
++    import media_io
++    import numpy as np
++    src = np.zeros((16, 16, 3), dtype=np.uint16)
++    src[..., 0] = np.linspace(0, 65535, 256, dtype=np.uint32).astype(
++        np.uint16).reshape(16, 16)
++    media_io.write_tiff(str(temp / "job001_img_step1_preprocess.tif"), src)
++
++    params = {
++        "temp_dir": str(temp), "log_dir": str(logs),
++        "photo_bit_depth": 16, "archival_mode": False,
++        "local_mask_denoise": False, "grain_synthesis": False,
++        "scratch_remove": False,
++    }
++    monkeypatch.setattr(sys, "argv", [
++        "stage5_postprocess.py", "--input", str(temp / "img.tif"),
++        "--job-id", "job001", "--params", json.dumps(params),
++    ])
++
++    rc = s5.main()
++    assert rc == 0, f"stage5 退出码 {rc}"
++
++    installs = [c for c in calls if c[0] == "install"]
++    watches = [c for c in calls if c[0] == "watch"]
++    assert installs, "stage5 没有安装取消守卫"
++    assert watches, "stage5 没有把产物登记给守卫"
++    _, out_path, extra, stage = watches[0]
++    assert out_path.endswith("job001_img_step5_postprocess.tif"), out_path
++    assert any(p.endswith(".cache.json") for p in extra), extra
++    assert stage == 5
++
++
++def test_new_v06_real_signal_leaves_failed_record_not_half_product(tmp_path):
++    """真机：真的收到 OS 信号 → 退出码 88，无半成品，有 FAILED 记录。
++
++    用一个最小脚本（而不是整个 stage）触发真实信号，避免依赖
++    "stage 恰好跑得够慢"这种不可控条件。
++    """
++    script = tmp_path / "sleepy_stage.py"
++    out = tmp_path / "job1_img_step5_postprocess.tif"
++    script.write_text(textwrap.dedent(f"""
++        import sys, time, os
++        sys.path.insert(0, {SHARED!r})
++        import cancel_guard
++        cancel_guard.install_cancel_guard(stage=5)
++        out = {str(out)!r}
++        cancel_guard.watch_outputs(out, extra_paths=[out + ".cache.json"])
++        with open(out, "wb") as f:            # 模拟写了一半
++            f.write(b"\\x00" * 8192)
++        time.sleep(10)                        # 等信号（漏掉信号也会自行退出）
++    """).strip(), encoding="utf-8")
++
++    popen_kwargs = {}
++    signum = None
++    if os.name == "nt":
++        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
++        signum = getattr(signal, "CTRL_BREAK_EVENT", None)
++    else:
++        signum = signal.SIGINT
++
++    if signum is None:  # pragma: no cover - 平台不支持
++        pytest.skip("该平台无法投递中断信号")
++
++    proc = subprocess.Popen([sys.executable, str(script)],
++                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                            **popen_kwargs)
++    try:
++        # 等到子进程真的写出半成品（也就是守卫已安装完毕）再发信号：
++        # 发得太早会命中系统默认行为，进程被直接终止，测不到处理器。
++        deadline = time.time() + 15
++        while time.time() < deadline and not os.path.exists(str(out)):
++            if proc.poll() is not None:
++                break
++            time.sleep(0.05)
++        time.sleep(0.3)
++        proc.send_signal(signum)
++        stdout, stderr = proc.communicate(timeout=25)
++    finally:
++        if proc.poll() is None:  # pragma: no cover - 兜底
++            proc.kill()
++            proc.wait(timeout=10)
++
++    if proc.returncode == -signum or proc.returncode == 3221225786:
++        pytest.skip("该平台未把信号交给 Python 处理器（默认直接终止）")
++
++    assert proc.returncode == EXIT_INTERRUPTED, (
++        f"期望退出码 {EXIT_INTERRUPTED}，实际 {proc.returncode}\n"
++        f"stderr={stderr.decode('utf-8', 'replace')[-800:]}")
++    assert not os.path.exists(str(out)), "半成品没有被清掉"
++
++    status_path = str(out) + ".status.json"
++    assert os.path.exists(status_path), "缺少 FAILED 记录"
++    with open(status_path, encoding="utf-8") as handle:
++        status = json.load(handle)
++    assert status["status"] == "FAILED"
++    assert status["failed_operation"] == "cancelled"
+diff --git a/tests/test_checkpoint_identity.py b/tests/test_checkpoint_identity.py
+new file mode 100644
+index 0000000..6d58de3
+--- /dev/null
++++ b/tests/test_checkpoint_identity.py
+@@ -0,0 +1,121 @@
++"""NEW-V-01: checkpoint 身份哈希在缺少硬依赖 xxhash 时的静默降级。
++
++背景（实测，见 修复清单.md NEW-V-01）：
++    shared_modules/checkpoint.py::compute_param_hash 原本用 `except Exception: pass`
++    包裹 get_file_xxhash()。xxhash 未安装时该调用抛 ImportError，被一并吞掉，
++    于是 file_hash_prefix 恒为 ""、stat_ok 恒为 False，身份退化为
++    「文件大小 + mtime + 文件名」。实测同名/同尺寸/同 mtime 但内容不同的两个文件
++    会算出同一个 param_hash → 中间产物被错误复用（静默的假缓存命中）。
++
++修复后契约：
++    * xxhash 缺失 = 硬依赖缺失 → 快速失败（抛 ImportError，携带安装指引）。
++    * 真实 I/O 异常（权限/文件消失/路径不可读）→ 允许降级，但必须打 warning 留痕。
++"""
++
++import importlib
++import importlib.util
++import os
++import sys
++import tempfile
++
++import pytest
++
++from checkpoint import compute_param_hash  # noqa: E402  (conftest 已注入 sys.path)
++
++
++class _BlockXxhash:
++    """上下文管理器：让 `import xxhash` 在本进程内抛出 ImportError。"""
++
++    def __init__(self) -> None:
++        self._finder = None
++
++    def find_module(self, *args, **kwargs):  # legacy API, 兼容旧导入钩子
++        return None
++
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname == "xxhash" or fullname.startswith("xxhash."):
++            raise ImportError("blocked by test: xxhash is unavailable")
++        return None
++
++    def __enter__(self):
++        sys.modules.pop("xxhash", None)
++        self._finder = self
++        sys.meta_path.insert(0, self)
++        return self
++
++    def __exit__(self, *exc):
++        try:
++            sys.meta_path.remove(self)
++        except ValueError:
++            pass
++        sys.modules.pop("xxhash", None)
++        return False
++
++
++def _make_twin(tmp_path, payload_a: bytes, payload_b: bytes):
++    """造两个同名、同尺寸、同 mtime、内容不同的文件（放在不同子目录）。"""
++    d1 = tmp_path / "run1"
++    d2 = tmp_path / "run2"
++    d1.mkdir()
++    d2.mkdir()
++    a = d1 / "clip.bin"
++    b = d2 / "clip.bin"
++    a.write_bytes(payload_a)
++    b.write_bytes(payload_b)
++    frozen = 1_600_000_000
++    os.utime(a, (frozen, frozen))
++    os.utime(b, (frozen, frozen))
++    return str(a), str(b)
++
++
++def test_new_v01_content_is_part_of_identity():
++    """装了 xxhash 时，内容必须参与身份计算 —— 同名同尺寸同 mtime 不得碰撞。"""
++    if importlib.util.find_spec("xxhash") is None:
++        pytest.skip("xxhash 未安装，无法验证正常路径（CI 需 pip install xxhash）")
++
++    with tempfile.TemporaryDirectory() as td:
++        import pathlib
++
++        a, b = _make_twin(pathlib.Path(td), b"A" * 4096, b"B" * 4096)
++        assert compute_param_hash(a, {}) != compute_param_hash(b, {}), (
++            "内容未参与身份：同名/同尺寸/同 mtime 的不同文件碰撞成同一个 param_hash"
++        )
++
++
++def test_new_v01_missing_xxhash_fails_loudly_not_silently():
++    """缺 xxhash 必须抛错，不得静默产出弱哈希。"""
++    with tempfile.TemporaryDirectory() as td:
++        import pathlib
++
++        a, b = _make_twin(pathlib.Path(td), b"A" * 4096, b"B" * 4096)
++
++        # 先证明：若按旧逻辑放行，这两个文件会碰撞（这是修复要消灭的行为）。
++        weak = None
++        with _BlockXxhash():
++            try:
++                weak = (compute_param_hash(a, {}), compute_param_hash(b, {}))
++            except ImportError:
++                weak = None
++        assert weak is None or weak[0] != weak[1], (
++            f"回归失败：缺少 xxhash 时仍产出了身份哈希 {weak}，"
++            "同名/同尺寸/同 mtime 的不同文件会碰撞"
++        )
++
++        # 再证明：现在的行为是快速失败，且错误信息带安装指引。
++        with _BlockXxhash():
++            with pytest.raises(ImportError) as excinfo:
++                compute_param_hash(a, {})
++        assert "xxhash is required" in str(excinfo.value), (
++            "错误信息必须指明缺失的依赖，便于直接修复"
++        )
++
++
++def test_new_v01_io_errors_still_degrade_with_a_warning(caplog):
++    """真实 I/O 异常（而非缺依赖）仍允许降级，但必须留痕，不能无声无息。"""
++    with tempfile.TemporaryDirectory() as td:
++        # 目录在 Windows 上无法以文件方式打开 → PermissionError/OSError
++        digest = compute_param_hash(td, {})
++        assert isinstance(digest, str) and len(digest) == 16
++        assert any(
++            "degraded" in r.getMessage() for r in caplog.records
++        ), "I/O 降级必须打 warning 留痕，不能静默 pass"
+diff --git a/tests/test_e2e_real_chain.py b/tests/test_e2e_real_chain.py
+new file mode 100644
+index 0000000..4e4f2eb
+--- /dev/null
++++ b/tests/test_e2e_real_chain.py
+@@ -0,0 +1,190 @@
++"""真实端到端链路（需 avifenc/avifdec）：stage5 -> stage6 -> 独立解码回读。
++
++与单测的区别：这里用 **subprocess 真实调用 stage 脚本**，并用
++**另一个厂商实现的解码器**（avifdec + libpng）回读验证，
++不依赖本项目自己写的读取代码下结论。
++
++环境缺口（本机实测，见 修复清单.md）：
++  * gmic 未安装 -> photo stage1 无法执行，因此 step1 中间产物由本测试
++    **合成**一份真实 16-bit RGB TIFF（内容由测试生成，非真实老照片）。
++  * VapourSynth / realesrgan / basicsr / gfpgan 未安装 -> stage2/3/4 不执行。
++  * 视频链（VapourSynth）无法执行。
++这些缺口在 修复清单.md 的"未执行项"中逐条登记。
++"""
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++
++import numpy as np
++import pytest
++
++import conftest  # noqa: F401  (sys.path bootstrap)
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++TOOLS = os.path.join(ROOT, "tests", "_out", "tools")
++E2E = os.path.join(ROOT, "tests", "_out", "e2e_chain")
++PY = sys.executable
++
++STAGE5 = os.path.join(ROOT, "photo_restoration_pipeline", "stages",
++                      "stage5_postprocess.py")
++STAGE6 = os.path.join(ROOT, "photo_restoration_pipeline", "stages",
++                      "stage6_encode.py")
++
++
++def _avifenc():
++    found = shutil.which("avifenc")
++    if found:
++        return found
++    local = os.path.join(TOOLS, "avifenc.exe")
++    return local if os.path.exists(local) else None
++
++
++def _avifdec():
++    found = shutil.which("avifdec")
++    if found:
++        return found
++    local = os.path.join(TOOLS, "avifdec.exe")
++    return local if os.path.exists(local) else None
++
++
++@pytest.fixture(scope="module")
++def chain_dir():
++    # 每次运行都用干净目录：否则 stage5 会命中上一次的缓存并返回 3（跳过）
++    if os.path.isdir(E2E):
++        shutil.rmtree(E2E, ignore_errors=True)
++    os.makedirs(E2E, exist_ok=True)
++    return E2E
++
++
++def _run(cmd, env=None):
++    r = subprocess.run(cmd, capture_output=True, text=True,
++                       shell=False, env=env, cwd=ROOT)
++    return r.returncode, (r.stdout or "") + (r.stderr or "")
++
++
++def _seed_step1(d, arr):
++    """合成一份真实 16-bit RGB TIFF 作为 step1 产物（gmic 缺失的替代）。"""
++    sys.path.insert(0, os.path.join(ROOT, "shared_modules"))
++    import media_io
++    p = os.path.join(d, "job001_oldphoto_step1_preprocess.tif")
++    media_io.write_tiff(p, arr)
++    return p
++
++
++def _env_with_avifenc():
++    env = dict(os.environ)
++    if os.path.isdir(TOOLS):
++        env["PATH"] = TOOLS + os.pathsep + env.get("PATH", "")
++    return env
++
++
++def test_e2e_stage5_keeps_true_16bit(chain_dir):
++    """NEW-V-03: 16-bit RGB TIFF 输入经过 stage5 后必须仍是真 16-bit。"""
++    temp = os.path.join(chain_dir, "temp")
++    logs = os.path.join(chain_dir, "logs")
++    for d in (temp, logs):
++        os.makedirs(d, exist_ok=True)
++
++    rng = np.random.default_rng(20261002)
++    src = rng.integers(0, 65536, (48, 64, 3)).astype(np.uint16)
++    _seed_step1(temp, src)
++
++    params = {
++        "temp_dir": temp, "log_dir": logs,
++        "photo_bit_depth": 16, "archival_mode": False,
++        "local_mask_denoise": False,   # 只验证位深保真，不做处理
++        "grain_synthesis": False,
++        "scratch_remove": False,
++    }
++    rc, out = _run([PY, STAGE5, "--input",
++                    os.path.join(temp, "oldphoto.tif"),
++                    "--job-id", "job001", "--params", json.dumps(params)])
++    assert rc == 0, f"stage5 exit={rc}\n{out[-2000:]}"
++
++    produced = os.path.join(temp, "job001_oldphoto_step5_postprocess.tif")
++    assert os.path.exists(produced), out[-2000:]
++
++    import tifffile
++    back = tifffile.imread(produced)
++    assert back.dtype == np.uint16, f"stage5 把 16-bit 压成了 {back.dtype}"
++
++    sys.path.insert(0, os.path.join(ROOT, "photo_restoration_pipeline",
++                                    "stages"))
++    import importlib.util as u
++    spec = u.spec_from_file_location("s6e2e", STAGE6)
++    s6 = u.module_from_spec(spec)
++    spec.loader.exec_module(s6)
++    eff = s6.effective_bit_depth(back)
++    assert eff >= 12, (
++        f"容器是 uint16 但有效位深只有 {eff} bit —— 16-bit 信息在上游被丢弃")
++
++    # status sidecar 必须是 SUCCESS，且没有 skipped_operations
++    with open(produced + ".status.json", encoding="utf-8") as f:
++        status = json.load(f)
++    assert status["status"] == "SUCCESS", status
++
++
++def test_e2e_stage6_real_avif_roundtrip(chain_dir):
++    """用真 avifenc 编码、用真 avifdec + libpng 独立回读。"""
++    avifenc = _avifenc()
++    avifdec = _avifdec()
++    if not (avifenc and avifdec):
++        pytest.skip("avifenc/avifdec 不可用（本机未安装，也未下载官方预编译包）")
++
++    temp = os.path.join(chain_dir, "temp")
++    logs = os.path.join(chain_dir, "logs")
++    outdir = os.path.join(chain_dir, "output")
++    os.makedirs(outdir, exist_ok=True)
++
++    step5 = os.path.join(temp, "job001_oldphoto_step5_postprocess.tif")
++    if not os.path.exists(step5):
++        pytest.skip("stage5 产物不存在（前一个用例被跳过或失败）")
++
++    params = {
++        "temp_dir": temp, "log_dir": logs, "output_dir": outdir,
++        "photo_bit_depth": 16, "archival_mode": True,
++    }
++    rc, out = _run([PY, STAGE6, "--input",
++                    os.path.join(temp, "oldphoto.tif"),
++                    "--job-id", "job001", "--params", json.dumps(params)],
++                   env=_env_with_avifenc())
++    assert rc == 0, f"stage6 exit={rc}\n{out[-3000:]}"
++
++    avif = os.path.join(outdir, "oldphoto_restored.avif")
++    assert os.path.exists(avif) and os.path.getsize(avif) > 0, out[-2000:]
++
++    contract_path = avif + ".encode_contract.json"
++    assert os.path.exists(contract_path), "缺少编码契约记录"
++    with open(contract_path, encoding="utf-8") as f:
++        contract = json.load(f)
++    depth_arg = json.dumps(contract)
++    assert "16" in depth_arg, "契约里没有记录 16-bit 相关决策"
++
++    # --- 独立解码回读（avifdec，非本项目代码）---
++    decoded = os.path.join(chain_dir, "decoded16.png")
++    rc2, out2 = _run([avifdec, "--depth", "16", "--sato", avif, decoded])
++    assert rc2 == 0, f"avifdec exit={rc2}\n{out2[-1500:]}"
++
++    try:
++        import cv2
++        back = cv2.imread(decoded, cv2.IMREAD_UNCHANGED)
++        assert back is not None, "libpng(cv2) 无法读取解码结果"
++        back = back[:, :, ::-1] if back.ndim == 3 else back
++    except ImportError:
++        import imagecodecs
++        back = imagecodecs.imread(decoded)
++
++    assert back.dtype == np.uint16, f"AVIF 回读只有 {back.dtype} —— 16-bit 未保住"
++
++    sys.path.insert(0, os.path.join(ROOT, "photo_restoration_pipeline",
++                                    "stages"))
++    import importlib.util as u
++    spec = u.spec_from_file_location("s6e2e2", STAGE6)
++    s6 = u.module_from_spec(spec)
++    spec.loader.exec_module(s6)
++    eff = s6.effective_bit_depth(back)
++    # 有损 AV1 会引入重建噪声，GCD 判据会偏小；只断言不是"8-bit 伪装"
++    assert eff > 8, f"回读有效位深仅 {eff} bit，疑似 8-bit 伪装成 16-bit"
+diff --git a/tests/test_manifest_concurrency.py b/tests/test_manifest_concurrency.py
+new file mode 100644
+index 0000000..92bebd5
+--- /dev/null
++++ b/tests/test_manifest_concurrency.py
+@@ -0,0 +1,198 @@
++"""V08 regression: concurrent manifest updates must not lose completions."""
++
++import json
++import multiprocessing
++import os
++
++import pytest
++
++import conftest  # noqa: F401
++from manifest_loader import (load_manifest, save_manifest,
++                             save_manifest_job_result, update_job_status,
++                             update_manifest, _unique_tmp_path,
++                             ManifestLockError)
++
++
++def _write(path, jobs):
++    with open(path, "w", encoding="utf-8") as f:
++        for j in jobs:
++            f.write(json.dumps(j, ensure_ascii=False) + "\n")
++
++
++def _jobs(n=2):
++    return [{"job_id": f"job{i}", "input_path": f"/in/clip{i}.mp4",
++             "detected_class": "dv_digital", "status": "PENDING",
++             "priority": 0} for i in range(n)]
++
++
++def _statuses(path):
++    m = load_manifest(path)
++    return {j["job_id"]: j["status"] for j in m["jobs"]}
++
++
++def test_v08_concurrent_single_job_updates_keep_every_result(tmp_path):
++    path = str(tmp_path / "m.jsonl")
++    _write(path, _jobs(3))
++    # Two "workers" each hold a stale snapshot, then report their own job.
++    _stale_a = load_manifest(path)
++    _stale_b = load_manifest(path)
++    save_manifest_job_result(path, "job0", "DONE", attempt=0,
++                             attempt_group="g1")
++    save_manifest_job_result(path, "job1", "DONE", attempt=0,
++                             attempt_group="g1")
++    assert _statuses(path) == {"job0": "DONE", "job1": "DONE",
++                               "job2": "PENDING"}
++
++
++def test_v08_old_whole_snapshot_write_still_loses_updates(tmp_path):
++    """Documents the defect: the legacy API is unsafe for multi-writer use."""
++    path = str(tmp_path / "m.jsonl")
++    _write(path, _jobs(2))
++    stale = load_manifest(path)          # snapshot taken before job0 finished
++    save_manifest_job_result(path, "job0", "DONE", attempt=0,
++                             attempt_group="g1")
++    update_job_status(stale, "job1", "DONE")   # other worker finishes
++    save_manifest(stale, path)                 # writes its stale snapshot
++    assert _statuses(path)["job0"] == "PENDING", (
++        "the legacy whole-snapshot write regressed job0; this is why callers "
++        "must use save_manifest_job_result")
++
++
++def test_v08_stale_attempt_cannot_overwrite_newer_result(tmp_path):
++    path = str(tmp_path / "m.jsonl")
++    _write(path, _jobs(1))
++    assert save_manifest_job_result(path, "job0", "DONE", attempt=2,
++                                    attempt_group="g1")
++    # a late result from an older attempt must be rejected
++    assert not save_manifest_job_result(path, "job0", "FAILED", attempt=1,
++                                        attempt_group="g1")
++    assert _statuses(path)["job0"] == "DONE"
++    # a new pipeline run (new group) is allowed to re-evaluate the job
++    assert save_manifest_job_result(path, "job0", "FAILED", attempt=0,
++                                    attempt_group="g2")
++    assert _statuses(path)["job0"] == "FAILED"
++
++
++def test_v08_corrupt_manifest_is_not_wiped(tmp_path):
++    path = str(tmp_path / "m.jsonl")
++    _write(path, _jobs(2))
++    with open(path, "a", encoding="utf-8") as f:
++        f.write("{not json\n")
++    before = open(path, "rb").read()   # corrupt-but-present content
++    assert update_manifest(path, lambda m: True) is False
++    assert open(path, "rb").read() == before, "corrupt read must not rewrite"
++
++
++def test_v08_temp_files_are_unique():
++    from pathlib import Path
++    a = _unique_tmp_path(Path("/tmp/m.jsonl"))
++    b = _unique_tmp_path(Path("/tmp/m.jsonl"))
++    assert a != b
++
++
++def _mp_worker(path, job_ids, group):
++    """Child process: report its own jobs through the locked API."""
++    import conftest  # noqa: F401  (path bootstrap inside the spawned process)
++    from manifest_loader import save_manifest_job_result
++    for jid in job_ids:
++        save_manifest_job_result(path, jid, "DONE", attempt=0,
++                                 attempt_group=group)
++
++
++def test_v08_real_multiprocess_writers(tmp_path):
++    """4 real processes × 10 jobs each on one manifest file."""
++    path = str(tmp_path / "m.jsonl")
++    jobs = _jobs(40)
++    _write(path, jobs)
++    groups = [f"g{i}" for i in range(4)]
++    ctx = multiprocessing.get_context("spawn")
++    procs = []
++    for i in range(4):
++        ids = [j["job_id"] for j in jobs[i * 10:(i + 1) * 10]]
++        p = ctx.Process(target=_mp_worker, args=(path, ids, groups[i]))
++        p.start()
++        procs.append(p)
++    for p in procs:
++        p.join(timeout=120)
++        assert p.exitcode == 0, f"worker failed with {p.exitcode}"
++
++    final = load_manifest(path)
++    assert len(final["jobs"]) == 40
++    assert all(j["status"] == "DONE" for j in final["jobs"]), \
++        [j for j in final["jobs"] if j["status"] != "DONE"][:3]
++    assert final["meta"]["done"] == 40
++    leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
++    assert not leftovers, leftovers
++
++
++def test_v08_lock_timeout_is_reported(tmp_path):
++    path = str(tmp_path / "locked.jsonl")
++    _write(path, _jobs(1))
++    lock = tmp_path / "locked.jsonl.lock"
++    with open(lock, "ab"):
++        pass
++    try:
++        import msvcrt
++        holder = open(lock, "a+b")
++        msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, 1)
++    except Exception:
++        pytest.skip("cannot hold an exclusive lock in this environment")
++    try:
++        with pytest.raises(ManifestLockError):
++            save_manifest_job_result(path, "job0", "DONE", timeout=0.3)
++    finally:
++        try:
++            msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, 1)
++        except Exception:
++            pass
++        holder.close()
++
++
++def test_new_v07_lock_file_open_denied_is_reported_not_crashed(tmp_path,
++                                                               monkeypatch):
++    """NEW-V-07: 打开锁文件被拒绝必须报"锁超时"，不能崩成 PermissionError。
++
++    实测触发条件（Windows）：另一个进程持有 msvcrt 锁区间时，
++    `open(lock_path, "a+b")` 会抛 `PermissionError: [Errno 13]`。
++    修复前它不在重试循环内 —— 4 进程并发时有 worker 直接崩（exitcode=1），
++    既没等到锁也没报超时。这里用 monkeypatch 稳定复现"open 被拒绝"。
++    """
++    import manifest_loader as ml
++
++    path = str(tmp_path / "m.jsonl")
++    _write(path, _jobs(1))
++
++    def denied(*_args, **_kwargs):
++        raise PermissionError(13, "Permission denied")
++
++    monkeypatch.setattr(ml, "open", denied, raising=False)
++
++    with pytest.raises(ml.ManifestLockError) as excinfo:
++        ml.save_manifest_job_result(path, "job0", "DONE", timeout=0.3)
++
++    assert "lock file" in str(excinfo.value), str(excinfo.value)
++
++
++def test_new_v07_lock_file_open_denied_is_reported_not_crashed(tmp_path,
++                                                               monkeypatch):
++    """NEW-V-07: 打开锁文件被拒绝必须报"锁超时"，不能崩成 PermissionError。
++
++    实测触发条件（Windows）：另一个进程持有 msvcrt 锁区间时，
++    `open(lock_path, "a+b")` 会抛 `PermissionError: [Errno 13]`。
++    修复前它不在重试循环内 —— 4 进程并发时有 worker 直接崩（exitcode=1），
++    既没等到锁也没报超时。这里用 monkeypatch 稳定复现"open 被拒绝"。
++    """
++    import manifest_loader as ml
++
++    path = str(tmp_path / "m.jsonl")
++    _write(path, _jobs(1))
++
++    def denied(*_args, **_kwargs):
++        raise PermissionError(13, "Permission denied")
++
++    monkeypatch.setattr(ml, "open", denied, raising=False)
++
++    with pytest.raises(ml.ManifestLockError) as excinfo:
++        ml.save_manifest_job_result(path, "job0", "DONE", timeout=0.3)
++
++    assert "lock file" in str(excinfo.value), str(excinfo.value)
+diff --git a/tests/test_media_io.py b/tests/test_media_io.py
+new file mode 100644
+index 0000000..4f42940
+--- /dev/null
++++ b/tests/test_media_io.py
+@@ -0,0 +1,236 @@
++"""V01/V02/V05 regression: encoder input adaptation + bit-depth contract.
++
++Targeted regressions only — no model inference, no GPU. Facts asserted here
++come from the libavif manual and the Pillow behaviour observed on this machine.
++"""
++
++import os
++import sys
++
++import numpy as np
++import pytest
++
++import conftest  # noqa: F401  (sys.path bootstrap)
++import media_io
++
++
++OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out")
++
++
++@pytest.fixture(scope="module")
++def outdir():
++    os.makedirs(OUT, exist_ok=True)
++    return OUT
++
++
++def _grad16(h=8, w=6):
++    """16-bit gradient with adjacent values that 8-bit quantisation merges."""
++    arr = np.zeros((h, w, 3), dtype=np.uint16)
++    arr[..., 0] = (np.arange(h * w) * 64).astype(np.uint16).reshape(h, w)
++    arr[..., 1] = 1000
++    arr[..., 2] = 65535
++    return arr
++
++
++# --- V01: --depth contract --------------------------------------------------
++
++def test_v01_bare_depth_16_is_never_emitted():
++    """avifenc --depth only accepts 8/10/12; 16 needs a documented extension."""
++    cap = media_io.AvifencCapability(available=True, version=(1, 4, 0))
++    depth_arg, effective, info = media_io.resolve_depth_spec(16, None, cap)
++    assert depth_arg == "12,8", depth_arg
++    assert effective == 16
++    assert info["mode"] == "depth-extension"
++    assert info["primary_depth"] == 12 and info["extension_depth"] == 8
++
++
++def test_v01_supported_base_depths():
++    cap = media_io.AvifencCapability(available=True, version=(1, 4, 0))
++    for depth in (8, 10, 12):
++        arg, effective, _ = media_io.resolve_depth_spec(depth, None, cap)
++        assert arg == str(depth) and effective == depth
++
++
++def test_v01_supported_extension_combinations():
++    cap = media_io.AvifencCapability(available=True, version=(1, 4, 0))
++    for combo in sorted(media_io.AVIFENC_DEPTH_EXTENSIONS):
++        arg, effective, info = media_io.resolve_depth_spec(combo[0], combo[1], cap)
++        assert arg == f"{combo[0]},{combo[1]}"
++        assert effective == 16
++        assert info["mode"] == "depth-extension"
++
++
++def test_v01_16bit_refused_when_encoder_lacks_extension():
++    """Must fail, not silently truncate 16 -> 12 while still saying 16-bit."""
++    old = media_io.AvifencCapability(available=True, version=(1, 2, 0))
++    with pytest.raises(media_io.UnsupportedAvifConfig):
++        media_io.resolve_depth_spec(16, None, old)
++    # explicit authorisation records the downgrade as 12-bit
++    arg, effective, info = media_io.resolve_depth_spec(16, None, old,
++                                                       allow_downgrade=True)
++    assert (arg, effective) == ("12", 12)
++    assert info["downgraded"] is True
++
++
++def test_v01_command_is_validated_before_launch():
++    cap = media_io.AvifencCapability(available=True, version=(1, 4, 0))
++    cmd, contract = media_io.build_avifenc_cmd(
++        "in.png", "out.avif", {"avif_rgb444_params": {"depth": 16}}, True, cap)
++    assert "--depth" in cmd
++    assert cmd[cmd.index("--depth") + 1] == "12,8"
++    assert contract["effective_decode_depth"] == 16
++    assert contract["depth_info"]["decode_requires"].startswith("avifdec")
++
++
++def test_v01_invalid_choices_rejected():
++    cap = media_io.AvifencCapability(available=True, version=(1, 4, 0))
++    for bad in ({"yuv": "411"}, {"cicp": "1/13"}, {"range": "tv"},
++                {"speed": 42}):
++        with pytest.raises(media_io.UnsupportedAvifConfig):
++            media_io.build_avifenc_cmd("in.png", "o.avif",
++                                       {"avif_params": bad}, False, cap)
++
++
++# --- V05: encoder input adaptation -----------------------------------------
++
++def test_v05_tiff_input_is_not_accepted_by_avifenc():
++    assert ".tif" not in media_io.AVIFENC_SUPPORTED_INPUT_EXTS
++    assert ".tiff" not in media_io.AVIFENC_SUPPORTED_INPUT_EXTS
++    cap = media_io.AvifencCapability(available=True, version=(1, 4, 0))
++    with pytest.raises(media_io.UnsupportedAvifConfig):
++        media_io.build_avifenc_cmd("intermediate.tif", "o.avif", {}, False, cap)
++
++
++def test_v05_adapter_converts_tiff_to_png_without_precision_loss(outdir):
++    src = os.path.join(outdir, "v05_source.tif")
++    arr = _grad16()
++    media_io.write_tiff(src, arr)
++
++    res = media_io.prepare_encoder_input(src, os.path.join(outdir, "ad"))
++    assert res["converted"] is True
++    assert res["source_dtype"] == "uint16"
++    assert res["path"].lower().endswith(".png")
++    assert res["verification"].endswith(":exact"), res["verification"]
++
++    # independent decoder confirms the 16-bit values survived
++    try:
++        import imagecodecs
++    except Exception:  # pragma: no cover
++        pytest.skip("imagecodecs not installed (independent PNG decoder)")
++    back = imagecodecs.imread(res["path"])
++    assert back.dtype == np.uint16
++    assert np.array_equal(back, arr)
++
++
++def test_v05_adapter_keeps_8bit_and_png_passthrough(outdir):
++    from PIL import Image
++    png = os.path.join(outdir, "v05_passthrough.png")
++    Image.fromarray(np.full((4, 4, 3), 7, dtype=np.uint8), mode="RGB").save(png)
++    res = media_io.prepare_encoder_input(png, os.path.join(outdir, "ad"))
++    assert res["converted"] is False
++    assert res["path"] == png
++
++
++def test_v05_grayscale_and_alpha_roundtrip(outdir):
++    for arr in (np.linspace(0, 65535, 12, dtype=np.uint16).reshape(3, 4),
++                np.dstack((np.zeros((4, 4), dtype=np.uint16),
++                           np.full((4, 4), 32768, dtype=np.uint16),
++                           np.full((4, 4), 1000, dtype=np.uint16),
++                           np.full((4, 4), 65535, dtype=np.uint16)))):
++        p = os.path.join(outdir, f"v05_{arr.ndim}c.png")
++        media_io.write_png(p, arr)
++        back = media_io.read_png(p)
++        assert back.shape == arr.shape, (back.shape, arr.shape)
++        assert np.array_equal(back, arr)
++
++
++# --- V02: high-bit-depth writing -------------------------------------------
++
++def test_v02_tiff_master_keeps_real_precision(outdir):
++    tifffile = pytest.importorskip("tifffile")
++    p = os.path.join(outdir, "v02_master.tif")
++    arr = _grad16()
++    media_io.write_tiff(p, arr)
++    back = tifffile.imread(p)
++    assert back.dtype == np.uint16
++    assert np.array_equal(back, arr)
++
++
++def test_v02_internal_tiff_writer_is_readable_by_third_party(outdir, monkeypatch):
++    """With tifffile unavailable the internal writer must still emit real 16-bit."""
++    tifffile = pytest.importorskip("tifffile")
++    monkeypatch.setitem(sys.modules, "tifffile", None)
++    p = os.path.join(outdir, "v02_internal.tif")
++    arr = _grad16()
++    writer = media_io.write_tiff(p, arr)
++    monkeypatch.undo()
++    assert writer == "internal-tiff"
++    back = tifffile.imread(p)
++    assert back.dtype == np.uint16
++    assert np.array_equal(back, arr)
++
++
++def test_v02_original_defect_is_reproduced(outdir):
++    """Documented evidence: Pillow 'RGB' -> TIFF yields 8-bit samples."""
++    from PIL import Image
++    p = os.path.join(outdir, "v02_pillow_rgb.tif")
++    img = Image.new("RGB", (8, 8), (10, 200, 30))
++    img.save(p, format="TIFF", compression="tiff_lzw")
++    with Image.open(p) as r:
++        assert r.tag_v2.get(258) == (8, 8, 8)
++
++# ---------------------------------------------------------------------------
++# NEW-V-02: PNG 反滤波必须逐字节进行（进位丢弃）
++# ---------------------------------------------------------------------------
++
++def _third_party_png_writer():
++    """返回一个能用 libpng 写出 PNG 的 (name, write_func)，都没有则 None。"""
++    try:
++        import cv2  # type: ignore
++        def _write(path, arr):
++            # cv2 以 BGR/BGRA 语义读写，这里来回翻转抵消
++            cv2.imwrite(path, arr[:, :, ::-1])
++        return "cv2", _write
++    except Exception:
++        pass
++    try:
++        import imagecodecs  # type: ignore
++        def _write(path, arr):
++            imagecodecs.imwrite(path, arr)
++        return "imagecodecs", _write
++    except Exception:
++        return None
++
++
++def test_new_v02_reader_matches_libpng_on_filtered_16bit_rgb(outdir):
++    """自家解码器必须与 libpng 逐像素一致（旧实现错把进位传进高字节）。"""
++    tp = _third_party_png_writer()
++    if tp is None:
++        pytest.skip("需要 cv2 或 imagecodecs 才能产出 libpng 自适应滤波的 16-bit PNG")
++    name, write = tp
++    rng = np.random.default_rng(20261002)
++    arr = rng.integers(0, 65536, (37, 53, 3)).astype(np.uint16)
++    p = os.path.join(outdir, "new_v02_rgb16.png")
++    write(p, arr)
++    mine = media_io.read_png(p)
++    assert mine.dtype == np.uint16, f"回读丢失精度: {mine.dtype}"
++    assert np.array_equal(mine, arr), (
++        f"独立解码器({name})与原数组不一致 —— PNG 反滤波不是逐字节执行"
++    )
++
++
++def test_new_v02_carry_must_not_leak_into_high_byte():
++    """构造必然产生低字节进位的样本：旧实现会在高字节上多出 +256。"""
++    tp = _third_party_png_writer()
++    if tp is None:
++        pytest.skip("需要 cv2 或 imagecodecs")
++    name, write = tp
++    # 相邻像素低字节和 >= 256、高字节不同 —— Sub 滤波必然触发进位
++    arr = np.zeros((2, 4, 3), dtype=np.uint16)
++    arr[0] = [[0x1234, 0x00ff, 0x0101], [0x1201, 0x0100, 0x0202],
++              [0x00f0, 0x00ff, 0x0303], [0x1100, 0x0001, 0x0404]]
++    arr[1] = arr[0][::-1].copy()
++    p = os.path.join(os.path.dirname(__file__), "_out", "new_v02_carry.png")
++    write(p, arr)
++    mine = media_io.read_png(p)
++    assert np.array_equal(mine, arr), "低字节进位被错误传播到高字节"
+diff --git a/tests/test_photo_stage5_contract.py b/tests/test_photo_stage5_contract.py
+new file mode 100644
+index 0000000..352ad86
+--- /dev/null
++++ b/tests/test_photo_stage5_contract.py
+@@ -0,0 +1,197 @@
++"""V06/V07 regression: photo stage5 failure propagation + cache identity.
++
++Uses stubs (no models, no GPU): the point is control flow and cache decisions,
++not image quality. Every assertion below failed against the pre-fix code.
++"""
++
++import json
++import os
++import shutil
++
++import numpy as np
++import pytest
++from PIL import Image
++
++import conftest  # noqa: F401
++import stage5_postprocess as s5
++
++
++BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "stage5")
++
++
++def _seed(tmp_path, job_id="job1", stem="clip", seed=7):
++    """Create a stage3 artifact + a matching input file, return (input, outdir)."""
++    temp = tmp_path / "temp"
++    temp.mkdir(parents=True, exist_ok=True)
++    art = temp / f"{job_id}_{stem}_step3_upscale.png"
++    rng = np.random.default_rng(seed)
++    arr = rng.integers(0, 255, (16, 16, 3), dtype=np.uint8)
++    Image.fromarray(arr, mode="RGB").save(art)
++    inp = tmp_path / f"{stem}.mp4"
++    inp.write_bytes(b"not-a-real-video")
++    return str(inp), str(temp)
++
++
++def _run(monkeypatch, tmp_path, params, job_id, sel=None, grain=None, seed=7):
++    inp, temp = _seed(tmp_path, job_id=job_id, seed=seed)
++    p = dict(params)
++    p.setdefault("temp_dir", temp)
++    p.setdefault("log_dir", str(tmp_path / "logs"))
++    p.setdefault("photo_bit_depth", 8)
++    if sel is not None:
++        monkeypatch.setattr(s5, "_apply_selective_processing", sel)
++    if grain is not None:
++        monkeypatch.setattr(s5, "_add_grain", grain)
++    monkeypatch.setattr("sys.argv",
++                        ["stage5", "--input", inp, "--job-id", job_id,
++                         "--params", json.dumps(p)])
++    rc = s5.main()
++    return rc, os.path.join(temp, f"{job_id}_clip_step5_postprocess.png"), p
++
++
++def _log_text(tmp_path, job_id):
++    path = tmp_path / "logs" / f"job_{job_id}.log"
++    return path.read_text(encoding="utf-8") if path.exists() else ""
++
++
++def _status(output_path):
++    p = output_path + ".status.json"
++    if not os.path.exists(p):
++        return None
++    with open(p, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++# --- V06 --------------------------------------------------------------------
++
++def test_v06_processing_failure_is_not_reported_as_success(tmp_path, monkeypatch):
++    def boom(img, params, logger):
++        raise RuntimeError("injected processing failure")
++
++    rc, out, _ = _run(monkeypatch, tmp_path, {}, "job_v06_a", sel=boom)
++    assert rc != 0, "a failed stage must not return success"
++    assert rc == 86, rc
++    assert not os.path.exists(out), "no artifact may occupy the success path"
++    st = _status(out)
++    assert st and st["status"] == "FAILED"
++    # diagnostic copy keeps a distinct name, it is NOT the stage result
++    assert os.path.exists(out + ".failed_input_copy")
++    log = _log_text(tmp_path, "job_v06_a")
++    assert "STAGE5_DONE" not in log, "the old code logged DONE on failure"
++    assert "STAGE5_ERROR" in log
++
++
++def test_v06_failure_exit_code_depends_on_exception_type(tmp_path, monkeypatch):
++    def io_boom(img, params, logger):
++        raise OSError("injected io failure")
++
++    rc, out, _ = _run(monkeypatch, tmp_path, {}, "job_v06_b", sel=io_boom)
++    assert rc == 82, rc  # I/O error → retryable per v7.32 §3.7
++    assert not os.path.exists(out)
++
++
++def test_v06_grain_failure_requires_explicit_authorisation(tmp_path, monkeypatch):
++    def dead_grain(src, dst, strength, size, rough, bit_depth=8):
++        return False
++
++    rc, out, _ = _run(monkeypatch, tmp_path, {}, "job_v06_c", grain=dead_grain)
++    assert rc == 86, rc
++    assert not os.path.exists(out)
++    st = _status(out)
++    assert st and st["failed_operation"] == "grain_synthesis"
++
++    # same failure, but the caller explicitly accepts a degraded result
++    rc2, out2, _ = _run(monkeypatch, tmp_path,
++                        {"allow_stage5_degrade": True}, "job_v06_d",
++                        grain=dead_grain)
++    assert rc2 == 0, rc2
++    assert os.path.exists(out2)
++    st2 = _status(out2)
++    assert st2 and st2["status"] == "DEGRADED"
++    assert st2["skipped_operations"] == ["grain_synthesis"]
++    # degraded output must not be cached as if it were complete
++    assert not os.path.exists(out2 + ".cache.json")
++
++
++# --- V07 --------------------------------------------------------------------
++
++def _ok_sel(img, params, logger):
++    return img
++
++
++def _make_grain(counter):
++    def grain(src, dst, strength, size, rough, bit_depth=8):
++        counter["n"] += 1
++        shutil.copyfile(src, dst)
++        return True
++    return grain
++
++
++def test_v07_cache_hit_then_invalidation(tmp_path, monkeypatch):
++    counter = {"n": 0}
++    grain = _make_grain(counter)
++
++    rc1, out, p = _run(monkeypatch, tmp_path,
++                       {"grain_strength": 0.3}, "job_v07_a",
++                       sel=_ok_sel, grain=grain)
++    assert rc1 == 0, rc1
++    assert os.path.exists(out + ".cache.json")
++    assert counter["n"] == 1
++
++    # identical params + identical input → reuse, processing must not rerun
++    rc2, out2, _ = _run(monkeypatch, tmp_path,
++                        {"grain_strength": 0.3}, "job_v07_a",
++                        sel=_ok_sel, grain=grain)
++    assert rc2 == 3, rc2
++    assert counter["n"] == 1, "cache hit must skip the work"
++
++    # a param that changes the output must invalidate the cache
++    rc3, out3, _ = _run(monkeypatch, tmp_path,
++                        {"grain_strength": 0.9}, "job_v07_a",
++                        sel=_ok_sel, grain=grain)
++    assert rc3 == 0, rc3
++    assert counter["n"] == 2, "changed grain_strength must force a recompute"
++
++
++def test_v07_unrelated_param_does_not_invalidate(tmp_path, monkeypatch):
++    counter = {"n": 0}
++    grain = _make_grain(counter)
++    _run(monkeypatch, tmp_path, {"grain_strength": 0.3}, "job_v07_b",
++         sel=_ok_sel, grain=grain)
++    rc, _, _ = _run(monkeypatch, tmp_path,
++                    {"grain_strength": 0.3, "ui_preview_theme": "dark"},
++                    "job_v07_b", sel=_ok_sel, grain=grain)
++    assert rc == 3, rc
++    assert counter["n"] == 1
++
++
++def test_v07_legacy_cache_without_identity_is_not_trusted(tmp_path, monkeypatch):
++    counter = {"n": 0}
++    grain = _make_grain(counter)
++    rc1, out, _ = _run(monkeypatch, tmp_path, {"grain_strength": 0.3},
++                       "job_v07_c", sel=_ok_sel, grain=grain)
++    assert rc1 == 0
++    os.remove(out + ".cache.json")  # simulate a pre-fix / failed-run artifact
++    rc2, _, _ = _run(monkeypatch, tmp_path, {"grain_strength": 0.3},
++                     "job_v07_c", sel=_ok_sel, grain=grain)
++    assert rc2 == 0, "existing file without identity must not be reused"
++    assert counter["n"] == 2
++
++
++def test_v07_upstream_change_invalidates(tmp_path, monkeypatch):
++    counter = {"n": 0}
++    grain = _make_grain(counter)
++    _run(monkeypatch, tmp_path, {"grain_strength": 0.3}, "job_v07_d",
++         sel=_ok_sel, grain=grain)
++    # replace the upstream artifact content (same path, different bytes)
++    rc, _, _ = _run(monkeypatch, tmp_path, {"grain_strength": 0.3},
++                    "job_v07_d", sel=_ok_sel, grain=grain, seed=99)
++    assert rc == 0, rc
++    assert counter["n"] == 2
++
++
++def test_v07_impl_version_is_part_of_identity(tmp_path):
++    a = s5.compute_stage5_cache_identity(__file__, {"grain_strength": 0.3}, 16)
++    b = s5.compute_stage5_cache_identity(__file__, {"grain_strength": 0.3}, 8)
++    assert a["cache_id"] != b["cache_id"]
++    assert a["impl"] == s5.STAGE5_IMPL_VERSION
+diff --git a/tests/test_stage6_encode_contract.py b/tests/test_stage6_encode_contract.py
+new file mode 100644
+index 0000000..0a9f105
+--- /dev/null
++++ b/tests/test_stage6_encode_contract.py
+@@ -0,0 +1,157 @@
++"""V02/V04 regression: photo stage6 colour + archival-master contracts."""
++
++import json
++import os
++
++import numpy as np
++import pytest
++from PIL import Image
++
++import conftest  # noqa: F401
++import stage6_encode as s6
++import media_io
++
++
++class _Log:
++    """Minimal logger stub capturing events."""
++
++    def __init__(self):
++        self.events = []
++
++    def _rec(self, name, msg, **kw):
++        self.events.append((name, msg))
++
++    info = warning = error = debug = _rec
++
++
++def _working_png(tmp_path, with_icc=False, size=(8, 8)):
++    p = tmp_path / "working.png"
++    img = Image.fromarray(
++        np.linspace(0, 255, size[0] * size[1] * 3, dtype=np.uint8)
++        .reshape(size[0], size[1], 3), mode="RGB")
++    kwargs = {}
++    if with_icc:
++        from PIL import ImageCms
++        kwargs["icc_profile"] = ImageCms.ImageCmsProfile(
++            ImageCms.createProfile("sRGB")).tobytes()
++    img.save(p, format="PNG", **kwargs)
++    return str(p)
++
++
++# --- V04 --------------------------------------------------------------------
++
++def test_v04_pillow_cannot_create_the_wide_gamut_profiles():
++    """Root-cause evidence: on-the-fly ADBE/ROMM creation is unsupported."""
++    from PIL import ImageCms
++    for name in ("ADBE", "ROMM"):
++        with pytest.raises(Exception):
++            ImageCms.createProfile(name)
++    ImageCms.createProfile("sRGB")  # sRGB is supported
++
++
++def test_v04_wide_gamut_without_profile_blocks_the_stage(tmp_path):
++    work = _working_png(tmp_path)
++    log = _Log()
++    color = s6.resolve_color_space(work, {"input_color_space": "adobergb"},
++                                   str(tmp_path), "j1", "clip", log)
++    assert color["status"] == s6.COLOR_FAILED
++    assert any(name == "STAGE6_COLOR_FAILED" for name, _ in log.events)
++
++
++def test_v04_degraded_encode_marks_cicp_unspecified(tmp_path):
++    work = _working_png(tmp_path)
++    log = _Log()
++    color = s6.resolve_color_space(
++        work, {"input_color_space": "adobergb",
++               "allow_unconverted_colorspace": True},
++        str(tmp_path), "j2", "clip", log)
++    assert color["status"] == s6.COLOR_DEGRADED
++    assert color["cicp_override"] == "2/2/0", "must not claim sRGB primaries"
++    assert any(name == "STAGE6_COLOR_DEGRADED" for name, _ in log.events)
++
++
++def test_v04_real_profile_is_used_for_conversion(tmp_path):
++    """With a real (openable) profile the pixels are actually transformed.
++
++    Limitation recorded in the ledger: the profile used here is an sRGB stand-in
++    because no Adobe RGB profile is distributed with this environment; the
++    assertion covers the control flow (open → transform → new file), not colour
++    accuracy of Adobe RGB.
++    """
++    from PIL import ImageCms
++    icc_path = tmp_path / "source.icc"
++    icc_path.write_bytes(ImageCms.ImageCmsProfile(
++        ImageCms.createProfile("sRGB")).tobytes())
++    work = _working_png(tmp_path)
++    log = _Log()
++    color = s6.resolve_color_space(
++        work, {"input_color_space": "adobergb",
++               "source_icc_path": str(icc_path)},
++        str(tmp_path), "j3", "clip", log)
++    assert color["status"] == s6.COLOR_CONVERTED, log.events
++    assert color["working_path"].endswith("_srgb.png")
++    assert os.path.exists(color["working_path"])
++    assert color["precision"] == "8-bit"  # honest about CMS precision
++
++
++def test_v04_unknown_source_is_recorded_not_guessed(tmp_path):
++    work = _working_png(tmp_path)  # no embedded ICC, no metadata
++    log = _Log()
++    color = s6.resolve_color_space(work, {}, str(tmp_path), "j4", "clip", log)
++    assert color["status"] == s6.COLOR_UNKNOWN
++    assert any(name == "STAGE6_COLOR_UNKNOWN" for name, _ in log.events)
++
++    strict = s6.resolve_color_space(work, {"require_known_color_space": True},
++                                    str(tmp_path), "j5", "clip", _Log())
++    assert strict["status"] == s6.COLOR_FAILED
++
++
++def test_v04_srgb_declared_source_passes_through(tmp_path):
++    work = _working_png(tmp_path, with_icc=True)
++    color = s6.resolve_color_space(work, {"input_color_space": "srgb"},
++                                   str(tmp_path), "j6", "clip", _Log())
++    assert color["status"] == s6.COLOR_NOT_NEEDED
++    assert color["working_path"] == work
++
++
++# --- V02 --------------------------------------------------------------------
++
++def test_v02_master_records_real_precision_instead_of_claiming_16(tmp_path):
++    work = _working_png(tmp_path)  # 8-bit source
++    out = str(tmp_path / "master.tif")
++    info = s6.write_archival_master(work, out, {"photo_bit_depth": 16}, _Log())
++    assert info["written"] is True
++    assert info["actual_bit_depth"] == 8
++    assert info["precision_loss"] is True
++    assert info["icc"] in ("none", "source")
++
++    tifffile = pytest.importorskip("tifffile")
++    written = tifffile.imread(out)
++    assert written.dtype == np.uint8, "must not fake a 16-bit master"
++
++
++def test_v02_16bit_source_keeps_16bit(tmp_path):
++    tifffile = pytest.importorskip("tifffile")
++    src = tmp_path / "src16.tif"
++    arr = np.zeros((6, 6, 3), dtype=np.uint16)
++    arr[..., 0] = np.arange(36, dtype=np.uint16).reshape(6, 6) * 100
++    media_io.write_tiff(str(src), arr)
++    out = str(tmp_path / "master16.tif")
++    info = s6.write_archival_master(str(src), out, {"photo_bit_depth": 16},
++                                    _Log())
++    assert info["actual_bit_depth"] == 16
++    assert info["precision_loss"] is False
++    assert tifffile.imread(out).dtype == np.uint16
++
++
++def test_v02_no_system_icc_is_pasted_on(tmp_path):
++    """A profile may only be attached when it belongs to these pixels."""
++    work = _working_png(tmp_path)  # no ICC in file
++    out = str(tmp_path / "master_noicc.tif")
++    info = s6.write_archival_master(work, out, {"photo_bit_depth": 16}, _Log())
++    assert info["icc"] == "none"
++    tifffile = pytest.importorskip("tifffile")
++    # tag 34675 (ICC profile) must be absent
++    with tifffile.TiffFile(out) as tf:
++        tags = [t.code for p in tf.pages for t in p.tags.values()]
++    assert 34675 not in tags
+diff --git a/tests/test_video_resume_artifacts.py b/tests/test_video_resume_artifacts.py
+new file mode 100644
+index 0000000..baf6fd6
+--- /dev/null
++++ b/tests/test_video_resume_artifacts.py
+@@ -0,0 +1,68 @@
++"""V03 regression: resume scanning must use the same artifact identity as the
++stages that write the artifacts."""
++
++import os
++from pathlib import Path
++
++import conftest  # noqa: F401
++import main as vmain
++
++
++def _seed(tmp_path, job_id, filename, step):
++    temp = tmp_path / "temp"
++    temp.mkdir(parents=True, exist_ok=True)
++    stem = Path(filename).stem.replace(" ", "_")
++    p = temp / f"{job_id}_{stem}_step{step}_traditional_pABC.mkv"
++    p.write_bytes(b"\x00" * 16)
++    return str(temp), str(p)
++
++
++def test_v03_safe_stem_matches_generator_contract():
++    from checkpoint import build_intermediate_name
++    name = build_intermediate_name("job1", "/in/clip.final.mp4", 2,
++                                   "traditional", "ABC", "mkv")
++    stem = vmain._safe_input_stem("/in/clip.final.mp4")
++    assert name.startswith(f"job1_{stem}_step2_"), (name, stem)
++
++
++def test_v03_resume_finds_artifacts_that_the_old_pattern_missed(tmp_path):
++    import glob
++    temp, created = _seed(tmp_path, "job1", "clip.final.mp4", 2)
++    found = vmain.find_stage_artifacts(temp, "job1", "/in/clip.final.mp4", 2)
++    assert found and os.path.abspath(found[0]) == os.path.abspath(created)
++    # the pre-fix pattern (full filename incl. extension) never matched:
++    legacy = glob.glob(str(Path(temp) / "job1_clip.final.mp4_step2*"))
++    assert legacy == []
++
++
++def test_v03_unicode_and_multi_dot_names(tmp_path):
++    temp, created = _seed(tmp_path, "job2", "老照片 01.final.mov", 3)
++    found = vmain.find_stage_artifacts(temp, "job2", "/in/老照片 01.final.mov", 3)
++    assert len(found) == 1
++
++
++def test_v03_final_output_is_found_outside_temp(tmp_path):
++    out = tmp_path / "output"
++    out.mkdir()
++    final = out / "clip_restored.mkv"
++    final.write_bytes(b"x")
++    job = {"job_id": "job3", "input_path": "/in/clip.mp4"}
++    cands = vmain.find_final_output(job, {}, {"output": str(out)})
++    assert any(os.path.abspath(c) == os.path.abspath(str(final))
++               for c in cands)
++
++
++def test_v03_explicit_output_path_is_honoured(tmp_path):
++    explicit = tmp_path / "custom.mkv"
++    explicit.write_bytes(b"x")
++    job = {"job_id": "job4", "input_path": "/in/clip.mp4",
++           "output_path": str(explicit)}
++    cands = vmain.find_final_output(job, {}, {"output": str(tmp_path / "out")})
++    assert str(explicit) in cands
++
++
++def test_v03_no_cross_job_bleed(tmp_path):
++    temp, _ = _seed(tmp_path, "jobA", "clip.mp4", 2)
++    _seed(tmp_path, "jobB", "clip.mp4", 2)
++    found = vmain.find_stage_artifacts(temp, "jobA", "/in/clip.mp4", 2)
++    assert len(found) == 1 and "jobA" in os.path.basename(found[0])
+diff --git a/video_restoration_pipeline/classify.py b/video_restoration_pipeline/classify.py
+index f47533c..12ba301 100644
+--- a/video_restoration_pipeline/classify.py
++++ b/video_restoration_pipeline/classify.py
+@@ -5,11 +5,11 @@ Classifies videos into: ANALOG_TAPE, DV_DIGITAL, HDV_AVCHD
+ Detects field order, PSF, IVTC requirements.
+ """
+ 
++import json
++import logging
+ import os
+ import subprocess
+ from pathlib import Path
+-from typing import Dict, Any, Tuple
+-import json
+ 
+ import numpy as np
+ 
+@@ -796,8 +796,16 @@ def classify_video(input_path: str) -> Dict[str, Any]:
+         sys.path.insert(0, str(Path(__file__).parent.parent / "shared_modules"))
+         from checkpoint import get_file_xxhash
+         result["file_hash_prefix"] = get_file_xxhash(input_path)
+-    except Exception:
+-        pass
++    except ImportError:
++        # NEW-V-01: xxhash 是硬依赖。旧实现静默 pass，导致 file_hash_prefix 恒为 ""，
++        # 进而使 manifest_generate 的「文件已变更 → 重置为 PENDING」保护
++        # （`if old_hash and new_hash and ...`）永久失效。必须快速失败。
++        raise
++    except Exception as exc:
++        logging.getLogger(__name__).warning(
++            "file_hash_prefix degraded for %s (%s: %s)",
++            input_path, type(exc).__name__, exc,
++        )
+ 
+     # ffprobe analysis
+     info = run_ffprobe(input_path)
+diff --git a/video_restoration_pipeline/main.py b/video_restoration_pipeline/main.py
+index 98837f8..d2742d4 100644
+--- a/video_restoration_pipeline/main.py
++++ b/video_restoration_pipeline/main.py
+@@ -14,17 +14,21 @@ v7.32 Compliance:
+ import os
+ import sys
+ import time
++import uuid
+ import argparse
+ import subprocess
+ from pathlib import Path
+-from typing import Dict, Any, Tuple
++from typing import Dict, Any, List, Optional, Tuple
+ 
+ # Add shared_modules to path
+ SCRIPT_DIR = Path(__file__).parent.resolve()
+ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+ 
+ from logger import get_logger  # noqa: E402
+-from manifest_loader import load_manifest, filter_jobs, save_manifest, update_job_status  # noqa: E402
++from manifest_loader import (  # noqa: E402
++    load_manifest, filter_jobs, save_manifest, update_job_status,
++    save_manifest_job_result,
++)
+ from checkpoint import cleanup_old_intermediates, check_wsl_space  # noqa: E402
+ 
+ 
+@@ -407,6 +411,55 @@ def _verify_stage2_output(job_id: str, input_path: str,
+     return True, step2_output
+ 
+ 
++def _safe_input_stem(input_path: str) -> str:
++    """FIX-V03: artifact identity contract (mirrors checkpoint.build_intermediate_name).
++
++    ORIGINAL resume scans used ``Path(input_path).name`` (WITH extension) while
++    every stage writes ``{job_id}_{Path(input).stem}_stepN*`` (see
++    stage2_traditional_check.py:146, stage3_ai_upscale.py:1206,
++    stage4_postprocess.py:138). The patterns never matched, so valid artifacts
++    were reported missing. Generator and reader must use the same contract.
++    """
++    return Path(input_path).stem.replace(" ", "_").replace("/", "_").replace("\\", "_")
++
++
++def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
++                         stage_num: int) -> List[str]:
++    """Return existing artifacts of (job_id, stage_num), newest first."""
++    import glob
++    pattern = str(Path(temp_dir) / f"{job_id}_{_safe_input_stem(input_path)}_step{stage_num}*")
++    candidates = glob.glob(pattern)
++    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
++    return candidates
++
++
++def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
++                      args) -> List[str]:
++    """FIX-V03: locate the stage7 final output.
++
++    Stage7 writes to ``output_dir`` (stage7_encode.py:517-521), NOT to temp, so
++    a completed job may have no ``step7`` file in temp_dir at all. The old
++    resume scan only looked in temp_dir and therefore never saw finished jobs.
++    """
++    import glob
++    candidates: List[str] = []
++    explicit = job.get("output_path") or ""
++    if explicit and os.path.exists(explicit):
++        candidates.append(explicit)
++    output_dir = ""
++    if isinstance(args, dict):
++        output_dir = args.get("output") or ""
++    else:
++        output_dir = getattr(args, "output", "") or ""
++    if not output_dir:
++        output_dir = config.get("global", {}).get("output_dir", "./output")
++    stem = _safe_input_stem(job.get("input_path", ""))
++    candidates.extend(sorted(
++        glob.glob(str(Path(output_dir) / f"{stem}_restored.*")),
++        key=lambda p: os.path.getmtime(p), reverse=True))
++    return candidates
++
++
+ def process_job(job: Dict[str, Any], config: Dict[str, Any],
+                 args, logger) -> Tuple[int, str]:
+     """Process a single job through all stages. Returns (exit_code, stderr)."""
+@@ -689,37 +742,53 @@ def _worker_wrapper(task: Dict[str, Any]) -> str:
+     jcfg = load_config(config_path)
+     jlogger = get_logger(log_dir=log_dir, level=jcfg.get("global", {}).get("log_level", "INFO"))
+     jmanifest = load_manifest(manifest_path)
+-    _run_single_job(job, jcfg, args, jlogger, jmanifest, manifest_path)
++    # FIX-V08: worker 只报告自己的 job 结果（锁内读-合并-写），不再整份回写快照
++    _run_single_job(job, jcfg, args, jlogger, jmanifest, manifest_path,
++                    attempt_group=task.get("manifest_attempt_group"))
+     return job["job_id"]
+ 
+ 
+ def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
+-                    args, logger, manifest: Dict[str, Any], manifest_path: str):
+-    """Run a single job with retry logic and manifest update."""
++                    args, logger, manifest: Dict[str, Any], manifest_path: str,
++                    attempt_group: Optional[str] = None):
++    """Run a single job with retry logic and manifest update.
++
++    FIX-V08: manifest persistence goes through save_manifest_job_result
++    (locked read-merge-write of one job). ORIGINAL saved the worker's whole
++    stale snapshot, so a concurrent worker's completion was lost.
++    """
+     job_id = job["job_id"]
+     retry_count = config.get("global", {}).get("retry_count", 2)
+     success = False
++    final_attempt = 0
++    last_error = ""
+     for attempt in range(retry_count + 1):
+         exit_code, stderr = process_job(job, config, args, logger)
+         if exit_code in (0, 3):
+-            update_job_status(manifest, job_id, "DONE")
++            save_manifest_job_result(manifest_path, job_id, "DONE",
++                                     attempt=attempt,
++                                     attempt_group=attempt_group)
+             success = True
++            final_attempt = attempt
+             break
+         else:
+             from checkpoint import is_retryable_error
+-            # FIX-W10: do not sleep after the final attempt. ORIGINAL slept 15s
+-            # even on the last retryable failure (attempt == retry_count) before
+-            # the loop ended and marked FAILED. Per v7.32 §3.10.18 the intervals
+-            # are 5s then 15s BETWEEN attempts only.
++            last_error = f"exit={exit_code}: {stderr}"[:2000]
+             if is_retryable_error(exit_code, stderr) and attempt < retry_count:
+                 wait = 5 if attempt == 0 else 15
+                 logger.warning("JOB_RETRY", f"Retrying job {job_id} in {wait}s")
+                 time.sleep(wait)
+             else:
++                final_attempt = attempt
+                 break
+     if not success:
+-        update_job_status(manifest, job_id, "FAILED")
+-    save_manifest(manifest, manifest_path)
++        save_manifest_job_result(manifest_path, job_id, "FAILED",
++                                 error_message=last_error,
++                                 attempt=final_attempt,
++                                 attempt_group=attempt_group)
++    # 内存快照同步（供本次进程内后续逻辑读取）；落盘由上面的锁定单任务更新完成
++    update_job_status(manifest, job_id, "DONE" if success else "FAILED",
++                      error_message=last_error)
+ 
+ 
+ def main():
+@@ -922,15 +991,14 @@ def main():
+             if job.get("status") != "FAILED":
+                 continue
+             job_id = job.get("job_id", "")
+-            input_name = Path(job.get("input_path", "")).name
++            input_path = job.get("input_path", "")
+             last_completed = -1
+             # FIX-P5-6: Scan step0..step7 to find highest valid intermediate, check all candidates
+-            import glob
++            # FIX-V03: use the shared artifact-identity helper (stem, not name)
+             for stage_num in range(7, -1, -1):
+-                pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
+-                candidates = glob.glob(pattern)
++                candidates = find_stage_artifacts(temp_dir, job_id, input_path,
++                                                  stage_num)
+                 if candidates:
+-                    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                     for cand in candidates:
+                         if verify_ffprobe_decodeable(cand):
+                             last_completed = stage_num
+@@ -947,8 +1015,8 @@ def main():
+             else:
+                 # FIX-P5-2: 删除所有损坏的中间文件，并重新标记为 PENDING
+                 for stage_num in range(8):
+-                    pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
+-                    for fpath in glob.glob(pattern):
++                    for fpath in find_stage_artifacts(temp_dir, job_id,
++                                                      input_path, stage_num):
+                         try:
+                             os.remove(fpath)
+                             logger.info("FAILED_CLEANUP", f"Removed corrupt intermediate: {fpath}")
+@@ -972,27 +1040,26 @@ def main():
+                 if job.get("status") != "PENDING":
+                     continue
+                 job_id = job.get("job_id", "")
+-                input_name = Path(job.get("input_path", "")).name
++                input_path = job.get("input_path", "")
+                 # Only mark DONE if step7 output exists and is valid
+                 step7_done = False
+-                import glob
+-                pattern = f"{temp_dir}/{job_id}_{input_name}_step7*"
+-                candidates = glob.glob(pattern)
+-                if candidates:
+-                    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+-                    if verify_ffprobe_decodeable(candidates[0]):
++                # FIX-V03: temp 内的 step7 中间产物 + output_dir 的最终产物都要看
++                candidates = find_stage_artifacts(temp_dir, job_id, input_path, 7)
++                candidates += find_final_output(job, config, args)
++                for cand in candidates:
++                    if verify_ffprobe_decodeable(cand):
+                         step7_done = True
+                         logger.info("RESUME_DONE",
+-                                   f"Job {job_id} has valid step7 output, marking DONE")
++                                   f"Job {job_id} has valid final output {cand}, marking DONE")
+                         job["status"] = "DONE"
++                        break
+                 if not step7_done:
+                     # Determine highest valid completed stage for partial resume
+                     last_completed = -1
+                     for stage_num in range(6, -1, -1):
+-                        pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
+-                        candidates = glob.glob(pattern)
++                        candidates = find_stage_artifacts(temp_dir, job_id,
++                                                          input_path, stage_num)
+                         if candidates:
+-                            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                             if verify_ffprobe_decodeable(candidates[0]):
+                                 last_completed = stage_num
+                                 break
+@@ -1085,6 +1152,9 @@ def main():
+ 
+         # Build task contexts for picklable worker submission
+         # BUG-040 fix: convert argparse.Namespace to plain dict for spawn safety
++        # FIX-V08: one attempt group per pipeline run so late results from an
++        # older run cannot overwrite this run's outcomes.
++        run_attempt_group = f"run-{os.getpid()}-{uuid.uuid4().hex}"
+         task_contexts = []
+         for job in jobs:
+             task_contexts.append({
+@@ -1092,6 +1162,7 @@ def main():
+                 "config_path": getattr(args, "config"),
+                 "log_dir": log_dir,
+                 "manifest_path": manifest_path,
++                "manifest_attempt_group": run_attempt_group,
+                 "args": {
+                     "config": getattr(args, "config"),
+                     "output": getattr(args, "output", None),
+@@ -1116,10 +1187,15 @@ def main():
+                 except Exception as e:
+                     logger.error("WORKER_ERROR", f"Job {ctx['job']['job_id']} failed in worker: {e}")
+                     update_job_status(manifest, ctx["job"]["job_id"], "FAILED")
+-                    save_manifest(manifest, manifest_path)
++                    # FIX-V08: 锁定单任务更新，不再整份快照回写
++                    save_manifest_job_result(
++                        manifest_path, ctx["job"]["job_id"], "FAILED",
++                        error_message=str(e)[:2000],
++                        attempt_group=run_attempt_group)
+     else:
+         for job in jobs:
+-            _run_single_job(job, config, args, logger, manifest, manifest_path)
++            _run_single_job(job, config, args, logger, manifest, manifest_path,
++                            attempt_group=f"seq-{os.getpid()}-{uuid.uuid4().hex}")
+ 
+     logger.info("PIPELINE_DONE", "Video pipeline complete")
+     print("Done.")

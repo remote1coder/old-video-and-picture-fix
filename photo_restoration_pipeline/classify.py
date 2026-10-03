@@ -10,10 +10,10 @@ v6.3 Compliance:
 - Computes file hash prefix for deduplication
 """
 
+import json
+import logging
 import subprocess
 from pathlib import Path
-from typing import Dict, Any
-import json
 
 
 def run_exiftool(input_path: str) -> Dict[str, str]:
@@ -332,8 +332,15 @@ def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
         sys.path.insert(0, str(Path(__file__).parent.parent / "shared_modules"))
         from checkpoint import get_file_xxhash
         result["file_hash_prefix"] = get_file_xxhash(input_path)
-    except Exception:
-        pass
+    except ImportError:
+        # NEW-V-01: 同 video/classify.py —— xxhash 缺失必须快速失败，
+        # 否则 file_hash_prefix 恒为 ""，manifest_generate 的变更检测保护被静默绕过。
+        raise
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "file_hash_prefix degraded for %s (%s: %s)",
+            input_path, type(exc).__name__, exc,
+        )
 
     # FIX-P11-3: v7.32 §3.9: Confidence threshold handling
     # Confidence < 80%: interactive mode requires manual confirmation,
