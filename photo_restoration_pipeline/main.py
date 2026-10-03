@@ -1188,7 +1188,7 @@ def main():
         sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
         from manifest_loader import (
             load_manifest, filter_jobs,
-            update_job_status, save_manifest
+            update_job_status, save_manifest, save_manifest_job_result
         )
         try:
             manifest = load_manifest(args.manifest)
@@ -1251,13 +1251,18 @@ def main():
                           f"with exit code {rc}", file=sys.stderr)
 
         # Update manifest with results
+        # FIX-V08: 每完成一个 job 就用锁定单任务更新落盘，避免父进程中断时
+        # 丢失整批进度（父进程仍是唯一写者，不会与 worker 抢写）。
         for job, rc in results:
             if rc == 0:
                 update_job_status(manifest, job["job_id"], "DONE")
+                save_manifest_job_result(args.manifest, job["job_id"], "DONE")
             else:
                 update_job_status(
                     manifest, job["job_id"], "FAILED",
                     error_message=f"Exit code {rc}")
+                save_manifest_job_result(args.manifest, job["job_id"], "FAILED",
+                                         error_message=f"Exit code {rc}")
         save_manifest(manifest, args.manifest)
 
         success_count = sum(1 for _, rc in results if rc == 0)

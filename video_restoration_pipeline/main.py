@@ -14,17 +14,21 @@ v7.32 Compliance:
 import os
 import sys
 import time
+import uuid
 import argparse
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 # Add shared_modules to path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from manifest_loader import load_manifest, filter_jobs, save_manifest, update_job_status  # noqa: E402
+from manifest_loader import (  # noqa: E402
+    load_manifest, filter_jobs, save_manifest, update_job_status,
+    save_manifest_job_result,
+)
 from checkpoint import cleanup_old_intermediates, check_wsl_space  # noqa: E402
 
 
@@ -407,6 +411,55 @@ def _verify_stage2_output(job_id: str, input_path: str,
     return True, step2_output
 
 
+def _safe_input_stem(input_path: str) -> str:
+    """FIX-V03: artifact identity contract (mirrors checkpoint.build_intermediate_name).
+
+    ORIGINAL resume scans used ``Path(input_path).name`` (WITH extension) while
+    every stage writes ``{job_id}_{Path(input).stem}_stepN*`` (see
+    stage2_traditional_check.py:146, stage3_ai_upscale.py:1206,
+    stage4_postprocess.py:138). The patterns never matched, so valid artifacts
+    were reported missing. Generator and reader must use the same contract.
+    """
+    return Path(input_path).stem.replace(" ", "_").replace("/", "_").replace("\\", "_")
+
+
+def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
+                         stage_num: int) -> List[str]:
+    """Return existing artifacts of (job_id, stage_num), newest first."""
+    import glob
+    pattern = str(Path(temp_dir) / f"{job_id}_{_safe_input_stem(input_path)}_step{stage_num}*")
+    candidates = glob.glob(pattern)
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates
+
+
+def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
+                      args) -> List[str]:
+    """FIX-V03: locate the stage7 final output.
+
+    Stage7 writes to ``output_dir`` (stage7_encode.py:517-521), NOT to temp, so
+    a completed job may have no ``step7`` file in temp_dir at all. The old
+    resume scan only looked in temp_dir and therefore never saw finished jobs.
+    """
+    import glob
+    candidates: List[str] = []
+    explicit = job.get("output_path") or ""
+    if explicit and os.path.exists(explicit):
+        candidates.append(explicit)
+    output_dir = ""
+    if isinstance(args, dict):
+        output_dir = args.get("output") or ""
+    else:
+        output_dir = getattr(args, "output", "") or ""
+    if not output_dir:
+        output_dir = config.get("global", {}).get("output_dir", "./output")
+    stem = _safe_input_stem(job.get("input_path", ""))
+    candidates.extend(sorted(
+        glob.glob(str(Path(output_dir) / f"{stem}_restored.*")),
+        key=lambda p: os.path.getmtime(p), reverse=True))
+    return candidates
+
+
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 args, logger) -> Tuple[int, str]:
     """Process a single job through all stages. Returns (exit_code, stderr)."""
@@ -689,37 +742,53 @@ def _worker_wrapper(task: Dict[str, Any]) -> str:
     jcfg = load_config(config_path)
     jlogger = get_logger(log_dir=log_dir, level=jcfg.get("global", {}).get("log_level", "INFO"))
     jmanifest = load_manifest(manifest_path)
-    _run_single_job(job, jcfg, args, jlogger, jmanifest, manifest_path)
+    # FIX-V08: worker 只报告自己的 job 结果（锁内读-合并-写），不再整份回写快照
+    _run_single_job(job, jcfg, args, jlogger, jmanifest, manifest_path,
+                    attempt_group=task.get("manifest_attempt_group"))
     return job["job_id"]
 
 
 def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
-                    args, logger, manifest: Dict[str, Any], manifest_path: str):
-    """Run a single job with retry logic and manifest update."""
+                    args, logger, manifest: Dict[str, Any], manifest_path: str,
+                    attempt_group: Optional[str] = None):
+    """Run a single job with retry logic and manifest update.
+
+    FIX-V08: manifest persistence goes through save_manifest_job_result
+    (locked read-merge-write of one job). ORIGINAL saved the worker's whole
+    stale snapshot, so a concurrent worker's completion was lost.
+    """
     job_id = job["job_id"]
     retry_count = config.get("global", {}).get("retry_count", 2)
     success = False
+    final_attempt = 0
+    last_error = ""
     for attempt in range(retry_count + 1):
         exit_code, stderr = process_job(job, config, args, logger)
         if exit_code in (0, 3):
-            update_job_status(manifest, job_id, "DONE")
+            save_manifest_job_result(manifest_path, job_id, "DONE",
+                                     attempt=attempt,
+                                     attempt_group=attempt_group)
             success = True
+            final_attempt = attempt
             break
         else:
             from checkpoint import is_retryable_error
-            # FIX-W10: do not sleep after the final attempt. ORIGINAL slept 15s
-            # even on the last retryable failure (attempt == retry_count) before
-            # the loop ended and marked FAILED. Per v7.32 §3.10.18 the intervals
-            # are 5s then 15s BETWEEN attempts only.
+            last_error = f"exit={exit_code}: {stderr}"[:2000]
             if is_retryable_error(exit_code, stderr) and attempt < retry_count:
                 wait = 5 if attempt == 0 else 15
                 logger.warning("JOB_RETRY", f"Retrying job {job_id} in {wait}s")
                 time.sleep(wait)
             else:
+                final_attempt = attempt
                 break
     if not success:
-        update_job_status(manifest, job_id, "FAILED")
-    save_manifest(manifest, manifest_path)
+        save_manifest_job_result(manifest_path, job_id, "FAILED",
+                                 error_message=last_error,
+                                 attempt=final_attempt,
+                                 attempt_group=attempt_group)
+    # 内存快照同步（供本次进程内后续逻辑读取）；落盘由上面的锁定单任务更新完成
+    update_job_status(manifest, job_id, "DONE" if success else "FAILED",
+                      error_message=last_error)
 
 
 def main():
@@ -922,15 +991,14 @@ def main():
             if job.get("status") != "FAILED":
                 continue
             job_id = job.get("job_id", "")
-            input_name = Path(job.get("input_path", "")).name
+            input_path = job.get("input_path", "")
             last_completed = -1
             # FIX-P5-6: Scan step0..step7 to find highest valid intermediate, check all candidates
-            import glob
+            # FIX-V03: use the shared artifact-identity helper (stem, not name)
             for stage_num in range(7, -1, -1):
-                pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
-                candidates = glob.glob(pattern)
+                candidates = find_stage_artifacts(temp_dir, job_id, input_path,
+                                                  stage_num)
                 if candidates:
-                    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
                     for cand in candidates:
                         if verify_ffprobe_decodeable(cand):
                             last_completed = stage_num
@@ -947,8 +1015,8 @@ def main():
             else:
                 # FIX-P5-2: 删除所有损坏的中间文件，并重新标记为 PENDING
                 for stage_num in range(8):
-                    pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
-                    for fpath in glob.glob(pattern):
+                    for fpath in find_stage_artifacts(temp_dir, job_id,
+                                                      input_path, stage_num):
                         try:
                             os.remove(fpath)
                             logger.info("FAILED_CLEANUP", f"Removed corrupt intermediate: {fpath}")
@@ -972,27 +1040,26 @@ def main():
                 if job.get("status") != "PENDING":
                     continue
                 job_id = job.get("job_id", "")
-                input_name = Path(job.get("input_path", "")).name
+                input_path = job.get("input_path", "")
                 # Only mark DONE if step7 output exists and is valid
                 step7_done = False
-                import glob
-                pattern = f"{temp_dir}/{job_id}_{input_name}_step7*"
-                candidates = glob.glob(pattern)
-                if candidates:
-                    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                    if verify_ffprobe_decodeable(candidates[0]):
+                # FIX-V03: temp 内的 step7 中间产物 + output_dir 的最终产物都要看
+                candidates = find_stage_artifacts(temp_dir, job_id, input_path, 7)
+                candidates += find_final_output(job, config, args)
+                for cand in candidates:
+                    if verify_ffprobe_decodeable(cand):
                         step7_done = True
                         logger.info("RESUME_DONE",
-                                   f"Job {job_id} has valid step7 output, marking DONE")
+                                   f"Job {job_id} has valid final output {cand}, marking DONE")
                         job["status"] = "DONE"
+                        break
                 if not step7_done:
                     # Determine highest valid completed stage for partial resume
                     last_completed = -1
                     for stage_num in range(6, -1, -1):
-                        pattern = f"{temp_dir}/{job_id}_{input_name}_step{stage_num}*"
-                        candidates = glob.glob(pattern)
+                        candidates = find_stage_artifacts(temp_dir, job_id,
+                                                          input_path, stage_num)
                         if candidates:
-                            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
                             if verify_ffprobe_decodeable(candidates[0]):
                                 last_completed = stage_num
                                 break
@@ -1085,6 +1152,9 @@ def main():
 
         # Build task contexts for picklable worker submission
         # BUG-040 fix: convert argparse.Namespace to plain dict for spawn safety
+        # FIX-V08: one attempt group per pipeline run so late results from an
+        # older run cannot overwrite this run's outcomes.
+        run_attempt_group = f"run-{os.getpid()}-{uuid.uuid4().hex}"
         task_contexts = []
         for job in jobs:
             task_contexts.append({
@@ -1092,6 +1162,7 @@ def main():
                 "config_path": getattr(args, "config"),
                 "log_dir": log_dir,
                 "manifest_path": manifest_path,
+                "manifest_attempt_group": run_attempt_group,
                 "args": {
                     "config": getattr(args, "config"),
                     "output": getattr(args, "output", None),
@@ -1116,10 +1187,15 @@ def main():
                 except Exception as e:
                     logger.error("WORKER_ERROR", f"Job {ctx['job']['job_id']} failed in worker: {e}")
                     update_job_status(manifest, ctx["job"]["job_id"], "FAILED")
-                    save_manifest(manifest, manifest_path)
+                    # FIX-V08: 锁定单任务更新，不再整份快照回写
+                    save_manifest_job_result(
+                        manifest_path, ctx["job"]["job_id"], "FAILED",
+                        error_message=str(e)[:2000],
+                        attempt_group=run_attempt_group)
     else:
         for job in jobs:
-            _run_single_job(job, config, args, logger, manifest, manifest_path)
+            _run_single_job(job, config, args, logger, manifest, manifest_path,
+                            attempt_group=f"seq-{os.getpid()}-{uuid.uuid4().hex}")
 
     logger.info("PIPELINE_DONE", "Video pipeline complete")
     print("Done.")

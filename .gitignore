@@ -19,6 +19,16 @@ shixian.md
 .claude/
 agents.md
 CLAUDE.md
+# 修复台账（本地工作记录，不入库）
+修复清单.md
+# 回归测试产物
+/tests/_out/
 /models/
 *.rnnn
 *.pth
+# 文档：默认忽略所有 md；README.md 与下面两本长期文档保留入库（用户指定）
+*.md
+!README.md
+!readme.md
+!PROJECT_MANUAL.md
+!architecture.md

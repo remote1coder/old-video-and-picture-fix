@@ -16,6 +16,7 @@ v7.3 §4.4-4.5 Compliance:
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -166,8 +167,21 @@ def compute_param_hash(input_path: str, params: Dict[str, Any]) -> str:
             file_mtime = int(st.st_mtime)
             file_hash_prefix = get_file_xxhash(input_path)
             stat_ok = True
-    except Exception:
-        pass
+    except ImportError:
+        # NEW-V-01: `xxhash` 是本函数的硬依赖（requirements.txt 与
+        # dependency_check.py 两处均声明 required）。旧实现用 `except Exception: pass`
+        # 把 ImportError 一并吞掉，后果是 file_hash_prefix 为空、stat_ok 保持 False，
+        # 身份退化为「文件大小 + mtime + 文件名」三元组：
+        #   实测（同名 / 同 4096 字节 / 同 mtime / 内容不同）两个文件算出同一个
+        #   param_hash → 中间产物被错误复用（静默的假缓存命中）。
+        # 身份降级属于「谎报」，按 V06 同款原则必须快速失败，不可静默。
+        raise
+    except Exception as exc:
+        # 真实 I/O 异常（权限、文件消失等）才允许降级，但必须留痕。
+        logging.getLogger(__name__).warning(
+            "compute_param_hash: input identity degraded for %s (%s: %s)",
+            input_path, type(exc).__name__, exc,
+        )
 
     # FIX-CK-R2-05: include stat_ok + input basename so two distinct failing
     # paths (or a failing path vs a real file) no longer collide into the same

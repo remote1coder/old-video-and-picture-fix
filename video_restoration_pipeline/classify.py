@@ -5,11 +5,11 @@ Classifies videos into: ANALOG_TAPE, DV_DIGITAL, HDV_AVCHD
 Detects field order, PSF, IVTC requirements.
 """
 
+import json
+import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Tuple
-import json
 
 import numpy as np
 
@@ -796,8 +796,16 @@ def classify_video(input_path: str) -> Dict[str, Any]:
         sys.path.insert(0, str(Path(__file__).parent.parent / "shared_modules"))
         from checkpoint import get_file_xxhash
         result["file_hash_prefix"] = get_file_xxhash(input_path)
-    except Exception:
-        pass
+    except ImportError:
+        # NEW-V-01: xxhash 是硬依赖。旧实现静默 pass，导致 file_hash_prefix 恒为 ""，
+        # 进而使 manifest_generate 的「文件已变更 → 重置为 PENDING」保护
+        # （`if old_hash and new_hash and ...`）永久失效。必须快速失败。
+        raise
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "file_hash_prefix degraded for %s (%s: %s)",
+            input_path, type(exc).__name__, exc,
+        )
 
     # ffprobe analysis
     info = run_ffprobe(input_path)
