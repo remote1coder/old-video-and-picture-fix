@@ -32,7 +32,7 @@ import glob
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
@@ -98,6 +98,107 @@ def _build_avifenc_cmd(input_path: str, output_path: str, params: dict,
     return cmd
 
 
+def _run_encoder(cmd: List[str], timeout: int, logger=None) -> Tuple[bool, str, int]:
+    """RV-12: run the encoder as a *managed* child process.
+
+    ``subprocess.run`` cannot be interrupted: a cancellation or a timeout
+    would kill only the Python stage while avifenc keeps writing. Here the
+    child is registered with the cancel guard and is killed+awaited on
+    timeout, cancellation or any ``BaseException``.
+
+    Returns ``(ok, stderr, returncode)``.
+    """
+    popen_kwargs: Dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "shell": False,
+    }
+    try:  # Windows: 独立进程组，便于 CTRL_BREAK_EVENT
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    if cancel_guard is not None:
+        cancel_guard.watch_process(proc)
+    try:
+        _out, _err = proc.communicate(timeout=timeout)
+        stderr = (_err or b"").decode("utf-8", "replace")
+        return proc.returncode == 0, stderr, int(proc.returncode)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=10)
+        except BaseException:  # noqa: BLE001
+            pass
+        if logger:
+            logger.error("STAGE6_ENCODER_TIMEOUT",
+                         f"Encoder exceeded {timeout}s and was terminated")
+        return False, f"timeout after {timeout}s", 124
+    except BaseException as exc:  # noqa: BLE001 - KeyboardInterrupt 也走这里
+        # 取消/中断：必须先把子进程收掉，再让异常继续向上（由守卫写 FAILED）
+        try:
+            proc.kill()
+            proc.wait(timeout=10)
+        except BaseException:  # noqa: BLE001
+            pass
+        if logger:
+            logger.error("STAGE6_ENCODER_ABORTED",
+                         f"Encoder terminated: {type(exc).__name__}")
+        raise
+    finally:
+        if cancel_guard is not None:
+            cancel_guard.unwatch_process(proc)
+
+
+def _write_json_sidecar(path: str, payload: Dict[str, Any]) -> bool:
+    """Atomically write a JSON sidecar (temp + replace)."""
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _color_skipped(color: Dict[str, Any]) -> List[str]:
+    """RV-06: operations that were requested but not actually performed."""
+    skipped: List[str] = []
+    if color.get("status") == COLOR_DEGRADED:
+        skipped.append("color_conversion")
+    return skipped
+
+
+def _fail(logger, status_path: str, operation: str, reason: str,
+          paths: Optional[List[str]] = None) -> None:
+    """RV-12: clean this run's temp artifacts and record an honest FAILED.
+
+    The status sidecar is what lets the scheduler and the next run tell
+    "failed" apart from "an old, still valid product".
+    """
+    for p in paths or []:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+    _write_json_sidecar(status_path, {
+        "status": "FAILED",
+        "stage": 6,
+        "failed_operation": operation,
+        "reason": str(reason)[:2000],
+    })
+    if cancel_guard is not None:
+        cancel_guard.release_outputs()
+
+
 def _calculate_avifenc_timeout(input_path: str, base_timeout: int = 600) -> int:
     """BUG-057 / ISSUE-P-S6-003: Dynamic timeout based on image pixel count."""
     try:
@@ -138,8 +239,47 @@ def _read_color_meta(temp_dir: str, job_id: str, stem: str) -> Dict[str, Any]:
         return {}
 
 
+#: RV-02: 这些值都不是"已知色彩空间"，不能当成声明值参与判断。
+#: 默认配置就是 "auto" —— 它是非空字符串，会盖过 stage1 sidecar，也不读嵌入
+#: ICC，于是"检测"这条路径永远走不到（复核实测：sidecar 写 AdobeRGB 仍被忽略，
+#: 无来源 + strict=true 也不失败）。
+AUTO_COLOR_VALUES = frozenset({"", "auto", "none", "null", "detect", "unknown",
+                               "unspecified", "default"})
+#: RV-02: 未指定标签（libavif 手册：CICP 中 2 = unspecified）。
+#: NEW-RV-03: 矩阵位不能写成 2 —— lossless 模式只接受 identity(0)/YCgCo，
+#: 真机实测 avifenc 1.4.2 会直接 rc=1（"Matrix coefficients have to be
+#: identity, YCgCo-Re, or YCgCo-Ro in lossless mode."）。因此这里用
+#: "2/2/0"：primaries/transfer 未指定 + identity 矩阵。
+CICP_UNSPECIFIED_RGB444 = "2/2/0"
+CICP_UNSPECIFIED_YUV = "2/2/1"
+#: 真实 sRGB 像素对应的标签：primaries=1(BT.709) / transfer=13(sRGB)
+CICP_SRGB_RGB444 = "1/13/0"   # RGB444 → matrix 0 (identity)
+CICP_SRGB_YUV = "1/13/1"      # YUV → matrix 1 (BT.709)
+
+
+def _normalize_declared_color(value: Any) -> Optional[str]:
+    """RV-02: normalise a declared colour space; ``auto`` means 'undecided'."""
+    text = str(value or "").strip().lower()
+    if text in AUTO_COLOR_VALUES:
+        return None
+    return text
+
+
 def _extract_source_icc(working_path: str) -> Optional[bytes]:
-    """Return the ICC profile actually embedded in the working image."""
+    """Return the ICC profile actually embedded in the working image.
+
+    RV-04: Pillow cannot represent 16-bit multi-channel data, so the profile
+    is read through media_io (TIFF tag 34675 / PNG iCCP) first and Pillow is
+    only a fallback.
+    """
+    if media_io is not None:
+        try:
+            _arr, meta = media_io.read_image_array(working_path)
+            icc = meta.get("icc_profile")
+            if icc:
+                return icc
+        except Exception:
+            pass
     try:
         from PIL import Image
         with Image.open(working_path) as im:
@@ -180,14 +320,23 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
         "precision": None,
         "reason": None,
         "profile_description": None,
+        # RV-02: 这个 job 最终采用的色彩标签依据（用户声明 / 实测 ICC / 未指定）
+        "color_basis": None,
+        "source_icc_bytes": None,
     }
     color_meta = _read_color_meta(temp_dir, job_id, stem)
-    declared = str(params.get("input_color_space")
-                   or color_meta.get("input_color_space") or "").lower()
-    if not declared:
+    # RV-02: 配置的 auto/空值不再被当成"已知声明"，因此会继续往下走
+    # sidecar → 嵌入 ICC 的检测路径。
+    declared = _normalize_declared_color(params.get("input_color_space"))
+    declared_source = "params" if declared else None
+    if declared is None:
+        declared = _normalize_declared_color(color_meta.get("input_color_space"))
+        declared_source = "stage1-sidecar" if declared else None
+    if declared is None:
         # No sidecar/override: fall back to the profile embedded in the file.
         icc = _extract_source_icc(working_path)
         if icc:
+            result["source_icc_bytes"] = icc
             desc = _describe_profile(icc).lower()
             result["profile_description"] = _describe_profile(icc) or None
             if "adobe" in desc:
@@ -200,26 +349,40 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
                 declared = "srgb"
             else:
                 declared = "unknown"
+            declared_source = "embedded-icc"
         else:
             declared = "unknown"
     result["source_space"] = declared or "unknown"
+    result["color_basis"] = declared_source
 
     if result["source_space"] not in WIDE_GAMUT_SPACES:
         if result["source_space"] == "unknown":
-            # FIX-V04: 未知源色彩不猜，也不假装是 sRGB
+            # FIX-V04 / RV-02: 未知源色彩不猜，也不假装是 sRGB。
+            # 之前这里直接 return，配置里的 sRGB 标签就原样落到产物上 ——
+            # 等于给来源不明的像素贴了一个没依据的标签。现在改成"未指定"。
             result["status"] = COLOR_UNKNOWN
             result["reason"] = ("source colour space not established; no ICC "
                                 "in file and no input_color_space metadata")
+            result["cicp_override"] = (CICP_UNSPECIFIED_RGB444
+                                       if params.get("archival_mode", False)
+                                       else CICP_UNSPECIFIED_YUV)
+            result["color_basis"] = "unspecified"
             logger.warning("STAGE6_COLOR_UNKNOWN",
-                           "Source colour space unknown; encoding with the "
-                           "configured CICP and recording it as unverified. "
-                           "Set require_known_color_space=true to fail instead.")
+                           "Source colour space unknown; encoding with "
+                           "UNSPECIFIED CICP (2/2/2) instead of claiming "
+                           "sRGB. Set require_known_color_space=true to fail "
+                           "instead.")
             if params.get("require_known_color_space", False):
                 result["status"] = COLOR_FAILED
                 result["reason"] += " (require_known_color_space=true)"
                 logger.error("STAGE6_COLOR_FAILED",
                              "Unknown source colour space is not accepted "
                              "(require_known_color_space=true)")
+        elif result["source_space"] == "srgb":
+            # 已确认是 sRGB：覆盖与之冲突的旧配置标签（RV-02 验收项）
+            result["cicp_override"] = (CICP_SRGB_RGB444
+                                       if params.get("archival_mode", False)
+                                       else CICP_SRGB_YUV)
         return result
 
     # --- wide-gamut source: a real transform is mandatory -------------------
@@ -288,8 +451,13 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
         converted.save(conv_path, format="PNG")
         result["status"] = COLOR_CONVERTED
         result["working_path"] = conv_path
-        result["cicp_override"] = None  # real sRGB pixels → configured CICP ok
+        # RV-02: 转换后的像素确实已经是 sRGB，因此必须覆盖与之冲突的旧配置
+        # 标签；同时**不能**把原始宽色域 profile 贴回转换后的像素（RV-04）。
+        result["cicp_override"] = (CICP_SRGB_RGB444
+                                   if params.get("archival_mode", False)
+                                   else CICP_SRGB_YUV)
         result["icc_path"] = None
+        result["color_basis"] = "converted-to-srgb"
         logger.info("STAGE6_COLOR_CONVERTED",
                     f"Converted {result['source_space']} -> sRGB with a real "
                     "ICC transform (8-bit CMS precision)",
@@ -315,14 +483,24 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
 
 # --- FIX-V02: archival TIFF master -----------------------------------------
 
-def effective_bit_depth(arr) -> int:
-    """Estimate how many bits of *information* the samples really carry.
+def quantization_grid_bits(arr) -> int:
+    """RV-14: **diagnostic** estimate of the sample value grid, NOT proof of
+    information depth.
 
-    NEW-V-03: 一个 uint16 TIFF 只说明"容器 16-bit"，不说明内容有 16-bit。
-    典型伪装：上游把 8-bit 数据乘 257 塞进 uint16（stage5 的旧行为），
-    此时所有样本都是 257 的倍数，真实信息量仍是 8 bit。
-    做法：对采样值取最大公约数 g，则可区分电平数 = 2^16 / g，
-    有效位深 = ceil(log2(电平数))。
+    What it actually measures: the greatest common divisor of the sample
+    values. If every sample is a multiple of ``g``, the data can only live on
+    a grid of ``2**16 / g`` levels — which detects patterns such as
+    "8-bit data multiplied by 257".
+
+    What it cannot prove:
+    * a genuinely 16-bit constant image uses very few levels, so this reports
+      a small number even though the source really was 16-bit;
+    * adding a 1-LSB perturbation to an 8-bit×257 image destroys the GCD
+      without restoring any real detail.
+
+    Therefore this value is recorded as a diagnostic only. Lossless acceptance
+    is decided by comparing pixels against a known reference with an
+    independent decoder (``np.array_equal``), never by this number.
     """
     import numpy as np
     a = np.asarray(arr)
@@ -340,6 +518,23 @@ def effective_bit_depth(arr) -> int:
     levels = max(1, 65536 // g)
     bits = int(np.ceil(np.log2(levels)))
     return max(1, min(16, bits))
+
+
+def effective_bit_depth(arr) -> int:
+    """Deprecated alias of :func:`quantization_grid_bits`.
+
+    Kept for backwards compatibility with existing callers. The name suggested
+    "how many bits of information the image really carries", which the GCD
+    heuristic cannot establish (RV-14) — use
+    :func:`quantization_grid_bits` and treat it as a diagnostic.
+    """
+    return quantization_grid_bits(arr)
+
+
+def container_bit_depth(arr) -> int:
+    """RV-14: the bit depth of the **container** (what the dtype can hold)."""
+    import numpy as np
+    return 16 if getattr(arr, "dtype", None) == np.uint16 else 8
 
 
 def write_archival_master(working_path: str, tiff_path: str,
@@ -369,20 +564,25 @@ def write_archival_master(working_path: str, tiff_path: str,
         arr, meta = media_io.read_image_array(working_path)
         arr = media_io._ensure_uint(arr)
         info["dtype"] = str(arr.dtype)
-        info["actual_bit_depth"] = 16 if arr.dtype == np.uint16 else 8
+        # RV-14: 三件事分开记录 —— 容器位深 / 量化网格诊断 / 像素保真。
+        # 旧代码把 GCD 结果叫 "effective_bit_depth" 并当成"真实信息位深"的
+        # 证据，这个推论不成立（常量 16-bit 图、加 1LSB 扰动都能反例）。
+        info["container_bit_depth"] = container_bit_depth(arr)
+        info["actual_bit_depth"] = info["container_bit_depth"]
         info["precision_loss"] = (info["requested_bit_depth"] == 16 and
-                                  info["actual_bit_depth"] == 8)
-        # NEW-V-03: 容器是 16-bit 不代表内容有 16-bit 信息量。
-        # 上游若把 8-bit 数据乘 257 塞进 uint16（stage5 的老行为），
-        # 所有样本都会是 257 的倍数 —— 有效位深其实只有 8 bit。
-        info["effective_bit_depth"] = effective_bit_depth(arr)
-        info["container_mismatch"] = (info["actual_bit_depth"] == 16 and
-                                      info["effective_bit_depth"] <= 8)
-        writer = media_io.write_tiff(tiff_path, arr)
+                                  info["container_bit_depth"] == 8)
+        info["quantization_grid_bits"] = quantization_grid_bits(arr)
+        # 兼容旧键名（下游/测试仍在读），但语义已降级为"诊断值"
+        info["effective_bit_depth"] = info["quantization_grid_bits"]
+        info["container_mismatch"] = (info["container_bit_depth"] == 16 and
+                                      info["quantization_grid_bits"] <= 8)
+        # RV-04: 只有在读取阶段确认了"这份像素的 ICC"时才带过去；转换后的像素
+        # 不贴原 profile。
+        icc_bytes = meta.get("icc_profile")
+        writer = media_io.write_tiff(tiff_path, arr, icc=icc_bytes)
         info["writer"] = writer
         info["written"] = True
-        # Only an ICC that describes these very pixels may be attached.
-        icc_bytes = meta.get("icc_profile")
+        info["icc_source"] = meta.get("icc_source")
         if icc_bytes:
             info["icc"] = ("source" if media_io.embed_icc_in_tiff(tiff_path, icc_bytes)
                            else "embed-failed")
@@ -396,10 +596,11 @@ def write_archival_master(working_path: str, tiff_path: str,
         if info["container_mismatch"]:
             logger.warning(
                 "STAGE6_TIFF_CONTAINER_MISMATCH",
-                "Master is stored in a 16-bit container but carries only "
-                f"{info['effective_bit_depth']}-bit of information (upstream "
-                "upscaled 8-bit data into uint16); the master is kept but the "
-                "real precision is recorded instead of being implied")
+                "Master is stored in a 16-bit container but its sample values "
+                f"sit on a {info['quantization_grid_bits']}-bit quantisation "
+                "grid (heuristic: e.g. 8-bit data scaled by 257). The master "
+                "is kept; this is a DIAGNOSTIC and must not be read as proof "
+                "of the source's information depth (RV-14).")
         if info["icc"] == "none":
             logger.info("STAGE6_TIFF_NO_SOURCE_ICC",
                         "No source ICC in the working image; TIFF master "
@@ -505,26 +706,36 @@ def main():
             f"{Path(input_name).stem}_restored.avif")
 
     # WSL2 redirect
+    # RV-13: **工作路径与发布路径必须分别保存**。ORIGINAL 在回拷成功后把
+    # output_path 改成发布路径，随后 TIFF 的源路径又从这个已换过的变量派生
+    # （取的是发布路径下的 tif，而母版其实写在工作路径），且回拷返回值没检查。
     no_wsl_redirect = params.get("no_wsl_redirect", False)
     platform = params.get("platform", "auto")
     redirected_path, original_output_path, _, _ = wsl_redirect_path(
         output_path, no_wsl_redirect=no_wsl_redirect, target_platform=platform
     )
+    work_output_path = redirected_path if original_output_path else output_path
+    publish_output_path = original_output_path or output_path
     if original_output_path:
         logger.info("STAGE6_WSL_REDIRECT",
-                   f"WSL redirect: {output_path} -> {redirected_path}")
-        output_path = redirected_path
+                   f"WSL redirect: {publish_output_path} -> {work_output_path}")
 
     logger.info("STAGE6_START", "Final photo encoding",
-                input=input_source, output=output_path)
+                input=input_source, output=publish_output_path)
 
-    # NEW-V-06: 写字节之前登记产物；中断时连契约 sidecar 一起清理，
-    # 避免"半截 AVIF + 完整契约"这种互相矛盾的状态。
+    # RV-12: 事务式发布 —— 先写临时文件，校验通过后再原子替换到发布路径。
+    # 这样"编码失败/中断"不会在最终路径留下半截 AVIF，也不会删掉上一轮的
+    # 有效成品（守卫只删本轮临时产物）。
+    tmp_avif = work_output_path + ".partial"
+    status_path = publish_output_path + ".status.json"
+    contract_path = publish_output_path + ".encode_contract.json"
     if cancel_guard is not None:
         cancel_guard.watch_outputs(
-            output_path,
-            extra_paths=[f"{output_path}.encode_contract.json"],
-            logger=logger, stage=6)
+            publish_output_path,
+            extra_paths=[tmp_avif],
+            logger=logger, stage=6,
+            delete_output=False,          # 不删上一次已发布的有效成品
+            status_path=status_path)      # 取消记录写在发布路径旁
 
     # --- FIX-V04: 色彩契约（必需转换失败即阻断）---
     _stem = Path(input_name).stem
@@ -553,15 +764,39 @@ def main():
                      f"{Path(encode_input).suffix}")
         return 86
 
-    # --- FIX-V02: 高位深母版（真实精度）---
+    # --- FIX-V02: 高位深母版（真实精度，同样走临时文件）---
     tiff_info: Dict[str, Any] = {"written": False}
+    work_tiff_path = ""
+    publish_tiff_path = ""
+    # RV-12: 本轮已经"发布"的产物集合；失败时要整批撤下，不能留下
+    # "有母版、没 AVIF"这种半个提交。
+    round_artifacts: List[str] = []
     if params.get("photo_bit_depth", 16) == 16:
-        tiff_path = output_path.rsplit(".", 1)[0] + ".tif"
-        tiff_info = write_archival_master(working_path, tiff_path, params, logger)
+        publish_tiff_path = publish_output_path.rsplit(".", 1)[0] + ".tif"
+        work_tiff_path = work_output_path.rsplit(".", 1)[0] + ".tif"
+        tmp_tiff = work_tiff_path + ".partial"
+        if cancel_guard is not None:
+            cancel_guard.watch_outputs(
+                publish_output_path,
+                extra_paths=[tmp_avif, tmp_tiff],
+                logger=logger, stage=6,
+                delete_output=False, status_path=status_path)
+        tiff_info = write_archival_master(working_path, tmp_tiff, params, logger)
+        if tiff_info.get("written"):
+            try:
+                os.replace(tmp_tiff, work_tiff_path)
+                tiff_info["master_path"] = work_tiff_path
+                round_artifacts.append(work_tiff_path)
+            except OSError as e:
+                tiff_info["written"] = False
+                tiff_info["error"] = f"publish failed: {e}"
         if not tiff_info.get("written") and params.get("archival_tiff_required", False):
             logger.error("STAGE6_TIFF_REQUIRED_FAIL",
                          "Archival TIFF master is required but could not be "
                          "written", error=tiff_info.get("error"))
+            _fail(logger, status_path, "tiff_master",
+                  tiff_info.get("error") or "archival TIFF master missing",
+                  paths=[tmp_avif] + round_artifacts)
             return 86
 
     # --- FIX-V01: 命令构造（不支持的组合在启动前失败）---
@@ -569,18 +804,28 @@ def main():
     use_rgb444 = archival_mode
     try:
         cmd, contract = media_io.build_avifenc_cmd(
-            encode_input, output_path, params, use_rgb444=use_rgb444,
-            capability=capability, icc_path=color.get("icc_path"))
+            encode_input, tmp_avif, params, use_rgb444=use_rgb444,
+            capability=capability, icc_path=color.get("icc_path"),
+            cicp_override=color.get("cicp_override"))
     except media_io.UnsupportedAvifConfig as e:
         logger.error("STAGE6_AVIF_CONFIG_UNSUPPORTED", str(e))
+        _fail(logger, status_path, "avif_config", str(e),
+              paths=[tmp_avif] + round_artifacts)
         return 86
 
     # 实际编码契约：记录"实际会编出什么"，而不是"用户想要什么"
     contract.update({
-        "color": {k: v for k, v in color.items() if k != "working_path"},
+        # RV-04: source_icc_bytes 是字节，不能进 JSON；长度单独记录
+        "color": {k: (len(v) if k == "source_icc_bytes" and isinstance(v, (bytes, bytearray))
+                      else v)
+                  for k, v in color.items()
+                  if k not in ("working_path", "source_icc_bytes")},
+        "color_source_icc_bytes": len(color.get("source_icc_bytes") or b""),
         "encoder_input": adapter,
         "tiff_master": tiff_info,
-        "output_path": output_path,
+        "output_path": publish_output_path,
+        "work_output_path": work_output_path,
+        "published": False,
     })
     logger.info("STAGE6_ENCODE_CONTRACT",
                 f"depth_arg={contract['depth_arg']} "
@@ -593,48 +838,88 @@ def main():
     logger.info("STAGE6_ENCODE", f"Encoding AVIF (archival={use_rgb444})",
                 cmd=" ".join(cmd))
     timeout = _calculate_avifenc_timeout(encode_input)
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout, shell=False)
-        ok = r.returncode == 0
-        stderr = (r.stderr or b"").decode("utf-8", "replace")
-    except Exception as e:
-        ok, stderr = False, str(e)
+    # RV-12: 用 Popen 而不是 subprocess.run —— 取消/超时必须能真正终止编码器
+    # 子进程并等它退出，否则会出现"stage 已退出、avifenc 还在写回"的孤儿写。
+    ok, stderr, rc = _run_encoder(cmd, timeout, logger)
     contract["exit_code"] = None if ok else 84
     if not ok:
         logger.error("STAGE6_AVIF_FAIL", "avifenc encoding failed",
-                     stderr=stderr[:2000])
+                     stderr=stderr[:2000], exit_code=rc)
         # FIX-H12-05: encoding failure must not be masked by another format
+        # RV-12: 失败必须清掉本轮临时产物，并在发布路径旁留下 FAILED 记录，
+        # 不能让"半截 AVIF"或"上一轮成品"被当成这次的成功结果。
+        _fail(logger, status_path, "avif_encode",
+              f"avifenc exited {rc}: {stderr[:500]}",
+              paths=[tmp_avif] + round_artifacts)
         return 84
-    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+    if not os.path.exists(tmp_avif) or os.path.getsize(tmp_avif) == 0:
         # 退出码 0 也不代表成功：必须验证产物本身
         logger.error("STAGE6_AVIF_OUTPUT_MISSING",
                      "avifenc returned 0 but the output is missing/empty",
-                     output=output_path)
+                     output=tmp_avif)
+        _fail(logger, status_path, "avif_encode",
+              "encoder produced an empty/missing file",
+              paths=[tmp_avif] + round_artifacts)
         return 84
 
-    # WSL redirect: copy back to original Linux path
+    # --- RV-12: 原子发布（临时 → 发布路径）---
+    try:
+        os.replace(tmp_avif, work_output_path)
+        contract["published"] = True
+    except OSError as e:
+        logger.error("STAGE6_PUBLISH_FAIL",
+                     f"Could not publish the encoded AVIF: {e}")
+        _fail(logger, status_path, "publish", str(e),
+              paths=[tmp_avif] + round_artifacts)
+        return 82
+
+    # WSL redirect: copy back **each** required artifact, checking every result
+    # RV-13: 源路径一律用工作路径（work_*），不再从已经换过的发布路径派生。
     if original_output_path:
-        if wsl_copy_back(output_path, original_output_path):
+        copied = wsl_copy_back(work_output_path, publish_output_path)
+        if copied:
             logger.info("STAGE6_WSL_COPYBACK",
-                        f"Copied result back to {original_output_path}")
-            output_path = original_output_path
+                        f"Copied result back to {publish_output_path}")
         else:
             logger.error("STAGE6_WSL_COPYBACK_FAIL",
-                         f"Failed to copy {output_path} back to {original_output_path}")
+                         f"Failed to copy {work_output_path} back to "
+                         f"{publish_output_path}")
+            _fail(logger, status_path, "wsl_copyback",
+                  f"copy back failed: {work_output_path}",
+                  paths=[tmp_avif] + round_artifacts)
             return 82
-        if tiff_info.get("written"):
-            orig_tiff = original_output_path.rsplit(".", 1)[0] + ".tif"
-            wsl_copy_back(str(Path(output_path).with_suffix(".tif")), orig_tiff)
+        if tiff_info.get("written") and work_tiff_path:
+            if wsl_copy_back(work_tiff_path, publish_tiff_path):
+                logger.info("STAGE6_WSL_COPYBACK_TIFF",
+                            f"Copied master back to {publish_tiff_path}")
+            else:
+                logger.error("STAGE6_WSL_COPYBACK_TIFF_FAIL",
+                             f"Failed to copy {work_tiff_path} back to "
+                             f"{publish_tiff_path}")
+                _fail(logger, status_path, "wsl_copyback_tiff",
+                      f"copy back failed: {work_tiff_path}",
+                      paths=[tmp_avif] + round_artifacts)
+                return 82
 
     # 落盘实际编码契约，供验收与上游读取
     try:
-        contract_path = output_path + ".encode_contract.json"
-        with open(contract_path, "w", encoding="utf-8") as f:
-            json.dump(contract, f, ensure_ascii=False, indent=2, sort_keys=True)
+        _write_json_sidecar(contract_path, contract)
     except Exception as e:
         logger.warning("STAGE6_CONTRACT_WRITE_FAIL", f"Could not write contract sidecar: {e}")
+    # RV-12: 成功必须留下 SUCCESS 状态侧车，否则上一次的 FAILED/cancelled
+    # 侧车会与新的成品长期共存，下游无法判断当前文件是否有效。
+    _write_json_sidecar(status_path, {
+        "status": "SUCCESS",
+        "stage": 6,
+        "skipped_operations": _color_skipped(color),
+        "output_path": publish_output_path,
+        "published": True,
+    })
+    # 已发布：守卫不再删除任何产物
+    if cancel_guard is not None:
+        cancel_guard.release_outputs()
 
-    logger.info("STAGE6_DONE", "Photo encoding complete", output=output_path)
+    logger.info("STAGE6_DONE", "Photo encoding complete", output=publish_output_path)
     return 0
 
 

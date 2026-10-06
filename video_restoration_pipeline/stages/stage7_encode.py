@@ -19,6 +19,7 @@ import argparse
 import subprocess
 import datetime
 import re
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
@@ -189,7 +190,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
         # (single source of truth) instead of bare params.get("arnndn_model").
         # Falls back to the raw config value if resolution returns None, matching
         # the audio_utils.process_audio pattern (L487-489).
-        from audio_utils import _get_arnndn_model_path
+        from audio_utils import _get_arnndn_model_path, filter_option_path as _fpath
         arnndn_model = _get_arnndn_model_path(params, detected_freq or 0)
         if not arnndn_model:
             arnndn_model = params.get("arnndn_model", "")
@@ -206,12 +207,12 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
             elif num_ch == 2:
                 audio_filters.append("aformat=channel_layouts=mono")
                 # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
-                audio_filters.append(f"arnndn=m={arnndn_model}")
+                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
                 layout = audio_layout.get("layout", "stereo")
                 audio_filters.append(f"aformat=channel_layouts={layout}")
             else:
                 # Mono: use arnndn directly
-                audio_filters.append(f"arnndn=m={arnndn_model}")
+                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
             logger.info("STAGE7_HUM_ARNNDN",
                         f"FFmpeg <4.4, using arnndn for {detected_freq}Hz hum removal",
                         model=arnndn_model)
@@ -227,7 +228,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
     if noise_reduction:
         # FIX-R7-S7-A2: reuse audio_utils._get_arnndn_model_path (consistent with
         # hum branch and audio_utils.process_audio L545-548).
-        from audio_utils import _get_arnndn_model_path
+        from audio_utils import _get_arnndn_model_path, filter_option_path as _fpath
         arnndn_model = _get_arnndn_model_path(params, detected_freq or 0)
         if not arnndn_model:
             arnndn_model = params.get("arnndn_model", "")
@@ -254,12 +255,12 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                 # Stereo: arnndn mono limitation, restore after processing
                 audio_filters.append("aformat=channel_layouts=mono")
                 # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
-                audio_filters.append(f"arnndn=m={arnndn_model}")
+                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
                 layout = audio_layout.get("layout", "stereo")
                 audio_filters.append(f"aformat=channel_layouts={layout}")
             else:
                 # Mono: use arnndn directly
-                audio_filters.append(f"arnndn=m={arnndn_model}")
+                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
         else:
             audio_filters.append("afftdn=nr=12:nf=-50")
 
@@ -299,8 +300,63 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
     return ",".join(audio_filters) if audio_filters else "anull"
 
 
+def _probe_packet_span(path: str, stream_type: str = "v") -> float:
+    """用 packet 时间戳求流跨度（NEW-RV-07）。
+
+    MKV/WebM 不填 `stream=duration`，而本管线的默认产物正是 `.mkv`
+    （`{stem}_restored.mkv`），所以只靠 `stream=duration` 会让 A/V 同步门
+    **对所有产物 100% 静默跳过**（真机实测：ffprobe 对 clip_restored.mkv
+    的 `stream=duration` 一律返回 `N/A`，而容器时长 2.071s 是读得到的）。
+    退路：读 packet 的 pts_time + duration_time，取 [min_start, max_end) 跨度。
+    只读包头、不解码，代价随文件线性增长，因此仅在 stream=duration 缺失时调用。
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+             "-show_entries", "packet=pts_time,duration_time",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=300, shell=False
+        )
+        if r.returncode != 0:
+            return 0.0
+    except Exception:
+        return 0.0
+
+    start = None
+    end = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        pts_s = parts[0].strip() if len(parts) > 0 else ""
+        dur_s = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            pts = float(pts_s)
+        except (TypeError, ValueError):
+            continue
+        try:
+            dur = float(dur_s)
+        except (TypeError, ValueError):
+            dur = 0.0
+        if start is None or pts < start:
+            start = pts
+        e = pts + (dur if dur > 0 else 0.0)
+        if end is None or e > end:
+            end = e
+    if start is None or end is None or end <= start:
+        return 0.0
+    return end - start
+
+
 def _get_stream_duration(path: str, stream_type: str = "v") -> float:
-    """Get video or audio stream duration using ffprobe."""
+    """Get video or audio stream duration using ffprobe.
+
+    三级取值（NEW-RV-07）：
+      1. `stream=duration` —— mp4/mov 有，MKV 基本为 N/A；
+      2. packet 时间戳跨度 —— MKV/WebM 的可靠退路；
+      3. 都没有 → 0.0（调用方按"无法确定"处理，不再假装通过）。
+    """
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
@@ -314,7 +370,7 @@ def _get_stream_duration(path: str, stream_type: str = "v") -> float:
                 return float(dur)
     except Exception:
         pass
-    return 0.0
+    return _probe_packet_span(path, stream_type)
 
 
 def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
@@ -385,6 +441,56 @@ def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
         if logger:
             logger.warning("STAGE7_CROP_FAIL", f"cropdetect failed: {e}")
     return info
+
+
+_ZSCALE_CAP_CACHE: Dict[str, bool] = {}
+
+
+def _zscale_has_option(option_expr: str) -> bool:
+    """NEW-RV-05: probe whether the installed ffmpeg's zscale accepts an option.
+
+    真机复现（ffmpeg 2023-11-13 gyan 构建）：``zscale=...:format=yuv444p10``
+    直接失败 —— "Error applying option 'format' to filter 'zscale': Option not
+    found"，stage7 因此 rc=84。该构建的 zscale 只有 w/h/size/dither/filter/
+    out_range… 没有 format。
+    选项是否可用必须**运行时探测**，不能写死（不同 ffmpeg/zimg 版本差异很大）。
+    """
+    if option_expr in _ZSCALE_CAP_CACHE:
+        return _ZSCALE_CAP_CACHE[option_expr]
+    available = False
+    try:
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i",
+             "color=c=black:s=64x64", "-vf", f"zscale={option_expr}",
+             "-f", "null", "-"],
+            capture_output=True, shell=False, timeout=15)
+        available = (probe.returncode == 0)
+    except Exception:
+        available = False
+    _ZSCALE_CAP_CACHE[option_expr] = available
+    return available
+
+
+def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
+    """Return the 16→10 bit filter chain that this ffmpeg can actually run."""
+    filters: List[str] = ["format=yuv444p16"]
+    if _zscale_has_option("format=yuv444p10"):
+        filters.append(f"zscale=rangein=limited:range=limited:"
+                       f"dither={dither}:format=yuv444p10")
+    else:
+        # 该构建没有 zscale 的 format 选项：降位深只能交给 format 滤镜，
+        # 于是**抖动并不作用在降位深这一步** —— 必须如实记录，不能假装做了。
+        filters.append(f"zscale=rangein=limited:range=limited:dither={dither}")
+        filters.append("format=yuv444p10")
+        if logger:
+            logger.warning(
+                "STAGE7_DITHER_DEGRADED",
+                "This ffmpeg's zscale has no 'format' option; the 16→10 bit "
+                "reduction is done by the format filter, so the requested "
+                f"{dither} dithering does NOT apply to the depth reduction",
+                dither=dither)
+    filters.append("format=yuv420p10le")
+    return filters
 
 
 def _get_source_color_info(video_path: str) -> tuple:
@@ -629,25 +735,27 @@ def main():
     # FIX-R7-S7-13: support libx265 (HEVC) as an alternative encoder per v6.32
     # Part 3 ("libsvtav1 或 libx265"). config video_encoder selects the codec;
     # libsvtav1 remains the default. libx265 uses -preset slow -crf 18.
+    # NEW-RV-04（真机 ffmpeg 复现）：**输入段与输出段必须分开拼**。
+    # ORIGINAL 把 -vf / -c:v 等**输出侧**选项插在第一个 -i 之后、第二个 -i 之前，
+    # ffmpeg 于是把它们当成"下一个输入文件的输入选项"：
+    #   "Option vf ... cannot be applied to input url jobV1_clip.mka --
+    #    you are trying to apply an input option to an output file or vice versa."
+    # 结果：只要素材有音轨，stage7 必然 rc=84。
+    # 修法：video_cmd 只放输入（所有 -i），output_opts 放全部输出侧选项，
+    # 最后先 extend 输出选项再写输出路径。
     video_encoder = params.get("video_encoder", "libsvtav1")
-    video_cmd = [
-        "ffmpeg", "-hide_banner", "-v", "error", "-y",
-        "-i", input_source,
-        "-c:v", video_encoder,
-        "-crf", str(crf),
-        "-preset", str(preset),
-        "-pix_fmt", pix_fmt,
-    ]
+    common_prefix = ["ffmpeg", "-hide_banner", "-v", "error", "-y"]
+    video_cmd = common_prefix + ["-i", input_source]
+    output_opts: List[str] = []
     if video_encoder == "libx265":
         # x265 CRF 18 ≈ visually lossless; preset slow per v6.32 Part 3.
-        video_cmd = [
-            "ffmpeg", "-hide_banner", "-v", "error", "-y",
-            "-i", input_source,
-            "-c:v", "libx265",
-            "-crf", str(params.get("libx265_crf", 18)),
-            "-preset", str(params.get("libx265_preset", "slow")),
-            "-pix_fmt", pix_fmt,
-        ]
+        output_opts.extend(["-c:v", "libx265",
+                            "-crf", str(params.get("libx265_crf", 18)),
+                            "-preset", str(params.get("libx265_preset", "slow")),
+                            "-pix_fmt", pix_fmt])
+    else:
+        output_opts.extend(["-c:v", video_encoder, "-crf", str(crf),
+                            "-preset", str(preset), "-pix_fmt", pix_fmt])
 
     # FIX-P7-1: BT.601→BT.709 color space conversion with range handling
     # FIX-P7-3: Probe stage output (input_source), not original input (args.input)
@@ -732,15 +840,11 @@ def main():
 
         if _zscale_ed_available:
             # Per v6.32 §阶段3: error_diffusion dithering in YUV444 space
-            vf_parts.append("format=yuv444p16")
-            vf_parts.append("zscale=rangein=limited:range=limited:dither=error_diffusion:format=yuv444p10")
-            vf_parts.append("format=yuv420p10le")
+            vf_parts.extend(_zscale_dither_filters("error_diffusion", logger))
             logger.info("STAGE7_DITHER", "Using error_diffusion dithering (16bit->10bit)")
         else:
             # Fallback: ordered dithering (available on all zimg versions)
-            vf_parts.append("format=yuv444p16")
-            vf_parts.append("zscale=rangein=limited:range=limited:dither=ordered:format=yuv444p10")
-            vf_parts.append("format=yuv420p10le")
+            vf_parts.extend(_zscale_dither_filters("ordered", logger))
             logger.warning("STAGE7_DITHER_FALLBACK",
                           "error_diffusion not available in zscale, "
                           "using ordered dithering (16bit->10bit)")
@@ -751,7 +855,9 @@ def main():
         vf_parts.append(_pad_filter)
 
     if vf_parts:
-        video_cmd.extend(["-vf", ",".join(vf_parts)])
+        # NEW-RV-04: -vf 是**输出侧**选项，必须在所有 -i 之后，否则 ffmpeg
+        # 会把它当成"下一个输入文件的输入选项"并直接报错退出。
+        output_opts.extend(["-vf", ",".join(vf_parts)])
 
     # Scene detection for audio handling (v6.3 §3.10.9)
     # Scene 1: duration unchanged -> asetpts=PTS only
@@ -809,8 +915,9 @@ def main():
             audio_codec = params.get("audio_codec", params.get("codec", "aac"))
             audio_bitrate = params.get("audio_bitrate", params.get("bitrate", "320k"))
 
-        video_cmd.extend([
-            "-i", audio_path,
+        # NEW-RV-04: 第二个输入必须紧跟在其它 -i 之后，输出侧选项全部后移
+        video_cmd.extend(["-i", audio_path])
+        output_opts.extend([
             "-af", audio_filter,
             "-map", "0:v:0",  # Map video from first input
             "-map", "1:a:0",  # Map audio from second input
@@ -820,17 +927,17 @@ def main():
 
         # Select codec per config (v6.3 §3.10.9)
         if audio_codec == "aac":
-            video_cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate])
+            output_opts.extend(["-c:a", "aac", "-b:a", audio_bitrate])
         elif audio_codec == "flac":
-            video_cmd.extend(["-c:a", "flac"])
+            output_opts.extend(["-c:a", "flac"])
         else:
-            video_cmd.extend(["-c:a", audio_codec])
+            output_opts.extend(["-c:a", audio_codec])
             if audio_bitrate:
-                video_cmd.extend(["-b:a", audio_bitrate])
+                output_opts.extend(["-b:a", audio_bitrate])
     else:
         # FIX-P7-8: Log when source has no audio stream
         logger.info("STAGE7_NO_AUDIO", "Source has no audio stream, outputting video only")
-        video_cmd.append("-an")
+        output_opts.append("-an")
 
     # Color metadata (v6.3: double marking)
     # SVT-AV1 uses numeric values, not string names
@@ -852,7 +959,7 @@ def main():
     svt_range = "0" if color_range == "limited" else "1"
 
     # FFmpeg global color metadata (string names)
-    video_cmd.extend([
+    output_opts.extend([
         "-color_primaries", color_primaries,
         "-color_trc", color_trc,
         "-colorspace", colorspace,
@@ -867,9 +974,10 @@ def main():
         svt_params = f"tile-rows={tile_rows}:tile-columns={tile_cols}"
         svt_params += f":color-primaries={svt_primaries}:transfer-characteristics={svt_trc}"
         svt_params += f":matrix-coefficients={svt_matrix}:color-range={svt_range}"
-        video_cmd.extend(["-svtav1-params", svt_params])
+        output_opts.extend(["-svtav1-params", svt_params])
 
-    # Metadata and output
+    # Metadata and output（NEW-RV-04: 输出侧选项统一在输出路径之前落地）
+    video_cmd.extend(output_opts)
     video_cmd.extend([
         "-metadata", "restored=true",
         # FIX-P7-12: Use proper datetime import per CLAUDE.md §4

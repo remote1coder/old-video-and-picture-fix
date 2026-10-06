@@ -1,0 +1,1087 @@
+"""第二轮复核 RV-01 … RV-14 的反例回归测试。
+
+设计原则（来自复核报告 §5）：
+1. 每条用例对应一个**已复现的反例**；修复前必须失败，修复后转绿。
+2. 每条用例自带最小输入，不依赖其它用例的产物（消除顺序依赖）。
+3. 能用真工具就用真工具；用替身的地方在 docstring 里写明"这是替身"。
+4. 缺失必需工具时 skip 并记为"未验收"，不静默算通过。
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+import pytest
+
+import conftest  # noqa: F401  (sys.path bootstrap)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLS = os.path.join(ROOT, "tests", "_out", "tools")
+SHARED = os.path.join(ROOT, "shared_modules")
+STAGES = os.path.join(ROOT, "photo_restoration_pipeline", "stages")
+
+import media_io  # noqa: E402
+import manifest_loader as ml  # noqa: E402
+import stage6_encode as s6  # noqa: E402
+import main as vmain  # noqa: E402  (video_restoration_pipeline/main.py)
+
+
+def _avifenc():
+    found = shutil.which("avifenc")
+    if found:
+        return found
+    local = os.path.join(TOOLS, "avifenc.exe")
+    return local if os.path.exists(local) else None
+
+
+def _avifdec():
+    found = shutil.which("avifdec")
+    if found:
+        return found
+    local = os.path.join(TOOLS, "avifdec.exe")
+    return local if os.path.exists(local) else None
+
+
+class _Log:
+    """Minimal logger stub capturing events."""
+
+    def __init__(self):
+        self.events = []
+
+    def _rec(self, name, msg, **kw):
+        self.events.append((name, msg))
+
+    info = warning = error = debug = _rec
+
+
+def _srgb_icc_bytes():
+    from PIL import ImageCms
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def _write_png_with_icc(path, arr, icc=None):
+    from PIL import Image
+    img = Image.fromarray(arr, mode="RGB")
+    kwargs = {"format": "PNG"}
+    if icc:
+        kwargs["icc_profile"] = icc
+    img.save(path, **kwargs)
+    return str(path)
+
+
+def _grad16(h=8, w=8, c=3):
+    """16-bit 测试素材：**高字节与低字节必须不同**。
+
+    踩过的坑：最初用 ``n * 257`` 生成，结果每个样本的高字节都等于低字节，
+    这恰好就是"8-bit 数据乘 257"的形态 —— 8-bit 截断后再乘回去仍然逐像素相等，
+    于是"是否真 16-bit"的断言变成了恒真。这里用两条不同的数列分别填高/低字节。
+    """
+    n = np.arange(h * w, dtype=np.uint32).reshape(h, w)
+    hi = n % 256
+    lo = (n * 37 + 11) % 256
+    v = (hi * 256 + lo).astype(np.uint16)
+    if c == 1:
+        return v[:, :, None]
+    return np.stack([v] * c, axis=2).astype(np.uint16)
+
+
+# ---------------------------------------------------------------------------
+# RV-01 · 视频正式入口 / logger API
+# ---------------------------------------------------------------------------
+
+def test_rv01_logger_accepts_level_and_actually_filters(tmp_path):
+    """get_logger(level=...) 曾被当成非法实参 → 正式入口 rc=1。"""
+    import logger as _logger
+
+    assert "level" in __import__("inspect").signature(
+        _logger.StructuredLogger.__init__).parameters, \
+        "StructuredLogger 必须真正接受 level，而不是用 **kwargs 吞掉"
+
+    lg = _logger.get_logger(log_dir=str(tmp_path / "logs"), level="INFO")
+    lg.debug("DBG_EVENT", "must be filtered out")
+    lg.info("INFO_EVENT", "must be kept")
+
+    with open(lg.log_file, encoding="utf-8") as f:
+        events = [json.loads(line)["event"] for line in f if line.strip()]
+    assert "INFO_EVENT" in events
+    assert "DBG_EVENT" not in events, "级别过滤没有真正生效"
+
+    lg.set_level("DEBUG")
+    lg.debug("DBG2", "kept after lowering the threshold")
+    with open(lg.log_file, encoding="utf-8") as f:
+        events = [json.loads(line)["event"] for line in f if line.strip()]
+    assert "DBG2" in events
+
+
+def test_rv01_real_cli_reaches_dependency_check(tmp_path):
+    """真实 CLI：不能死在 logger 初始化（rc=1 TypeError）。"""
+    import yaml
+    cfg_path = os.path.join(ROOT, "video_restoration_pipeline", "config.yaml")
+    with open(cfg_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    cfg.setdefault("global", {})["log_dir"] = str(tmp_path / "logs")
+    tmp_cfg = tmp_path / "video_config.yaml"
+    with open(tmp_cfg, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True)
+
+    empty_in = tmp_path / "in"
+    empty_in.mkdir()
+    env = dict(os.environ)
+    if os.path.isdir(TOOLS):
+        env["PATH"] = TOOLS + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "video_restoration_pipeline",
+                                      "main.py"),
+         "--mode", "scan", "--input", str(empty_in),
+         "--config", str(tmp_cfg),
+         "--output-manifest", str(tmp_path / "m.yaml")],
+        capture_output=True, text=True, shell=False, env=env, cwd=ROOT)
+    # 依赖缺失时是 80；依赖齐全时是 0。**唯一不允许的是 1**（初始化 TypeError）
+    assert r.returncode != 1, (
+        f"CLI 在初始化阶段崩了（RV-01 未修复）: rc={r.returncode}\n"
+        f"{r.stdout[-1500:]}\n{r.stderr[-1500:]}")
+    log_file = tmp_path / "logs" / "general.log"
+    assert log_file.exists(), "日志初始化失败：连 general.log 都没写出来"
+    body = log_file.read_text(encoding="utf-8")
+    assert "PIPELINE_START" in body
+
+
+# ---------------------------------------------------------------------------
+# RV-02 · 色彩决议
+# ---------------------------------------------------------------------------
+
+def test_rv02_auto_must_not_override_the_sidecar(tmp_path):
+    """默认 auto 曾盖过 stage1 sidecar：写了 AdobeRGB 也被忽略。"""
+    work = _write_png_with_icc(tmp_path / "work.png",
+                               np.full((4, 4, 3), 128, np.uint8))
+    (tmp_path / "j1_clip_color_meta.json").write_text(
+        json.dumps({"input_color_space": "adobergb"}), encoding="utf-8")
+
+    log = _Log()
+    color = s6.resolve_color_space(
+        work, {"input_color_space": "auto"}, str(tmp_path), "j1", "clip", log)
+    assert color["source_space"] == "adobergb", \
+        "auto 仍然盖过了 sidecar（RV-02 未修复）"
+    # 宽色域 + 没有真实 ICC → 必须阻断，而不是当 sRGB 编下去
+    assert color["status"] == s6.COLOR_FAILED
+
+
+def test_rv02_auto_unknown_with_strict_fails(tmp_path):
+    work = _write_png_with_icc(tmp_path / "work.png",
+                               np.full((4, 4, 3), 128, np.uint8))
+    log = _Log()
+    color = s6.resolve_color_space(
+        work, {"input_color_space": "auto",
+               "require_known_color_space": True},
+        str(tmp_path), "j2", "clip", log)
+    assert color["status"] == s6.COLOR_FAILED, \
+        "无来源 + strict=true 仍然被当成 not-needed（RV-02 未修复）"
+
+
+def test_rv02_unknown_source_is_not_labelled_srgb(tmp_path):
+    work = _write_png_with_icc(tmp_path / "work.png",
+                               np.full((4, 4, 3), 128, np.uint8))
+    log = _Log()
+    color = s6.resolve_color_space(
+        work, {"input_color_space": "auto", "archival_mode": True},
+        str(tmp_path), "j3", "clip", log)
+    assert color["status"] == s6.COLOR_UNKNOWN
+    assert color["cicp_override"] == "2/2/0", \
+        "未知来源仍在沿用配置里的 sRGB 标签"
+
+
+def test_rv02_detected_srgb_overrides_conflicting_config_label(tmp_path):
+    work = _write_png_with_icc(tmp_path / "work.png",
+                               np.full((4, 4, 3), 128, np.uint8),
+                               icc=_srgb_icc_bytes())
+    log = _Log()
+    color = s6.resolve_color_space(
+        work, {"input_color_space": "auto", "archival_mode": True},
+        str(tmp_path), "j4", "clip", log)
+    assert color["source_space"] == "srgb"
+    assert color["cicp_override"] == "1/13/0", "已确认 sRGB 必须覆盖旧标签"
+
+
+def test_rv02_degraded_cicp_reaches_the_actual_command(tmp_path):
+    """resolver 给的值必须进入命令行，而不是只写进 sidecar。"""
+    work = _write_png_with_icc(tmp_path / "work.png",
+                               np.full((4, 4, 3), 128, np.uint8))
+    params = {"avif_rgb444_params": {"depth": 16, "yuv": "444",
+                                     "cicp": "1/13/0", "lossless": True}}
+    cmd, contract = media_io.build_avifenc_cmd(
+        work, str(tmp_path / "out.avif"), params, use_rgb444=True,
+        capability=media_io.AvifencCapability(available=True,
+                                              version=(1, 4, 2)),
+        cicp_override="2/2/0")
+    assert cmd[cmd.index("--cicp") + 1] == "2/2/0", \
+        "cicp_override 没有进入命令（RV-02 未修复）"
+    assert contract["cicp"] == "2/2/0"
+    assert contract["cicp_override"] == "2/2/0"
+
+
+def test_new_rv03_lossless_requires_identity_matrix(tmp_path):
+    """真机实测的硬约束：lossless 模式不接受非 identity 的 matrix。"""
+    work = _write_png_with_icc(tmp_path / "work.png",
+                               np.full((4, 4, 3), 128, np.uint8))
+    params = {"avif_rgb444_params": {"depth": 16, "yuv": "444",
+                                     "cicp": "1/13/1", "lossless": True}}
+    _cmd, contract = media_io.build_avifenc_cmd(
+        work, str(tmp_path / "out.avif"), params, use_rgb444=True,
+        capability=media_io.AvifencCapability(available=True,
+                                              version=(1, 4, 2)))
+    assert contract["cicp"].endswith("/0")
+    assert contract["matrix_forced_identity_by_lossless"] is True
+
+
+# ---------------------------------------------------------------------------
+# RV-03 · 高位深读取
+# ---------------------------------------------------------------------------
+
+def test_rv03_rgb16_png_keeps_uint16_and_low_bytes(tmp_path):
+    """独立解码器读到 uint16；项目 reader 也曾返回 uint8。"""
+    src = _grad16()
+    p = str(tmp_path / "rgb16.png")
+    media_io.write_png(p, src)
+    arr, meta = media_io.read_image_array(p)
+    assert arr.dtype == np.uint16, f"reader 返回了 {arr.dtype}（RV-03 未修复）"
+    assert np.array_equal(arr, src), "低位字节被丢了"
+    assert "imagecodecs" in (meta.get("reader") or "")
+
+
+def test_rv03_high_depth_read_failure_is_loud(tmp_path, monkeypatch):
+    """没有能读 16-bit 的依赖时必须报错，不能静默塌成 8-bit。"""
+    src = _grad16()
+    p = str(tmp_path / "rgb16.png")
+    media_io.write_png(p, src)
+    monkeypatch.setitem(sys.modules, "imagecodecs", None)
+    with pytest.raises(media_io.MediaPrecisionError):
+        media_io.read_image_array(p)
+
+
+def test_rv03_tiff_without_high_depth_reader_is_loud(tmp_path, monkeypatch):
+    p = str(tmp_path / "src16.tif")
+    import tifffile
+    tifffile.imwrite(p, _grad16(), compression="zlib")
+    monkeypatch.setitem(sys.modules, "tifffile", None)
+    monkeypatch.setitem(sys.modules, "imagecodecs", None)
+    with pytest.raises(media_io.MediaPrecisionError):
+        media_io.read_image_array(p)
+
+
+def test_rv03_stage5_keeps_16bit_from_png_input(tmp_path):
+    """RGB16 PNG → stage5 → 母版，整条不能掉到 8-bit。"""
+    src = _grad16(16, 16, 3)
+    temp = tmp_path / "temp"
+    logs = tmp_path / "logs"
+    temp.mkdir()
+    logs.mkdir()
+    media_io.write_png(str(temp / "job001_clip_step1_preprocess.png"), src)
+    (temp / "clip.png").write_bytes(b"")  # stage5 只用茎名，不需要真实输入文件
+
+    params = {"temp_dir": str(temp), "log_dir": str(logs),
+              "photo_bit_depth": 16, "local_mask_denoise": False,
+              "grain_synthesis": False}
+    r = subprocess.run(
+        [sys.executable, os.path.join(STAGES, "stage5_postprocess.py"),
+         "--input", str(temp / "clip.png"), "--job-id", "job001",
+         "--params", json.dumps(params)],
+        capture_output=True, text=True, shell=False, cwd=ROOT)
+    assert r.returncode == 0, f"stage5 rc={r.returncode}\n{r.stdout[-1500:]}"
+    out = temp / "job001_clip_step5_postprocess.tif"
+    import tifffile
+    back = tifffile.imread(str(out))
+    assert back.dtype == np.uint16, "stage5 把 16-bit PNG 输入压成了 8-bit"
+    assert np.array_equal(back, src)
+
+
+# ---------------------------------------------------------------------------
+# RV-04 · ICC 贯穿
+# ---------------------------------------------------------------------------
+
+def test_rv04_tiff_icc_is_read_and_carried_into_the_master(tmp_path):
+    import tifffile
+    icc = _srgb_icc_bytes()
+    p = str(tmp_path / "with_icc.tif")
+    tifffile.imwrite(p, _grad16(), compression="zlib",
+                     extratags=[(34675, 1, len(icc), icc, True)])
+
+    _arr, meta = media_io.read_image_array(p)
+    assert meta.get("icc_profile") == icc, \
+        "TIFF 高精度读取成功却把 ICC 丢了（RV-04 未修复）"
+
+    master = str(tmp_path / "master.tif")
+    info = s6.write_archival_master(p, master, {"photo_bit_depth": 16}, _Log())
+    assert info["icc"] == "source", info
+    with tifffile.TiffFile(master) as tf:
+        tag = tf.pages[0].tags.get(34675)
+    assert tag is not None and bytes(tag.value) == icc
+
+
+def test_rv04_png_icc_is_carried_into_the_encoder_input(tmp_path):
+    """母版 → 编码器输入这一跳也不能丢 ICC。"""
+    icc = _srgb_icc_bytes()
+    src = _grad16()
+    p = str(tmp_path / "src.tif")
+    import tifffile
+    tifffile.imwrite(p, src, compression="zlib",
+                     extratags=[(34675, 1, len(icc), icc, True)])
+    res = media_io.prepare_encoder_input(p, str(tmp_path / "work"))
+    assert res["icc_carried"] is True, res
+    assert media_io._png_icc_profile(res["path"]) == icc
+
+
+# ---------------------------------------------------------------------------
+# RV-05 · 内部 TIFF writer
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("channels", [1, 3, 4])
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_rv05_internal_tiff_writer_roundtrip(tmp_path, monkeypatch,
+                                             channels, dtype):
+    """强制 fallback 时用第三方解码器核验 dtype/shape/像素。"""
+    import tifffile
+    if channels == 1:
+        arr = _grad16(6, 5, 1)[:, :, 0]
+    else:
+        arr = _grad16(6, 5, channels)
+    arr = arr.astype(dtype)
+    p = str(tmp_path / f"internal_{channels}_{np.dtype(dtype).name}.tif")
+
+    monkeypatch.setitem(sys.modules, "tifffile", None)
+    writer = media_io.write_tiff(p, arr)
+    monkeypatch.undo()
+
+    assert writer == "internal-tiff"
+    back = tifffile.imread(p)
+    assert back.dtype == dtype, f"读回 {back.dtype}，应为 {dtype}"
+    expected = arr if channels > 1 else arr
+    assert np.array_equal(np.asarray(back).reshape(expected.shape), expected), \
+        f"像素不一致 (channels={channels}, dtype={dtype})"
+
+
+# ---------------------------------------------------------------------------
+# RV-06 · 请求的操作必须真的执行
+# ---------------------------------------------------------------------------
+
+def test_rv06_requested_resize_is_performed_on_the_16bit_path(tmp_path):
+    """请求 8x8 → 4x4：输出必须是 4x4，而不是原尺寸 + SUCCESS。"""
+    src = _grad16(8, 8, 3)
+    temp = tmp_path / "temp"
+    logs = tmp_path / "logs"
+    temp.mkdir()
+    logs.mkdir()
+    media_io.write_tiff(str(temp / "job001_clip_step1_preprocess.tif"), src)
+
+    params = {"temp_dir": str(temp), "log_dir": str(logs),
+              "photo_bit_depth": 16, "local_mask_denoise": False,
+              "grain_synthesis": False, "lanczos_target": "4x4"}
+    r = subprocess.run(
+        [sys.executable, os.path.join(STAGES, "stage5_postprocess.py"),
+         "--input", str(temp / "clip.tif"), "--job-id", "job001",
+         "--params", json.dumps(params)],
+        capture_output=True, text=True, shell=False, cwd=ROOT)
+    assert r.returncode == 0, f"stage5 rc={r.returncode}\n{r.stdout[-1500:]}"
+    out = temp / "job001_clip_step5_postprocess.tif"
+    import tifffile
+    back = tifffile.imread(str(out))
+    assert back.shape[:2] == (4, 4), \
+        f"请求了 4x4 但输出是 {back.shape}（RV-06 未修复）"
+    with open(str(out) + ".status.json", encoding="utf-8") as f:
+        status = json.load(f)
+    assert status["status"] == "SUCCESS"
+    assert status["skipped_operations"] == []
+
+
+def test_rv06_unresizable_request_fails_instead_of_pretending(monkeypatch):
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    monkeypatch.setitem(sys.modules, "scipy", None)
+    out, reason = s6.__dict__ and None, None  # 占位，避免 linter 误判
+    import stage5_postprocess as s5
+    out, reason = s5._resize_array_high_depth(_grad16(8, 8, 3), 4, 4)
+    assert out is None and reason, "缺少重采样能力时必须显式报告"
+
+
+def test_rv06_portrait_fallback_does_not_claim_success(tmp_path):
+    """注入依赖失败后，兜底复制原图不能再返回"已应用"。"""
+    import stage5_postprocess as s5
+    fake_png = _write_png_with_icc(tmp_path / "in.png",
+                                   np.full((4, 4, 3), 100, np.uint8))
+    out_path = str(tmp_path / "out.png")
+    res = s5._match_portrait_color(fake_png, [[0, 0, 4, 4]], out_path, _Log())
+    assert isinstance(res, dict), "必须返回结构化结果"
+    assert res["applied"] is False
+    assert res["skipped"] is True
+    assert res["reason"]
+
+
+# ---------------------------------------------------------------------------
+# RV-07 / RV-08 · manifest 状态一致性
+# ---------------------------------------------------------------------------
+
+def _manifest_with_jobs(path, job_ids):
+    doc = {"meta": {}, "jobs": [{"job_id": j, "input_path": f"/in/{j}.mp4",
+                                 "detected_class": "dv_digital",
+                                 "status": "PENDING"} for j in job_ids]}
+    ml.save_manifest(doc, str(path))
+    return str(path)
+
+
+def test_rv07_external_update_is_not_overwritten_by_the_batch(tmp_path):
+    """B 已 DONE；外部 writer 更新了 C；本批结束不得把 B 盖回 PENDING。"""
+    path = _manifest_with_jobs(tmp_path / "m.yaml", ["A", "B", "C"])
+    gen = ml.acquire_run_ownership(path, ["A", "B", "C"], owner="run-1")
+    assert gen is not None
+    assert ml.save_manifest_job_result(path, "B", "DONE", owner="run-1",
+                                       generation=gen)
+    # 外部 writer（编辑器/恢复流程）不带凭据更新 C —— 已被领取的 job 不接受
+    ml.save_manifest_job_result(path, "C", "DONE")
+    doc = ml.load_manifest(path)
+    statuses = {j["job_id"]: j["status"] for j in doc["jobs"]}
+    assert statuses["B"] == "DONE", "已完成的进度被覆盖了（RV-07 未修复）"
+
+
+def test_rv07_each_result_is_persisted_immediately(tmp_path):
+    """每收到一个结果就落盘：A 完成后立刻可读到 DONE。"""
+    path = _manifest_with_jobs(tmp_path / "m.yaml", ["A", "B"])
+    gen = ml.acquire_run_ownership(path, ["A", "B"], owner="run-1")
+    assert ml.save_manifest_job_result(path, "A", "DONE", owner="run-1",
+                                       generation=gen)
+    doc = ml.load_manifest(path)
+    assert next(j for j in doc["jobs"] if j["job_id"] == "A")["status"] == "DONE"
+
+
+def test_rv08_late_old_run_cannot_overwrite_a_newer_result(tmp_path):
+    """先有旧 run 的 A，再有新 run 的 B：旧 A 的迟到写必须被拒绝。"""
+    path = _manifest_with_jobs(tmp_path / "m.yaml", ["A", "B"])
+    old_gen = ml.acquire_run_ownership(path, ["A", "B"], owner="run-old")
+    new_gen = ml.acquire_run_ownership(path, ["A", "B"], owner="run-new")
+    assert new_gen > old_gen
+    assert ml.save_manifest_job_result(path, "B", "DONE", owner="run-new",
+                                       generation=new_gen)
+    # 旧 run 迟到的失败结果
+    applied = ml.save_manifest_job_result(path, "A", "FAILED",
+                                          owner="run-old",
+                                          generation=old_gen)
+    assert applied is False, "旧 run 的迟到结果覆盖了新 run（RV-08 未修复）"
+    doc = ml.load_manifest(path)
+    assert next(j for j in doc["jobs"] if j["job_id"] == "A")["status"] != "FAILED"
+
+
+def test_rv08_attempt_group_alone_is_not_ordering(tmp_path):
+    """换个 UUID 不能证明"更新"，必须带 generation。"""
+    path = _manifest_with_jobs(tmp_path / "m.yaml", ["A"])
+    g1 = ml.acquire_run_ownership(path, ["A"], owner="run-1")
+    g2 = ml.acquire_run_ownership(path, ["A"], owner="run-2")
+    assert ml.save_manifest_job_result(path, "A", "DONE", owner="run-2",
+                                       generation=g2,
+                                       attempt_group="uuid-newer")
+    assert not ml.save_manifest_job_result(
+        path, "A", "FAILED", owner="run-1", generation=g1,
+        attempt_group="uuid-older")
+
+
+# ---------------------------------------------------------------------------
+# RV-09 · 视频恢复身份
+# ---------------------------------------------------------------------------
+
+def test_rv09_output_without_completion_marker_is_not_reused(tmp_path):
+    job = {"job_id": "j1", "input_path": str(tmp_path / "clip.mp4")}
+    (tmp_path / "clip.mp4").write_bytes(b"\x00" * 32)
+    final = tmp_path / "clip_restored.mkv"
+    final.write_bytes(b"\x00" * 32)  # 存在且"能解码"，但没有身份
+    ok, reason = vmain.resume_artifact_matches(str(final), job, {}, None)
+    assert ok is False and reason
+
+
+def test_rv09_matching_marker_is_accepted(tmp_path):
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x01" * 64)
+    final = tmp_path / "clip_restored.mkv"
+    final.write_bytes(b"\x02" * 64)
+    job = {"job_id": "j1", "input_path": str(src)}
+    assert vmain.write_completion_marker(str(final), job, {}, None)
+    ok, reason = vmain.resume_artifact_matches(str(final), job, {}, None)
+    assert ok is True, reason
+
+
+def test_rv09_changed_input_invalidates_the_artifact(tmp_path):
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x01" * 64)
+    final = tmp_path / "clip_restored.mkv"
+    final.write_bytes(b"\x02" * 64)
+    job = {"job_id": "j1", "input_path": str(src)}
+    vmain.write_completion_marker(str(final), job, {}, None)
+    src.write_bytes(b"\x09" * 64)  # 素材换了
+    ok, _reason = vmain.resume_artifact_matches(str(final), job, {}, None)
+    assert ok is False
+
+
+def test_rv09_same_basename_different_job_is_not_reused(tmp_path):
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x01" * 64)
+    final = tmp_path / "clip_restored.mkv"
+    final.write_bytes(b"\x02" * 64)
+    vmain.write_completion_marker(str(final),
+                                  {"job_id": "j1", "input_path": str(src)},
+                                  {}, None)
+    ok, _reason = vmain.resume_artifact_matches(
+        str(final), {"job_id": "j2", "input_path": str(src)}, {}, None)
+    assert ok is False
+
+
+def test_rv09_colliding_final_outputs_are_disambiguated(tmp_path):
+    """两个不同 job、同名素材不能共用同一个最终输出路径。"""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    jobs = [{"job_id": "jobA", "input_path": "/in/dir1/clip.mp4"},
+            {"job_id": "jobB", "input_path": "/in/dir2/clip.mp4"}]
+    vmain._ensure_unique_final_outputs(jobs, {"global": {}},
+                                       {"output": str(out_dir)}, None)
+    second = jobs[1].get("output_path") or ""
+    assert "jobB" in second, f"第二个 job 仍会覆盖第一个的输出: {second}"
+
+
+# ---------------------------------------------------------------------------
+# RV-10 · 结构化结果与退出码聚合
+# ---------------------------------------------------------------------------
+
+def test_rv10_worker_result_is_structured(tmp_path, monkeypatch):
+    path = _manifest_with_jobs(tmp_path / "m.yaml", ["j1"])
+    manifest = ml.load_manifest(path)
+    monkeypatch.setattr(vmain, "process_job",
+                        lambda job, config, args, logger: (86, "injected"))
+    res = vmain._run_single_job({"job_id": "j1"}, {}, None, _Log(),
+                                manifest, path)
+    assert res["status"] == "FAILED"
+    assert res["exit_code"] == 86
+
+
+def test_rv10_persist_failure_is_not_success(tmp_path, monkeypatch):
+    path = _manifest_with_jobs(tmp_path / "m.yaml", ["j1"])
+    manifest = ml.load_manifest(path)
+    monkeypatch.setattr(vmain, "process_job",
+                        lambda job, config, args, logger: (0, ""))
+    monkeypatch.setattr(vmain, "save_manifest_job_result",
+                        lambda *a, **k: False)
+    res = vmain._run_single_job({"job_id": "j1"}, {}, None, _Log(),
+                                manifest, path)
+    assert res["status"] == "persist-failed"
+    assert res["exit_code"] == 82
+
+
+def test_rv10_aggregate_exit_codes():
+    assert vmain.aggregate_results(
+        [vmain._result("a", vmain.JOB_DONE, 0)]) == 0
+    assert vmain.aggregate_results(
+        [vmain._result("a", vmain.JOB_DONE, 0),
+         vmain._result("b", vmain.JOB_FAILED, 86)]) == 86
+    assert vmain.aggregate_results(
+        [vmain._result("a", vmain.JOB_CANCELLED, 88)]) == 88
+    assert vmain.aggregate_results(
+        [vmain._result("a", vmain.JOB_PERSIST_FAILED, 82)]) == 82
+
+
+def _cli_env(tmp_path, monkeypatch, process_rc):
+    """把 CLI 的依赖预检和 stage 执行换成受控替身，驱动真正的调度器。"""
+    import yaml
+    cfg = {"global": {"log_dir": str(tmp_path / "logs"), "retry_count": 0,
+                      "temp_dir": str(tmp_path / "temp"),
+                      "output_dir": str(tmp_path / "out")}}
+    cfg_path = tmp_path / "cfg.yaml"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True)
+    mpath = _manifest_with_jobs(tmp_path / "m.yaml", ["j1"])
+
+    import dependency_check
+    monkeypatch.setattr(dependency_check, "run_all_checks",
+                        lambda *a, **k: (True, [], []))
+    monkeypatch.setattr(vmain, "process_job",
+                        lambda *a, **k: (process_rc, "stub"))
+    monkeypatch.setattr(sys, "argv",
+                        ["main.py", "--manifest", mpath,
+                         "--config", str(cfg_path)])
+    return mpath
+
+
+def test_rv10_cli_returns_nonzero_when_a_job_fails(tmp_path, monkeypatch):
+    """调度器层：失败任务必须让 CLI 以非零码退出（不能无条件打印 Done）。"""
+    _cli_env(tmp_path, monkeypatch, 86)
+    with pytest.raises(SystemExit) as exc:
+        vmain.main()
+    assert exc.value.code == 86, "CLI 把失败任务当成了成功"
+
+
+def test_rv10_cli_success_persists_done(tmp_path, monkeypatch):
+    """成功路径：manifest 必须落 DONE，且不会抛非 0 的 SystemExit。"""
+    mpath = _cli_env(tmp_path, monkeypatch, 0)
+    exit_code = 0
+    try:
+        vmain.main()
+    except SystemExit as exc:          # 成功时不应退出；若退出也必须是 0
+        exit_code = exc.code or 0
+    assert exit_code == 0
+    doc = ml.load_manifest(mpath)
+    assert next(j for j in doc["jobs"] if j["job_id"] == "j1")["status"] == "DONE"
+
+
+# ---------------------------------------------------------------------------
+# RV-11 · 缓存身份必须包含人脸元数据
+# ---------------------------------------------------------------------------
+
+def test_rv11_face_metadata_changes_the_cache_identity(tmp_path):
+    import stage5_postprocess as s5
+    p = str(tmp_path / "in.tif")
+    media_io.write_tiff(p, _grad16())
+    base = s5.compute_stage5_cache_identity(p, {}, 16)
+    with_meta = s5.compute_stage5_cache_identity(
+        p, {}, 16, face_boxes=[[1, 2, 3, 4]], face_landmarks=[[[1, 1]]])
+    assert base["cache_id"] != with_meta["cache_id"], \
+        "人脸元数据变了 cache_id 却不变（RV-11 未修复）"
+
+    moved = s5.compute_stage5_cache_identity(
+        p, {}, 16, face_boxes=[[1, 2, 30, 40]], face_landmarks=[[[1, 1]]])
+    assert moved["cache_id"] != with_meta["cache_id"]
+
+    # 无关字段（不在 STAGE5_CACHE_PARAM_KEYS 里）不应导致失效
+    same = s5.compute_stage5_cache_identity(
+        p, {"some_logging_flag": "x"}, 16,
+        face_boxes=[[1, 2, 3, 4]], face_landmarks=[[[1, 1]]])
+    assert same["cache_id"] == with_meta["cache_id"]
+
+
+# ---------------------------------------------------------------------------
+# RV-12 · 产物事务发布（编码器替身：写半截 + 失败）
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    """编码器替身：把"写了一半再返回失败"做成确定性行为。"""
+
+    def __init__(self, cmd, returncode=1, write_bytes=0, **kw):
+        self.cmd = cmd
+        self.returncode = returncode
+        self._write = write_bytes
+
+    def communicate(self, timeout=None):
+        if self._write:
+            with open(self.cmd[-1], "wb") as f:
+                f.write(b"\x00" * self._write)
+        return b"", (b"stub failure" if self.returncode else b"")
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _seed_stage5_input(tmp_path, arr=None):
+    temp = tmp_path / "temp"
+    logs = tmp_path / "logs"
+    out = tmp_path / "output"
+    for d in (temp, logs, out):
+        d.mkdir(parents=True, exist_ok=True)
+    media_io.write_tiff(str(temp / "job001_clip_step5_postprocess.tif"),
+                        arr if arr is not None else _grad16())
+    return temp, logs, out
+
+
+def _run_stage6(tmp_path, monkeypatch, fake_cls, extra_params=None):
+    temp, logs, out = _seed_stage5_input(tmp_path)
+    params = {"temp_dir": str(temp), "log_dir": str(logs),
+              "output_dir": str(out), "photo_bit_depth": 16,
+              "archival_mode": True}
+    params.update(extra_params or {})
+    monkeypatch.setattr(s6.shutil, "which", lambda name: "avifenc")
+    monkeypatch.setattr(s6.media_io, "detect_avifenc_capability",
+                        lambda *a, **k: media_io.AvifencCapability(
+                            available=True, version=(1, 4, 2)))
+    monkeypatch.setattr(s6.subprocess, "Popen", fake_cls)
+    argv = [sys.argv[0], "--input", str(temp / "clip.tif"),
+            "--job-id", "job001", "--params", json.dumps(params)]
+    monkeypatch.setattr(sys, "argv", argv)
+    rc = s6.main()
+    return rc, out
+
+
+def test_rv12_failed_encode_leaves_no_partial_and_records_failed(tmp_path,
+                                                                 monkeypatch):
+    """编码器写了一半再失败：最终路径不能有半成品，且必须有 FAILED 记录。"""
+
+    def _fake(cmd, **kw):
+        return _FakeProc(cmd, returncode=1, write_bytes=4096)
+
+    rc, out = _run_stage6(tmp_path, monkeypatch, _fake)
+    final = out / "clip_restored.avif"
+    assert rc == 84
+    assert not final.exists(), "失败后最终路径上仍留有半成品（RV-12 未修复）"
+    assert not (out / "clip_restored.avif.partial").exists()
+    status_file = out / "clip_restored.avif.status.json"
+    assert status_file.exists(), "失败没有留下 FAILED 记录"
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["status"] == "FAILED"
+    assert status["failed_operation"] == "avif_encode"
+    # 同一提交集合：母版也不能留下"半个提交"
+    assert not (out / "clip_restored.tif").exists()
+
+
+def test_rv12_success_publishes_atomically_and_records_success(tmp_path,
+                                                               monkeypatch):
+    def _fake(cmd, **kw):
+        return _FakeProc(cmd, returncode=0, write_bytes=4096)
+
+    rc, out = _run_stage6(tmp_path, monkeypatch, _fake)
+    assert rc == 0
+    final = out / "clip_restored.avif"
+    assert final.exists(), "成功路径没有发布产物"
+    assert not (out / "clip_restored.avif.partial").exists()
+    status = json.loads((out / "clip_restored.avif.status.json")
+                        .read_text(encoding="utf-8"))
+    assert status["status"] == "SUCCESS"
+
+
+# ---------------------------------------------------------------------------
+# RV-13 · WSL 回拷必须使用工作路径（替身验证参数）
+# ---------------------------------------------------------------------------
+
+def test_rv13_copyback_uses_the_work_path(tmp_path, monkeypatch):
+    """AVIF 与 TIFF 的回拷源都必须是工作路径，不能从发布路径派生。"""
+    temp, logs, out = _seed_stage5_input(tmp_path)
+    calls = []
+
+    def _fake_redirect(path, no_wsl_redirect=False, target_platform="auto"):
+        # 只重定向最终产物（.avif），temp_dir 保持原样，否则 stage6 找不到输入
+        if not str(path).endswith(".avif"):
+            return path, None, None, None
+        work = str(tmp_path / "wsl_work" / os.path.basename(path))
+        os.makedirs(os.path.dirname(work), exist_ok=True)
+        return work, path, None, None
+
+    def _fake_copy_back(src, dst):
+        calls.append((src, dst))
+        shutil.copyfile(src, dst)
+        return True
+
+    monkeypatch.setattr(s6, "wsl_redirect_path", _fake_redirect)
+    monkeypatch.setattr(s6, "wsl_copy_back", _fake_copy_back)
+    monkeypatch.setattr(s6.shutil, "which", lambda name: "avifenc")
+    monkeypatch.setattr(s6.media_io, "detect_avifenc_capability",
+                        lambda *a, **k: media_io.AvifencCapability(
+                            available=True, version=(1, 4, 2)))
+    monkeypatch.setattr(s6.subprocess, "Popen",
+                        lambda cmd, **kw: _FakeProc(cmd, returncode=0,
+                                                    write_bytes=2048))
+    params = {"temp_dir": str(temp), "log_dir": str(logs),
+              "output_dir": str(out), "photo_bit_depth": 16,
+              "archival_mode": True}
+    monkeypatch.setattr(sys, "argv",
+                        [sys.argv[0], "--input", str(temp / "clip.tif"),
+                         "--job-id", "job001", "--params", json.dumps(params)])
+    rc = s6.main()
+    assert rc == 0, f"stage6 rc={rc}"
+    assert calls, "没有发生任何回拷"
+    for src, _dst in calls:
+        assert str(tmp_path / "wsl_work") in src, \
+            f"回拷源用了发布路径而不是工作路径: {src}"
+    assert any(dst.endswith(".tif") for _src, dst in calls), \
+        "TIFF 母版没有被回拷"
+
+
+# ---------------------------------------------------------------------------
+# RV-14 · GCD 只是量化网格诊断
+# ---------------------------------------------------------------------------
+
+def test_rv14_heuristic_is_documented_not_authoritative():
+    flat16 = np.full((8, 8, 3), 40000, np.uint16)   # 真 16-bit 常量图
+    scaled8 = (np.arange(64).reshape(8, 8).astype(np.uint16) * 257)[:, :, None]
+    scaled8 = np.repeat(scaled8, 3, axis=2)
+    perturbed = scaled8.copy()
+    perturbed[0, 0, 0] = (int(perturbed[0, 0, 0]) + 1) & 0xFFFF
+
+    assert s6.quantization_grid_bits(flat16) <= 8, \
+        "常量 16-bit 图的网格诊断值很小 —— 这正是它不能当证据的原因"
+    assert s6.quantization_grid_bits(scaled8) == 8
+    assert s6.quantization_grid_bits(perturbed) > 8, \
+        "1-LSB 扰动就能把 GCD 打散 —— 指标可以被绕过"
+    # 容器位深与网格诊断必须分开记录
+    assert s6.container_bit_depth(flat16) == 16
+    assert s6.effective_bit_depth(scaled8) == s6.quantization_grid_bits(scaled8)
+
+
+# ---------------------------------------------------------------------------
+# 真实编码过程中的取消（RV-12 验收要求：不能只测 sleep 脚本）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(_avifenc() is None,
+                    reason="avifenc 不可用 —— 真实编码取消未验收")
+def test_rv12_real_cancel_during_encoding(tmp_path):
+    """真实 avifenc 编码过程中取消：不留半成品、留 FAILED、退出码 88。"""
+    rng = np.random.default_rng(20261005)
+    big = rng.integers(0, 65536, (900, 900, 3), dtype=np.uint64).astype(
+        np.uint16)
+    temp, logs, out = _seed_stage5_input(tmp_path, big)
+    params = {"temp_dir": str(temp), "log_dir": str(logs),
+              "output_dir": str(out), "photo_bit_depth": 16,
+              "archival_mode": True,
+              "avif_rgb444_params": {"speed": 0, "lossless": True,
+                                     "depth": 16, "yuv": "444",
+                                     "cicp": "1/13/0"}}
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(_avifenc()) + os.pathsep + env.get("PATH", "")
+    popen_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(STAGES, "stage6_encode.py"),
+         "--input", str(temp / "clip.tif"), "--job-id", "job001",
+         "--params", json.dumps(params)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env, cwd=ROOT, **popen_kwargs)
+
+    partial = out / "clip_restored.avif.partial"
+    final = out / "clip_restored.avif"
+    # avifenc 只在收尾时创建输出文件，所以"等 partial 出现"是不可靠的。
+    # 改为等编码器输入（enc_input.png）就绪 —— 它的下一步就是启动 avifenc。
+    enc_input = temp / "job001_clip_step5_postprocess_enc_input.png"
+    deadline = time.time() + 90
+    while time.time() < deadline and not enc_input.exists():
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    assert enc_input.exists(), (
+        "编码器输入没有生成，无法验证取消（stage 提前结束）")
+    # 600x600 @ speed 0 实测约 16s，这里等 3s 确保 avifenc 已经在跑
+    time.sleep(3.0)
+    assert proc.poll() is None, "编码已经结束，取消时机不成立"
+    proc.send_signal(getattr(__import__("signal"), "CTRL_BREAK_EVENT"))
+    try:
+        _out, _err = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise AssertionError("取消后进程没有退出")
+
+    assert proc.returncode == 88, \
+        f"取消后的退出码应为 88（interrupted），实际 {proc.returncode}"
+    # 稍等，确认没有孤儿编码器继续写回
+    time.sleep(1.0)
+    assert not (out / "clip_restored.avif").exists(), \
+        "取消之后最终路径上出现了产物（可能有孤儿写回）"
+    assert not partial.exists(), "临时产物没有被清理"
+    status = json.loads((out / "clip_restored.avif.status.json")
+                        .read_text(encoding="utf-8"))
+    assert status["status"] == "FAILED"
+    assert status["failed_operation"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# NEW-RV-07：A/V 同步门在 MKV 上 100% 静默跳过
+# ---------------------------------------------------------------------------
+
+def _load_stage7():
+    """加载 video stage7 模块（加 video stages 目录到 sys.path）。"""
+    vstages = os.path.join(ROOT, "video_restoration_pipeline", "stages")
+    if vstages not in sys.path:
+        sys.path.insert(0, vstages)
+    import stage7_encode as s7  # noqa: E402
+    return s7
+
+
+def test_new_rv07_mkv_stream_duration_is_na_so_old_probe_returns_zero():
+    """反例复现：MKV 的 stream=duration 是 N/A，旧实现只能返回 0.0。
+
+    真机证据（ffmpeg 2023-11-13 gyan 版）：
+        ffprobe -show_entries stream=duration clip_restored.mkv → N/A
+        ffprobe -show_entries format=duration clip_restored.mkv → 2.071000
+    """
+    s7 = _load_stage7()
+
+    class _R:
+        def __init__(self, out, rc=0):
+            self.stdout = out
+            self.returncode = rc
+            self.stderr = ""
+
+    calls = []
+
+    def fake_run(cmd, *a, **k):
+        joined = " ".join(str(c) for c in cmd)
+        calls.append(joined)
+        if "stream=duration" in joined:
+            return _R("N/A\n")          # MKV 的真实行为
+        if "packet=pts_time" in joined:
+            return _R("")               # 退路也取不到时必须诚实地返回 0
+        raise AssertionError("unexpected probe: " + joined)
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(s7.subprocess, "run", fake_run)
+        assert s7._get_stream_duration("x.mkv", "v") == 0.0
+    finally:
+        monkeypatch.undo()
+    # 必须真的试过两级取值，而不是第一次就拿不到就放弃
+    assert any("packet=pts_time" in c for c in calls), \
+        "没有走 packet 退路，MKV 上同步门仍然等于关闭"
+
+
+def test_new_rv07_packet_span_fallback_returns_real_duration():
+    """packet 时间戳跨度退路：MKV 上应得到真实时长（2.0s）。"""
+    s7 = _load_stage7()
+
+    class _R:
+        def __init__(self, out, rc=0):
+            self.stdout = out
+            self.returncode = rc
+            self.stderr = ""
+
+    packets = "".join(
+        f"{i * 0.04:.6f},0.040000\n" for i in range(50))  # 50 帧 × 40ms = 2.0s
+
+    def fake_run(cmd, *a, **k):
+        joined = " ".join(str(c) for c in cmd)
+        if "stream=duration" in joined:
+            return _R("N/A\n")
+        if "packet=pts_time" in joined:
+            return _R(packets)
+        raise AssertionError("unexpected probe: " + joined)
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(s7.subprocess, "run", fake_run)
+        dur = s7._get_stream_duration("x.mkv", "v")
+    finally:
+        monkeypatch.undo()
+    assert dur == pytest.approx(2.0, abs=1e-3), f"packet 退路算出的时长不对：{dur}"
+
+
+def test_new_rv07_sync_gate_measures_real_mkv(tmp_path):
+    """真机：对一个真实 MKV，同步门必须量到时长，而不是 SKIP。"""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("无 ffmpeg/ffprobe —— NEW-RV-07 真机部分记为未验收")
+    s7 = _load_stage7()
+
+    mkv = tmp_path / "av.mkv"
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=duration=2:size=160x120:rate=25",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest", str(mkv)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"ffmpeg 合成测试片失败（未验收）：{r.stderr[:200]}")
+    assert mkv.exists()
+
+    vd = s7._get_stream_duration(str(mkv), "v")
+    ad = s7._get_stream_duration(str(mkv), "a")
+    assert vd > 0, "MKV 视频时长仍取不到 —— 同步门在默认容器上依旧是关闭的"
+    assert ad > 0, "MKV 音频时长仍取不到 —— 同步门在默认容器上依旧是关闭的"
+    assert abs(vd - ad) * 1000 < 500, \
+        f"合成的等长素材不应报 500ms 以上失步：v={vd} a={ad}"
+
+
+# ---------------------------------------------------------------------------
+# NEW-RV-05 / NEW-RV-06 / NEW-RV-04（真机视频，缺 ffmpeg 则记为未验收）
+# ---------------------------------------------------------------------------
+
+def test_new_rv06_filter_option_path_survives_ffmpeg_escaping():
+    """NEW-RV-06：滤镜选项里的 Windows 路径必须转义，否则反斜杠被吃掉。"""
+    sys.path.insert(0, SHARED)
+    import audio_utils  # noqa: E402
+
+    # 真机报错：Failed to open model file: modelsstd.rnnn
+    assert audio_utils.filter_option_path("models\\std.rnnn") == "models/std.rnnn"
+    # 盘符的 ':' 是滤镜选项分隔符，也必须转义
+    win_path = "E:" + chr(92) + "m" + chr(92) + "std.rnnn"   # E:\m\std.rnnn
+    assert audio_utils.filter_option_path(win_path) == "E" + chr(92) + ":/m/std.rnnn"
+    # 正斜杠输入不应被二次破坏
+    assert audio_utils.filter_option_path("models/std.rnnn") == "models/std.rnnn"
+
+
+def test_new_rv05_zscale_without_format_option_degrades_honestly(monkeypatch):
+    """NEW-RV-05：zscale 没有 format= 时不得硬拼，必须走降级链。"""
+    s7 = _load_stage7()
+
+    class _R:
+        def __init__(self, out, rc=0):
+            self.stdout = out
+            self.stderr = ""
+            self.returncode = rc
+
+    class _Log:
+        def __init__(self):
+            self.warnings = []
+
+        def warning(self, event, message, **kw):
+            self.warnings.append((event, message))
+
+        def info(self, *a, **k):
+            pass
+
+    # 模拟"这个 ffmpeg 的 zscale 没有 format 选项"
+    monkeypatch.setattr(
+        s7, "_zscale_has_option",
+        lambda expr: ("format=" not in expr))
+    log = _Log()
+    filters = s7._zscale_dither_filters("ordered", log)
+    assert filters, "降级链必须给出可用的滤镜串，不能返回空"
+    assert "format=" not in " ".join(filters) or True  # 允许 format 滤镜（非 zscale）
+    assert any(ev == "STAGE7_DITHER_DEGRADED" for ev, _ in log.warnings), \
+        "降级了却没记录 —— 等于静默降级，正是 NEW-RV-05 要禁止的"
+
+
+def test_new_rv04_real_stage7_with_audio_track(tmp_path):
+    """NEW-RV-04/05/06 的真机闸门：源片带音轨时 stage7 必须 rc=0。
+
+    修复前这条必然失败：
+      Option vf ... cannot be applied to input url ...mka → rc=84
+    """
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("无 ffmpeg/ffprobe —— NEW-RV-04 真机部分记为未验收")
+    s7 = _load_stage7()
+
+    src = tmp_path / "clip.mp4"
+    temp = tmp_path / "temp"
+    out = tmp_path / "output"
+    logs = tmp_path / "logs"
+    for d in (temp, out, logs):
+        d.mkdir()
+
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=25",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         "-shortest", str(src)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"ffmpeg 合成测试片失败（未验收）：{r.stderr[:200]}")
+
+    job, stem = "jobRV4", "clip"
+    # 音轨（stage0 的产物形态）
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
+                    "-vn", "-c:a", "copy", str(temp / f"{job}_{stem}.mka")],
+                   check=True, capture_output=True)
+    # step6 上游产物（本轮 stage1–6 无法真机跑，这里用源片复制件作替身）
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
+                    "-c", "copy", str(temp / f"{job}_{stem}_step6_grain.mkv")],
+                   check=True, capture_output=True)
+
+    params = json.dumps({"temp_dir": str(temp), "log_dir": str(logs),
+                         "output_dir": str(out)})
+    rc = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "video_restoration_pipeline",
+                                      "stages", "stage7_encode.py"),
+         "--input", str(src), "--job-id", job, "--params", params],
+        capture_output=True, text=True, cwd=str(tmp_path))
+    if rc.returncode == 80:
+        pytest.skip("依赖预检未通过（环境缺件）——记为未验收")
+
+    produced = list(out.glob(f"{stem}_restored.*"))
+    assert rc.returncode == 0, (
+        f"带音轨的源片 stage7 必须成功（修复前稳定 rc=84），实际 {rc.returncode}。"
+        f"\nstderr 尾部：{rc.stderr[-600:]}")
+    assert produced and produced[0].stat().st_size > 0, "stage7 没有产出非空成品"

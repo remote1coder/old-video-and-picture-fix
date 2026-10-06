@@ -231,7 +231,7 @@ def check_ffmpeg_filters_minimal_calls(pipeline_type: str = "photo") -> List[str
     if arnndn_model.exists():
         code, _, err = run_cmd([
             "ffmpeg", "-f", "lavfi", "-i", "sine=frequency=50:duration=1",
-            "-af", f"arnndn=m={arnndn_model}",
+            "-af", f"arnndn=m={filter_option_path(arnndn_model)}",
             "-f", "null", "-"
         ], timeout=15)
         if code != 0:
@@ -279,6 +279,47 @@ def _ver_lt(a, b) -> bool:
     return pa < pb
 
 
+def _iter_vs_plugins(core: Any) -> List[Dict[str, Any]]:
+    """NEW-RV-02: enumerate loaded VapourSynth plugins across API generations.
+
+    * VapourSynth R81: ``core.plugins()`` → iterable of ``Plugin`` objects with
+      ``name`` / ``namespace`` / ``version`` attributes.
+    * Older cores: ``core.get_plugins()`` → dict of ``{id: {...}}``.
+
+    Returns a normalised list of dicts so the caller never has to care.
+    """
+    raw: Any = None
+    if hasattr(core, "plugins"):
+        try:
+            raw = list(core.plugins())
+        except Exception:
+            raw = None
+    if raw is None and hasattr(core, "get_plugins"):
+        try:
+            got = core.get_plugins()
+            raw = list(got.values()) if isinstance(got, dict) else list(got)
+        except Exception:
+            raw = None
+    if not raw:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append({
+                "name": str(item.get("name", "")),
+                "namespace": str(item.get("namespace", "")),
+                "version": item.get("version"),
+            })
+        else:
+            out.append({
+                "name": str(getattr(item, "name", "") or ""),
+                "namespace": str(getattr(item, "namespace", "") or ""),
+                "version": getattr(item, "version", None),
+            })
+    return out
+
+
 def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
     """Check VapourSynth plugins. Skipped for photo pipeline."""
     if pipeline_type == "photo":
@@ -287,13 +328,18 @@ def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
     try:
         import vapoursynth as vs
         core = vs.core
-        plugins = core.get_plugins()
+        # NEW-RV-02（本机实测 VapourSynth R81）：``core.get_plugins()`` 已被
+        # 移除，调用它抛 "No attribute with the name get_plugins exists..."，
+        # 于是整个插件检查变成一条"检查出错"的阻断项 —— 真正的缺失插件反而
+        # 一条都没列出来。R81 的 API 是 ``core.plugins()``，返回 Plugin 对象
+        # 的可迭代对象（属性 name/namespace/version），不再是 {id: dict}。
+        plugins = _iter_vs_plugins(core)
         loaded = set()
         # FIX-P2-4: capture version strings (best-effort) for min-version check
         plugin_versions: Dict[str, str] = {}
-        for pid, pinfo in plugins.items():
-            name = pinfo.get("name", "").lower()
-            namespace = pinfo.get("namespace", "").lower()
+        for pinfo in plugins:
+            name = str(pinfo.get("name", "")).lower()
+            namespace = str(pinfo.get("namespace", "")).lower()
             loaded.add(name)
             loaded.add(namespace)
             ver = pinfo.get("version")

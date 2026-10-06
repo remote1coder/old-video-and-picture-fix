@@ -31,6 +31,36 @@ except ImportError:
         _HAS_MSVCRT = False
 
 
+# --- RV-01: 真正的级别过滤 -------------------------------------------------
+# 背景（真实 CLI 复现）：video_restoration_pipeline/main.py:799 / :743 调用
+# ``get_logger(..., level=cfg["log_level"])``，而 ``StructuredLogger.__init__``
+# 不接受 level，于是正式入口在**依赖预检之前**就以
+# ``TypeError: unexpected keyword argument 'level'`` 退出（rc=1）。
+# 修法不是用 **kwargs 把参数吞掉（那只是让测试不报错），而是真正实现级别过滤，
+# 并让 get_logger 的 ``level`` 实参落到实现上。
+LOG_LEVEL_ORDER: Dict[str, int] = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARN": 30,
+    "WARNING": 30,
+    "ERROR": 40,
+    "CRITICAL": 50,
+}
+#: 默认不过滤任何级别（保持修复前的行为，避免悄悄丢日志）
+DEFAULT_LOG_LEVEL = "DEBUG"
+
+
+def _normalize_level(level: Any) -> str:
+    """Map a configured level onto a known name. Unknown → DEBUG (no filter)."""
+    if level is None:
+        return DEFAULT_LOG_LEVEL
+    name = str(level).strip().upper()
+    if name in LOG_LEVEL_ORDER:
+        return "WARNING" if name == "WARN" else name
+    # 未知级别不猜：退回"不过滤"，由调用方决定是否记录告警
+    return DEFAULT_LOG_LEVEL
+
+
 class StructuredLogger:
     """Structured JSON Lines logger with per-job log files."""
 
@@ -39,7 +69,8 @@ class StructuredLogger:
                  job_id: Optional[str] = None,
                  log_max_lines: int = 10000,
                  log_backup_count: int = 5,
-                 log_max_line_bytes: int = 1048576):
+                 log_max_line_bytes: int = 1048576,
+                 level: Any = DEFAULT_LOG_LEVEL):
         self.log_dir = Path(log_dir).resolve()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.job_id = job_id
@@ -47,6 +78,9 @@ class StructuredLogger:
         self.log_backup_count = log_backup_count
         self.log_max_line_bytes = log_max_line_bytes
         self.lock = threading.Lock()
+        # RV-01: 真实实现级别过滤（此前该实参根本不被接受）。
+        self.level = _normalize_level(level)
+        self.level_value = LOG_LEVEL_ORDER[self.level]
         # FIX-P3-1: Track line count for rotation instead of size estimation
         # per v7.32 §3.10.12
         self._line_count = 0
@@ -63,6 +97,19 @@ class StructuredLogger:
             # rotated by line count. A single shared file is safe here
             # because all writes go through the cross-process lock below.
             self.log_file = self.log_dir / "general.log"
+
+    def _is_filtered(self, level: str) -> bool:
+        """RV-01: True when `level` is below the configured threshold."""
+        try:
+            return LOG_LEVEL_ORDER[str(level).strip().upper()] < self.level_value
+        except KeyError:
+            # 未知级别一律放行：宁可多写一条，也不能悄悄丢掉诊断信息
+            return False
+
+    def set_level(self, level: Any) -> None:
+        """RV-01: change the threshold at runtime (used by worker/main)."""
+        self.level = _normalize_level(level)
+        self.level_value = LOG_LEVEL_ORDER[self.level]
 
     def _get_current_line_count(self) -> int:
         """Count current lines in log file (called before each write)."""
@@ -170,6 +217,9 @@ class StructuredLogger:
 
     def log(self, level: str, event: str, message: str, **kwargs):
         """Write a structured log entry."""
+        # RV-01: 级别过滤真正生效（entry 的 level 字段保持调用方给的原文）
+        if self._is_filtered(level):
+            return
         # FIX-P1-3: Truncate large fields by byte length per v7.32 §3.10.12
         for key, value in kwargs.items():
             vbytes = str(value).encode("utf-8")
@@ -307,14 +357,31 @@ _loggers_lock = threading.Lock()
 
 def get_logger(log_dir: str = "./logs",
                job_id: Optional[str] = None,
+               level: Any = None,
                **kwargs) -> StructuredLogger:
-    """Singleton factory: returns existing logger for job_id, or creates new one."""
+    """Singleton factory: returns existing logger for job_id, or creates new one.
+
+    RV-01: ``level`` is an explicitly supported argument (video main.py passes
+    ``global.log_level``). ORIGINAL forwarded every kwarg straight into
+    ``StructuredLogger.__init__``, which did not accept ``level`` — the video
+    CLI died with ``TypeError: unexpected keyword argument 'level'`` before the
+    dependency pre-check. The parameter is now implemented as real threshold
+    filtering instead of being swallowed by ``**kwargs``.
+    """
+    if level is not None:
+        kwargs["level"] = level
     if job_id:
         key = f"{log_dir}/{job_id}"
         with _loggers_lock:
-            if key not in _loggers:
-                _loggers[key] = StructuredLogger(log_dir=log_dir, job_id=job_id, **kwargs)
-            return _loggers[key]
+            existing = _loggers.get(key)
+            if existing is None:
+                _loggers[key] = StructuredLogger(log_dir=log_dir,
+                                                 job_id=job_id, **kwargs)
+                return _loggers[key]
+            if level is not None:
+                # 单例已存在时也要让新传入的级别生效，否则"配置改了没效果"
+                existing.set_level(level)
+            return existing
     return StructuredLogger(log_dir=log_dir, job_id=job_id, **kwargs)
 
 

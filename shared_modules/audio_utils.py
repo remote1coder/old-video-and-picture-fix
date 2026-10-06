@@ -309,6 +309,20 @@ def _get_ffmpeg_version() -> Tuple[bool, str]:
     return False, "unknown"
 
 
+def filter_option_path(path: str) -> str:
+    """NEW-RV-06: escape a filesystem path for use **inside** an ffmpeg filter option.
+
+    真机复现（Windows + ffmpeg 2023-11-13）：把 ``models\\std.rnnn`` 直接写进
+    ``-af arnndn=m=...`` 后，ffmpeg 报
+    ``Failed to open model file: modelsstd.rnnn`` —— 滤镜图解析器把 ``\\s`` 当成
+    转义序列，反斜杠被吃掉，路径整个变形，stage7 因此 rc=84。
+    修法：统一成正斜杠，并把滤镜语法里的分隔符 ``:`` 转义掉。
+    """
+    text = str(path).replace("\\", "/")
+    # ffmpeg 滤镜选项里 ':' 是选项分隔符，必须转义
+    return text.replace(":", r"\:")
+
+
 def _get_arnndn_model_path(config: Dict[str, Any], primary_freq: int) -> Optional[str]:
     """Get arnndn model path.
 
@@ -505,7 +519,7 @@ def process_audio(audio_path: str, output_path: str,
                         for i, ch in enumerate(ch_names):
                             fc_parts.append(f"[0:a]pan=mono|c0={ch}[ch{i}]")
                             fc_parts.append(
-                                f"[ch{i}]arnndn=m={arnndn_model}[ch{i}_h]"
+                                f"[ch{i}]arnndn=m={filter_option_path(arnndn_model)}[ch{i}_h]"
                             )
                         merge_inputs = "".join(
                             f"[ch{i}_h]" for i in range(len(ch_names))
@@ -520,7 +534,7 @@ def process_audio(audio_path: str, output_path: str,
                                    f"{num_channels}ch (FFmpeg <4.4)",
                                    model=arnndn_model)
                     else:
-                        filters.append(f"arnndn=m={arnndn_model}")
+                        filters.append(f"arnndn=m={filter_option_path(arnndn_model)}")
                         logger.info("AUDIO_HUM_ARNNDN",
                                    f"Using arnndn for {primary_freq}Hz hum "
                                    f"removal (FFmpeg <4.4)",
@@ -586,7 +600,7 @@ def process_audio(audio_path: str, output_path: str,
                                 f"[dch{i}]"
                             )
                             fc_parts.append(
-                                f"[dch{i}]arnndn=m={arnndn_model}"
+                                f"[dch{i}]arnndn=m={filter_option_path(arnndn_model)}"
                                 f"[dch{i}_out]"
                             )
                         merge_inputs = "".join(
@@ -617,12 +631,12 @@ def process_audio(audio_path: str, output_path: str,
                                     f"[ch{i}]{br_chain}[ch{i}_br]"
                                 )
                                 fc_parts.append(
-                                    f"[ch{i}_br]arnndn=m={arnndn_model}"
+                                    f"[ch{i}_br]arnndn=m={filter_option_path(arnndn_model)}"
                                     f"[ch{i}_d]"
                                 )
                             else:
                                 fc_parts.append(
-                                    f"[ch{i}]arnndn=m={arnndn_model}"
+                                    f"[ch{i}]arnndn=m={filter_option_path(arnndn_model)}"
                                     f"[ch{i}_d]"
                                 )
                         merge_inputs = "".join(
@@ -640,7 +654,7 @@ def process_audio(audio_path: str, output_path: str,
                             f"{num_channels}ch",
                             model=arnndn_model)
                 else:
-                    filters.append(f"arnndn=m={arnndn_model}")
+                    filters.append(f"arnndn=m={filter_option_path(arnndn_model)}")
                     logger.info("AUDIO_DENOISE",
                                "Using arnndn noise reduction",
                                model=arnndn_model)
