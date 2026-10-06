@@ -1,4 +1,5 @@
 /temp1/
+/logs/
 *_output.txt
 __pycache__/
 *-audit.md

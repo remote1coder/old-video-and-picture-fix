@@ -13,11 +13,14 @@ v7.32 Compliance:
 
 import os
 import sys
+import json
 import time
 import uuid
+import hashlib
 import argparse
 import subprocess
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 # Add shared_modules to path
@@ -27,7 +30,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 from manifest_loader import (  # noqa: E402
     load_manifest, filter_jobs, save_manifest, update_job_status,
-    save_manifest_job_result,
+    save_manifest_job_result, acquire_run_ownership,
 )
 from checkpoint import cleanup_old_intermediates, check_wsl_space  # noqa: E402
 
@@ -433,6 +436,125 @@ def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
     return candidates
 
 
+# --- RV-09: 产物身份（resume 不能再"只看名字 + 能解码"）------------------
+#: 实现/恢复契约版本。改动产物语义时必须升版本，否则旧产物的身份无法区分。
+VIDEO_IMPL_VERSION = "video-pipeline/2.0-resume-identity"
+
+
+def _chunked_sha256(path: str, chunk: int = 1 << 20) -> Optional[str]:
+    """Content fingerprint: whole file when small, head+tail+size otherwise.
+
+    mtime 不能作为身份（复制/重写都会变），只用 size + 内容。
+    """
+    try:
+        size = os.path.getsize(path)
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            h.update(f.read(chunk))
+            if size > 2 * chunk:
+                f.seek(-chunk, os.SEEK_END)
+                h.update(f.read(chunk))
+        h.update(str(size).encode("ascii"))
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def build_input_identity(input_path: str) -> Dict[str, Any]:
+    """RV-09: identity of the *source* material an artifact was made from."""
+    ident: Dict[str, Any] = {"path": str(input_path), "size": None,
+                             "digest": None}
+    try:
+        st = os.stat(input_path)
+        ident["size"] = st.st_size
+    except Exception:
+        pass
+    ident["digest"] = _chunked_sha256(input_path)
+    return ident
+
+
+def build_params_identity(config: Dict[str, Any], job: Dict[str, Any],
+                          logger=None) -> str:
+    """RV-09: digest of the *effective* parameters of this job.
+
+    Uses the real 6-layer merge (merge_params) so a changed config or a changed
+    user override invalidates previously produced artifacts.
+    """
+    try:
+        params = merge_params(job, config, {}, logger)
+    except Exception:
+        params = dict(job or {})
+    payload = json.dumps(params, sort_keys=True, ensure_ascii=False,
+                         default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def completion_marker_path(final_path: str) -> str:
+    return str(final_path) + ".done.json"
+
+
+def write_completion_marker(final_path: str, job: Dict[str, Any],
+                            config: Dict[str, Any], logger=None) -> bool:
+    """RV-09: record *what* this artifact is, next to the artifact itself.
+
+    Without it, resume can only check "a file with this name exists and
+    decodes" — which is satisfied by a different input, a different config or
+    a different job that happens to share the basename.
+    """
+    payload = {
+        "impl": VIDEO_IMPL_VERSION,
+        "job_id": job.get("job_id", ""),
+        "input_path": job.get("input_path", ""),
+        "input_identity": build_input_identity(job.get("input_path", "")),
+        "params_identity": build_params_identity(config, job, logger),
+        "output_path": str(final_path),
+        "output_size": (os.path.getsize(final_path)
+                        if os.path.exists(final_path) else None),
+        "completed_at": datetime.now().astimezone().isoformat(),
+    }
+    try:
+        tmp = completion_marker_path(final_path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
+        os.replace(tmp, completion_marker_path(final_path))
+        return True
+    except Exception as e:
+        if logger:
+            logger.warning("COMPLETION_MARKER_FAIL",
+                           f"Could not record completion marker: {e}")
+        return False
+
+
+def resume_artifact_matches(final_path: str, job: Dict[str, Any],
+                            config: Dict[str, Any],
+                            logger=None) -> Tuple[bool, str]:
+    """RV-09: decide whether `final_path` really belongs to *this* job."""
+    marker = completion_marker_path(final_path)
+    if not os.path.exists(marker):
+        return False, ("no completion marker; the artifact cannot be bound to "
+                       "this job's input/params")
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"unreadable completion marker: {e}"
+    if str(data.get("impl", "")) != VIDEO_IMPL_VERSION:
+        return False, (f"produced by implementation {data.get('impl')!r}, "
+                       f"current is {VIDEO_IMPL_VERSION!r}")
+    if str(data.get("job_id", "")) != str(job.get("job_id", "")):
+        return False, (f"belongs to job {data.get('job_id')!r}, "
+                       f"not {job.get('job_id')!r}")
+    recorded = data.get("input_identity") or {}
+    current = build_input_identity(job.get("input_path", ""))
+    if recorded.get("digest") and current.get("digest") and \
+            recorded["digest"] != current["digest"]:
+        return False, "input content changed since the artifact was produced"
+    if str(data.get("params_identity", "")) and \
+            data["params_identity"] != build_params_identity(config, job, logger):
+        return False, "effective parameters changed since it was produced"
+    return True, "identity-match"
+
+
 def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
                       args) -> List[str]:
     """FIX-V03: locate the stage7 final output.
@@ -440,6 +562,11 @@ def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
     Stage7 writes to ``output_dir`` (stage7_encode.py:517-521), NOT to temp, so
     a completed job may have no ``step7`` file in temp_dir at all. The old
     resume scan only looked in temp_dir and therefore never saw finished jobs.
+
+    RV-09: the plain ``{stem}_restored.*`` name is NOT job-specific, so two jobs
+    whose inputs share a basename resolve to the same file. Candidates are now
+    ordered explicit-output → job-scoped name → plain name, and callers must
+    still verify identity via :func:`resume_artifact_matches`.
     """
     import glob
     candidates: List[str] = []
@@ -454,10 +581,57 @@ def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
     if not output_dir:
         output_dir = config.get("global", {}).get("output_dir", "./output")
     stem = _safe_input_stem(job.get("input_path", ""))
-    candidates.extend(sorted(
+    job_id = str(job.get("job_id", "") or "")
+    # RV-09: 同名不同 job 的候选：{stem}_{job_id}_restored.* 由
+    # _ensure_unique_final_outputs 在检测到冲突时产生。
+    job_scoped: List[str] = []
+    if job_id:
+        job_scoped = sorted(
+            glob.glob(str(Path(output_dir) / f"{stem}_{job_id}_restored.*")),
+            key=lambda p: os.path.getmtime(p), reverse=True)
+    plain = sorted(
         glob.glob(str(Path(output_dir) / f"{stem}_restored.*")),
-        key=lambda p: os.path.getmtime(p), reverse=True))
+        key=lambda p: os.path.getmtime(p), reverse=True)
+    candidates.extend(job_scoped + plain)
     return candidates
+
+
+def _ensure_unique_final_outputs(jobs: List[Dict[str, Any]],
+                                 config: Dict[str, Any], args,
+                                 logger=None) -> None:
+    """RV-09: two jobs with the same basename must not share one output path.
+
+    The default name is ``{output_dir}/{stem}_restored.mkv``; two jobs from
+    different input directories with the same filename therefore collide and
+    one silently overwrites the other. When a collision is detected the later
+    job gets a job-scoped name (single jobs are unaffected, so existing output
+    names are preserved).
+    """
+    seen: Dict[str, str] = {}
+    for job in jobs:
+        if job.get("output_path"):
+            continue
+        stem = _safe_input_stem(job.get("input_path", ""))
+        output_dir = ""
+        if isinstance(args, dict):
+            output_dir = args.get("output") or ""
+        else:
+            output_dir = getattr(args, "output", "") or ""
+        if not output_dir:
+            output_dir = config.get("global", {}).get("output_dir", "./output")
+        default_path = str(Path(output_dir) / f"{stem}_restored.mkv")
+        if default_path in seen:
+            job_id = str(job.get("job_id", "") or "job")
+            unique = str(Path(output_dir) / f"{stem}_{job_id}_restored.mkv")
+            job["output_path"] = unique
+            if logger:
+                logger.warning(
+                    "FINAL_OUTPUT_COLLISION",
+                    f"Job {job_id} would write to the same final path as "
+                    f"{seen[default_path]}; using a job-scoped name instead",
+                    collided=default_path, used=unique)
+        else:
+            seen[default_path] = str(job.get("job_id", ""))
 
 
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
@@ -724,6 +898,17 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             cleanup_old_intermediates(temp_dir, job_id, keep_steps)
 
     logger.info("JOB_DONE", f"Job {job_id} complete")
+    # RV-09: 成功后写下"这个产物是用哪个输入/哪套参数做出来的"，
+    # 否则下一次运行没有任何依据判断能否复用。
+    try:
+        finals = find_final_output(job, config, args)
+        for cand in finals:
+            if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                write_completion_marker(cand, job, config, job_logger)
+                break
+    except Exception as e:
+        job_logger.warning("COMPLETION_MARKER_SKIP",
+                           f"Could not record completion identity: {e}")
     return 0, ""
 
 
@@ -740,34 +925,93 @@ def _worker_wrapper(task: Dict[str, Any]) -> str:
     args = task["args"]
 
     jcfg = load_config(config_path)
-    jlogger = get_logger(log_dir=log_dir, level=jcfg.get("global", {}).get("log_level", "INFO"))
+    # RV-01: level 现在被 logger 真正实现（不再是非法实参）
+    jlogger = get_logger(log_dir=log_dir,
+                         level=jcfg.get("global", {}).get("log_level", "INFO"))
     jmanifest = load_manifest(manifest_path)
     # FIX-V08: worker 只报告自己的 job 结果（锁内读-合并-写），不再整份回写快照
-    _run_single_job(job, jcfg, args, jlogger, jmanifest, manifest_path,
-                    attempt_group=task.get("manifest_attempt_group"))
-    return job["job_id"]
+    # RV-10: 必须把结构化结果 **返回给父进程**，否则父进程无从聚合失败
+    # （ORIGINAL 只返回 job_id，父进程末尾无条件打印 Done、退出码恒为 0）。
+    return _run_single_job(job, jcfg, args, jlogger, jmanifest, manifest_path,
+                           attempt_group=task.get("manifest_attempt_group"),
+                           owner=task.get("manifest_owner"),
+                           generation=task.get("manifest_generation"))
+
+
+# --- RV-10: 结构化任务结果（父进程据此聚合，不再"无条件成功"）--------------
+#: 正常完成
+JOB_DONE = "DONE"
+#: 处理失败
+JOB_FAILED = "FAILED"
+#: 被取消/中断（退出码 88）
+JOB_CANCELLED = "cancelled"
+#: 结果没能落到 manifest（保存失败）——不能当成成功
+JOB_PERSIST_FAILED = "persist-failed"
+#: manifest 写入/IO 失败的退出码（AGENTS.md §4.4：82 = I/O error）
+EXIT_PERSIST_FAILED = 82
+#: 被信号中断（与 shared_modules/cancel_guard.EXIT_INTERRUPTED 一致）
+EXIT_INTERRUPTED = 88
+
+
+def _result(job_id: str, status: str, exit_code: int,
+            error: str = "") -> Dict[str, Any]:
+    return {"job_id": job_id, "status": status, "exit_code": int(exit_code),
+            "error": error}
+
+
+def aggregate_results(results: List[Dict[str, Any]], logger=None) -> int:
+    """RV-10: fold per-job results into a single exit code.
+
+    Returns 0 only when every job reported DONE. Otherwise the most severe
+    observed exit code is returned (project range 80–113), so a failed batch
+    can never leave the CLI with rc=0.
+    """
+    if not results:
+        return 0
+    counts: Dict[str, int] = {}
+    for r in results:
+        counts[r.get("status", "?")] = counts.get(r.get("status", "?"), 0) + 1
+    failures = [r for r in results if r.get("status") != JOB_DONE]
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    if logger is not None:
+        (logger.error if failures else logger.info)(
+            "BATCH_SUMMARY",
+            f"{len(results) - len(failures)}/{len(results)} jobs complete "
+            f"({summary})",
+            counts=counts)
+    if not failures:
+        return 0
+    codes = [int(r.get("exit_code") or 0) for r in failures]
+    # 取最严重（数值最大）的失败码；未知时落到 86（校验/处理失败）
+    worst = max(codes) if codes else 0
+    return worst if worst > 0 else 86
 
 
 def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
                     args, logger, manifest: Dict[str, Any], manifest_path: str,
-                    attempt_group: Optional[str] = None):
+                    attempt_group: Optional[str] = None,
+                    owner: Optional[str] = None,
+                    generation: Optional[int] = None) -> Dict[str, Any]:
     """Run a single job with retry logic and manifest update.
 
     FIX-V08: manifest persistence goes through save_manifest_job_result
     (locked read-merge-write of one job). ORIGINAL saved the worker's whole
     stale snapshot, so a concurrent worker's completion was lost.
+
+    RV-10: returns a **structured result**. ORIGINAL returned nothing, so the
+    parent could not tell success from failure and always exited 0 — while in
+    memory the job was already marked FAILED. A result that cannot be
+    persisted is reported as ``persist-failed`` (never as success).
     """
     job_id = job["job_id"]
     retry_count = config.get("global", {}).get("retry_count", 2)
     success = False
     final_attempt = 0
     last_error = ""
+    exit_code = 0
     for attempt in range(retry_count + 1):
         exit_code, stderr = process_job(job, config, args, logger)
         if exit_code in (0, 3):
-            save_manifest_job_result(manifest_path, job_id, "DONE",
-                                     attempt=attempt,
-                                     attempt_group=attempt_group)
             success = True
             final_attempt = attempt
             break
@@ -781,14 +1025,28 @@ def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
             else:
                 final_attempt = attempt
                 break
-    if not success:
-        save_manifest_job_result(manifest_path, job_id, "FAILED",
-                                 error_message=last_error,
-                                 attempt=final_attempt,
-                                 attempt_group=attempt_group)
-    # 内存快照同步（供本次进程内后续逻辑读取）；落盘由上面的锁定单任务更新完成
+    status = JOB_DONE if success else JOB_FAILED
+    if not success and exit_code == EXIT_INTERRUPTED:
+        status = JOB_CANCELLED
+    # 内存快照同步（供本次进程内后续逻辑读取）；落盘由下面的锁定单任务更新完成
     update_job_status(manifest, job_id, "DONE" if success else "FAILED",
                       error_message=last_error)
+
+    saved = save_manifest_job_result(manifest_path, job_id,
+                                     "DONE" if success else "FAILED",
+                                     error_message=last_error,
+                                     attempt=final_attempt,
+                                     attempt_group=attempt_group,
+                                     owner=owner, generation=generation)
+    if not saved:
+        # 结果没落盘 = 这次运行不能被算作完成：重跑时必须重新处理
+        logger.error("JOB_RESULT_PERSIST_FAILED",
+                     f"Job {job_id} result could not be written to the "
+                     "manifest; reporting it as NOT complete",
+                     job_id=job_id, status=status)
+        return _result(job_id, JOB_PERSIST_FAILED, EXIT_PERSIST_FAILED,
+                       last_error or "manifest save failed")
+    return _result(job_id, status, 0 if success else int(exit_code), last_error)
 
 
 def main():
@@ -872,18 +1130,31 @@ def main():
         # FIX-W7: wrap execution in try/finally so the temporary quick manifest
         # is removed even if a job crashes mid-batch. ORIGINAL only unlinked on
         # the happy path, leaving batch_manifest_quick.yaml behind on crash.
+        # RV-10: 串行路径也必须收集结构化结果并聚合退出码
+        results: List[Dict[str, Any]] = []
         try:
             manifest = load_manifest(manifest_path)
             jobs = filter_jobs(manifest, ["PENDING"])
             logger.info("QUICK_START", f"Quick mode: {len(jobs)} jobs")
             print(f"Quick mode: scanning done, executing {len(jobs)} jobs...")
             for job in jobs:
-                _run_single_job(job, config, args, logger, manifest, manifest_path)
+                results.append(_run_single_job(job, config, args, logger,
+                                               manifest, manifest_path))
         finally:
             try:
                 Path(manifest_path).unlink(missing_ok=True)
             except Exception:
                 pass
+        rc = aggregate_results(results, logger)
+        if rc != 0:
+            for r in results:
+                if r["status"] != JOB_DONE:
+                    print(f"[{r['job_id']}] {r['status']} "
+                          f"(exit {r['exit_code']})", file=sys.stderr)
+            logger.info("PIPELINE_DONE",
+                        f"Video pipeline finished with failures (quick mode, rc={rc})")
+            print("Finished with failures.", file=sys.stderr)
+            sys.exit(rc)
         logger.info("PIPELINE_DONE", "Video pipeline complete (quick mode)")
         print("Done.")
         return
@@ -957,11 +1228,21 @@ def main():
                 print("AI upscale disabled for this file.")
                 job.setdefault("user_overrides", {})["ai_enabled"] = False
         # Run single job
-        _run_single_job(job, config, args, logger, manifest, manifest_path)
+        # RV-10: 单任务模式同样要按结果决定退出码
+        _res = _run_single_job(job, config, args, logger, manifest, manifest_path)
         try:
             Path(manifest_path).unlink(missing_ok=True)
         except Exception:
             pass
+        rc = aggregate_results([_res], logger)
+        if rc != 0:
+            print(f"[{job['job_id']}] {_res['status']} "
+                  f"(exit {_res['exit_code']})", file=sys.stderr)
+            logger.info("PIPELINE_DONE",
+                        f"Video pipeline finished with failures "
+                        f"(interactive mode, rc={rc})")
+            print("Finished with failures.", file=sys.stderr)
+            sys.exit(rc)
         logger.info("PIPELINE_DONE", "Video pipeline complete (interactive mode)")
         print("Done.")
         return
@@ -992,19 +1273,35 @@ def main():
                 continue
             job_id = job.get("job_id", "")
             input_path = job.get("input_path", "")
+            # RV-09: 素材换了就绝不复用旧 intermediate —— 中间产物的名字里
+            # 只有 job_id/stem/stage/param_hash，无法反映"输入内容是否变了"。
+            current_ident = build_input_identity(input_path)
+            recorded_ident = job.get("input_identity")
+            input_changed = bool(
+                isinstance(recorded_ident, dict) and
+                recorded_ident.get("digest") and current_ident.get("digest") and
+                recorded_ident["digest"] != current_ident["digest"])
+            if input_changed:
+                logger.info("RESUME_INPUT_CHANGED",
+                            f"Job {job_id}: input content changed since the "
+                            "intermediates were produced; recomputing from "
+                            "scratch", input=input_path)
+            job["input_identity"] = current_ident
             last_completed = -1
-            # FIX-P5-6: Scan step0..step7 to find highest valid intermediate, check all candidates
-            # FIX-V03: use the shared artifact-identity helper (stem, not name)
-            for stage_num in range(7, -1, -1):
-                candidates = find_stage_artifacts(temp_dir, job_id, input_path,
-                                                  stage_num)
-                if candidates:
-                    for cand in candidates:
-                        if verify_ffprobe_decodeable(cand):
-                            last_completed = stage_num
+            if not input_changed:
+                # FIX-P5-6: Scan step0..step7 to find highest valid intermediate,
+                # check all candidates
+                # FIX-V03: use the shared artifact-identity helper (stem, not name)
+                for stage_num in range(7, -1, -1):
+                    candidates = find_stage_artifacts(temp_dir, job_id, input_path,
+                                                      stage_num)
+                    if candidates:
+                        for cand in candidates:
+                            if verify_ffprobe_decodeable(cand):
+                                last_completed = stage_num
+                                break
+                        if last_completed >= 0:
                             break
-                    if last_completed >= 0:
-                        break
             job["last_completed_stage"] = last_completed
             if last_completed >= 0:
                 logger.info("FAILED_DOWNGRADE",
@@ -1046,13 +1343,27 @@ def main():
                 # FIX-V03: temp 内的 step7 中间产物 + output_dir 的最终产物都要看
                 candidates = find_stage_artifacts(temp_dir, job_id, input_path, 7)
                 candidates += find_final_output(job, config, args)
+                # RV-09: 产物必须"能解码"**且**属于当前 job（输入内容 + 有效参数
+                # + 实现版本）。只查名字和可解码性会把别的 job / 别的参数 / 别的
+                # 素材的产物当成自己的成果。
                 for cand in candidates:
-                    if verify_ffprobe_decodeable(cand):
-                        step7_done = True
-                        logger.info("RESUME_DONE",
-                                   f"Job {job_id} has valid final output {cand}, marking DONE")
-                        job["status"] = "DONE"
-                        break
+                    if not verify_ffprobe_decodeable(cand):
+                        continue
+                    ok, reason = resume_artifact_matches(cand, job, config,
+                                                         logger)
+                    if not ok:
+                        logger.info("RESUME_REJECTED",
+                                    f"Job {job_id}: {cand} is not a valid "
+                                    f"result for the current input/params "
+                                    f"({reason}); recomputing",
+                                    candidate=cand)
+                        continue
+                    step7_done = True
+                    logger.info("RESUME_DONE",
+                                f"Job {job_id} has a verified final output "
+                                f"{cand}, marking DONE", candidate=cand)
+                    job["status"] = "DONE"
+                    break
                 if not step7_done:
                     # Determine highest valid completed stage for partial resume
                     last_completed = -1
@@ -1078,6 +1389,13 @@ def main():
     else:
         # FIX-P5-5: Sort by priority per v7.32 §3.3: priority=1 first, then others
         jobs.sort(key=lambda j: (0 if j.get("priority") == 1 else 1))
+
+    # RV-09: 同名不同 job 不能共用一个最终输出路径；同时把当前输入身份写进
+    # job，供下一次运行判断"素材是否换过"。
+    _ensure_unique_final_outputs(jobs, config, args, logger)
+    for _j in jobs:
+        if not _j.get("input_identity"):
+            _j["input_identity"] = build_input_identity(_j.get("input_path", ""))
 
     logger.info("BATCH_START", f"Processing {len(jobs)} video jobs")
     print(f"Processing {len(jobs)} video jobs...")
@@ -1143,6 +1461,17 @@ def main():
         print("Preview mode complete. Inspect frames and re-run without --preview.")
         return
 
+    # RV-08: 本 run 先领取归属（generation 单调递增），迟到旧 run 的结果
+    # 会被 manifest_loader 拒绝；attempt_group 只是 UUID，没有时间顺序。
+    # 必须在串行/并行两条路径**之前**完成，否则串行分支拿不到凭据。
+    run_owner = f"video-run-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    run_generation = acquire_run_ownership(
+        manifest_path, [j.get("job_id") for j in jobs], owner=run_owner)
+    if run_generation is None:
+        logger.error("RUN_CLAIM_FAILED",
+                     "Could not claim this run's jobs in the manifest; "
+                     "refusing to report success later")
+
     # Parallel worker pool
     workers = max(1, args.workers)
     if workers > 1 and len(jobs) > 1:
@@ -1163,6 +1492,9 @@ def main():
                 "log_dir": log_dir,
                 "manifest_path": manifest_path,
                 "manifest_attempt_group": run_attempt_group,
+                # RV-08: 运行归属凭据（generation 由父进程领取后下发）
+                "manifest_owner": run_owner,
+                "manifest_generation": run_generation,
                 "args": {
                     "config": getattr(args, "config"),
                     "output": getattr(args, "output", None),
@@ -1178,24 +1510,48 @@ def main():
                 },
             })
 
+        results: List[Dict[str, Any]] = []
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_worker_wrapper, ctx): ctx for ctx in task_contexts}
             for future in as_completed(futures):
                 ctx = futures[future]
                 try:
-                    future.result()
+                    res = future.result()
+                    if not isinstance(res, dict):
+                        res = _result(ctx["job"]["job_id"], JOB_FAILED, 86,
+                                      f"unexpected worker result {res!r}")
+                    results.append(res)
                 except Exception as e:
                     logger.error("WORKER_ERROR", f"Job {ctx['job']['job_id']} failed in worker: {e}")
                     update_job_status(manifest, ctx["job"]["job_id"], "FAILED")
                     # FIX-V08: 锁定单任务更新，不再整份快照回写
-                    save_manifest_job_result(
+                    saved = save_manifest_job_result(
                         manifest_path, ctx["job"]["job_id"], "FAILED",
                         error_message=str(e)[:2000],
-                        attempt_group=run_attempt_group)
+                        attempt_group=run_attempt_group,
+                        owner=run_owner, generation=run_generation)
+                    results.append(_result(
+                        ctx["job"]["job_id"],
+                        JOB_FAILED if saved else JOB_PERSIST_FAILED,
+                        86 if saved else EXIT_PERSIST_FAILED, str(e)[:2000]))
     else:
+        results = []
         for job in jobs:
-            _run_single_job(job, config, args, logger, manifest, manifest_path,
-                            attempt_group=f"seq-{os.getpid()}-{uuid.uuid4().hex}")
+            results.append(_run_single_job(
+                job, config, args, logger, manifest, manifest_path,
+                attempt_group=f"seq-{os.getpid()}-{uuid.uuid4().hex}",
+                owner=run_owner, generation=run_generation))
+
+    # RV-10: 顶层聚合 —— 有任何失败/取消/落盘失败就不能以 0 退出
+    rc = aggregate_results(results, logger)
+    if rc != 0:
+        for r in results:
+            if r["status"] != JOB_DONE:
+                print(f"[{r['job_id']}] {r['status']} "
+                      f"(exit {r['exit_code']})", file=sys.stderr)
+        logger.info("PIPELINE_DONE", f"Video pipeline finished with failures (rc={rc})")
+        print(f"\nFinished with failures: exit {rc}", file=sys.stderr)
+        sys.exit(rc)
 
     logger.info("PIPELINE_DONE", "Video pipeline complete")
     print("Done.")

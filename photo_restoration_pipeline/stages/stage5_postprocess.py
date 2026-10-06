@@ -30,7 +30,7 @@ import glob
 import subprocess
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -78,6 +78,40 @@ def read_true_input_array(path: str):
     if arr.ndim != 3 or arr.shape[2] not in (3, 4):
         return None
     return arr
+
+
+def _resize_array_high_depth(arr: "np.ndarray", target_w: int, target_h: int):
+    """RV-06: resize a uint16 array *at* 16-bit precision.
+
+    Returns ``(resized_array, method)`` or ``(None, reason)``. cv2's Lanczos4
+    is preferred (it keeps uint16 end-to-end); scipy's cubic zoom is the
+    fallback. Nothing is silently skipped — the caller decides between an
+    authorised DEGRADED result and a hard failure.
+    """
+    import numpy as np
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    if arr.shape[2] > 4:
+        return None, f"unsupported channel count {arr.shape[2]}"
+    try:
+        import cv2  # type: ignore
+        out = cv2.resize(arr, (int(target_w), int(target_h)),
+                         interpolation=cv2.INTER_LANCZOS4)
+        if out.dtype == np.uint16:
+            if out.ndim == 2:
+                out = out[:, :, None]
+            return out, "cv2:INTER_LANCZOS4(uint16)"
+    except Exception:
+        pass
+    try:
+        from scipy import ndimage  # type: ignore
+        zoom_factors = (target_h / arr.shape[0], target_w / arr.shape[1], 1)
+        out = ndimage.zoom(arr.astype(np.float32), zoom_factors, order=3)
+        out = np.clip(out, 0, 65535).astype(np.uint16)
+        return out, "scipy:ndimage.zoom(order=3)"
+    except Exception:
+        pass
+    return None, "no high-depth resampler available (cv2 and scipy missing)"
 
 
 def _detect_text_regions(gray: np.ndarray, min_aspect_ratio: float = 2.0) -> np.ndarray:
@@ -353,7 +387,7 @@ def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
 
 def _match_portrait_color(image_path: str, face_boxes: list,
                           output_path: str, logger=None,
-                          landmarks: list = None) -> bool:
+                          landmarks: list = None) -> Dict[str, Any]:
     """Automated half-body portrait color matching per v7.32 §3.10.7.
 
     FIX-P12-6: Migrated from stage4_ai_face.py to stage5_postprocess.py.
@@ -365,6 +399,12 @@ def _match_portrait_color(image_path: str, face_boxes: list,
     face-box lower edge) and fold hand skin-tone pixels into the reference so
     the restored face matches body skin, not just neck. Falls back to geometric
     ROI when landmarks are None (YOLOv8-face).
+
+    RV-06: returns a **structured result** ``{"applied", "skipped", "reason"}``.
+    ORIGINAL returned ``True`` from the failure fallback that simply copied the
+    input through, so the caller logged "color matching applied" for pixels
+    that were never matched. A skipped/failed operation may never look like a
+    successful one.
     """
     try:
         import numpy as np
@@ -468,7 +508,9 @@ def _match_portrait_color(image_path: str, face_boxes: list,
         if face_mask.max() < 0.5:
             # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
             shutil.copyfile(image_path, output_path)
-            return True
+            # RV-06: 这是"没有可处理的区域"，不是"已应用匹配" —— 不能报成功
+            return {"applied": False, "skipped": True,
+                    "reason": "no usable face region; nothing was matched"}
 
         # Feather the mask edge
         mask_img = Image.fromarray((face_mask * 255).astype(np.uint8))
@@ -480,7 +522,7 @@ def _match_portrait_color(image_path: str, face_boxes: list,
         blended = mask_smooth * corrected + (1.0 - mask_smooth) * img_arr
         blended = np.clip(blended, 0, 255).astype(np.uint8)
         Image.fromarray(blended).save(output_path)
-        return True
+        return {"applied": True, "skipped": False, "reason": ""}
     except Exception as e:
         if logger:
             logger.warning("STAGE5_COLOR_MATCH_FAIL",
@@ -501,9 +543,15 @@ def _match_portrait_color(image_path: str, face_boxes: list,
                                f"(v7.32 §3.10.7 方案C)")
             # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
             shutil.copyfile(image_path, output_path)
-            return True
+            # RV-06: 兜底只是"把原图交回主流程"，**不是**完成了色彩匹配。
+            # ORIGINAL 返回 True，调用方据此写入"已应用匹配"的日志，
+            # 于是"请求了但没做"被记成了"做了"。
+            return {"applied": False, "skipped": True,
+                    "reason": f"portrait color matching failed: {e}"}
         except Exception:
-            return False
+            return {"applied": False, "skipped": True,
+                    "reason": "portrait color matching failed and the "
+                              "fallback could not be written"}
 
 
 def _add_grain_python(input_path: str, output_path: str,
@@ -847,7 +895,8 @@ STAGE5_CACHE_PARAM_KEYS = (
 
 # FIX-V07: 实现/模型版本。任何会改变本阶段像素输出的实现调整都应递增，
 # 否则旧产物会被当成"同一实现"而错误复用。
-STAGE5_IMPL_VERSION = "photo-stage5-postprocess/2.0-cache-identity"
+# RV-11/RV-06: 缓存身份与操作语义都变了，升版本以免误用旧 cache sidecar。
+STAGE5_IMPL_VERSION = "photo-stage5-postprocess/3.0-rv06-rv11"
 
 
 def _json_sidecar_path(artifact_path: str, kind: str) -> str:
@@ -920,12 +969,62 @@ def _file_identity(path: str) -> dict:
     return ident
 
 
+def _canonical_metadata(value: Any) -> Any:
+    """RV-11: stable representation of non-image inputs for the cache identity.
+
+    ``None`` / missing is a state of its own (encoded as ``"__absent__"``), so
+    "no metadata" → "metadata present" invalidates the cache instead of
+    silently reusing an output produced without it.
+    """
+    if value is None:
+        return "__absent__"
+    try:
+        import numpy as np
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+    except Exception:
+        pass
+    try:
+        return json.loads(json.dumps(value, sort_keys=True, default=str))
+    except Exception:
+        return repr(value)
+
+
+def _read_face_metadata(temp_dir: str, job_id: str,
+                        stem: str) -> Tuple[Optional[list], Optional[list]]:
+    """Read stage4's face metadata (RV-11: it is an input to this stage).
+
+    Returns ``(face_boxes, face_landmarks)``; ``None`` means "no metadata
+    file / unusable", which is a distinct state from an empty list.
+    """
+    face_meta_path = os.path.join(temp_dir, f"{job_id}_{stem}_face_boxes.json")
+    if not os.path.exists(face_meta_path):
+        return None, None
+    try:
+        with open(face_meta_path, "r", encoding="utf-8") as f:
+            face_meta = json.load(f)
+        boxes = face_meta.get("face_boxes", [])
+        landmarks = face_meta.get("face_landmarks", [])  # FIX-H-12-06
+        return list(boxes or []), list(landmarks or [])
+    except Exception:
+        return None, None
+
+
 def compute_stage5_cache_identity(input_source: str, params: dict,
-                                  bit_depth: int) -> dict:
-    """FIX-V07: canonical cache identity for stage5.
+                                  bit_depth: int,
+                                  face_boxes: Optional[list] = None,
+                                  face_landmarks: Optional[list] = None) -> dict:
+    """FIX-V07 / RV-11: canonical cache identity for stage5.
 
     Covers (a) upstream artifact identity, (b) params that affect this stage's
-    pixels, (c) implementation version and (d) the bit-depth contract.
+    pixels, (c) implementation version, (d) the bit-depth contract and
+    (e) **non-image inputs that actually change the output** — the face
+    boxes/landmarks read from stage4's metadata.
+
+    RV-11: ORIGINAL hashed image + params + impl only, so changing the face
+    metadata (or adding it where none existed) kept the same ``cache_id`` and
+    the stale output was reused. Metadata absence is itself a state and is
+    encoded explicitly.
     """
     ident = _file_identity(input_source)
     # 只有内容相关的字段参与身份计算：mtime 被任何复制/重写改变，会导致永久失效，
@@ -938,6 +1037,9 @@ def compute_stage5_cache_identity(input_source: str, params: dict,
         "bit_depth": bit_depth,
         "input": content_ident,
         "params": selected,
+        # RV-11: 人脸元数据也影响像素 —— 必须参与身份
+        "face_boxes": _canonical_metadata(face_boxes),
+        "face_landmarks": _canonical_metadata(face_landmarks),
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -1070,8 +1172,12 @@ def main():
     # FIX-V07: 缓存命中必须比对身份，不再只判断"文件存在且非空"。
     # ORIGINAL: `if exists(output_path) and size>0: return 3` —— 改了颗粒/位深等
     # 参数仍会复用旧产物，且 V06 的失败副本也会命中。
-    cache_identity = compute_stage5_cache_identity(input_source, params,
-                                                   bit_depth)
+    # RV-11: 人脸元数据也影响像素，所以必须先读出来再算身份。
+    face_boxes, face_landmarks = _read_face_metadata(
+        temp_dir, job_id, Path(input_name).stem)
+    cache_identity = compute_stage5_cache_identity(
+        input_source, params, bit_depth,
+        face_boxes=face_boxes, face_landmarks=face_landmarks)
     cache_meta_path = _json_sidecar_path(output_path, "cache")
     # NEW-V-06: 必须在写入任何字节**之前**登记产物，否则首次运行被中断时
     # 守卫无东西可清理，半成品会留在最终产物路径上。
@@ -1137,8 +1243,55 @@ def main():
             img_16bit = img.convert("RGB")
 
         # Lanczos resize to target resolution if explicitly specified
+        # RV-06: 请求了缩放就必须真的做（见下方具体分支）。
+        skipped_operations: List[str] = []
         lanczos_target = params.get("lanczos_target", "auto")
-        if lanczos_target and lanczos_target != "auto" and img_16bit is not None:
+        if (lanczos_target and lanczos_target != "auto" and
+                true_arr16 is not None):
+            try:
+                target_w, target_h = lanczos_target.split("x")
+                target_w, target_h = int(target_w), int(target_h)
+            except Exception as e:
+                logger.warning("STAGE5_LANCZOS_PARAM",
+                               f"Invalid lanczos_target {lanczos_target!r}: {e}")
+                target_w = target_h = None
+            if target_w and target_h and (true_arr16.shape[1] != target_w or
+                                          true_arr16.shape[0] != target_h):
+                resized, method = _resize_array_high_depth(
+                    true_arr16, target_w, target_h)
+                if resized is None:
+                    if not params.get("allow_stage5_degrade", False):
+                        logger.error(
+                            "STAGE5_LANCZOS_UNSUPPORTED",
+                            "A target size was requested but no high-depth "
+                            "resampler is available; failing instead of "
+                            "reporting a full success "
+                            "(set allow_stage5_degrade=true to accept a "
+                            "DEGRADED result)",
+                            target=lanczos_target,
+                            reason=method)
+                        _discard_partial_output(output_path, [cache_meta_path])
+                        _write_json_sidecar(
+                            _json_sidecar_path(output_path, "status"), {
+                                "status": STAGE_STATUS_FAILED,
+                                "stage": 5,
+                                "failed_operation": "lanczos_resize",
+                                "reason": f"resize not performed: {method}",
+                                "impl": STAGE5_IMPL_VERSION,
+                            })
+                        return 86
+                    skipped_operations.append("lanczos_resize")
+                    logger.warning("STAGE5_LANCZOS_DEGRADED",
+                                   "Resize not performed on the 16-bit path; "
+                                   "DEGRADED result accepted",
+                                   reason=method,
+                                   skipped_operations=skipped_operations)
+                else:
+                    true_arr16 = resized
+                    logger.info("STAGE5_LANCZOS",
+                                f"Resized 16-bit array -> "
+                                f"{target_w}x{target_h} via {method}")
+        elif lanczos_target and lanczos_target != "auto" and img_16bit is not None:
             try:
                 target_w, target_h = lanczos_target.split("x")
                 target_w, target_h = int(target_w), int(target_h)
@@ -1151,10 +1304,9 @@ def main():
             except Exception as e:
                 logger.warning("STAGE5_LANCZOS_WARN",
                               f"Lanczos resize skipped: {e}")
-        elif lanczos_target and lanczos_target != "auto" and true_arr16 is not None:
-            logger.warning("STAGE5_LANCZOS_WARN",
-                           "Lanczos resize not supported on the 16-bit array "
-                           "path; skipped")
+                # RV-06: 跳过了就必须登记，不能假装做过了
+                if params.get("lanczos_target", "auto") not in (None, "auto", ""):
+                    skipped_operations.append("lanczos_resize")
 
         # Selective local processing with region separation
         # FIX-R13-2: Track image data as numpy array for 16-bit path
@@ -1218,28 +1370,20 @@ def main():
         # FIX-P12-6: Half-body portrait color matching per v7.32 §3.10.7
         # Must run after face restore (stage4) and before grain synthesis
         enable_color_match = params.get("portrait_color_match", True)
-        face_boxes = []
-        face_landmarks = []  # FIX-H-12-06: parallel to face_boxes
-        # Read face_boxes from stage4 metadata file
-        face_meta_path = os.path.join(
-            temp_dir, f"{job_id}_{Path(input_name).stem}_face_boxes.json")
-        if os.path.exists(face_meta_path):
-            try:
-                with open(face_meta_path, "r", encoding="utf-8") as f:
-                    face_meta = json.load(f)
-                face_boxes = face_meta.get("face_boxes", [])
-                # FIX-H-12-06: read landmarks written by stage4 for chin-based
-                # neck ROI + hand skin-tone reference per v7.32 §3.10.7.
-                face_landmarks = face_meta.get("face_landmarks", [])
-            except Exception:
-                face_boxes = []
-                face_landmarks = []
-        else:
+        # RV-11: 人脸元数据已在计算缓存身份前读入（见 _read_face_metadata）
+        if face_boxes is None:
+            face_boxes = []
+        if face_landmarks is None:
             face_landmarks = []
 
         if enable_color_match and face_boxes:
             # Save current state before color matching
-            color_match_temp = output_path + ".pre_color_match"
+            # RV-06: 中间文件必须有**真实扩展名**。ORIGINAL 用
+            # `output_path + ".pre_color_match"` / ".color_matched"，
+            # Pillow 的 Image.save() 无法从这种名字推断格式 → ValueError
+            # （Pillow 文档：format 缺省时按扩展名推断）。
+            color_match_temp = output_path + ".pre_color_match.tif"
+            color_matched_out = output_path + ".color_matched.png"
             if current_arr is not None:
                 # Save 16-bit array as TIFF for color matching
                 arr_u16 = (current_arr * 65535.0).clip(0, 65535).astype(
@@ -1250,14 +1394,18 @@ def main():
                                     compression="zlib")
                 except ImportError:
                     # Fallback: save as 8-bit for color matching
+                    color_match_temp = output_path + ".pre_color_match.png"
                     arr_8 = (current_arr * 255.0).clip(0, 255).astype(
                         np.uint8)
                     Image.fromarray(arr_8).save(color_match_temp)
             else:
-                current_img.save(color_match_temp)
-            if _match_portrait_color(color_match_temp, face_boxes,
-                                     output_path + ".color_matched", logger,
-                                     landmarks=face_landmarks):
+                color_match_temp = output_path + ".pre_color_match.png"
+                current_img.convert("RGB").save(color_match_temp)
+            match_result = _match_portrait_color(color_match_temp, face_boxes,
+                                                 color_matched_out, logger,
+                                                 landmarks=face_landmarks)
+            match_applied = bool(match_result.get("applied"))
+            if match_applied:
                 # Reload the color-matched image
                 # FIX-R13-2: For 16-bit path, load directly as numpy array
                 # to avoid PIL I;16 3-channel data loss
@@ -1266,8 +1414,7 @@ def main():
                         # Try tifffile first for 16-bit
                         try:
                             import tifffile
-                            loaded = tifffile.imread(
-                                output_path + ".color_matched")
+                            loaded = tifffile.imread(color_matched_out)
                             if loaded.dtype == np.uint16:
                                 current_arr = loaded.astype(
                                     np.float32) / 65535.0
@@ -1276,34 +1423,30 @@ def main():
                                     np.float32) / 255.0
                         except (ImportError, Exception):
                             # Fallback to PIL (may lose 16-bit precision)
-                            cm_img = Image.open(
-                                output_path + ".color_matched")
+                            cm_img = Image.open(color_matched_out)
                             cm_arr = np.array(cm_img.convert("RGB"),
                                               dtype=np.float32) / 255.0
                             current_arr = cm_arr
                     else:
-                        current_img = Image.open(
-                            output_path + ".color_matched")
+                        current_img = Image.open(color_matched_out)
                     logger.info("STAGE5_COLOR_MATCH",
                                 "Portrait color matching applied per v7.32 §3.10.7")
                 except Exception:
                     logger.warning("STAGE5_COLOR_MATCH_RELOAD",
                                   "Failed to reload color-matched image")
-                # Clean up temp files
-                for tmp in [color_match_temp,
-                            output_path + ".color_matched"]:
-                    if os.path.exists(tmp):
-                        try:
-                            os.remove(tmp)
-                        except Exception:
-                            pass
             else:
+                # RV-06: 请求了但没做成 —— 必须留痕，不能等同于成功
+                reason = match_result.get("reason") or "not applied"
+                skipped_operations.append("portrait_color_match")
                 logger.warning("STAGE5_COLOR_MATCH_SKIP",
-                              "Color matching failed, continuing without it")
-                color_match_temp = output_path + ".pre_color_match"
-                if os.path.exists(color_match_temp):
+                               f"Color matching was requested but not applied: "
+                               f"{reason}; continuing with unmatched pixels",
+                               skipped_operations=["portrait_color_match"])
+            # Clean up temp files
+            for tmp in [color_match_temp, color_matched_out]:
+                if os.path.exists(tmp):
                     try:
-                        os.remove(color_match_temp)
+                        os.remove(tmp)
                     except Exception:
                         pass
 
@@ -1451,7 +1594,9 @@ def main():
             _json_sidecar_path(output_path, "status"), {
                 "status": STAGE_STATUS_SUCCESS,
                 "stage": 5,
-                "skipped_operations": [],
+                # RV-06: 被跳过/未执行的操作必须出现在成功记录里，
+                # 否则"没有 skipped"会被下游当成"全部都做了"。
+                "skipped_operations": skipped_operations,
                 "impl": STAGE5_IMPL_VERSION,
             })
         logger.info("STAGE5_DONE", "Post-processing complete",

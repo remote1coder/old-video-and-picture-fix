@@ -58,6 +58,9 @@ __all__ = [
     "CancelGuard",
     "install_cancel_guard",
     "watch_outputs",
+    "watch_process",
+    "unwatch_process",
+    "release_outputs",
     "guard",
 ]
 
@@ -93,6 +96,14 @@ class CancelGuard:
         self._extra_paths: List[str] = []
         self._logger: Any = None
         self._stage: Optional[int] = None
+        # RV-12: 发布路径与"本轮临时产物"必须分开 —— 取消时只能删本轮的临时
+        # 文件，绝不能顺手删掉先前已经发布过的有效成品。
+        self._status_path: Optional[str] = None
+        self._delete_output: bool = True
+        # RV-12: 外部编码子进程。取消/超时必须把它一起收掉，否则会出现
+        # "stage 已经退出，avifenc 还在往回写"的孤儿进程。
+        self._processes: List[Any] = []
+        self._released: bool = False
 
     # ------------------------------------------------------------------ setup
     def install(self, stage: Optional[int] = None, logger: Any = None) -> bool:
@@ -143,19 +154,57 @@ class CancelGuard:
         extra_paths: Optional[List[str]] = None,
         logger: Any = None,
         stage: Optional[int] = None,
+        delete_output: bool = True,
+        status_path: Optional[str] = None,
     ) -> None:
         """Register the artifacts that must be discarded on cancellation.
 
         Call this as soon as the final artifact path is known — before any
         bytes are written — otherwise a first-run cancellation has nothing
         to clean up.
+
+        RV-12 additions:
+        * ``delete_output=False`` keeps the published artifact (it may hold a
+          previously completed result) while still deleting the temp files
+          listed in ``extra_paths``.
+        * ``status_path`` writes the FAILED record next to the *published*
+          artifact even when publishing happens through a temp file.
         """
         self._output_path = str(output_path)
         self._extra_paths = [str(p) for p in (extra_paths or [])]
+        self._delete_output = bool(delete_output)
+        self._status_path = str(status_path) if status_path else None
+        self._released = False
         if logger is not None:
             self._logger = logger
         if stage is not None:
             self._stage = stage
+
+    def watch_process(self, proc: Any) -> None:
+        """RV-12: register a child process that must be killed on cancellation.
+
+        Encoders (avifenc/ffmpeg) are separate processes; killing only the
+        Python stage leaves them running and able to keep writing files.
+        """
+        if proc is not None:
+            self._processes.append(proc)
+
+    def unwatch_process(self, proc: Any) -> None:
+        """Stop tracking a finished child process."""
+        try:
+            self._processes.remove(proc)
+        except (ValueError, BaseException):  # noqa: BLE001
+            pass
+
+    def release(self) -> None:
+        """RV-12: artifacts are published successfully — stop guarding them.
+
+        Called after a transactional publish so a later interrupt cannot delete
+        a finished product.
+        """
+        self._released = True
+        self._extra_paths = []
+        self._processes = []
 
     # ------------------------------------------------------------- behaviour
     def _fire(self, signum: int, frame: Any) -> None:
@@ -198,7 +247,27 @@ class CancelGuard:
         removed: List[str] = []
         status_path: Optional[str] = None
 
-        for path in [self._output_path] + list(self._extra_paths):
+        # RV-12: 先收子进程再删文件 —— 否则被杀掉的 stage 之外，编码器子进程
+        # 可能在我们清理完之后继续往产物路径写回。
+        for proc in list(self._processes):
+            try:
+                poll = getattr(proc, "poll", None)
+                if poll is not None and poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except BaseException:  # noqa: BLE001
+                        pass
+            except BaseException:  # noqa: BLE001
+                continue
+        self._processes = []
+
+        targets: List[str] = []
+        if self._output_path and self._delete_output:
+            targets.append(self._output_path)
+        targets.extend(self._extra_paths)
+
+        for path in targets:
             if not path:
                 continue
             try:
@@ -208,8 +277,9 @@ class CancelGuard:
             except BaseException:  # noqa: BLE001 - 处理器内 I/O 会抛 KBInterrupt
                 continue
 
-        if self._output_path:
-            status_path = f"{self._output_path}.status.json"
+        status_path = self._status_path or (
+            f"{self._output_path}.status.json" if self._output_path else None)
+        if status_path:
             payload = {
                 "status": "FAILED",
                 "failed_operation": CANCELLED_OPERATION,
@@ -288,7 +358,25 @@ def install_cancel_guard(stage: Optional[int] = None,
 def watch_outputs(output_path: str,
                   extra_paths: Optional[List[str]] = None,
                   logger: Any = None,
-                  stage: Optional[int] = None) -> None:
-    """Register artifacts for the process-wide guard."""
-    guard.watch(output_path, extra_paths=extra_paths,
-                logger=logger, stage=stage)
+                  stage: Optional[int] = None,
+                  delete_output: bool = True,
+                  status_path: Optional[str] = None) -> None:
+    """Register artifacts for the process-wide guard. See :meth:`CancelGuard.watch`."""
+    guard.watch(output_path, extra_paths=extra_paths, logger=logger,
+                stage=stage, delete_output=delete_output,
+                status_path=status_path)
+
+
+def watch_process(proc: Any) -> None:
+    """RV-12: register a child process to be killed when cancellation fires."""
+    guard.watch_process(proc)
+
+
+def unwatch_process(proc: Any) -> None:
+    """Stop tracking a child process that finished normally."""
+    guard.unwatch_process(proc)
+
+
+def release_outputs() -> None:
+    """RV-12: artifacts are published; stop guarding them."""
+    guard.release()

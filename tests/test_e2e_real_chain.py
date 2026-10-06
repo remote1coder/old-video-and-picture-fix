@@ -74,24 +74,27 @@ def _seed_step1(d, arr):
     return p
 
 
-def _env_with_avifenc():
-    env = dict(os.environ)
-    if os.path.isdir(TOOLS):
-        env["PATH"] = TOOLS + os.pathsep + env.get("PATH", "")
-    return env
+def _source_array():
+    """固定种子的合成 16-bit RGB 素材（gmic 缺失，无法跑真实 stage1）。"""
+    rng = np.random.default_rng(20261002)
+    return rng.integers(0, 65536, (48, 64, 3)).astype(np.uint16)
 
 
-def test_e2e_stage5_keeps_true_16bit(chain_dir):
-    """NEW-V-03: 16-bit RGB TIFF 输入经过 stage5 后必须仍是真 16-bit。"""
+def _ensure_step5(chain_dir):
+    """确保 step5 产物存在（不存在就自己跑一遍 stage5）。
+
+    RV-交付要求：每条 e2e 用例必须自带输入，不能依赖前一个用例的产物 ——
+    单独运行 stage6 用例时不应该 skip。
+    """
     temp = os.path.join(chain_dir, "temp")
     logs = os.path.join(chain_dir, "logs")
-    for d in (temp, logs):
-        os.makedirs(d, exist_ok=True)
+    os.makedirs(temp, exist_ok=True)
+    os.makedirs(logs, exist_ok=True)
+    step5 = os.path.join(temp, "job001_oldphoto_step5_postprocess.tif")
+    if os.path.exists(step5):
+        return step5
 
-    rng = np.random.default_rng(20261002)
-    src = rng.integers(0, 65536, (48, 64, 3)).astype(np.uint16)
-    _seed_step1(temp, src)
-
+    _seed_step1(temp, _source_array())
     params = {
         "temp_dir": temp, "log_dir": logs,
         "photo_bit_depth": 16, "archival_mode": False,
@@ -103,28 +106,46 @@ def test_e2e_stage5_keeps_true_16bit(chain_dir):
                     os.path.join(temp, "oldphoto.tif"),
                     "--job-id", "job001", "--params", json.dumps(params)])
     assert rc == 0, f"stage5 exit={rc}\n{out[-2000:]}"
+    return step5
 
-    produced = os.path.join(temp, "job001_oldphoto_step5_postprocess.tif")
-    assert os.path.exists(produced), out[-2000:]
+
+def _load_stage6_module(alias):
+    import importlib.util as u
+    spec = u.spec_from_file_location(alias, STAGE6)
+    mod = u.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _env_with_avifenc():
+    env = dict(os.environ)
+    if os.path.isdir(TOOLS):
+        env["PATH"] = TOOLS + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def test_e2e_stage5_keeps_true_16bit(chain_dir):
+    """NEW-V-03: 16-bit RGB TIFF 输入经过 stage5 后必须仍是真 16-bit。"""
+    temp = os.path.join(chain_dir, "temp")
+    os.makedirs(temp, exist_ok=True)
+    src = _source_array()
+    _seed_step1(temp, src)
+    step5 = _ensure_step5(chain_dir)
 
     import tifffile
-    back = tifffile.imread(produced)
+    back = tifffile.imread(step5)
     assert back.dtype == np.uint16, f"stage5 把 16-bit 压成了 {back.dtype}"
 
-    sys.path.insert(0, os.path.join(ROOT, "photo_restoration_pipeline",
-                                    "stages"))
-    import importlib.util as u
-    spec = u.spec_from_file_location("s6e2e", STAGE6)
-    s6 = u.module_from_spec(spec)
-    spec.loader.exec_module(s6)
-    eff = s6.effective_bit_depth(back)
-    assert eff >= 12, (
-        f"容器是 uint16 但有效位深只有 {eff} bit —— 16-bit 信息在上游被丢弃")
+    s6 = _load_stage6_module("s6e2e")
+    # RV-14: 量化网格诊断只作参考，真正的无损判据是**逐像素比较**
+    assert np.array_equal(back, src), \
+        "stage5 在无处理分支上改动了像素（应逐像素相等）"
 
     # status sidecar 必须是 SUCCESS，且没有 skipped_operations
-    with open(produced + ".status.json", encoding="utf-8") as f:
+    with open(step5 + ".status.json", encoding="utf-8") as f:
         status = json.load(f)
     assert status["status"] == "SUCCESS", status
+    assert status["skipped_operations"] == [], status
 
 
 def test_e2e_stage6_real_avif_roundtrip(chain_dir):
@@ -139,9 +160,8 @@ def test_e2e_stage6_real_avif_roundtrip(chain_dir):
     outdir = os.path.join(chain_dir, "output")
     os.makedirs(outdir, exist_ok=True)
 
-    step5 = os.path.join(temp, "job001_oldphoto_step5_postprocess.tif")
-    if not os.path.exists(step5):
-        pytest.skip("stage5 产物不存在（前一个用例被跳过或失败）")
+    # 自带输入：不依赖前一个用例（单独运行本用例也必须能跑）
+    step5 = _ensure_step5(chain_dir)
 
     params = {
         "temp_dir": temp, "log_dir": logs, "output_dir": outdir,
@@ -160,8 +180,16 @@ def test_e2e_stage6_real_avif_roundtrip(chain_dir):
     assert os.path.exists(contract_path), "缺少编码契约记录"
     with open(contract_path, encoding="utf-8") as f:
         contract = json.load(f)
-    depth_arg = json.dumps(contract)
-    assert "16" in depth_arg, "契约里没有记录 16-bit 相关决策"
+    # 不能只查"JSON 里出现过字符串 16"—— 必须核对真正决定位深的字段
+    assert contract["depth_arg"] == "12,8", contract
+    assert contract["effective_decode_depth"] == 16, contract
+    assert contract["cicp"] == "2/2/0", contract  # 未知来源 → 未指定标签
+    assert contract["lossless"] is True
+
+    # RV-12: 成功必须留下 SUCCESS 状态侧车
+    with open(avif + ".status.json", encoding="utf-8") as f:
+        st = json.load(f)
+    assert st["status"] == "SUCCESS", st
 
     # --- 独立解码回读（avifdec，非本项目代码）---
     decoded = os.path.join(chain_dir, "decoded16.png")
@@ -179,12 +207,27 @@ def test_e2e_stage6_real_avif_roundtrip(chain_dir):
 
     assert back.dtype == np.uint16, f"AVIF 回读只有 {back.dtype} —— 16-bit 未保住"
 
-    sys.path.insert(0, os.path.join(ROOT, "photo_restoration_pipeline",
-                                    "stages"))
-    import importlib.util as u
-    spec = u.spec_from_file_location("s6e2e2", STAGE6)
-    s6 = u.module_from_spec(spec)
-    spec.loader.exec_module(s6)
-    eff = s6.effective_bit_depth(back)
-    # 有损 AV1 会引入重建噪声，GCD 判据会偏小；只断言不是"8-bit 伪装"
-    assert eff > 8, f"回读有效位深仅 {eff} bit，疑似 8-bit 伪装成 16-bit"
+    # 归档档是 lossless：必须与 stage5 输出**逐像素相等**（不是"差不多"）
+    import tifffile
+    reference = tifffile.imread(step5)
+    assert np.array_equal(back, reference), (
+        "无损归档分支出现像素差异："
+        f"MAE={np.abs(back.astype(np.int64) - reference.astype(np.int64)).mean()}")
+
+
+def test_e2e_lossless_assertion_can_actually_fail(chain_dir):
+    """负向对照：注入 1-LSB 错误后，上面的无损判据必须失败。
+
+    没有这条，"array_equal 通过"可能只是因为两边都被写成了同一个空数组。
+    """
+    step5 = _ensure_step5(chain_dir)
+    import tifffile
+    ref = tifffile.imread(step5)
+    assert ref.size > 0
+
+    corrupted = ref.copy()
+    corrupted[0, 0, 0] = (int(corrupted[0, 0, 0]) + 1) & 0xFFFF
+    assert not np.array_equal(corrupted, ref), "1-LSB 错误竟然被判为相等"
+
+    swapped = ref[:, :, ::-1].copy()
+    assert not np.array_equal(swapped, ref), "通道交换竟然被判为相等"

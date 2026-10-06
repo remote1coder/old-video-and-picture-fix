@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -1213,7 +1213,37 @@ def main():
 
         print(f"Manifest mode: {len(jobs)} jobs to process "
               f"(statuses={statuses})")
+        # RV-07: 本 run 先领取归属（generation 单调递增），这样旧 run 的迟到
+        # 结果不会覆盖本次结果，也不会出现"末尾整份旧快照回写"。
+        from manifest_loader import acquire_run_ownership
+        run_owner = f"photo-run-{os.getpid()}"
+        run_generation = acquire_run_ownership(
+            args.manifest, [j.get("job_id") for j in jobs], owner=run_owner)
+        if run_generation is None:
+            print("WARNING: could not claim the run in the manifest; results "
+                  "may not be persisted", file=sys.stderr)
+
         results = []
+        failures: List[tuple] = []
+
+        def _record(job: Dict[str, Any], rc: int) -> None:
+            """RV-07: 收到一个结果就立刻落盘（锁内单任务更新）。"""
+            status = "DONE" if rc == 0 else "FAILED"
+            update_job_status(manifest, job["job_id"], status,
+                              error_message="" if rc == 0 else f"Exit code {rc}")
+            saved = save_manifest_job_result(
+                args.manifest, job["job_id"], status,
+                error_message="" if rc == 0 else f"Exit code {rc}",
+                owner=run_owner, generation=run_generation)
+            results.append((job, rc))
+            if rc != 0 or not saved:
+                failures.append((job, rc if rc != 0 else 82))
+                print(f"[{job['job_id']}] FAILED "
+                      f"with exit code {rc}", file=sys.stderr)
+            if not saved:
+                print(f"[{job['job_id']}] result could NOT be persisted to "
+                      f"the manifest", file=sys.stderr)
+
         if args.workers > 1:
             print(f"Parallel processing with {args.workers} workers "
                   f"(spawn context)")
@@ -1234,10 +1264,8 @@ def main():
                         print(f"[{job['job_id']}] Worker crashed: {e}",
                               file=sys.stderr)
                         rc = 84
-                    results.append((job, rc))
-                    if rc != 0:
-                        print(f"[{job['job_id']}] FAILED "
-                              f"with exit code {rc}", file=sys.stderr)
+                    # RV-07: 逐个结果即时落盘，不等整批结束
+                    _record(job, rc)
             finally:
                 pool.close()
                 pool.join()
@@ -1245,37 +1273,21 @@ def main():
             for job in jobs:
                 rc = _run_single_job(
                     job, args.config, config, dict(cli_params))
-                results.append((job, rc))
-                if rc != 0:
-                    print(f"[{job['job_id']}] FAILED "
-                          f"with exit code {rc}", file=sys.stderr)
+                _record(job, rc)
 
-        # Update manifest with results
-        # FIX-V08: 每完成一个 job 就用锁定单任务更新落盘，避免父进程中断时
-        # 丢失整批进度（父进程仍是唯一写者，不会与 worker 抢写）。
-        for job, rc in results:
-            if rc == 0:
-                update_job_status(manifest, job["job_id"], "DONE")
-                save_manifest_job_result(args.manifest, job["job_id"], "DONE")
-            else:
-                update_job_status(
-                    manifest, job["job_id"], "FAILED",
-                    error_message=f"Exit code {rc}")
-                save_manifest_job_result(args.manifest, job["job_id"], "FAILED",
-                                         error_message=f"Exit code {rc}")
-        save_manifest(manifest, args.manifest)
+        # RV-07: 不再执行 save_manifest(manifest, ...) —— 那是开头读入的旧快照，
+        # 会把本批已经写好的 DONE 倒盖回 PENDING（复核已复现 B: DONE -> PENDING）。
 
         success_count = sum(1 for _, rc in results if rc == 0)
         print(f"\nManifest complete: "
               f"{success_count}/{len(jobs)} succeeded")
-        failed = [(j, rc) for j, rc in results if rc != 0]
-        if failed:
-            print(f"Failed jobs ({len(failed)}):")
-            for j, rc in failed:
+        if failures:
+            print(f"Failed jobs ({len(failures)}):")
+            for j, rc in failures:
                 print(f"  {j['job_id']} ({j['input_path']}) "
                       f"-> exit {rc}")
-        sys.exit(0 if not failed
-                 else max(rc for _, rc in failed))
+        sys.exit(0 if not failures
+                 else max(rc for _, rc in failures))
 
     # Batch mode via --input-dir (Bug 11.8 / P-1 fix)
     # BUG-054 fix: support --workers for parallel batch processing

@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -183,17 +183,66 @@ def update_manifest(path: str,
         return True
 
 
+def _claim_is_expired(job: Dict[str, Any], lease_seconds: Optional[float]) -> bool:
+    """RV-08: True when an existing claim is older than its lease.
+
+    A crashed scheduler must not lock a job forever: after the lease expires a
+    newer run may take over. ``lease_seconds=None`` means "never expires".
+    """
+    if not lease_seconds:
+        return False
+    claimed_at = job.get("run_claimed_at")
+    if not claimed_at:
+        return True
+    try:
+        claimed_dt = datetime.fromisoformat(str(claimed_at))
+    except (TypeError, ValueError):
+        return True
+    if claimed_dt.tzinfo is None:
+        claimed_dt = claimed_dt.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - claimed_dt).total_seconds()
+    return age > float(lease_seconds)
+
+
 def _should_apply_job_result(job: Dict[str, Any], status: str,
                              attempt: Optional[int],
-                             attempt_group: Optional[str]) -> Tuple[bool, str]:
+                             attempt_group: Optional[str],
+                             owner: Optional[str] = None,
+                             generation: Optional[int] = None,
+                             lease_seconds: Optional[float] = None) -> Tuple[bool, str]:
     """State-transition guard for a single-job result (late/stale attempts).
 
-    Rules:
+    Rules (first match wins):
+    - The job is owned by a run and the writer brings no generation → reject
+      (an unclaimed writer must not overwrite a claimed run's result).
+    - The writer's generation is older than the recorded one → reject (RV-08:
+      a *different* UUID is not proof of being newer).
+    - Same generation but a different owner → reject.
+    - Lease expired → allow takeover.
     - No attempt info (or no recorded attempt) → apply.
     - A different attempt group (new pipeline run) → apply (newer run wins).
     - Same group, older attempt → reject (stale late writer).
     - Same group, same-or-newer attempt → apply.
     """
+    recorded_generation = job.get("run_generation")
+    recorded_owner = job.get("run_owner")
+    if recorded_generation is not None:
+        if generation is None:
+            # 已被某个 run 领取，却来了一个不带领取凭据的写入 —— 不能接受，
+            # 否则"换个 UUID 的重跑"仍然能覆盖当前结果。
+            return False, "unclaimed-result-for-claimed-job"
+        try:
+            if int(generation) < int(recorded_generation):
+                return False, "stale-run-generation"
+        except (TypeError, ValueError):
+            return False, "unparsable-generation"
+        if int(generation) == int(recorded_generation):
+            if owner and recorded_owner and str(owner) != str(recorded_owner):
+                return False, "other-owner-same-generation"
+            if not owner and not _claim_is_expired(job, lease_seconds):
+                return False, "claimed-by-another-run"
+            if not owner and _claim_is_expired(job, lease_seconds):
+                return True, "lease-expired-takeover"
     recorded_attempt = job.get("result_attempt")
     recorded_group = job.get("result_attempt_group")
     if attempt is None or recorded_attempt is None:
@@ -208,15 +257,65 @@ def _should_apply_job_result(job: Dict[str, Any], status: str,
     return True, "same-or-newer-attempt"
 
 
+def acquire_run_ownership(path: str,
+                          job_ids: Optional[List[str]] = None,
+                          owner: Optional[str] = None,
+                          timeout: float = 30.0) -> Optional[int]:
+    """RV-08: claim jobs for *this* run and return its generation number.
+
+    The generation is a monotonically increasing counter stored in the
+    manifest meta, so "run B started after run A" is a fact instead of an
+    assumption. A late result from an older run is then rejected by
+    :func:`save_manifest_job_result` because its generation is smaller.
+
+    Returns the generation, or None when the claim could not be written
+    (in that case the caller must not report success either).
+    """
+    owner = owner or f"pid-{os.getpid()}"
+    state: Dict[str, Any] = {"generation": None, "claimed": 0}
+
+    def _mutate(manifest: Dict[str, Any]) -> bool:
+        meta = manifest.setdefault("meta", {})
+        try:
+            generation = int(meta.get("run_generation") or 0) + 1
+        except (TypeError, ValueError):
+            generation = 1
+        meta["run_generation"] = generation
+        meta["last_run_owner"] = owner
+        claimed_at = datetime.now().astimezone().isoformat()
+        wanted = None if not job_ids else {str(j) for j in job_ids}
+        for job in manifest.get("jobs", []):
+            if wanted is not None and str(job.get("job_id")) not in wanted:
+                continue
+            job["run_generation"] = generation
+            job["run_owner"] = owner
+            job["run_claimed_at"] = claimed_at
+            state["claimed"] += 1
+        state["generation"] = generation
+        return True
+
+    if not update_manifest(path, _mutate, timeout=timeout):
+        return None
+    return state["generation"]
+
+
 def save_manifest_job_result(path: str, job_id: str, status: str,
                              error_message: str = "",
                              attempt: Optional[int] = None,
                              attempt_group: Optional[str] = None,
-                             timeout: float = 30.0) -> bool:
+                             timeout: float = 30.0,
+                             owner: Optional[str] = None,
+                             generation: Optional[int] = None,
+                             lease_seconds: Optional[float] = None) -> bool:
     """FIX-V08: report a single job's result under the cross-process lock.
 
     Replaces "worker saves its whole stale snapshot". Only the targeted job is
     modified, everything else is re-read from disk inside the lock.
+
+    RV-08: pass ``owner``/``generation`` (obtained from
+    :func:`acquire_run_ownership`) so a *late* result from an older run cannot
+    overwrite a newer run's outcome. "Different attempt group" is not evidence
+    of being newer — a UUID has no ordering.
     """
     if status not in VALID_STATUSES:
         raise ValueError(
@@ -228,8 +327,10 @@ def save_manifest_job_result(path: str, job_id: str, status: str,
         for job in manifest.get("jobs", []):
             if job.get("job_id") != job_id:
                 continue
-            ok, reason = _should_apply_job_result(job, status, attempt,
-                                                  attempt_group)
+            ok, reason = _should_apply_job_result(
+                job, status, attempt, attempt_group,
+                owner=owner, generation=generation,
+                lease_seconds=lease_seconds)
             if not ok:
                 applied["reason"] = reason
                 logging.warning(
@@ -244,6 +345,10 @@ def save_manifest_job_result(path: str, job_id: str, status: str,
                 job["result_attempt"] = int(attempt)
             if attempt_group is not None:
                 job["result_attempt_group"] = attempt_group
+            if generation is not None:
+                job["run_generation"] = int(generation)
+            if owner is not None:
+                job["run_owner"] = owner
             applied.update({"ok": True, "reason": reason})
             return True
         logging.warning("MANIFEST_RESULT_MISSING_JOB: %s not in %s", job_id, path)
