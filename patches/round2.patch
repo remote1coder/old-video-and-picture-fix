@@ -2448,10 +2448,10 @@ index 4e4f2eb..a93083b 100644
 +    assert not np.array_equal(swapped, ref), "通道交换竟然被判为相等"
 diff --git a/tests/test_rv_round2.py b/tests/test_rv_round2.py
 new file mode 100644
-index 0000000..0d0080a
+index 0000000..c487a8a
 --- /dev/null
 +++ b/tests/test_rv_round2.py
-@@ -0,0 +1,1087 @@
+@@ -0,0 +1,1156 @@
 +"""第二轮复核 RV-01 … RV-14 的反例回归测试。
 +
 +设计原则（来自复核报告 §5）：
@@ -3539,6 +3539,75 @@ index 0000000..0d0080a
 +        f"带音轨的源片 stage7 必须成功（修复前稳定 rc=84），实际 {rc.returncode}。"
 +        f"\nstderr 尾部：{rc.stderr[-600:]}")
 +    assert produced and produced[0].stat().st_size > 0, "stage7 没有产出非空成品"
++
++
++# ---------------------------------------------------------------------------
++# RV-08 的真实多进程压测（补 §10.17 里登记的"并发压测未做"缺口）
++# ---------------------------------------------------------------------------
++
++def _stress_worker(path, job_ids, owner, generation, status, barrier_sec):
++    """子进程体：用**指定**的 owner/generation 写结果（spawn 安全，必须模块级）。"""
++    import time
++    import conftest  # noqa: F401  (sys.path bootstrap)
++    import manifest_loader as m
++
++    time.sleep(barrier_sec)  # 让新旧 run 真正重叠
++    for jid in job_ids:
++        m.save_manifest_job_result(path, jid, status, owner=owner,
++                                   generation=generation)
++    return 0
++
++
++def test_rv08_real_multiprocess_stress_with_stale_late_writer(tmp_path):
++    """真实多进程压测：8 进程 × 160 job，其中 2 个是"迟到的旧 run"。
++
++    补的是 `修复清单.md` §10.17 里"并发压测未做"这条缺口。
++    判据不只是"最后都写进去了"，而是**旧 run 的迟到结果不得覆盖新 run**。
++    """
++    path = str(tmp_path / "stress.jsonl")
++    jobs = [{"job_id": f"j{i:03d}", "status": "PENDING"} for i in range(160)]
++    with open(path, "w", encoding="utf-8") as f:
++        for j in jobs:
++            f.write(json.dumps(j) + "\n")
++    ml.write_meta(path, {"total": len(jobs)}) if hasattr(ml, "write_meta") else None
++
++    # 旧 run 先认领（拿到较小的 generation），随后新 run 再认领（generation 更大）
++    gen_old = ml.acquire_run_ownership(path, owner="run-old")
++    gen_new = ml.acquire_run_ownership(path, owner="run-new")
++    assert gen_old is not None and gen_new is not None, "未能取得 run 所有权"
++    assert gen_new > gen_old, f"新 run 的 generation 必须更大：{gen_new} vs {gen_old}"
++
++    ids = [j["job_id"] for j in jobs]
++    # 160 个 job 分给 8 个进程：6 个属于新 run，2 个属于"迟到的旧 run"
++    chunks = [ids[i::8] for i in range(8)]
++    ctx = __import__("multiprocessing").get_context("spawn")
++    procs = []
++    for i, chunk in enumerate(chunks):
++        stale = (i >= 6)          # 最后两个是迟到旧 run
++        owner = "run-old" if stale else "run-new"
++        gen = gen_old if stale else gen_new
++        status = "FAILED" if stale else "DONE"
++        # 旧 run 睡得更久，确保它在新 run 之后才落笔
++        p = ctx.Process(target=_stress_worker,
++                        args=(path, chunk, owner, gen, status, 1.5 if stale else 0.0))
++        p.start()
++        procs.append(p)
++    for p in procs:
++        p.join(timeout=180)
++        assert p.exitcode == 0, f"worker 失败：exitcode={p.exitcode}"
++
++    final = ml.load_manifest(path)
++    by_status = {}
++    for j in final["jobs"]:
++        by_status[j["status"]] = by_status.get(j["status"], 0) + 1
++    assert len(final["jobs"]) == 160, f"job 数被写坏了：{len(final['jobs'])}"
++    # 新 run 覆盖 6/8 的 job；旧 run 只分到 2/8，且必须全部被拒
++    assert by_status.get("FAILED", 0) == 0, (
++        f"迟到的旧 run 覆盖了新 run 的结果：{by_status}")
++    assert by_status.get("DONE", 0) >= 100, (
++        f"并发写入丢更新，只落了 {by_status.get('DONE', 0)} 条 DONE：{by_status}")
++    leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
++    assert not leftovers, f"残留临时文件：{leftovers}"
 diff --git a/video_restoration_pipeline/main.py b/video_restoration_pipeline/main.py
 index d2742d4..73225ac 100644
 --- a/video_restoration_pipeline/main.py
