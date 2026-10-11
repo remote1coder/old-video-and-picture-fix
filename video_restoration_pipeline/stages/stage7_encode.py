@@ -19,7 +19,7 @@ import argparse
 import subprocess
 import datetime
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
@@ -50,6 +50,93 @@ def _get_audio_layout(audio_path: str) -> dict:
     except Exception:
         pass
     return {"channels": 2, "layout": "stereo"}
+
+
+def _arnndn_filters(model: str, audio_layout: dict, escape,
+                    logger=None) -> List[str]:
+    """R2-10: build the arnndn filter chain **without merging channels**.
+
+    旧实现（``aformat=channel_layouts=mono`` → arnndn → ``aformat=...stereo``）
+    会把左右声道**下混成同一个单声道**再复制回去，左右差异永久丢失。
+    实测（L=440Hz / R=880Hz 的立体声，本机 ffmpeg）：
+
+    ==============================  ==========================
+    链                              处理后 L 与 R 是否相同
+    ==============================  ==========================
+    mono→arnndn→stereo（旧）        **相同**（信息已合并）
+    直接 arnndn（立体声）           不同
+    channelsplit→逐声道→join（采用） 不同
+    ==============================  ==========================
+
+    采用逐声道方案而不是"直接喂立体声"，因为后者依赖 arnndn 对多声道的支持，
+    各版本不一致；channelsplit 保证每个分支拿到的都是单声道，行为稳定。
+
+    >2 声道：逐声道 arnndn **未实现**（需要按 layout 生成 N 组标签，本机无
+    5.1 素材可验证），改用 afftdn（其内部按声道处理）并明确记录降级原因。
+    """
+    layout = (audio_layout or {}).get("layout", "stereo")
+    channels = int((audio_layout or {}).get("channels", 1) or 1)
+    arg = escape(model)
+
+    if channels <= 1:
+        return [f"arnndn=m={arg}"]
+
+    if channels == 2:
+        return [f"channelsplit=channel_layout={layout}[_dnL][_dnR];"
+                f"[_dnL]arnndn=m={arg}[_dnLo];"
+                f"[_dnR]arnndn=m={arg}[_dnRo];"
+                f"[_dnLo][_dnRo]join=inputs=2:channel_layout={layout}"]
+
+    if logger:
+        logger.warning("STAGE7_ARNNDN_MULTICHANNEL_DEGRADED",
+                       f"per-channel arnndn for {channels}ch is not "
+                       "implemented (needs per-layout labels and could not be "
+                       "verified here); using afftdn, which processes channels "
+                       "independently", channels=channels)
+    return ["afftdn=nr=12:nf=-50"]
+
+
+def _resolve_audio_denoise(params: dict) -> Tuple[str, str]:
+    """R2-10: resolve the *effective* audio denoise choice.
+
+    旧实现只看 ``params["noise_reduction"]``（默认 True），再按"模型在不在"选算法，
+    于是主入口已经合并好的 ``audio_denoise=False`` 与 ``audio_denoise="afftdn"``
+    都被忽略（独立用例 A18 复现：两种设置下链里都出现 arnndn）。
+
+    优先级：``audio_denoise`` > ``noise_reduction``（旧别名）。
+    取值语义：
+      * ``False`` / ``"false"`` / ``"off"`` / ``"none"`` / ``0``  → ``"off"``
+      * ``"arnndn"`` / ``"afftdn"``                               → 指定算法
+      * ``True`` / ``"true"`` / ``1``                             → 默认策略
+        （arnndn 模型可用则用 arnndn，否则 afftdn）
+
+    Returns:
+        ``(algorithm, source)``，algorithm ∈ {"off", "arnndn", "afftdn", "auto"}。
+    """
+    raw = None
+    source = ""
+    if "audio_denoise" in params:
+        raw = params.get("audio_denoise")
+        source = "audio_denoise"
+    elif "noise_reduction" in params:
+        raw = params.get("noise_reduction")
+        source = "noise_reduction(legacy alias)"
+
+    if raw is None:
+        return "auto", "unset"
+    if isinstance(raw, bool):
+        return ("auto" if raw else "off"), source
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return ("auto" if raw else "off"), source
+    text = str(raw).strip().lower()
+    if text in ("", "false", "off", "none", "no", "0"):
+        # 空串按"未设置"处理（与主入口的合并语义一致），其余都是明确关闭
+        return ("auto" if text == "" else "off"), source
+    if text in ("arnndn", "afftdn"):
+        return text, source
+    if text in ("true", "on", "yes", "1"):
+        return "auto", source
+    return "auto", source
 
 
 def _build_audio_filter(audio_path: str, params: dict, logger=None,
@@ -204,15 +291,10 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                                f"FFmpeg <4.4, arnndn requires mono input, cannot "
                                f"remove {detected_freq}Hz hum from {num_ch}ch. "
                                f"afftdn will provide general noise reduction only.")
-            elif num_ch == 2:
-                audio_filters.append("aformat=channel_layouts=mono")
-                # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
-                layout = audio_layout.get("layout", "stereo")
-                audio_filters.append(f"aformat=channel_layouts={layout}")
             else:
-                # Mono: use arnndn directly
-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
+                # R2-10：立体声同样不能用 mono 回绕，否则左右被下混成同一份。
+                audio_filters.extend(_arnndn_filters(
+                    arnndn_model, audio_layout, _fpath, logger))
             logger.info("STAGE7_HUM_ARNNDN",
                         f"FFmpeg <4.4, using arnndn for {detected_freq}Hz hum removal",
                         model=arnndn_model)
@@ -223,46 +305,64 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                            f"afftdn will provide general noise reduction only. "
                            f"Download arnndn models from https://github.com/richardpl/arnndn-models (std.rnnn)")
 
-    # Noise reduction AFTER bandreject
-    noise_reduction = params.get("noise_reduction", True)
-    if noise_reduction:
-        # FIX-R7-S7-A2: reuse audio_utils._get_arnndn_model_path (consistent with
-        # hum branch and audio_utils.process_audio L545-548).
+    # R2-10: 消费真正合并后的降噪选择，而不是"默认 True + 看模型在不在"。
+    choice, choice_source = _resolve_audio_denoise(params)
+    if logger:
+        logger.info("STAGE7_DENOISE_CHOICE",
+                    f"audio denoise resolved to {choice!r}",
+                    source=choice_source,
+                    audio_denoise=params.get("audio_denoise", "<unset>"),
+                    noise_reduction=params.get("noise_reduction", "<unset>"))
+
+    if choice == "off":
+        # 明确关闭降噪：后面 compand / tempo / asetpts 仍然要照常走。
+        if logger:
+            logger.info("STAGE7_DENOISE_OFF",
+                        "audio denoise disabled by effective config; no "
+                        "arnndn/afftdn will be added", source=choice_source)
+    else:
         from audio_utils import _get_arnndn_model_path, filter_option_path as _fpath
         arnndn_model = _get_arnndn_model_path(params, detected_freq or 0)
         if not arnndn_model:
             arnndn_model = params.get("arnndn_model", "")
         if audio_layout is None:
             audio_layout = _get_audio_layout(audio_path)
-        num_channels = audio_layout.get("channels", 2)
+        model_exists = bool(arnndn_model) and Path(arnndn_model).exists()
 
-        if arnndn_model and Path(arnndn_model).exists():
-            # FIX-P7-3: Per v7.32 §3.10.9 "严禁混缩为立体声":
-            # - Mono: use arnndn directly (no layout change needed)
-            # - Stereo: aformat=mono → arnndn → restore (acceptable per §7.30
-            #   mono input recommendation, preserves stereo on output)
-            # - Multi-channel (>2): use afftdn instead to avoid downmix;
-            #   arnndn requires mono which would destroy spatial info in 5.1/7.1
-            # ORIGINAL: always used aformat=mono → arnndn for all channel counts,
-            # which downmixes multi-channel audio violating the spec.
-            if num_channels > 2:
-                logger.warning("STAGE7_ARNNDN_MULTICHANNEL_SKIP",
-                               f"arnndn requires mono input, would downmix "
-                               f"{num_channels}ch audio. Using afftdn instead "
-                               f"per v7.32 §3.10.9 (no downmix allowed).")
+        if choice == "afftdn":
+            # 用户明确指定 afftdn：模型存在也不许换成 arnndn。
+            audio_filters.append(f"afftdn=nr={params.get('afftdn_nr', 12)}:"
+                                 f"nf={params.get('afftdn_nf', -50)}")
+            if logger:
+                logger.info("STAGE7_DENOISE_AFFTDN",
+                            "afftdn applied as explicitly requested")
+        elif choice == "arnndn":
+            if model_exists:
+                audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
+                                                     _fpath, logger))
+            elif params.get("allow_audio_degrade", False):
                 audio_filters.append("afftdn=nr=12:nf=-50")
-            elif num_channels == 2:
-                # Stereo: arnndn mono limitation, restore after processing
-                audio_filters.append("aformat=channel_layouts=mono")
-                # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
-                layout = audio_layout.get("layout", "stereo")
-                audio_filters.append(f"aformat=channel_layouts={layout}")
+                if logger:
+                    logger.warning("STAGE7_DENOISE_DEGRADED",
+                                   "arnndn requested but model not found; "
+                                   "degraded to afftdn because "
+                                   "allow_audio_degrade is set",
+                                   model=arnndn_model)
             else:
-                # Mono: use arnndn directly
-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
-        else:
-            audio_filters.append("afftdn=nr=12:nf=-50")
+                if logger:
+                    logger.error("STAGE7_DENOISE_UNAVAILABLE",
+                                 "arnndn requested but model not found and no "
+                                 "degradation is authorized; skipping denoise",
+                                 model=arnndn_model)
+        else:  # "auto"
+            if model_exists:
+                audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
+                                                     _fpath, logger))
+            else:
+                audio_filters.append("afftdn=nr=12:nf=-50")
+                if logger:
+                    logger.info("STAGE7_DENOISE_AFFTDN",
+                                "no arnndn model available; using afftdn")
 
     # V-P-053 fix: compand dynamic range compression
     # FIX-P7-8: Default changed to False per v7.32 §3.10.9 (not mandatory)
@@ -444,29 +544,52 @@ def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
 
 
 _ZSCALE_CAP_CACHE: Dict[str, bool] = {}
+#: R2-12：探测结论（用于日志区分"不支持 / 超时 / 工具缺失"）
+_ZSCALE_CAP_REASON: Dict[str, str] = {}
+#: R2-12：探测必须**限制帧数**。lavfi 的 color/testsrc 源是无限的，
+#: 不限制的话 ffmpeg 会一直跑到 timeout —— 实测同一被支持的选项要 15.031s
+#: 才返回 False（超时被当成"不支持"），加 -frames:v 1 后约 0.063s 返回 0。
+_ZSCALE_PROBE_FRAMES = "1"
+
+
+def _zscale_probe(option_expr: str) -> str:
+    """Probe an option and report *why*: supported / unsupported / timeout / missing."""
+    if option_expr in _ZSCALE_CAP_REASON:
+        return _ZSCALE_CAP_REASON[option_expr]
+    reason = "unsupported"
+    try:
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
+             "color=c=black:s=64x64", "-frames:v", _ZSCALE_PROBE_FRAMES,
+             "-vf", f"zscale={option_expr}", "-f", "null", "-"],
+            capture_output=True, shell=False, timeout=15)
+        if probe.returncode == 0:
+            reason = "supported"
+    except subprocess.TimeoutExpired:
+        reason = "timeout"
+    except FileNotFoundError:
+        reason = "missing"
+    except Exception:
+        reason = "unsupported"
+    _ZSCALE_CAP_REASON[option_expr] = reason
+    return reason
 
 
 def _zscale_has_option(option_expr: str) -> bool:
-    """NEW-RV-05: probe whether the installed ffmpeg's zscale accepts an option.
+    """NEW-RV-05 / R2-12: probe whether the installed ffmpeg's zscale accepts an option.
 
     真机复现（ffmpeg 2023-11-13 gyan 构建）：``zscale=...:format=yuv444p10``
     直接失败 —— "Error applying option 'format' to filter 'zscale': Option not
     found"，stage7 因此 rc=84。该构建的 zscale 只有 w/h/size/dither/filter/
     out_range… 没有 format。
     选项是否可用必须**运行时探测**，不能写死（不同 ffmpeg/zimg 版本差异很大）。
+
+    R2-12：探测必须限帧，否则无限 lavfi 源会跑到超时，
+    "超时"被误记成"不支持"（实测 15.031s 判 False，限帧后 0.063s 判 True）。
     """
     if option_expr in _ZSCALE_CAP_CACHE:
         return _ZSCALE_CAP_CACHE[option_expr]
-    available = False
-    try:
-        probe = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i",
-             "color=c=black:s=64x64", "-vf", f"zscale={option_expr}",
-             "-f", "null", "-"],
-            capture_output=True, shell=False, timeout=15)
-        available = (probe.returncode == 0)
-    except Exception:
-        available = False
+    available = (_zscale_probe(option_expr) == "supported")
     _ZSCALE_CAP_CACHE[option_expr] = available
     return available
 
@@ -477,18 +600,32 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
     if _zscale_has_option("format=yuv444p10"):
         filters.append(f"zscale=rangein=limited:range=limited:"
                        f"dither={dither}:format=yuv444p10")
+        if logger:
+            logger.info("STAGE7_DITHER_MODE",
+                        "zscale performs the 16→10 bit reduction with the "
+                        "requested dither", dither=dither)
     else:
-        # 该构建没有 zscale 的 format 选项：降位深只能交给 format 滤镜，
-        # 于是**抖动并不作用在降位深这一步** —— 必须如实记录，不能假装做了。
+        # 该构建没有 zscale 的 format 选项：降位深由后面的 format 滤镜完成。
+        #
+        # R2-12 修正：第二轮曾在这里断言"抖动不作用于降位深"，**这是错的**。
+        # 实测（本机 ffmpeg，16-bit 梯度 → 10-bit，与 dither=none 逐字节比对）：
+        #   ordered          → 1750 字节不同
+        #   error_diffusion  → 1069 字节不同
+        # 即所选抖动**确实改变了最终像素**。能确定的是像素层面可观察到差异；
+        # 其内部作用点（zscale 内还是相邻 format 滤镜协商后）未进一步拆解，
+        # 不作为结论。日志只陈述事实，不再声称"无效"。
+        reason = _zscale_probe("format=yuv444p10")
         filters.append(f"zscale=rangein=limited:range=limited:dither={dither}")
         filters.append("format=yuv444p10")
         if logger:
             logger.warning(
-                "STAGE7_DITHER_DEGRADED",
-                "This ffmpeg's zscale has no 'format' option; the 16→10 bit "
-                "reduction is done by the format filter, so the requested "
-                f"{dither} dithering does NOT apply to the depth reduction",
-                dither=dither)
+                "STAGE7_DITHER_FALLBACK_CHAIN",
+                "This ffmpeg's zscale has no 'format' option "
+                f"(probe: {reason}); the 16→10 bit reduction is done by the "
+                "format filter after zscale. The requested dither still changes "
+                "the output pixels (measured: ordered/error_diffusion differ "
+                "from none), but the reduction itself is not performed inside "
+                "zscale", dither=dither, zscale_format_probe=reason)
     filters.append("format=yuv420p10le")
     return filters
 
@@ -544,6 +681,67 @@ def _get_source_color_info(video_path: str) -> tuple:
     return "limited", "NTSC", False, False
 
 
+def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
+    """Return a stream's start time in seconds, or None.
+
+    R2-11：同步不能只比"时长"。MKV 的 `stream=start_time` 能真实反映
+    `-itsoffset` 造成的偏移（实测：video 0.000000 / audio 1.000000），
+    比逐 packet 便宜得多，因此作为首选；拿不到时再退回 packet 首时间戳。
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+             "-show_entries", "stream=start_time",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30, shell=False)
+        if r.returncode == 0:
+            txt = r.stdout.strip()
+            if txt and txt != "N/A":
+                return float(txt)
+    except Exception:
+        pass
+    # 退回：packet 的最小 pts
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=300, shell=False)
+        if r.returncode == 0:
+            vals = []
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    vals.append(float(line))
+                except ValueError:
+                    continue
+            if vals:
+                return min(vals)
+    except Exception:
+        pass
+    return None
+
+
+def _probe_audio_presence(path: str) -> str:
+    """三态：``"present"`` / ``"absent"`` / ``"unknown"``。
+
+    必须区分这三种，否则会把"文件不存在 / ffprobe 失败"误判成"本来就没音轨"，
+    于是探测失败又变成静默通过（A07 就是这条路径）。
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30, shell=False)
+    except Exception:
+        return "unknown"
+    if r.returncode != 0:
+        return "unknown"
+    return "present" if r.stdout.strip() else "absent"
+
+
 def _validate_av_sync(muxed_path: str, logger) -> int:
     """Validate A/V sync on the final muxed output file.
 
@@ -551,34 +749,85 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
     - diff > 100ms: WARNING
     - diff > 300ms: sync processing needed
     - diff > 500ms: ERROR/FAILED (return 86)
+
+    R2-11：旧实现只比 `视频时长` 与 `音频时长` 的**差值**，因此"两边一样长、
+    但整条音轨晚 1 秒"这种固定偏移会被判为同步（实测 A16：video [0,2] /
+    audio [1,3]，旧门返回 0）。而且取不到时长时记一条 SKIP 就返回 0，
+    等于"测不出来就算通过"（A07）。
+
+    现在同时检查三件事：
+      1. 起点差 start_diff —— 固定偏移只能靠它发现；
+      2. 终点差 end_diff；
+      3. 持续时长漂移 dur_diff —— 随时间线性漂移只能靠它发现。
+    三者取最大值按阈值判定。取不到**任何**一侧区间时返回 86（未验收），
+    不再静默放行；容器**根本没有音轨**是另一种情形，由输入契约决定是否允许，
+    这里记录后返回 0，不与"探测失败"共用同一个 0 语义。
     """
-    video_dur = _get_stream_duration(muxed_path, "v")
-    audio_dur = _get_stream_duration(muxed_path, "a")
+    presence = _probe_audio_presence(muxed_path)
+    if presence == "unknown":
+        # 探测本身就失败了 —— 这**不是**"没有音轨"，不能放行。
+        logger.error("STAGE7_SYNC_UNMEASURABLE",
+                     "Cannot probe the muxed output; refusing to claim the "
+                     "output is in sync (not a pass)", path=muxed_path)
+        return 86
+    if presence == "absent":
+        logger.warning("STAGE7_SYNC_NO_AUDIO",
+                       "No audio stream in the muxed output; sync check not "
+                       "applicable (allowed only if the input contract says the "
+                       "source has no audio)")
+        return 0
 
-    if video_dur == 0 or audio_dur == 0:
-        logger.warning("STAGE7_SYNC_SKIP", "Cannot determine durations for sync check")
-        return 0  # Continue anyway
+    intervals = {}
+    for st in ("v", "a"):
+        start = _probe_stream_start(muxed_path, st)
+        span = _get_stream_duration(muxed_path, st)
+        if start is None or not span:
+            intervals[st] = None
+        else:
+            intervals[st] = (start, start + span)
 
-    diff_ms = abs(video_dur - audio_dur) * 1000
+    if intervals.get("v") is None or intervals.get("a") is None:
+        logger.error("STAGE7_SYNC_UNMEASURABLE",
+                     "Cannot determine one or both stream intervals; refusing "
+                     "to claim the output is in sync (not a pass)",
+                     video_interval=intervals.get("v"),
+                     audio_interval=intervals.get("a"))
+        return 86
+
+    v_start, v_end = intervals["v"]
+    a_start, a_end = intervals["a"]
+    start_diff = abs(v_start - a_start)
+    end_diff = abs(v_end - a_end)
+    dur_diff = abs((v_end - v_start) - (a_end - a_start))
+    diff_ms = max(start_diff, end_diff, dur_diff) * 1000
+
+    def _detail():
+        return dict(video_start=v_start, video_end=v_end,
+                    audio_start=a_start, audio_end=a_end,
+                    start_diff_ms=start_diff * 1000,
+                    end_diff_ms=end_diff * 1000,
+                    duration_drift_ms=dur_diff * 1000)
 
     if diff_ms > 500:
         logger.error("STAGE7_SYNC_FAIL",
-                    f"AV sync difference {diff_ms:.0f}ms exceeds 500ms threshold",
-                    video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
+                     f"AV sync difference {diff_ms:.0f}ms exceeds 500ms threshold "
+                     f"(start {start_diff * 1000:.0f}ms / end {end_diff * 1000:.0f}ms "
+                     f"/ drift {dur_diff * 1000:.0f}ms)", **_detail())
         return 86
     elif diff_ms > 300:
         logger.warning("STAGE7_SYNC_WARN",
-                      f"AV sync difference {diff_ms:.0f}ms exceeds 300ms threshold, sync processing recommended",
-                      video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
+                       f"AV sync difference {diff_ms:.0f}ms exceeds 300ms threshold, "
+                       "sync processing recommended", **_detail())
         return 0  # Continue but warn
     elif diff_ms > 100:
-        # FIX-R7-S7-11: >100ms must be WARNING per v7.32 §3.10.9 ("音视频时长
-        # 差值 > 100ms 触发 WARNING"). ORIGINAL logged INFO.
+        # FIX-R7-S7-11: >100ms must be WARNING per v7.32 §3.10.9.
         logger.warning("STAGE7_SYNC_WARN_100",
-                      f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
-                      video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
+                       f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
+                       **_detail())
         return 0  # Continue
 
+    logger.info("STAGE7_SYNC_OK",
+                f"AV sync within tolerance ({diff_ms:.0f}ms)", **_detail())
     return 0
 
 
@@ -826,17 +1075,15 @@ def main():
         logger.warning("STAGE7_16BIT_QUANT",
                        "16bit limited range (black=4096/white=60160) is industry "
                        "convention, NOT ITU standard (per v7.32 §3.10.26)")
-        # Check if zscale supports error_diffusion dithering
-        _zscale_ed_available = False
-        try:
-            _zd = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "color=c=black:s=64x64",
-                 "-vf", "zscale=dither=error_diffusion", "-f", "null", "-"],
-                capture_output=True, shell=False, timeout=10
-            )
-            _zscale_ed_available = (_zd.returncode == 0)
-        except Exception:
-            pass
+        # Check if zscale supports error_diffusion dithering.
+        # R2-12：这里原来是**无限** lavfi color 源 + timeout=10 ——
+        # 实测要跑满 10 秒才把它判成"不支持"。改用统一限帧探测函数。
+        _ed_probe = _zscale_probe("dither=error_diffusion")
+        _zscale_ed_available = (_ed_probe == "supported")
+        if _ed_probe in ("timeout", "missing"):
+            logger.warning("STAGE7_ZSCALE_PROBE_INCONCLUSIVE",
+                           "error_diffusion probe was inconclusive; treating as "
+                           "unavailable", reason=_ed_probe)
 
         if _zscale_ed_available:
             # Per v6.32 §阶段3: error_diffusion dithering in YUV444 space

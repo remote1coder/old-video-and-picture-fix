@@ -30,7 +30,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 from manifest_loader import (  # noqa: E402
     load_manifest, filter_jobs, save_manifest, update_job_status,
-    save_manifest_job_result, acquire_run_ownership,
+    save_manifest_job_result, acquire_run_ownership, update_manifest_with_writer,
 )
 from checkpoint import cleanup_old_intermediates, check_wsl_space  # noqa: E402
 
@@ -438,32 +438,62 @@ def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
 
 # --- RV-09: 产物身份（resume 不能再"只看名字 + 能解码"）------------------
 #: 实现/恢复契约版本。改动产物语义时必须升版本，否则旧产物的身份无法区分。
-VIDEO_IMPL_VERSION = "video-pipeline/2.0-resume-identity"
+#: R2-07：输入摘要从"首/尾采样"改成"全内容流式哈希"，身份语义变了，
+#: 旧 marker 一律判为不属于当前实现（安全方向：重算，而不是错配）。
+VIDEO_IMPL_VERSION = "video-pipeline/3.0-r2-07-full-content-identity"
+
+
+def _input_identity_status(recorded: Any, current: Dict[str, Any]) -> str:
+    """Compare a recorded input identity with the current one.
+
+    Returns one of:
+      * ``"match"``    —— 两边都拿到了摘要且相等；
+      * ``"changed"``  —— 两边都拿到了摘要但不相等（源内容变了，禁止复用）；
+      * ``"unproven"`` —— 任一侧拿不到摘要（缺失/读取失败/旧格式）。
+        R2-07 要求这种情形**拒绝复用**，不能落回"文件名能对上"的猜测。
+    """
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return "unproven"
+    old_digest = recorded.get("digest")
+    new_digest = current.get("digest")
+    if not old_digest or not new_digest:
+        return "unproven"
+    return "match" if str(old_digest) == str(new_digest) else "changed"
 
 
 def _chunked_sha256(path: str, chunk: int = 1 << 20) -> Optional[str]:
-    """Content fingerprint: whole file when small, head+tail+size otherwise.
+    """Content fingerprint: SHA-256 over the **whole** file (streamed).
 
     mtime 不能作为身份（复制/重写都会变），只用 size + 内容。
+
+    R2-07 / A10：旧实现只取首 1MiB，并且**仅当 size > 2MiB** 才补读尾 1MiB。
+    后果有两个盲区：
+      * 1–2MiB 的文件：第二个 1MiB 之后的任何改动都看不见
+        —— 实测 1.5MiB 文件在 1200KiB 处改 1024 字节，旧摘要**不变**；
+      * >2MiB 的文件：只采首尾，中部改动同样看不见。
+    采样指纹不能声称"内容未变"，这里改成流式全内容哈希。
+    代价：O(文件大小)；SHA-256 吞吐约数百 MB/s，对素材库可接受。
+    若将来确实需要性能折中，必须是显式开关 + 明确可靠性边界，不能默认采样。
     """
     try:
-        size = os.path.getsize(path)
         h = hashlib.sha256()
         with open(path, "rb") as f:
-            h.update(f.read(chunk))
-            if size > 2 * chunk:
-                f.seek(-chunk, os.SEEK_END)
-                h.update(f.read(chunk))
-        h.update(str(size).encode("ascii"))
+            for block in iter(lambda: f.read(chunk), b""):
+                h.update(block)
+        h.update(str(os.path.getsize(path)).encode("ascii"))
         return h.hexdigest()
     except Exception:
         return None
 
 
+#: R2-07：身份算法模式。写进 marker，便于将来区分"全量哈希"与任何显式折中模式。
+IDENTITY_DIGEST_MODE = "full-stream-sha256"
+
+
 def build_input_identity(input_path: str) -> Dict[str, Any]:
-    """RV-09: identity of the *source* material an artifact was made from."""
+    """RV-09 / R2-07: identity of the *source* material an artifact was made from."""
     ident: Dict[str, Any] = {"path": str(input_path), "size": None,
-                             "digest": None}
+                             "digest": None, "mode": IDENTITY_DIGEST_MODE}
     try:
         st = os.stat(input_path)
         ident["size"] = st.st_size
@@ -546,9 +576,13 @@ def resume_artifact_matches(final_path: str, job: Dict[str, Any],
                        f"not {job.get('job_id')!r}")
     recorded = data.get("input_identity") or {}
     current = build_input_identity(job.get("input_path", ""))
-    if recorded.get("digest") and current.get("digest") and \
-            recorded["digest"] != current["digest"]:
+    # R2-07：身份"拿不到"与"对不上"都要拒绝，不能因为缺摘要就放行。
+    status = _input_identity_status(recorded, current)
+    if status == "changed":
         return False, "input content changed since the artifact was produced"
+    if status == "unproven":
+        return False, ("input identity cannot be verified (missing/unreadable "
+                       "on one side); refusing to reuse the artifact")
     if str(data.get("params_identity", "")) and \
             data["params_identity"] != build_params_identity(config, job, logger):
         return False, "effective parameters changed since it was produced"
@@ -987,6 +1021,97 @@ def aggregate_results(results: List[Dict[str, Any]], logger=None) -> int:
     return worst if worst > 0 else 86
 
 
+def _apply_startup_job_decision(manifest_path: str, job_id: str,
+                                decision: Dict[str, Any],
+                                expect_statuses: Optional[list],
+                                logger=None) -> bool:
+    """R2-04 / A09: 启动期对**单个 job** 做锁内局部更新。
+
+    旧代码在启动期对整份 manifest 做 `save_manifest(manifest, ...)`，
+    而 `manifest` 是本次进程开头读入的**旧快照**：另一个运行在此期间写好的
+    DONE 会被整表覆盖回 PENDING，新 generation 也被抹掉（A09 实测）。
+
+    这里改成：
+      1. 锁内**重新读取**当前磁盘内容；
+      2. 只改这一个 job 的指定字段；
+      3. 若磁盘上该 job 已经不在预期状态（例如已经是 DONE），
+         **不写**。状态只能前进，不能靠旧快照倒退。
+
+    Returns:
+        True 表示写入成功；False 表示跳过或失败。
+    """
+    def mutator(doc):
+        for j in doc.get("jobs", []):
+            if str(j.get("job_id", "")) != str(job_id):
+                continue
+            current = str(j.get("status", ""))
+            if expect_statuses and current not in expect_statuses:
+                if logger:
+                    logger.info("STARTUP_DECISION_SKIPPED",
+                                f"Job {job_id} is now {current!r} on disk; "
+                                "not applying a decision made from a stale "
+                                "snapshot",
+                                job_id=job_id, on_disk_status=current,
+                                expected=list(expect_statuses))
+                return False
+            # 状态倒退保护：绝不能把 DONE/FAILED 的完成态退回 PENDING
+            new_status = str(decision.get("status", current))
+            if current in ("DONE",) and new_status in ("PENDING", "FAILED"):
+                if logger:
+                    logger.info("STARTUP_DECISION_SKIPPED",
+                                f"Refusing to move job {job_id} from DONE "
+                                f"back to {new_status}", job_id=job_id)
+                return False
+            j.update(decision)
+            return True
+        return False
+
+    try:
+        # 写回仍在锁内，且统一走 save_manifest 入口（便于诊断与可观测性）
+        return update_manifest_with_writer(manifest_path, mutator,
+                                           writer=save_manifest)
+    except Exception as e:
+        if logger:
+            logger.warning("STARTUP_DECISION_FAILED",
+                           f"Locked startup update failed for {job_id}: {e}",
+                           job_id=job_id)
+        return False
+
+
+def _persist_job_result(manifest_path: str, job_id: str, status: str,
+                        error_message: str = "", attempt: Optional[int] = None,
+                        attempt_group: Optional[str] = None,
+                        owner: Optional[str] = None,
+                        generation: Optional[int] = None,
+                        logger=None) -> Tuple[bool, str]:
+    """R2-06 / A08: 持久化边界统一处理。
+
+    `save_manifest_job_result` 的真实契约是"成功返回 True，失败返回 False 或
+    **抛异常**"（比如 `Path.replace` 被拒 → RuntimeError/PermissionError）。
+    旧代码只判断了返回值，异常直接穿透 worker 边界，调用方拿不到结构化的
+    `persist-failed`，更拿不到 82 —— 一次磁盘拒绝就变成了未分类崩溃。
+
+    这里把锁超时、写入、替换异常都收口，保留原始原因，统一返回
+    ``(ok, reason)``。磁盘彻底不可写时**不谎称**失败状态已落盘：
+    返回失败并把原因交给调用方写日志/标准错误。
+    """
+    try:
+        saved = save_manifest_job_result(
+            manifest_path, job_id, status, error_message=error_message,
+            attempt=attempt, attempt_group=attempt_group,
+            owner=owner, generation=generation)
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+        if logger:
+            logger.error("JOB_RESULT_PERSIST_EXCEPTION",
+                         f"Persisting job {job_id} raised {reason}",
+                         job_id=job_id, status=status)
+        return False, reason
+    if not saved:
+        return False, "save_manifest_job_result returned False"
+    return True, ""
+
+
 def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
                     args, logger, manifest: Dict[str, Any], manifest_path: str,
                     attempt_group: Optional[str] = None,
@@ -1032,20 +1157,20 @@ def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
     update_job_status(manifest, job_id, "DONE" if success else "FAILED",
                       error_message=last_error)
 
-    saved = save_manifest_job_result(manifest_path, job_id,
-                                     "DONE" if success else "FAILED",
-                                     error_message=last_error,
-                                     attempt=final_attempt,
-                                     attempt_group=attempt_group,
-                                     owner=owner, generation=generation)
+    saved, save_reason = _persist_job_result(
+        manifest_path, job_id, "DONE" if success else "FAILED",
+        error_message=last_error, attempt=final_attempt,
+        attempt_group=attempt_group, owner=owner, generation=generation,
+        logger=logger)
     if not saved:
         # 结果没落盘 = 这次运行不能被算作完成：重跑时必须重新处理
         logger.error("JOB_RESULT_PERSIST_FAILED",
                      f"Job {job_id} result could not be written to the "
                      "manifest; reporting it as NOT complete",
-                     job_id=job_id, status=status)
+                     job_id=job_id, status=status, reason=save_reason)
         return _result(job_id, JOB_PERSIST_FAILED, EXIT_PERSIST_FAILED,
-                       last_error or "manifest save failed")
+                       (last_error or save_reason or "manifest save failed")
+                       + " | " + save_reason)
     return _result(job_id, status, 0 if success else int(exit_code), last_error)
 
 
@@ -1056,6 +1181,22 @@ def main():
     log_dir = gcfg.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, level=gcfg.get("log_level", "INFO"))
     logger.info("PIPELINE_START", "Video restoration pipeline starting")
+
+    # R2-07 / A11：CLI 覆盖必须在**任何身份/恢复判定之前**并入 config。
+    # 旧代码把 --ai-enabled 只交给 process_job 内部的 cli_overrides，
+    # 而 build_params_identity() 走的是 merge_params(job, config, {})，
+    # 于是"用 AI 关闭跑出来的旧产物"在加了 --ai-enabled 之后仍然被判为可复用
+    # （实测：执行函数调用次数为 0，直接标 DONE）。
+    if getattr(args, "ai_enabled", False):
+        ai_cfg = config.get("ai")
+        ai_cfg = dict(ai_cfg) if isinstance(ai_cfg, dict) else {}
+        if ai_cfg.get("enabled") is not True:
+            logger.info("CLI_CONFIG_OVERRIDE",
+                        "CLI --ai-enabled merged into config before identity "
+                        "checks", key="ai.enabled", old=ai_cfg.get("enabled"),
+                        new=True)
+        ai_cfg["enabled"] = True
+        config["ai"] = ai_cfg
 
     # Dependency check
     try:
@@ -1302,13 +1443,18 @@ def main():
                                 break
                         if last_completed >= 0:
                             break
-            job["last_completed_stage"] = last_completed
             if last_completed >= 0:
                 logger.info("FAILED_DOWNGRADE",
                            f"Job {job_id} has valid step{last_completed}, downgrading to PENDING "
                            f"(will resume from stage {last_completed + 1})")
-                job["status"] = "PENDING"
-                job["resume_from_stage"] = last_completed + 1
+                # R2-04：锁内局部更新（不用开头的旧快照整表覆盖）
+                _apply_startup_job_decision(
+                    manifest_path, job_id,
+                    {"status": "PENDING",
+                     "last_completed_stage": last_completed,
+                     "resume_from_stage": last_completed + 1,
+                     "input_identity": current_ident},
+                    expect_statuses=["FAILED"], logger=logger)
             else:
                 # FIX-P5-2: 删除所有损坏的中间文件，并重新标记为 PENDING
                 for stage_num in range(8):
@@ -1319,11 +1465,15 @@ def main():
                             logger.info("FAILED_CLEANUP", f"Removed corrupt intermediate: {fpath}")
                         except Exception as e:
                             logger.warning("FAILED_CLEANUP_FAIL", f"Could not remove {fpath}: {e}")
-                job["status"] = "PENDING"
-                job.pop("resume_from_stage", None)
                 logger.info("FAILED_DOWNGRADE",
                            f"Job {job_id} no valid intermediates, cleaned up and downgraded to PENDING")
-        save_manifest(manifest, manifest_path)
+                _apply_startup_job_decision(
+                    manifest_path, job_id,
+                    {"status": "PENDING",
+                     "last_completed_stage": -1,
+                     "resume_from_stage": 0,
+                     "input_identity": current_ident},
+                    expect_statuses=["FAILED"], logger=logger)
     except Exception as e:
         logger.warning("FAILED_CHECK", f"FAILED job check skipped: {e}")
 
@@ -1362,24 +1512,61 @@ def main():
                     logger.info("RESUME_DONE",
                                 f"Job {job_id} has a verified final output "
                                 f"{cand}, marking DONE", candidate=cand)
-                    job["status"] = "DONE"
+                    # R2-04：锁内把这一个 job 置为 DONE（不用旧快照整表覆盖）
+                    _apply_startup_job_decision(
+                        manifest_path, job_id,
+                        {"status": "DONE",
+                         "input_identity": build_input_identity(input_path)},
+                        expect_statuses=["PENDING", "FAILED"], logger=logger)
                     break
                 if not step7_done:
+                    # R2-07 / A17：部分恢复**先过源身份门**。
+                    # 旧代码只做"中间文件存在 + 能解码"，素材换了照样从 stage7 接着跑。
+                    # 中间产物名字里只有 job_id/stem/stage，无法证明它属于当前输入，
+                    # 因此必须以 job 记录的 input_identity 为准；记录缺失或读不出来
+                    # 时按 "unproven" 拒绝复用（安全方向：重算）。
+                    current_ident = build_input_identity(input_path)
+                    ident_status = _input_identity_status(
+                        job.get("input_identity"), current_ident)
+                    if ident_status == "changed":
+                        logger.info("RESUME_INPUT_CHANGED",
+                                    f"Job {job_id}: input content changed; "
+                                    "old intermediates are not reused",
+                                    input=input_path)
+                    elif ident_status == "unproven":
+                        logger.info("RESUME_IDENTITY_UNPROVEN",
+                                    f"Job {job_id}: cannot prove the existing "
+                                    "intermediates were made from this input; "
+                                    "recomputing from scratch",
+                                    input=input_path)
+                    job["input_identity"] = current_ident
                     # Determine highest valid completed stage for partial resume
                     last_completed = -1
-                    for stage_num in range(6, -1, -1):
-                        candidates = find_stage_artifacts(temp_dir, job_id,
-                                                          input_path, stage_num)
-                        if candidates:
-                            if verify_ffprobe_decodeable(candidates[0]):
-                                last_completed = stage_num
-                                break
-                    job["last_completed_stage"] = last_completed
+                    if ident_status == "match":
+                        for stage_num in range(6, -1, -1):
+                            candidates = find_stage_artifacts(temp_dir, job_id,
+                                                              input_path, stage_num)
+                            if candidates:
+                                if verify_ffprobe_decodeable(candidates[0]):
+                                    last_completed = stage_num
+                                    break
                     if last_completed >= 0:
-                        job["resume_from_stage"] = last_completed + 1
                         logger.info("RESUME_PARTIAL",
                                    f"Job {job_id} resuming from stage {last_completed + 1}")
-            save_manifest(manifest, manifest_path)
+                        # R2-04：锁内逐 job 局部更新
+                        _apply_startup_job_decision(
+                            manifest_path, job_id,
+                            {"last_completed_stage": last_completed,
+                             "resume_from_stage": last_completed + 1,
+                             "input_identity": current_ident},
+                            expect_statuses=["PENDING"], logger=logger)
+                    else:
+                        _apply_startup_job_decision(
+                            manifest_path, job_id,
+                            {"last_completed_stage": -1,
+                             "resume_from_stage": 0,
+                             "input_identity": current_ident},
+                            expect_statuses=["PENDING"], logger=logger)
         except Exception as e:
             logger.warning("RESUME_CHECK", f"Resume check skipped: {e}")
 

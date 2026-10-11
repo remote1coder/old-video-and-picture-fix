@@ -176,6 +176,60 @@ def _color_skipped(color: Dict[str, Any]) -> List[str]:
     return skipped
 
 
+class PublishAbort(Exception):
+    """R2-01: 成套提交过程中任一步失败 —— 必须整批回滚，不能留下半代。"""
+
+    def __init__(self, operation: str, reason: str):
+        super().__init__(f"{operation}: {reason}")
+        self.operation = operation
+        self.reason = reason
+
+
+def _snapshot_for_rollback(paths: List[str], backup_dir: str,
+                           logger=None) -> Dict[str, Optional[str]]:
+    """R2-01: 提交前先把**现存**产物复制到备份目录。
+
+    Returns ``{目标路径: 备份文件路径 或 None}``。``None`` 表示提交前该路径
+    不存在（回滚时应撤下本次新建的文件），或备份失败（无法恢复，必须留痕）。
+    """
+    snapshot: Dict[str, Optional[str]] = {}
+    for idx, path in enumerate([p for p in paths if p]):
+        if not os.path.isfile(path):
+            snapshot[path] = None
+            continue
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+            backup = os.path.join(backup_dir, f"{idx}_{os.path.basename(path)}")
+            shutil.copyfile(path, backup)
+            snapshot[path] = backup
+        except OSError as e:
+            snapshot[path] = None
+            if logger:
+                logger.error("STAGE6_ROLLBACK_BACKUP_FAIL",
+                             f"Cannot back up {path} before publishing: {e}. "
+                             "A later failure could NOT restore it.",
+                             path=path)
+    return snapshot
+
+
+def _rollback_publish(snapshot: Dict[str, Optional[str]], logger=None) -> None:
+    """R2-01: 把每个目标路径恢复成提交前的内容。
+
+    有备份 → 拷回；没备份（本次新建）→ 删除本次写入的文件。
+    目标是"最终只能看到完整旧代"，不能是混合代。
+    """
+    for path, backup in snapshot.items():
+        try:
+            if backup and os.path.isfile(backup):
+                shutil.copyfile(backup, path)
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            if logger:
+                logger.error("STAGE6_ROLLBACK_FAIL",
+                             f"Could not restore {path}: {e}", path=path)
+
+
 def _fail(logger, status_path: str, operation: str, reason: str,
           paths: Optional[List[str]] = None) -> None:
     """RV-12: clean this run's temp artifacts and record an honest FAILED.
@@ -419,7 +473,12 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
                          "encode pixels that would be mislabelled as sRGB.")
             return result
         result["status"] = COLOR_DEGRADED
-        result["cicp_override"] = "2/2/0"  # primaries+transfer unspecified
+        # R2-13：按**最终布局**选合法矩阵，不能硬写 identity 0。
+        # 常规 YUV420 下传 0 时 avifenc **不报错**，而是警告后自动改成 6，
+        # 于是契约（0）与真实文件头（6）不一致（A20 实测）。
+        result["cicp_override"] = (CICP_UNSPECIFIED_RGB444
+                                   if params.get("archival_mode", False)
+                                   else CICP_UNSPECIFIED_YUV)
         result["reason"] = (result["reason"] or "no usable source ICC profile")
         logger.warning("STAGE6_COLOR_DEGRADED",
                        "Encoding without colour conversion; CICP set to "
@@ -471,7 +530,14 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
                          f"Mandatory colour conversion failed: {e}")
             return result
         result["status"] = COLOR_DEGRADED
-        result["cicp_override"] = "2/2/0"
+        # R2-13：CICP 必须按**最终布局**选合法矩阵。
+        # 旧代码这里硬写 "2/2/0"（矩阵 0 = Identity）：在 RGB444 下合法，
+        # 但在常规 YUV420 下 avifenc 不会拒绝，而是**警告后自动把 0 改成 6**，
+        # 于是保存的契约（0）与真实文件头（6）不一致 —— 契约失真。
+        # 实测（A20）：avifdec 读回 Matrix Coeffs = 6，contract 仍写 0。
+        result["cicp_override"] = (CICP_UNSPECIFIED_RGB444
+                                   if params.get("archival_mode", False)
+                                   else CICP_UNSPECIFIED_YUV)
         result["icc_path"] = source_icc_file
         result["reason"] = f"colour conversion failed: {e}"
         logger.warning("STAGE6_COLOR_DEGRADED",
@@ -768,6 +834,7 @@ def main():
     tiff_info: Dict[str, Any] = {"written": False}
     work_tiff_path = ""
     publish_tiff_path = ""
+    tmp_tiff = ""
     # RV-12: 本轮已经"发布"的产物集合；失败时要整批撤下，不能留下
     # "有母版、没 AVIF"这种半个提交。
     round_artifacts: List[str] = []
@@ -783,13 +850,12 @@ def main():
                 delete_output=False, status_path=status_path)
         tiff_info = write_archival_master(working_path, tmp_tiff, params, logger)
         if tiff_info.get("written"):
-            try:
-                os.replace(tmp_tiff, work_tiff_path)
-                tiff_info["master_path"] = work_tiff_path
-                round_artifacts.append(work_tiff_path)
-            except OSError as e:
-                tiff_info["written"] = False
-                tiff_info["error"] = f"publish failed: {e}"
+            # R2-01：母版**先留在暂存路径**，不在这里覆盖旧母版。
+            # 旧实现在此 `os.replace(tmp_tiff, work_tiff_path)` 直接盖掉上一代
+            # 母版，随后编码失败时 `_fail` 又把这个路径删掉 —— 实测结果是
+            # 旧 AVIF 还在、旧 TIFF 已丢失（A01）。移动动作推迟到提交阶段，
+            # 且提交阶段有备份可回滚。
+            tiff_info["staging_path"] = tmp_tiff
         if not tiff_info.get("written") and params.get("archival_tiff_required", False):
             logger.error("STAGE6_TIFF_REQUIRED_FAIL",
                          "Archival TIFF master is required but could not be "
@@ -862,59 +928,106 @@ def main():
               paths=[tmp_avif] + round_artifacts)
         return 84
 
-    # --- RV-12: 原子发布（临时 → 发布路径）---
+    # --- R2-13: 发布前读回真实文件头，核对色彩标签 -----------------------
+    # 命令参数只是"意图"，编码器可能接受并改写（实测 identity 矩阵 0 → 6）。
+    # 这里用 avifdec 独立回读实际头部，与契约逐项比对并记录；不一致时按
+    # require_header_match 决定是否判失败，绝不默默把契约当事实。
+    try:
+        actual = media_io.read_avif_header(tmp_avif, capability=capability)
+    except Exception as e:  # 回读失败本身要留痕，但不能因此丢掉已经编好的产物
+        actual = {}
+        logger.warning("STAGE6_HEADER_READBACK_FAIL",
+                       f"Could not read back the encoded AVIF header: {e}",
+                       output=tmp_avif)
+    if actual:
+        contract["actual_header"] = actual
+        declared_matrix = media_io.cicp_matrix(contract.get("cicp"))
+        actual_matrix = actual.get("matrix")
+        contract["header_matches_contract"] = (
+            declared_matrix is not None
+            and actual_matrix is not None
+            and int(declared_matrix) == int(actual_matrix))
+        if not contract["header_matches_contract"]:
+            logger.warning(
+                "STAGE6_HEADER_MISMATCH",
+                "Encoder wrote different colour tags than the contract "
+                "claims (command arguments are intent, the file header is "
+                "fact)",
+                declared_cicp=contract.get("cicp"),
+                declared_matrix=declared_matrix,
+                actual_matrix=actual_matrix)
+            if params.get("require_header_match", False):
+                _fail(logger, status_path, "header_verification",
+                      f"encoded header matrix {actual_matrix} != contract "
+                      f"{declared_matrix}",
+                      paths=[tmp_avif] + round_artifacts)
+                return 86
+
+    # --- R2-01: 成套提交（备份旧代 → 逐个提交 → 任一步失败整批回滚）---
+    # 连续几次 os.replace **不等于**整组原子：AVIF 换成了新代、TIFF 回拷失败
+    # 时，磁盘上就是"新 AVIF + 旧 TIFF"的混合代（A02 实测）。
+    # 这里用"提交前整体备份 + 失败整体恢复"的协议，保证最终只会看到
+    # 完整旧代或完整新代。
+    commit_targets: List[str] = [work_output_path]
+    if tiff_info.get("written"):
+        commit_targets.append(work_tiff_path)
+    if original_output_path:
+        commit_targets.append(publish_output_path)
+        if tiff_info.get("written"):
+            commit_targets.append(publish_tiff_path)
+    backup_dir = work_output_path + ".pubbak"
+    snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
+
     try:
         os.replace(tmp_avif, work_output_path)
         contract["published"] = True
-    except OSError as e:
-        logger.error("STAGE6_PUBLISH_FAIL",
-                     f"Could not publish the encoded AVIF: {e}")
-        _fail(logger, status_path, "publish", str(e),
-              paths=[tmp_avif] + round_artifacts)
-        return 82
-
-    # WSL redirect: copy back **each** required artifact, checking every result
-    # RV-13: 源路径一律用工作路径（work_*），不再从已经换过的发布路径派生。
-    if original_output_path:
-        copied = wsl_copy_back(work_output_path, publish_output_path)
-        if copied:
+        if tiff_info.get("written") and tmp_tiff:
+            os.replace(tmp_tiff, work_tiff_path)
+            tiff_info["master_path"] = work_tiff_path
+        if original_output_path:
+            # RV-13: 源路径一律用工作路径（work_*）
+            if not wsl_copy_back(work_output_path, publish_output_path):
+                raise PublishAbort("wsl_copyback",
+                                   f"copy back failed: {work_output_path}")
             logger.info("STAGE6_WSL_COPYBACK",
                         f"Copied result back to {publish_output_path}")
-        else:
-            logger.error("STAGE6_WSL_COPYBACK_FAIL",
-                         f"Failed to copy {work_output_path} back to "
-                         f"{publish_output_path}")
-            _fail(logger, status_path, "wsl_copyback",
-                  f"copy back failed: {work_output_path}",
-                  paths=[tmp_avif] + round_artifacts)
-            return 82
-        if tiff_info.get("written") and work_tiff_path:
-            if wsl_copy_back(work_tiff_path, publish_tiff_path):
+            if tiff_info.get("written") and work_tiff_path:
+                if not wsl_copy_back(work_tiff_path, publish_tiff_path):
+                    raise PublishAbort(
+                        "wsl_copyback_tiff",
+                        f"copy back failed: {work_tiff_path}")
                 logger.info("STAGE6_WSL_COPYBACK_TIFF",
                             f"Copied master back to {publish_tiff_path}")
-            else:
-                logger.error("STAGE6_WSL_COPYBACK_TIFF_FAIL",
-                             f"Failed to copy {work_tiff_path} back to "
-                             f"{publish_tiff_path}")
-                _fail(logger, status_path, "wsl_copyback_tiff",
-                      f"copy back failed: {work_tiff_path}",
-                      paths=[tmp_avif] + round_artifacts)
-                return 82
+        # 契约与状态必须**写成功**才算提交完成（A12：侧车写失败仍 rc=0 是错的）
+        if not _write_json_sidecar(contract_path, contract):
+            raise PublishAbort("contract",
+                               "could not write the encode contract sidecar")
+        if not _write_json_sidecar(status_path, {
+            "status": "SUCCESS",
+            "stage": 6,
+            "skipped_operations": _color_skipped(color),
+            "output_path": publish_output_path,
+            "published": True,
+        }):
+            raise PublishAbort("status",
+                               "could not write the SUCCESS status sidecar")
+    except PublishAbort as abort:
+        logger.error("STAGE6_PUBLISH_ABORT",
+                     f"Publish aborted at {abort.operation}: {abort.reason}; "
+                     "rolling the whole generation back",
+                     operation=abort.operation)
+        _rollback_publish(snapshot, logger)
+        logger.warning("STAGE6_PUBLISH_ROLLBACK",
+                       "Previous generation restored; no mixed-generation "
+                       "output is left behind")
+        _fail(logger, status_path, abort.operation, abort.reason, paths=[])
+        return 82
+    except OSError as e:
+        logger.error("STAGE6_PUBLISH_FAIL", f"Could not publish the output: {e}")
+        _rollback_publish(snapshot, logger)
+        _fail(logger, status_path, "publish", str(e), paths=[])
+        return 82
 
-    # 落盘实际编码契约，供验收与上游读取
-    try:
-        _write_json_sidecar(contract_path, contract)
-    except Exception as e:
-        logger.warning("STAGE6_CONTRACT_WRITE_FAIL", f"Could not write contract sidecar: {e}")
-    # RV-12: 成功必须留下 SUCCESS 状态侧车，否则上一次的 FAILED/cancelled
-    # 侧车会与新的成品长期共存，下游无法判断当前文件是否有效。
-    _write_json_sidecar(status_path, {
-        "status": "SUCCESS",
-        "stage": 6,
-        "skipped_operations": _color_skipped(color),
-        "output_path": publish_output_path,
-        "published": True,
-    })
     # 已发布：守卫不再删除任何产物
     if cancel_guard is not None:
         cancel_guard.release_outputs()

@@ -247,6 +247,23 @@ class CancelGuard:
         removed: List[str] = []
         status_path: Optional[str] = None
 
+        # R2-01 / A13：已发布（release）之后，任何清理都不得再动产物。
+        # 旧实现 release 只清 _extra_paths/_processes，_output_path 仍在 targets
+        # 里 —— 实测 `watch → release → cleanup_and_record` 之后已完成的文件
+        # 被删除（A13）。发布是不可逆的成功事件，后续取消/清理必须直接退出。
+        if self._released:
+            if self._logger is not None:
+                try:
+                    self._logger.info(
+                        f"STAGE{self._stage if self._stage is not None else ''}"
+                        "_CLEANUP_SKIPPED",
+                        "Artifacts were already published (release called); "
+                        "cancellation cleanup skipped",
+                        output=self._output_path or "")
+                except BaseException:  # noqa: BLE001
+                    pass
+            return {"removed": [], "status_path": None, "released": True}
+
         # RV-12: 先收子进程再删文件 —— 否则被杀掉的 stage 之外，编码器子进程
         # 可能在我们清理完之后继续往产物路径写回。
         for proc in list(self._processes):

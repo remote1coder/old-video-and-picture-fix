@@ -144,7 +144,52 @@ def _write_manifest_locked(manifest: Dict[str, Any], path: str) -> None:
                     Path(cand).unlink(missing_ok=True)
                 except Exception:
                     pass
-        raise RuntimeError(f"Failed to save manifest atomically: {e}") from e
+        # R2-06：保留原始异常类型与信息（调用方要据此区分"磁盘不可写"与
+        # "锁超时"），并用 `from e` 保留 __cause__ 链，不丢根因。
+        raise RuntimeError(
+            f"Failed to save manifest atomically ({type(e).__name__}): {e}"
+        ) from e
+
+
+def update_manifest_with_writer(path: str,
+                                mutator: Callable[[Dict[str, Any]], Any],
+                                writer=None,
+                                timeout: float = 30.0) -> bool:
+    """Same as :func:`update_manifest` but the write-back goes through ``writer``.
+
+    R2-04：启动期（FAILED 降级 / resume 决议）必须"锁内重新读取 + 只改目标 job"，
+    不能用本次进程开头读入的旧快照整表覆盖。同时，为了保持"所有写回都经过
+    同一个持久化入口"（便于诊断、日志与测试可观测），把写回函数做成可注入：
+    默认仍走 ``_write_manifest_locked``，调用方也可以传入
+    ``save_manifest`` —— **写回仍在锁内发生**，因此不存在中间态被覆盖的窗口。
+
+    Returns:
+        True 表示已写回；False 表示跳过（mutator 返回 False）或读写失败。
+    """
+    p = Path(path)
+    lock_path = p.parent / (p.name + ".lock")
+    with _file_lock(lock_path, timeout=timeout):
+        try:
+            manifest = load_manifest(path)
+        except Exception as e:
+            logging.error("MANIFEST_LOCKED_UPDATE_SKIP: cannot re-read %s: %s",
+                          path, e)
+            return False
+        if not isinstance(manifest, dict):
+            logging.error("MANIFEST_LOCKED_UPDATE_SKIP: %s is not a mapping",
+                          path)
+            return False
+        manifest.setdefault("jobs", [])
+        manifest.setdefault("meta", {})
+        result = mutator(manifest)
+        if result is False:
+            return False
+        _update_meta_counts(manifest)
+        if writer is not None:
+            writer(manifest, path)
+        else:
+            _write_manifest_locked(manifest, path)
+        return True
 
 
 def update_manifest(path: str,

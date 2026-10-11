@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该�
 
 
 def read_true_input_array(path: str):
-    """Return the input's real uint16 array, or None when it is not 16-bit.
+    """Return ``(array, icc_bytes)`` for the input's real uint16 data.
 
     NEW-V-03: ``PIL.Image.open()`` on a 16-bit **RGB** TIFF returns mode
     ``'RGB'`` backed by **uint8** data truncated to the high byte
@@ -62,22 +62,81 @@ def read_true_input_array(path: str):
     于是 16-bit RGB 素材在 stage5 就被静默压成 8-bit，
     后面的 "16-bit 归档" 只剩容器是 16-bit、内容只有 8-bit 的信息量。
     这里改用 tifffile（media_io.read_image_array）判定真实位深。
+
+    R2-02 / A03：同时把**源 ICC**带回来。旧实现丢弃 meta，
+    于是输入 PNG 里 588 字节的 sRGB profile 在 stage5 输出里变成 0 字节 ——
+    像素与元数据必须一起传递。
+
+    Returns:
+        ``(None, icc_or_None)`` 当输入不是 16-bit；读取彻底失败时同。
     """
     if _media_io is None:
-        return None
+        return None, None
+    icc = None
     try:
-        arr, _meta = _media_io.read_image_array(path)
+        arr, meta = _media_io.read_image_array(path)
+        icc = (meta or {}).get("icc_profile")
+    except getattr(_media_io, "MediaPrecisionError", Exception):
+        # R2-02 / A04：高精度读取失败是**必须向上抛**的硬错误。
+        # 旧实现 `except Exception: return None`，于是调用方退回 Pillow 的
+        # 8-bit 通道，把整幅图压成 257 的整数倍再装回 uint16，最后 rc=0。
+        # 底层"响亮失败"没有贯穿调用方，等于没失败。
+        raise
     except Exception:
-        return None
+        return None, None
     if arr is None:
-        return None
+        return None, icc
     if getattr(arr, "dtype", None) != np.uint16:
-        return None
+        return None, icc
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=2)
     if arr.ndim != 3 or arr.shape[2] not in (3, 4):
-        return None
-    return arr
+        return None, icc
+    return arr, icc
+
+
+#: R2-03：单维度上限。超过这个值基本可以断定是笔误/恶意输入，
+#: 真要去分配这么大的中间缓冲也会把机器拖死，因此在参数层就拒绝。
+_MAX_LANCZOS_DIMENSION = 32768
+
+
+def _cached_was_degraded(cached_meta: Optional[Dict[str, Any]]) -> bool:
+    """R2-03: whether a cache entry records operations that were *not* performed."""
+    if not isinstance(cached_meta, dict):
+        return False
+    skipped = cached_meta.get("skipped_operations")
+    return bool(skipped) if isinstance(skipped, (list, tuple)) else bool(skipped)
+
+
+def parse_lanczos_target(value: Any) -> Tuple[Optional[int], Optional[int],
+                                              Optional[str]]:
+    """R2-03: validate an explicitly requested resize target.
+
+    Returns ``(w, h, error)``；``error`` 非 None 表示请求非法。
+
+    旧实现解析失败或解析出 0 时只记一条 warning 就跳过，然后**照常返回成功**
+    （A14：`lanczos_target="0x0"` → rc=0，输出照写）。
+    "请求了却没做"必须在参数层拒绝，不能靠后面"看起来没坏"蒙过去。
+    """
+    if value is None:
+        return None, None, None
+    text = str(value).strip()
+    if text in ("", "auto"):
+        return None, None, None
+    if "x" not in text:
+        return None, None, f"not in <width>x<height> form: {value!r}"
+    w_text, _, h_text = text.partition("x")
+    try:
+        w = int(w_text)
+        h = int(h_text)
+    except (TypeError, ValueError):
+        return None, None, f"non-integer dimensions: {value!r}"
+    if w <= 0 or h <= 0:
+        return None, None, f"dimensions must be positive: {value!r}"
+    if w > _MAX_LANCZOS_DIMENSION or h > _MAX_LANCZOS_DIMENSION:
+        return None, None, (f"dimension exceeds the supported maximum "
+                            f"{_MAX_LANCZOS_DIMENSION}: {value!r}")
+    return w, h, None
 
 
 def _resize_array_high_depth(arr: "np.ndarray", target_w: int, target_h: int):
@@ -385,6 +444,49 @@ def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
         return np.empty((0, 3), dtype=np.float32)
 
 
+def _carry_icc_to_output(output_path: str, icc: Optional[bytes],
+                         logger=None) -> bool:
+    """R2-02 / A03: attach the source ICC to the stage5 output.
+
+    stage5 不做色彩空间转换，因此"未变化的 profile"应当原样带下去。
+    实测（A03）：输入 RGB16 PNG 带 588 字节 sRGB ICC，
+    真实 stage5 子进程 rc=0、像素一致，但输出 TIFF 的 34675 标签是 0 字节。
+    失败只记 warning，不因此让已经产出的像素作废。
+    """
+    if not icc:
+        return False
+    if _media_io is None:
+        return False
+    try:
+        ok = _media_io.embed_icc_in_tiff(output_path, icc)
+    except Exception as e:
+        ok = False
+        if logger:
+            logger.warning("STAGE5_ICC_EMBED_FAIL",
+                           f"Could not embed the source ICC: {e}",
+                           output=output_path)
+    if ok and logger:
+        logger.info("STAGE5_ICC_CARRIED",
+                    "Source ICC carried through stage5 into the output",
+                    icc_bytes=len(icc), output=output_path)
+    return bool(ok)
+
+
+def _write_color_matched(output_path: str, arr: "np.ndarray") -> None:
+    """R2-02: 按数组真实位深写出色彩匹配结果（不用 Pillow 的 8-bit save）。"""
+    if _media_io is not None:
+        try:
+            if getattr(arr, "dtype", None) == np.uint16:
+                _media_io.write_tiff(output_path, arr)
+            else:
+                _media_io.write_png(output_path, arr)
+            return
+        except Exception:
+            pass
+    from PIL import Image as _PILImage
+    _PILImage.fromarray(arr).save(output_path)
+
+
 def _match_portrait_color(image_path: str, face_boxes: list,
                           output_path: str, logger=None,
                           landmarks: list = None) -> Dict[str, Any]:
@@ -411,8 +513,24 @@ def _match_portrait_color(image_path: str, face_boxes: list,
         from PIL import Image, ImageFilter
         import cv2
 
-        img = Image.open(image_path).convert("RGB")
-        img_arr = np.array(img, dtype=np.float32)
+        # R2-02 / A15：不能用 Pillow 读 —— 它对 16-bit TIFF/PNG 返回 uint8，
+        # 于是整幅图（连人脸框外的未处理区域）都被量化成 8-bit 网格再写回。
+        # 实测：左上角未处理像素 [39380,45372,27148] → [39321,45489,27242]。
+        # 必须用 media_io.read_image_array 拿到真实位深的数组，全程按原生范围运算。
+        _arr = None
+        if _media_io is not None:
+            try:
+                _arr, _meta_icc = _media_io.read_image_array(image_path)
+            except Exception:
+                _arr = None
+        if _arr is None:
+            _pil = Image.open(image_path).convert("RGB")
+            _arr = np.array(_pil)
+        if _arr.ndim == 2:
+            _arr = np.stack([_arr] * 3, axis=2)
+        source_dtype = getattr(_arr, "dtype", None)
+        _scale_max = 65535.0 if source_dtype == np.uint16 else 255.0
+        img_arr = _arr[:, :, :3].astype(np.float32)
         h_img, w_img = img_arr.shape[:2]
 
         # Build a combined mask for all face regions
@@ -520,8 +638,11 @@ def _match_portrait_color(image_path: str, face_boxes: list,
         mask_smooth = np.stack([mask_smooth] * 3, axis=2)
 
         blended = mask_smooth * corrected + (1.0 - mask_smooth) * img_arr
-        blended = np.clip(blended, 0, 255).astype(np.uint8)
-        Image.fromarray(blended).save(output_path)
+        # R2-02 / A15：按**输入真实位深**回写，不能一律压成 uint8。
+        blended = np.clip(blended, 0, _scale_max)
+        out_dtype = np.uint16 if source_dtype == np.uint16 else np.uint8
+        out_arr = blended.astype(out_dtype)
+        _write_color_matched(output_path, out_arr)
         return {"applied": True, "skipped": False, "reason": ""}
     except Exception as e:
         if logger:
@@ -1202,6 +1323,13 @@ def main():
                         changed_params=changed,
                         cached_impl=cached_meta.get("impl"),
                         current_impl=cache_identity["impl"])
+        elif _cached_was_degraded(cached_meta):
+            # R2-03：上一次是"降级结果"（有操作没做成）却写了 SUCCESS 缓存。
+            # 依赖恢复后（比如装上了 resampler）必须允许补做，不能一直命中旧缓存。
+            logger.info("STAGE5_CACHE_DEGRADED_RECOMPUTE",
+                        "Cached result was produced with skipped operations; "
+                        "recomputing so the missing work can be retried",
+                        cached_skipped=cached_meta.get("skipped_operations"))
         elif not _verify_output_readable(output_path):
             logger.info("STAGE5_CACHE_UNREADABLE",
                         "Cached output failed validation; recomputing")
@@ -1221,9 +1349,17 @@ def main():
         # NEW-V-03: Pillow 对 16-bit RGB TIFF 报的是 mode='RGB'（uint8 截断），
         # 直接 convert("RGB") 会让 16-bit 素材在 stage5 静默塌成 8-bit。
         true_arr16 = None
-        if bit_depth == 16:
-            true_arr16 = read_true_input_array(input_source)
-            if true_arr16 is not None and logger is not None:
+        if _media_io is not None:
+            true_arr16, input_icc = read_true_input_array(input_source)
+        else:
+            input_icc = None
+        # Pillow 也能拿到 ICC（PNG iCCP / TIFF 34675），作为兜底与交叉来源
+        if input_icc is None:
+            try:
+                input_icc = (img.info or {}).get("icc_profile")
+            except Exception:
+                input_icc = None
+        if true_arr16 is not None and logger is not None:
                 logger.info(
                     "STAGE5_TRUE_16BIT_INPUT",
                     "Input is genuinely 16-bit; Pillow reports mode "
@@ -1246,15 +1382,27 @@ def main():
         # RV-06: 请求了缩放就必须真的做（见下方具体分支）。
         skipped_operations: List[str] = []
         lanczos_target = params.get("lanczos_target", "auto")
+        # R2-03：非法目标尺寸在参数层就拒绝（旧代码解析出 0 就直接跳过并成功）
+        target_err = parse_lanczos_target(lanczos_target)[2]
+        if target_err:
+            logger.error("STAGE5_LANCZOS_INVALID_TARGET",
+                         "Invalid lanczos_target; failing instead of silently "
+                         "skipping the requested resize",
+                         lanczos_target=lanczos_target, reason=target_err)
+            _discard_partial_output(output_path, [cache_meta_path])
+            _write_json_sidecar(
+                _json_sidecar_path(output_path, "status"), {
+                    "status": STAGE_STATUS_FAILED,
+                    "stage": 5,
+                    "failed_operation": "invalid_lanczos_target",
+                    "reason": target_err,
+                    "impl": STAGE5_IMPL_VERSION,
+                })
+            return 86
+
         if (lanczos_target and lanczos_target != "auto" and
                 true_arr16 is not None):
-            try:
-                target_w, target_h = lanczos_target.split("x")
-                target_w, target_h = int(target_w), int(target_h)
-            except Exception as e:
-                logger.warning("STAGE5_LANCZOS_PARAM",
-                               f"Invalid lanczos_target {lanczos_target!r}: {e}")
-                target_w = target_h = None
+            target_w, target_h = parse_lanczos_target(lanczos_target)[:2]
             if target_w and target_h and (true_arr16.shape[1] != target_w or
                                           true_arr16.shape[0] != target_h):
                 resized, method = _resize_array_high_depth(
@@ -1292,21 +1440,21 @@ def main():
                                 f"Resized 16-bit array -> "
                                 f"{target_w}x{target_h} via {method}")
         elif lanczos_target and lanczos_target != "auto" and img_16bit is not None:
-            try:
-                target_w, target_h = lanczos_target.split("x")
-                target_w, target_h = int(target_w), int(target_h)
-                if img_16bit.width != target_w or img_16bit.height != target_h:
-                    img_16bit = img_16bit.resize(
-                        (target_w, target_h), Image.LANCZOS)
-                    logger.info("STAGE5_LANCZOS",
-                                f"Resized {img_16bit.width}x{img_16bit.height} "
-                                f"-> {target_w}x{target_h}")
-            except Exception as e:
-                logger.warning("STAGE5_LANCZOS_WARN",
-                              f"Lanczos resize skipped: {e}")
-                # RV-06: 跳过了就必须登记，不能假装做过了
-                if params.get("lanczos_target", "auto") not in (None, "auto", ""):
-                    skipped_operations.append("lanczos_resize")
+            target_w, target_h = parse_lanczos_target(lanczos_target)[:2]
+            if target_w and target_h:
+                try:
+                    if img_16bit.width != target_w or img_16bit.height != target_h:
+                        img_16bit = img_16bit.resize(
+                            (target_w, target_h), Image.LANCZOS)
+                        logger.info("STAGE5_LANCZOS",
+                                    f"Resized {img_16bit.width}x{img_16bit.height} "
+                                    f"-> {target_w}x{target_h}")
+                except Exception as e:
+                    logger.warning("STAGE5_LANCZOS_WARN",
+                                  f"Lanczos resize skipped: {e}")
+                    # RV-06: 跳过了就必须登记，不能假装做过了
+                    if params.get("lanczos_target", "auto") not in (None, "auto", ""):
+                        skipped_operations.append("lanczos_resize")
 
         # Selective local processing with region separation
         # FIX-R13-2: Track image data as numpy array for 16-bit path
@@ -1383,7 +1531,10 @@ def main():
             # Pillow 的 Image.save() 无法从这种名字推断格式 → ValueError
             # （Pillow 文档：format 缺省时按扩展名推断）。
             color_match_temp = output_path + ".pre_color_match.tif"
-            color_matched_out = output_path + ".color_matched.png"
+            # R2-02：匹配结果按真实位深写出（16-bit 走 TIFF），
+            # 因此扩展名必须是 .tif —— 旧代码固定 .png，配合 8-bit save
+            # 会把整图量化。
+            color_matched_out = output_path + ".color_matched.tif"
             if current_arr is not None:
                 # Save 16-bit array as TIFF for color matching
                 arr_u16 = (current_arr * 65535.0).clip(0, 65535).astype(
@@ -1561,6 +1712,7 @@ def main():
                                "accepted via allow_stage5_degrade",
                                skipped_operations=["grain_synthesis"])
                 shutil.move(grain_temp, output_path)
+                _carry_icc_to_output(output_path, input_icc, logger)
                 # 降级结果不写缓存身份：下次运行必须重跑完整处理，不能被复用
                 _write_json_sidecar(
                     _json_sidecar_path(output_path, "status"), {
@@ -1575,6 +1727,8 @@ def main():
                 return 0
         else:
             shutil.move(grain_temp, output_path)
+        # R2-02 / A03：源 ICC 必须跟着像素走到最终产物。
+        _carry_icc_to_output(output_path, input_icc, logger)
 
         # FIX-V07: 只在完全成功后提交缓存身份（先验证产物可读）
         if not _verify_output_readable(output_path):
@@ -1589,6 +1743,9 @@ def main():
                     "impl": STAGE5_IMPL_VERSION,
                 })
             return 86
+        # R2-03：缓存条目必须记录"哪些操作没做成"，否则降级结果与完整结果
+        # 在缓存层无法区分，依赖恢复后也不会重做。
+        cache_identity["skipped_operations"] = list(skipped_operations)
         _write_json_sidecar(cache_meta_path, cache_identity)
         _write_json_sidecar(
             _json_sidecar_path(output_path, "status"), {
