@@ -988,49 +988,132 @@ def test_new_rv07_sync_gate_measures_real_mkv(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_new_rv06_filter_option_path_survives_ffmpeg_escaping():
-    """NEW-RV-06：滤镜选项里的 Windows 路径必须转义，否则反斜杠被吃掉。"""
+    """NEW-RV-06 → R2-09：滤镜选项里的路径必须按 FFmpeg **两层**转义。
+
+    契约变更说明（必须有理由，不能只改断言）：
+    第二轮只做了第 1 层（``\\`` → ``/``，``:`` → ``\\:``），这条断言当时是
+    ``E\\:/m/std.rnnn``。第三轮 R2-09 用真实 ffmpeg 实测证明该输出在
+    Windows 绝对路径上**会失败** —— ``\\:`` 的反斜杠在第 2 层被吃掉，
+    盘符冒号失去转义，被 arnndn 当成 ``mix`` 选项分隔符。
+    新契约是两层转义后的 ``E\\\\:/m/std.rnnn``，8 种路径实测全部 rc=0
+    （证据 `_repair_r3_20261010/evidence/a19_probe.json`）。
+    等价反例由下面的 `test_r2_09_real_ffmpeg_model_path_matrix` 承担
+    （真实 ffmpeg 调用，而不是字符串比对）。
+    """
     sys.path.insert(0, SHARED)
     import audio_utils  # noqa: E402
 
-    # 真机报错：Failed to open model file: modelsstd.rnnn
+    # 真机报错（第二轮）：Failed to open model file: modelsstd.rnnn
     assert audio_utils.filter_option_path("models\\std.rnnn") == "models/std.rnnn"
-    # 盘符的 ':' 是滤镜选项分隔符，也必须转义
+    # 盘符的 ':' 是滤镜选项分隔符；第 1 层转义成 `\:` 后，第 2 层要把 `\` 再转义一次
     win_path = "E:" + chr(92) + "m" + chr(92) + "std.rnnn"   # E:\m\std.rnnn
-    assert audio_utils.filter_option_path(win_path) == "E" + chr(92) + ":/m/std.rnnn"
+    assert audio_utils.filter_option_path(win_path) == "E" + chr(92) * 2 + ":/m/std.rnnn"
+    # 第 2 层特殊字符：, ; [ ] '
+    assert audio_utils.filter_option_path("models/a,b.rnnn") == "models/a" + chr(92) + ",b.rnnn"
+    assert audio_utils.filter_option_path("models/a;b.rnnn") == "models/a" + chr(92) + ";b.rnnn"
+    assert audio_utils.filter_option_path("models/a[b].rnnn") == "models/a" + chr(92) + "[" + "b" + chr(92) + "].rnnn"
+    # 第 1 层+第 2 层都处理单引号：' → \' → \\'
+    assert audio_utils.filter_option_path("models/it's.rnnn") == \
+        "models/it" + chr(92) * 2 + chr(92) + "'s.rnnn"
     # 正斜杠输入不应被二次破坏
     assert audio_utils.filter_option_path("models/std.rnnn") == "models/std.rnnn"
 
 
 def test_new_rv05_zscale_without_format_option_degrades_honestly(monkeypatch):
-    """NEW-RV-05：zscale 没有 format= 时不得硬拼，必须走降级链。"""
-    s7 = _load_stage7()
+    """NEW-RV-05 / R2-12：zscale 没有 format= 时不得硬拼，必须走降级链。
 
-    class _R:
-        def __init__(self, out, rc=0):
-            self.stdout = out
-            self.stderr = ""
-            self.returncode = rc
+    契约变更说明：第二轮该用例断言事件名 `STAGE7_DITHER_DEGRADED`，
+    且日志声称"dither 不作用于降位深"。第三轮 R2-12 实测证明**这个说法是错的**
+    （dither=ordered/error_diffusion 与 none 相比确实改变像素），
+    因此事件改名为 `STAGE7_DITHER_FALLBACK_CHAIN`，日志改为陈述事实。
+    断言同步更新，并新增下面两条真实像素/限帧用例作为等价（更强）反例。
+    """
+    s7 = _load_stage7()
 
     class _Log:
         def __init__(self):
             self.warnings = []
+            self.infos = []
 
         def warning(self, event, message, **kw):
             self.warnings.append((event, message))
 
         def info(self, *a, **k):
-            pass
+            self.infos.append((a[0] if a else "",))
 
-    # 模拟"这个 ffmpeg 的 zscale 没有 format 选项"
-    monkeypatch.setattr(
-        s7, "_zscale_has_option",
-        lambda expr: ("format=" not in expr))
+    monkeypatch.setattr(s7, "_zscale_probe", lambda expr: "unsupported")
+    monkeypatch.setattr(s7, "_zscale_has_option", lambda expr: False)
     log = _Log()
     filters = s7._zscale_dither_filters("ordered", log)
     assert filters, "降级链必须给出可用的滤镜串，不能返回空"
-    assert "format=" not in " ".join(filters) or True  # 允许 format 滤镜（非 zscale）
-    assert any(ev == "STAGE7_DITHER_DEGRADED" for ev, _ in log.warnings), \
+    # 关键：绝不能把 zscale 不支持的 format= 拼进 zscale 里（NEW-RV-05）
+    assert not any(f.startswith("zscale=") and "format=" in f for f in filters), \
+        "又把 format= 拼进 zscale 了 —— 该构建会 rc=84"
+    assert any(ev == "STAGE7_DITHER_FALLBACK_CHAIN" for ev, _ in log.warnings), \
         "降级了却没记录 —— 等于静默降级，正是 NEW-RV-05 要禁止的"
+    # R2-12：不能再声称"抖动无效"
+    joined = " ".join(m for _, m in log.warnings)
+    assert "does NOT apply" not in joined, (
+        "仍在声称 dither 不作用于降位深 —— 实测该说法错误（R2-12）")
+
+
+def test_r212_zscale_probe_is_bounded(monkeypatch):
+    """R2-12：能力探测必须限帧，不能靠超时兜底。
+
+    无限 lavfi color 源会让"支持的选项"跑到超时（实测 15s 才返回 False）。
+    这里断言探测命令里带 -frames:v，且限时内返回结论。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— R2-12 限帧探测记为未验收")
+    s7 = _load_stage7()
+    s7._ZSCALE_CAP_CACHE.clear()
+    s7._ZSCALE_CAP_REASON.clear()
+
+    seen = {}
+    orig_run = s7.subprocess.run      # 先取原函数，否则 spy 会递归调自己
+
+    def spy_run(cmd, *a, **kw):
+        seen["cmd"] = list(cmd)
+        return orig_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(s7.subprocess, "run", spy_run)
+    start = time.time()
+    reason = s7._zscale_probe("dither=ordered")
+    elapsed = time.time() - start
+
+    assert reason == "supported", f"受支持的选项被判成 {reason}（限帧探测仍有误判）"
+    assert "-frames:v" in seen.get("cmd", []), \
+        "探测没有限帧 —— 无限 lavfi 源会靠超时兜底（实测 15s 判 False）"
+    assert elapsed < 10, f"限帧探测仍耗时 {elapsed:.1f}s，说明没有真正生效"
+
+
+def test_r212_dither_changes_pixels_in_fallback_chain(tmp_path):
+    """R2-12 真实负向对照：降级链里 dither 必须真的改变像素。
+
+    没有这条，"dither 有效/无效"都只是日志里的形容词。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— R2-12 像素对照记为未验收")
+
+    def run(dither: str) -> bytes:
+        vf = (f"format=yuv444p16,zscale=rangein=limited:range=limited:"
+              f"dither={dither},format=yuv444p10")
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi",
+             "-i", "testsrc2=s=64x64:d=1:r=1", "-vf", vf,
+             "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p10le", "-"],
+            capture_output=True, timeout=60)
+        assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[:300]
+        return r.stdout
+
+    base = run("none")
+    assert base, "参考输出为空，对照不成立"
+    for dither in ("ordered", "error_diffusion"):
+        other = run(dither)
+        diff = sum(1 for a, b in zip(base, other) if a != b)
+        assert diff > 0, (
+            f"dither={dither} 与 none 的输出完全相同 —— "
+            "说明该链里抖动确实无效，日志/文档必须据此修正")
 
 
 def test_new_rv04_real_stage7_with_audio_track(tmp_path):
@@ -1154,3 +1237,313 @@ def test_rv08_real_multiprocess_stress_with_stale_late_writer(tmp_path):
         f"并发写入丢更新，只落了 {by_status.get('DONE', 0)} 条 DONE：{by_status}")
     leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
     assert not leftovers, f"残留临时文件：{leftovers}"
+
+
+# ---------------------------------------------------------------------------
+# R2-09：FFmpeg 模型路径两层转义 —— 真实 ffmpeg 矩阵（不是字符串比对）
+# ---------------------------------------------------------------------------
+
+_R209_CASES = ["relative", "absolute", "space", "chinese", "comma",
+               "semicolon", "bracket", "quote"]
+
+
+def test_r209_real_ffmpeg_model_path_matrix(tmp_path):
+    """R2-09：同一有效模型在 8 种路径下都必须经**真实 ffmpeg** 处理成功。
+
+    第二轮只做了一层转义，实测 5 种失败（absolute/comma/semicolon/bracket/quote）。
+    这里不做字符串比对，而是真的跑 ffmpeg 并断言 rc=0 —— 只断言"长得像转义过"
+    是自欺（交接明确禁止）。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— R2-09 真机部分记为未验收")
+    sys.path.insert(0, SHARED)
+    import audio_utils  # noqa: E402
+
+    model_src = os.path.join(ROOT, "models", "std.rnnn")
+    if not os.path.exists(model_src):
+        pytest.skip("仓库内没有 models/std.rnnn —— R2-09 真机部分记为未验收")
+
+    modeldir = tmp_path / "models"
+    modeldir.mkdir()
+    names = {
+        "relative": "std.rnnn",
+        "absolute": "std.rnnn",
+        "space": "my model.rnnn",
+        "chinese": "模型 中文.rnnn",
+        "comma": "a,b.rnnn",
+        "semicolon": "a;b.rnnn",
+        "bracket": "a[b].rnnn",
+        "quote": "it's.rnnn",
+    }
+    failures = {}
+    for kind in _R209_CASES:
+        model = modeldir / names[kind]
+        shutil.copyfile(model_src, str(model))
+        argument = str(model) if kind == "absolute" else "models/" + names[kind]
+        chain = "arnndn=m=" + audio_utils.filter_option_path(argument)
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi",
+             "-i", "sine=duration=0.2:sample_rate=48000",
+             "-af", chain, "-f", "null", "-"],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            failures[kind] = {"argument": argument, "chain": chain,
+                              "stderr": (r.stderr or "")[:300]}
+    assert not failures, (
+        "R2-09：以下路径经真实 ffmpeg 失败（滤镜图两层转义不完整）："
+        + json.dumps(failures, ensure_ascii=False, indent=2))
+
+
+def test_r209_second_level_escape_is_actually_needed(tmp_path):
+    """负向对照：只做第 1 层转义时，真实 ffmpeg 必须失败 —— 证明两层是必要的。
+
+    没有这条，"两层转义"就可能只是把字符串改复杂了，而没解决任何真实缺陷。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— R2-09 负向对照记为未验收")
+    sys.path.insert(0, SHARED)
+    import audio_utils  # noqa: E402
+
+    model_src = os.path.join(ROOT, "models", "std.rnnn")
+    if not os.path.exists(model_src):
+        pytest.skip("仓库内没有 models/std.rnnn —— R2-09 负向对照记为未验收")
+
+    modeldir = tmp_path / "models"
+    modeldir.mkdir()
+    model = modeldir / "a,b.rnnn"      # 逗号只在第 2 层是特殊字符
+    shutil.copyfile(model_src, str(model))
+
+    # 只做第 1 层（逗号不是第 1 层特殊字符，等于原样）
+    only_l1 = "arnndn=m=models/a,b.rnnn"
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi",
+         "-i", "sine=duration=0.2:sample_rate=48000",
+         "-af", only_l1, "-f", "null", "-"],
+        cwd=str(tmp_path), capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0, (
+        "只做第 1 层转义居然通过了 —— 说明第 2 层转义可能并不需要，需要重新核对")
+
+
+# ---------------------------------------------------------------------------
+# R2-10：立体声内容保留（真实波形，不是只看声道数恢复成 2）
+# ---------------------------------------------------------------------------
+
+def _make_stereo_wav(path, seconds=1.0, rate=48000):
+    """左右**不同**频率的双声道素材：L=440Hz，R=880Hz。"""
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}:sample_rate={rate}",
+         "-f", "lavfi", "-i", f"sine=frequency=880:duration={seconds}:sample_rate={rate}",
+         "-filter_complex", "[0:a][1:a]join=inputs=2:channel_layout=stereo[a]",
+         "-map", "[a]", "-c:a", "pcm_s16le", str(path)],
+        capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        pytest.skip(f"无法合成双声道素材（未验收）：{r.stderr[:200]}")
+    return path
+
+
+def _extract_channel(path, index):
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-af",
+         f"pan=mono|c0=c{index}", "-f", "s16le", "-"],
+        capture_output=True, timeout=60)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[:200]
+    return r.stdout
+
+
+def test_r210_stereo_information_survives_arnndn(tmp_path):
+    """R2-10：arnndn 之后左右声道**不得**变成同一份内容。
+
+    旧实现 `aformat=channel_layouts=mono → arnndn → aformat=...stereo`
+    会把左右下混成一个单声道再复制回去，声道数看起来还是 2，但内容已经合并。
+    实测（本机 ffmpeg）：旧链处理后 L 与 R **完全相同**。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— R2-10 声道保留记为未验收")
+    s7 = _load_stage7()
+    model = os.path.join(ROOT, "models", "std.rnnn")
+    if not os.path.exists(model):
+        pytest.skip("仓库内没有 models/std.rnnn —— R2-10 声道保留记为未验收")
+
+    sys.path.insert(0, SHARED)
+    from audio_utils import filter_option_path
+
+    src = _make_stereo_wav(tmp_path / "stereo.wav")
+    assert _extract_channel(src, 0) != _extract_channel(src, 1), \
+        "素材本身左右就相同，对照不成立"
+
+    chain = ",".join(s7._arnndn_filters(
+        model, {"channels": 2, "layout": "stereo"}, filter_option_path, None))
+    out = tmp_path / "denoised.wav"
+    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
+                        "-af", chain, "-f", "wav", str(out)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"逐声道 arnndn 链跑不起来：{r.stderr[:300]}"
+    left = _extract_channel(out, 0)
+    right = _extract_channel(out, 1)
+    assert left and right, "输出声道为空"
+    assert left != right, \
+        "arnndn 之后左右声道完全相同 —— 说明左右信息被下混合并了（R2-10）"
+
+
+def test_r210_old_mono_roundtrip_really_merges_channels(tmp_path):
+    """负向对照：旧的 mono 回绕链**必须**被判为合并。
+
+    没有这条，上一条可能只是"本来就没差异"，证明不了门有效。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— R2-10 负向对照记为未验收")
+    model = os.path.join(ROOT, "models", "std.rnnn")
+    if not os.path.exists(model):
+        pytest.skip("仓库内没有 models/std.rnnn —— R2-10 负向对照记为未验收")
+
+    sys.path.insert(0, SHARED)
+    from audio_utils import filter_option_path
+
+    src = _make_stereo_wav(tmp_path / "stereo.wav")
+    old_chain = (f"aformat=channel_layouts=mono,"
+                 f"arnndn=m={filter_option_path(model)},"
+                 f"aformat=channel_layouts=stereo")
+    out = tmp_path / "old.wav"
+    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
+                        "-af", old_chain, "-f", "wav", str(out)],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        pytest.skip(f"旧链在本机跑不起来（未验收）：{r.stderr[:200]}")
+    assert _extract_channel(out, 0) == _extract_channel(out, 1), (
+        "旧 mono 回绕链居然没有合并左右 —— 那么上一条用例就没有证明力，"
+        "需要重新设计对照")
+
+
+# ---------------------------------------------------------------------------
+# R2-04 / R2-05：调度入口（视频不覆盖并发结果、照片完成顺序落盘）
+# ---------------------------------------------------------------------------
+
+def test_r204_video_startup_does_not_clobber_concurrent_done(tmp_path,
+                                                             monkeypatch):
+    """R2-04 等价反例：视频启动期不得用旧快照把并发写好的 DONE 盖回 PENDING。
+
+    与独立用例 A09 同一注入设置；这里不依赖"启动期一定会整表写盘"这一前提，
+    而是直接断言磁盘最终状态（因此更强）。
+    """
+    path = _cli_env(tmp_path, monkeypatch, 0)
+    original_load = vmain.load_manifest
+    injected = {"done": False}
+
+    def stale_load(p):
+        old = original_load(p)
+        if str(p) == path and not injected["done"]:
+            injected["done"] = True
+            gen = ml.acquire_run_ownership(path, ["j1"], owner="concurrent-A")
+            assert ml.save_manifest_job_result(
+                path, "j1", "DONE", owner="concurrent-A", generation=gen)
+        return old          # 本次进程拿到的是**注入前**的旧快照
+
+    # 必须在"作业真正被处理之前"停下来看磁盘：否则后面 job 处理完又会写一次
+    # DONE，把启动期的覆盖掩盖掉（第一版用例就是这样在基线上也通过的）。
+    class _Stop(Exception):
+        pass
+
+    def _boom(*_a, **_k):
+        raise _Stop()
+
+    monkeypatch.setattr(vmain, "load_manifest", stale_load)
+    monkeypatch.setattr(vmain, "process_job", _boom)
+    try:
+        vmain.main()
+    except _Stop:
+        pass
+    except SystemExit:
+        pass
+    final = ml.load_manifest(path)
+    assert final["jobs"][0]["status"] == "DONE", (
+        "视频启动期用旧快照整表覆盖，把并发运行的 DONE 打回 "
+        f"{final['jobs'][0]['status']}（R2-04）")
+
+
+def test_r205_photo_scheduler_persists_completed_job_without_waiting(
+        tmp_path, monkeypatch):
+    """R2-05：已完成的 job 不得被前面那个慢 job 挡住落盘。
+
+    驱动**真正的 photo main() 调度入口**：
+      * job A 在 worker 里阻塞（等事件）；job B 立即返回；
+      * A 只有在"读到磁盘上 B 已是 DONE"之后才放行 —— 这消除了竞态，
+        如果父进程是按提交顺序 future.get() 阻塞，A 永远等不到 B 落盘，
+        于是断言失败。
+    进程池换成线程池，是为了让父进程里替换的 _run_single_job 在 worker 中
+    可见（spawn 子进程看不到 monkeypatch）；被测对象是**父进程的收集逻辑**，
+    这正是 R2-05 的缺陷所在。
+    """
+    import importlib.util as _ilu
+    import multiprocessing as _mp
+    import multiprocessing.pool as _mppool
+    import threading
+
+    pmain_path = os.path.join(ROOT, "photo_restoration_pipeline", "main.py")
+    spec = _ilu.spec_from_file_location("photo_main_r205", pmain_path)
+    pmain = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(pmain)
+
+    manifest_path = str(tmp_path / "m.jsonl")
+    jobs = [{"job_id": "A", "status": "PENDING", "input_path": "a.png",
+             "detected_class": "scan_print",
+             "output_path": str(tmp_path / "a.out")},
+            {"job_id": "B", "status": "PENDING", "input_path": "b.png",
+             "detected_class": "scan_print",
+             "output_path": str(tmp_path / "b.out")}]
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        for j in jobs:
+            f.write(json.dumps(j) + "\n")
+    ml.write_meta(manifest_path, {"total": len(jobs)}) if hasattr(
+        ml, "write_meta") else None
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("global:/n  temp_dir: .\n", encoding="utf-8")
+
+    observed = {"b_done_before_a": False}
+    release = threading.Event()
+
+    def fake_run_single_job(job, config_path, config, cli_params):
+        if job["job_id"] == "A":
+            # 轮询等待：B 的结果必须**已经在磁盘上**才放行
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                doc = ml.load_manifest(manifest_path)
+                hit = [j for j in doc["jobs"] if j["job_id"] == "B"]
+                if hit and hit[0].get("status") == "DONE":
+                    observed["b_done_before_a"] = True
+                    break
+                time.sleep(0.05)
+            return 0
+        rc = 0
+        return rc
+
+    class _ThreadContext:
+        def Pool(self, processes=None):
+            return _mppool.ThreadPool(processes=processes or 2)
+
+    class _FakeMp:
+        @staticmethod
+        def get_context(_name=None):
+            return _ThreadContext()
+
+    # photo main 在函数内部 `import multiprocessing as mp` 后调用
+    # `mp.get_context('spawn')`，因此要 patch multiprocessing 模块本身。
+    monkeypatch.setattr(pmain, "_run_single_job", fake_run_single_job)
+    monkeypatch.setattr(_mp, "get_context", _FakeMp.get_context)
+    monkeypatch.setattr(sys, "argv",
+                        ["main.py", "--manifest", manifest_path,
+                         "--config", str(cfg_path), "--workers", "2"])
+
+    try:
+        pmain.main()
+    except SystemExit as e:
+        assert e.code in (0, None, 3), f"photo main 退出码异常：{e.code}"
+
+    assert observed["b_done_before_a"], (
+        "R2-05：job B 已经完成，但在 job A 结束前它的结果没有被落盘 —— "
+        "说明父进程仍按提交顺序阻塞收集（此时调度器退出就会丢掉 B 的状态）")
+    final = ml.load_manifest(manifest_path)
+    statuses = {j["job_id"]: j["status"] for j in final["jobs"]}
+    assert statuses.get("B") == "DONE", f"B 最终状态不对：{statuses}"
+    assert statuses.get("A") == "DONE", f"A 最终状态不对：{statuses}"

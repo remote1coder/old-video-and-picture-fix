@@ -1231,16 +1231,28 @@ def main():
             status = "DONE" if rc == 0 else "FAILED"
             update_job_status(manifest, job["job_id"], status,
                               error_message="" if rc == 0 else f"Exit code {rc}")
-            saved = save_manifest_job_result(
-                args.manifest, job["job_id"], status,
-                error_message="" if rc == 0 else f"Exit code {rc}",
-                owner=run_owner, generation=run_generation)
+            # R2-06：持久化的真实契约包含"抛异常"（磁盘拒绝写入、
+            # Path.replace 失败等）。旧代码只判断返回值，异常会直接逃出
+            # _record 并打断整个批次。这里收口并保留原始原因。
+            try:
+                saved = save_manifest_job_result(
+                    args.manifest, job["job_id"], status,
+                    error_message="" if rc == 0 else f"Exit code {rc}",
+                    owner=run_owner, generation=run_generation)
+                save_reason = ""
+            except Exception as e:
+                saved = False
+                save_reason = f"{type(e).__name__}: {e}"
+                print(f"[{job['job_id']}] result persistence raised "
+                      f"{save_reason}", file=sys.stderr)
             results.append((job, rc))
             if rc != 0 or not saved:
                 failures.append((job, rc if rc != 0 else 82))
                 print(f"[{job['job_id']}] FAILED "
                       f"with exit code {rc}", file=sys.stderr)
             if not saved:
+                # 磁盘不可写时**不谎称**已记录失败状态：只把它作为本次运行的
+                # 失败原因报出去，诊断信息走 stderr/日志。
                 print(f"[{job['job_id']}] result could NOT be persisted to "
                       f"the manifest", file=sys.stderr)
 
@@ -1251,21 +1263,29 @@ def main():
             import multiprocessing as mp
             pool = mp.get_context('spawn').Pool(processes=args.workers)
             try:
-                futures = {}
+                # R2-05：旧代码 `for future, job in futures.items(): future.get()`
+                # 是**按提交顺序**阻塞等待 —— 前一个 job 慢，后面已经完成的
+                # job 就进不了 _record；此时调度器退出会丢掉它们的状态。
+                # 改成用 callback：结果一到就由 pool 的 result handler 线程
+                # 调用 _record，天然是"完成顺序"。
+                futures = []
                 for job in jobs:
-                    future = pool.apply_async(
-                        _run_single_job,
-                        (job, args.config, config, dict(cli_params)))
-                    futures[future] = job
-                for future, job in futures.items():
-                    try:
-                        rc = future.get()
-                    except Exception as e:
-                        print(f"[{job['job_id']}] Worker crashed: {e}",
+                    # 每个 job 各自绑定（不能把 job 捕获在外层定义里）
+                    def _done(rc, _job=job):
+                        _record(_job, rc)
+
+                    def _failed(exc, _job=job):
+                        print(f"[{_job['job_id']}] Worker crashed: {exc}",
                               file=sys.stderr)
-                        rc = 84
-                    # RV-07: 逐个结果即时落盘，不等整批结束
-                    _record(job, rc)
+                        _record(_job, 84)
+
+                    futures.append(pool.apply_async(
+                        _run_single_job,
+                        (job, args.config, config, dict(cli_params)),
+                        callback=_done, error_callback=_failed))
+                # 只负责等待，不再按提交顺序收集结果
+                for future in futures:
+                    future.wait()
             finally:
                 pool.close()
                 pool.join()

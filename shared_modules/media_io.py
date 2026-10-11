@@ -886,3 +886,82 @@ def prepare_encoder_input(path: str, workdir: str,
                     dtype=result["source_dtype"],
                     verification=result["verification"])
     return result
+
+
+# --- R2-13: 真实头部回读 ----------------------------------------------------
+
+def _avifdec_binary(capability: Any = None) -> str:
+    """Locate avifdec (same search order the tests use: PATH, then tests/_out/tools)."""
+    import shutil
+    found = shutil.which("avifdec")
+    if found:
+        return found
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent / "tests" / "_out" / "tools" / "avifdec.exe",
+                 here.parent / "tests" / "_out" / "tools" / "avifdec"):
+        if cand.exists():
+            return str(cand)
+    return "avifdec"
+
+
+def read_avif_header(path: str, capability: Any = None) -> Dict[str, Any]:
+    """R2-13: read back the **actual** AVIF header with avifdec.
+
+    命令参数是"意图"，编码器可能接受并改写。典型例子（A20 实测）：
+    常规 YUV420 路径传 ``--cicp 2/2/0``（矩阵 0 = Identity），avifenc 不报错，
+    而是**警告后自动改成 6**；``avifdec --info`` 读回 Matrix Coeffs = 6，
+    但保存的契约仍写着 0 —— 契约失真。因此发布前必须回读头部核对。
+
+    Returns:
+        解析出的头部字段（键：bit_depth / format / range / color_primaries /
+        transfer / matrix / icc_present ...）。回读失败返回空 dict。
+    """
+    import re
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [_avifdec_binary(capability), "--info", path],
+            capture_output=True, text=True, timeout=30, shell=False)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+
+    text = (r.stdout or "") + "\n" + (r.stderr or "")
+
+    def _grab(label: str) -> Optional[str]:
+        m = re.search(rf"{re.escape(label)}\s*:\s*(\S+)", text)
+        return m.group(1) if m else None
+
+    def _as_int(value: Optional[str]) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    header: Dict[str, Any] = {
+        "bit_depth": _as_int(_grab("Bit Depth")),
+        "format": _grab("Format"),
+        "range": _grab("Range"),
+        "color_primaries": _as_int(_grab("Color Primaries")),
+        "transfer": _as_int(_grab("Transfer Char.")),
+        "matrix": _as_int(_grab("Matrix Coeffs.")),
+        "icc_present": (_grab("ICC Profile") or "").lower() not in ("absent", ""),
+        "alpha_present": (_grab("Alpha") or "").lower() not in ("absent", ""),
+        "raw": text[:2000],
+    }
+    return header
+
+
+def cicp_matrix(cicp: Optional[str]) -> Optional[int]:
+    """Extract the matrix component from a ``p/t/m`` CICP string."""
+    if not cicp:
+        return None
+    parts = str(cicp).split("/")
+    if len(parts) < 3:
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None

@@ -66,8 +66,36 @@ def test_v04_degraded_encode_marks_cicp_unspecified(tmp_path):
                "allow_unconverted_colorspace": True},
         str(tmp_path), "j2", "clip", log)
     assert color["status"] == s6.COLOR_DEGRADED
-    assert color["cicp_override"] == "2/2/0", "must not claim sRGB primaries"
+    # R2-13（第三轮）契约变更 + 理由：
+    # 旧断言是 "2/2/0"（矩阵 0 = Identity）。实测（独立用例 A20）证明在
+    # **常规 YUV420** 下 avifenc 不会拒绝，而是警告后把 identity 矩阵 0 自动
+    # 改成 6 —— 于是保存的契约与真实文件头不一致。因此降级 CICP 必须按最终
+    # 布局选：archival/RGB444 → 2/2/0，常规 YUV → 2/2/1。
+    # 这里 archical 未开启（默认 False），故应为 YUV 形式。
+    assert color["cicp_override"] == "2/2/1", (
+        "degraded non-archival (YUV) encode must not claim an identity "
+        "matrix; avifenc rewrites 0 to 6 and the contract would be a lie")
+    assert not color["cicp_override"].startswith("1/13"), \
+        "must not claim sRGB primaries"
     assert any(name == "STAGE6_COLOR_DEGRADED" for name, _ in log.events)
+
+
+def test_r213_degraded_archival_keeps_identity_matrix(tmp_path):
+    """R2-13 配套：archival（RGB444）路径下 identity 矩阵是**合法**的。
+
+    上一条断言 YUV 用 2/2/1；这一条确认 RGB444 仍用 2/2/0，
+    避免把上一条理解成"identity 一律禁止"。
+    """
+    work = _working_png(tmp_path)
+    log = _Log()
+    color = s6.resolve_color_space(
+        work, {"input_color_space": "adobergb",
+               "allow_unconverted_colorspace": True,
+               "archival_mode": True},
+        str(tmp_path), "j2a", "clip", log)
+    assert color["status"] == s6.COLOR_DEGRADED
+    assert color["cicp_override"] == "2/2/0", \
+        "RGB444 (archival) may legitimately use the identity matrix"
 
 
 def test_v04_real_profile_is_used_for_conversion(tmp_path):

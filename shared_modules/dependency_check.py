@@ -22,6 +22,16 @@ import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 
+SCRIPT_DIR = Path(__file__).parent.resolve()
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+# R2-08: `arnndn=m=...` 的模型路径必须经 filter_option_path 转义（见
+# audio_utils 的 docstring）。此前该函数在本模块**被调用但未导入**，
+# 一旦 models/std.rnnn 存在、真正进入该分支就抛
+# `NameError: name 'filter_option_path' is not defined`（独立用例 A05 复现）。
+from audio_utils import filter_option_path  # noqa: E402
+
 
 def run_cmd(cmd: List[str], capture: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
     """Run a command with shell=False."""

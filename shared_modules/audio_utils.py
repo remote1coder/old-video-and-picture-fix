@@ -4,6 +4,7 @@ Audio Restoration Utilities
 Shared audio processing for both video and photo pipelines.
 """
 
+import os
 import sys
 from pathlib import Path
 import subprocess
@@ -309,18 +310,57 @@ def _get_ffmpeg_version() -> Tuple[bool, str]:
     return False, "unknown"
 
 
-def filter_option_path(path: str) -> str:
-    """NEW-RV-06: escape a filesystem path for use **inside** an ffmpeg filter option.
+# R2-09：FFmpeg 滤镜图有**两层**转义（doc/filters.texi
+# "Notes on filtergraph escaping"，2026-10-10 取自 FFmpeg 官方仓库）：
+#   第 1 层（filter option value）：\ ' : （: 用于分隔选项值）
+#   第 2 层（filter description，嵌入 filtergraph 时）：\ ' , [ ] ;
+# shell=False 只免掉第 3 层（shell），滤镜图内部的两层仍然生效。
+_LEVEL1_SPECIALS = "\\':"
+_LEVEL2_SPECIALS = "\\'[],;"
 
-    真机复现（Windows + ffmpeg 2023-11-13）：把 ``models\\std.rnnn`` 直接写进
-    ``-af arnndn=m=...`` 后，ffmpeg 报
-    ``Failed to open model file: modelsstd.rnnn`` —— 滤镜图解析器把 ``\\s`` 当成
-    转义序列，反斜杠被吃掉，路径整个变形，stage7 因此 rc=84。
-    修法：统一成正斜杠，并把滤镜语法里的分隔符 ``:`` 转义掉。
+
+def _escape_once(text: str, specials: str) -> str:
+    """按 FFmpeg 规则给特殊字符逐个前置反斜杠。"""
+    out = []
+    for ch in text:
+        if ch in specials:
+            out.append("\\")
+        out.append(ch)
+    return "".join(out)
+
+
+def filter_option_path(path: str) -> str:
+    """Escape a filesystem path for use **inside** an ffmpeg filter option.
+
+    历史（NEW-RV-06，第二轮）：只把 ``\\`` 换成正斜杠、把 ``:`` 转成 ``\\:``，
+    属于**只做了第 1 层**。真机实测（ffmpeg 2023-11-13 gyan 构建）证明这不够 ——
+    ``\\:`` 里的反斜杠会在第 2 层被吃掉，于是 ``E:\\...`` 的盘符冒号没有被转义，
+    ``:`` 被当成 arnndn 的 ``mix`` 选项分隔符。
+    R2-09 实测矩阵（相对/绝对/空格/中文/逗号/分号/方括号/单引号，共 8 种）：
+
+    ==========================  ==========================================
+    方案                        真实 ffmpeg rc
+    ==========================  ==========================================
+    旧实现（只第 1 层）         absolute/comma/semicolon/bracket/quote 全失败
+    只第 1 层                   同上，仍全失败
+    第 1 层 + 第 2 层           8/8 rc=0
+    归一正斜杠 + 两层（本实现） 8/8 rc=0
+    ==========================  ==========================================
+
+    证据：`E:/codex/_repair_r3_20261010/evidence/a19_probe.json`。
+
+    Args:
+        path: 要嵌入滤镜选项值的路径。
+
+    Returns:
+        已按两层规则转义、可直接拼进 ``arnndn=m=<...>`` 的字符串。
     """
-    text = str(path).replace("\\", "/")
-    # ffmpeg 滤镜选项里 ':' 是选项分隔符，必须转义
-    return text.replace(":", r"\:")
+    text = str(path)
+    if os.sep == "\\":
+        # Windows：先把分隔符归一成正斜杠，避免反斜杠参与转义。
+        # POSIX 下反斜杠是合法文件名字符，不能替换，交给两层转义处理。
+        text = text.replace("\\", "/")
+    return _escape_once(_escape_once(text, _LEVEL1_SPECIALS), _LEVEL2_SPECIALS)
 
 
 def _get_arnndn_model_path(config: Dict[str, Any], primary_freq: int) -> Optional[str]:

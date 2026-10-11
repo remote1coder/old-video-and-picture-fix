@@ -1,0 +1,2368 @@
+diff --git a/photo_restoration_pipeline/main.py b/photo_restoration_pipeline/main.py
+index bcbb5b0..60f093c 100644
+--- a/photo_restoration_pipeline/main.py
++++ b/photo_restoration_pipeline/main.py
+@@ -1231,16 +1231,28 @@ def main():
+             status = "DONE" if rc == 0 else "FAILED"
+             update_job_status(manifest, job["job_id"], status,
+                               error_message="" if rc == 0 else f"Exit code {rc}")
+-            saved = save_manifest_job_result(
+-                args.manifest, job["job_id"], status,
+-                error_message="" if rc == 0 else f"Exit code {rc}",
+-                owner=run_owner, generation=run_generation)
++            # R2-06：持久化的真实契约包含"抛异常"（磁盘拒绝写入、
++            # Path.replace 失败等）。旧代码只判断返回值，异常会直接逃出
++            # _record 并打断整个批次。这里收口并保留原始原因。
++            try:
++                saved = save_manifest_job_result(
++                    args.manifest, job["job_id"], status,
++                    error_message="" if rc == 0 else f"Exit code {rc}",
++                    owner=run_owner, generation=run_generation)
++                save_reason = ""
++            except Exception as e:
++                saved = False
++                save_reason = f"{type(e).__name__}: {e}"
++                print(f"[{job['job_id']}] result persistence raised "
++                      f"{save_reason}", file=sys.stderr)
+             results.append((job, rc))
+             if rc != 0 or not saved:
+                 failures.append((job, rc if rc != 0 else 82))
+                 print(f"[{job['job_id']}] FAILED "
+                       f"with exit code {rc}", file=sys.stderr)
+             if not saved:
++                # 磁盘不可写时**不谎称**已记录失败状态：只把它作为本次运行的
++                # 失败原因报出去，诊断信息走 stderr/日志。
+                 print(f"[{job['job_id']}] result could NOT be persisted to "
+                       f"the manifest", file=sys.stderr)
+ 
+@@ -1251,21 +1263,29 @@ def main():
+             import multiprocessing as mp
+             pool = mp.get_context('spawn').Pool(processes=args.workers)
+             try:
+-                futures = {}
++                # R2-05：旧代码 `for future, job in futures.items(): future.get()`
++                # 是**按提交顺序**阻塞等待 —— 前一个 job 慢，后面已经完成的
++                # job 就进不了 _record；此时调度器退出会丢掉它们的状态。
++                # 改成用 callback：结果一到就由 pool 的 result handler 线程
++                # 调用 _record，天然是"完成顺序"。
++                futures = []
+                 for job in jobs:
+-                    future = pool.apply_async(
+-                        _run_single_job,
+-                        (job, args.config, config, dict(cli_params)))
+-                    futures[future] = job
+-                for future, job in futures.items():
+-                    try:
+-                        rc = future.get()
+-                    except Exception as e:
+-                        print(f"[{job['job_id']}] Worker crashed: {e}",
++                    # 每个 job 各自绑定（不能把 job 捕获在外层定义里）
++                    def _done(rc, _job=job):
++                        _record(_job, rc)
++
++                    def _failed(exc, _job=job):
++                        print(f"[{_job['job_id']}] Worker crashed: {exc}",
+                               file=sys.stderr)
+-                        rc = 84
+-                    # RV-07: 逐个结果即时落盘，不等整批结束
+-                    _record(job, rc)
++                        _record(_job, 84)
++
++                    futures.append(pool.apply_async(
++                        _run_single_job,
++                        (job, args.config, config, dict(cli_params)),
++                        callback=_done, error_callback=_failed))
++                # 只负责等待，不再按提交顺序收集结果
++                for future in futures:
++                    future.wait()
+             finally:
+                 pool.close()
+                 pool.join()
+diff --git a/photo_restoration_pipeline/stages/stage5_postprocess.py b/photo_restoration_pipeline/stages/stage5_postprocess.py
+index 08d23d5..7093bac 100644
+--- a/photo_restoration_pipeline/stages/stage5_postprocess.py
++++ b/photo_restoration_pipeline/stages/stage5_postprocess.py
+@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该
+ 
+ 
+ def read_true_input_array(path: str):
+-    """Return the input's real uint16 array, or None when it is not 16-bit.
++    """Return ``(array, icc_bytes)`` for the input's real uint16 data.
+ 
+     NEW-V-03: ``PIL.Image.open()`` on a 16-bit **RGB** TIFF returns mode
+     ``'RGB'`` backed by **uint8** data truncated to the high byte
+@@ -62,22 +62,81 @@ def read_true_input_array(path: str):
+     于是 16-bit RGB 素材在 stage5 就被静默压成 8-bit，
+     后面的 "16-bit 归档" 只剩容器是 16-bit、内容只有 8-bit 的信息量。
+     这里改用 tifffile（media_io.read_image_array）判定真实位深。
++
++    R2-02 / A03：同时把**源 ICC**带回来。旧实现丢弃 meta，
++    于是输入 PNG 里 588 字节的 sRGB profile 在 stage5 输出里变成 0 字节 ——
++    像素与元数据必须一起传递。
++
++    Returns:
++        ``(None, icc_or_None)`` 当输入不是 16-bit；读取彻底失败时同。
+     """
+     if _media_io is None:
+-        return None
++        return None, None
++    icc = None
+     try:
+-        arr, _meta = _media_io.read_image_array(path)
++        arr, meta = _media_io.read_image_array(path)
++        icc = (meta or {}).get("icc_profile")
++    except getattr(_media_io, "MediaPrecisionError", Exception):
++        # R2-02 / A04：高精度读取失败是**必须向上抛**的硬错误。
++        # 旧实现 `except Exception: return None`，于是调用方退回 Pillow 的
++        # 8-bit 通道，把整幅图压成 257 的整数倍再装回 uint16，最后 rc=0。
++        # 底层"响亮失败"没有贯穿调用方，等于没失败。
++        raise
+     except Exception:
+-        return None
++        return None, None
+     if arr is None:
+-        return None
++        return None, icc
+     if getattr(arr, "dtype", None) != np.uint16:
+-        return None
++        return None, icc
+     if arr.ndim == 2:
+         arr = np.stack([arr, arr, arr], axis=2)
+     if arr.ndim != 3 or arr.shape[2] not in (3, 4):
+-        return None
+-    return arr
++        return None, icc
++    return arr, icc
++
++
++#: R2-03：单维度上限。超过这个值基本可以断定是笔误/恶意输入，
++#: 真要去分配这么大的中间缓冲也会把机器拖死，因此在参数层就拒绝。
++_MAX_LANCZOS_DIMENSION = 32768
++
++
++def _cached_was_degraded(cached_meta: Optional[Dict[str, Any]]) -> bool:
++    """R2-03: whether a cache entry records operations that were *not* performed."""
++    if not isinstance(cached_meta, dict):
++        return False
++    skipped = cached_meta.get("skipped_operations")
++    return bool(skipped) if isinstance(skipped, (list, tuple)) else bool(skipped)
++
++
++def parse_lanczos_target(value: Any) -> Tuple[Optional[int], Optional[int],
++                                              Optional[str]]:
++    """R2-03: validate an explicitly requested resize target.
++
++    Returns ``(w, h, error)``；``error`` 非 None 表示请求非法。
++
++    旧实现解析失败或解析出 0 时只记一条 warning 就跳过，然后**照常返回成功**
++    （A14：`lanczos_target="0x0"` → rc=0，输出照写）。
++    "请求了却没做"必须在参数层拒绝，不能靠后面"看起来没坏"蒙过去。
++    """
++    if value is None:
++        return None, None, None
++    text = str(value).strip()
++    if text in ("", "auto"):
++        return None, None, None
++    if "x" not in text:
++        return None, None, f"not in <width>x<height> form: {value!r}"
++    w_text, _, h_text = text.partition("x")
++    try:
++        w = int(w_text)
++        h = int(h_text)
++    except (TypeError, ValueError):
++        return None, None, f"non-integer dimensions: {value!r}"
++    if w <= 0 or h <= 0:
++        return None, None, f"dimensions must be positive: {value!r}"
++    if w > _MAX_LANCZOS_DIMENSION or h > _MAX_LANCZOS_DIMENSION:
++        return None, None, (f"dimension exceeds the supported maximum "
++                            f"{_MAX_LANCZOS_DIMENSION}: {value!r}")
++    return w, h, None
+ 
+ 
+ def _resize_array_high_depth(arr: "np.ndarray", target_w: int, target_h: int):
+@@ -385,6 +444,49 @@ def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
+         return np.empty((0, 3), dtype=np.float32)
+ 
+ 
++def _carry_icc_to_output(output_path: str, icc: Optional[bytes],
++                         logger=None) -> bool:
++    """R2-02 / A03: attach the source ICC to the stage5 output.
++
++    stage5 不做色彩空间转换，因此"未变化的 profile"应当原样带下去。
++    实测（A03）：输入 RGB16 PNG 带 588 字节 sRGB ICC，
++    真实 stage5 子进程 rc=0、像素一致，但输出 TIFF 的 34675 标签是 0 字节。
++    失败只记 warning，不因此让已经产出的像素作废。
++    """
++    if not icc:
++        return False
++    if _media_io is None:
++        return False
++    try:
++        ok = _media_io.embed_icc_in_tiff(output_path, icc)
++    except Exception as e:
++        ok = False
++        if logger:
++            logger.warning("STAGE5_ICC_EMBED_FAIL",
++                           f"Could not embed the source ICC: {e}",
++                           output=output_path)
++    if ok and logger:
++        logger.info("STAGE5_ICC_CARRIED",
++                    "Source ICC carried through stage5 into the output",
++                    icc_bytes=len(icc), output=output_path)
++    return bool(ok)
++
++
++def _write_color_matched(output_path: str, arr: "np.ndarray") -> None:
++    """R2-02: 按数组真实位深写出色彩匹配结果（不用 Pillow 的 8-bit save）。"""
++    if _media_io is not None:
++        try:
++            if getattr(arr, "dtype", None) == np.uint16:
++                _media_io.write_tiff(output_path, arr)
++            else:
++                _media_io.write_png(output_path, arr)
++            return
++        except Exception:
++            pass
++    from PIL import Image as _PILImage
++    _PILImage.fromarray(arr).save(output_path)
++
++
+ def _match_portrait_color(image_path: str, face_boxes: list,
+                           output_path: str, logger=None,
+                           landmarks: list = None) -> Dict[str, Any]:
+@@ -411,8 +513,24 @@ def _match_portrait_color(image_path: str, face_boxes: list,
+         from PIL import Image, ImageFilter
+         import cv2
+ 
+-        img = Image.open(image_path).convert("RGB")
+-        img_arr = np.array(img, dtype=np.float32)
++        # R2-02 / A15：不能用 Pillow 读 —— 它对 16-bit TIFF/PNG 返回 uint8，
++        # 于是整幅图（连人脸框外的未处理区域）都被量化成 8-bit 网格再写回。
++        # 实测：左上角未处理像素 [39380,45372,27148] → [39321,45489,27242]。
++        # 必须用 media_io.read_image_array 拿到真实位深的数组，全程按原生范围运算。
++        _arr = None
++        if _media_io is not None:
++            try:
++                _arr, _meta_icc = _media_io.read_image_array(image_path)
++            except Exception:
++                _arr = None
++        if _arr is None:
++            _pil = Image.open(image_path).convert("RGB")
++            _arr = np.array(_pil)
++        if _arr.ndim == 2:
++            _arr = np.stack([_arr] * 3, axis=2)
++        source_dtype = getattr(_arr, "dtype", None)
++        _scale_max = 65535.0 if source_dtype == np.uint16 else 255.0
++        img_arr = _arr[:, :, :3].astype(np.float32)
+         h_img, w_img = img_arr.shape[:2]
+ 
+         # Build a combined mask for all face regions
+@@ -520,8 +638,11 @@ def _match_portrait_color(image_path: str, face_boxes: list,
+         mask_smooth = np.stack([mask_smooth] * 3, axis=2)
+ 
+         blended = mask_smooth * corrected + (1.0 - mask_smooth) * img_arr
+-        blended = np.clip(blended, 0, 255).astype(np.uint8)
+-        Image.fromarray(blended).save(output_path)
++        # R2-02 / A15：按**输入真实位深**回写，不能一律压成 uint8。
++        blended = np.clip(blended, 0, _scale_max)
++        out_dtype = np.uint16 if source_dtype == np.uint16 else np.uint8
++        out_arr = blended.astype(out_dtype)
++        _write_color_matched(output_path, out_arr)
+         return {"applied": True, "skipped": False, "reason": ""}
+     except Exception as e:
+         if logger:
+@@ -1202,6 +1323,13 @@ def main():
+                         changed_params=changed,
+                         cached_impl=cached_meta.get("impl"),
+                         current_impl=cache_identity["impl"])
++        elif _cached_was_degraded(cached_meta):
++            # R2-03：上一次是"降级结果"（有操作没做成）却写了 SUCCESS 缓存。
++            # 依赖恢复后（比如装上了 resampler）必须允许补做，不能一直命中旧缓存。
++            logger.info("STAGE5_CACHE_DEGRADED_RECOMPUTE",
++                        "Cached result was produced with skipped operations; "
++                        "recomputing so the missing work can be retried",
++                        cached_skipped=cached_meta.get("skipped_operations"))
+         elif not _verify_output_readable(output_path):
+             logger.info("STAGE5_CACHE_UNREADABLE",
+                         "Cached output failed validation; recomputing")
+@@ -1221,9 +1349,17 @@ def main():
+         # NEW-V-03: Pillow 对 16-bit RGB TIFF 报的是 mode='RGB'（uint8 截断），
+         # 直接 convert("RGB") 会让 16-bit 素材在 stage5 静默塌成 8-bit。
+         true_arr16 = None
+-        if bit_depth == 16:
+-            true_arr16 = read_true_input_array(input_source)
+-            if true_arr16 is not None and logger is not None:
++        if _media_io is not None:
++            true_arr16, input_icc = read_true_input_array(input_source)
++        else:
++            input_icc = None
++        # Pillow 也能拿到 ICC（PNG iCCP / TIFF 34675），作为兜底与交叉来源
++        if input_icc is None:
++            try:
++                input_icc = (img.info or {}).get("icc_profile")
++            except Exception:
++                input_icc = None
++        if true_arr16 is not None and logger is not None:
+                 logger.info(
+                     "STAGE5_TRUE_16BIT_INPUT",
+                     "Input is genuinely 16-bit; Pillow reports mode "
+@@ -1246,15 +1382,27 @@ def main():
+         # RV-06: 请求了缩放就必须真的做（见下方具体分支）。
+         skipped_operations: List[str] = []
+         lanczos_target = params.get("lanczos_target", "auto")
++        # R2-03：非法目标尺寸在参数层就拒绝（旧代码解析出 0 就直接跳过并成功）
++        target_err = parse_lanczos_target(lanczos_target)[2]
++        if target_err:
++            logger.error("STAGE5_LANCZOS_INVALID_TARGET",
++                         "Invalid lanczos_target; failing instead of silently "
++                         "skipping the requested resize",
++                         lanczos_target=lanczos_target, reason=target_err)
++            _discard_partial_output(output_path, [cache_meta_path])
++            _write_json_sidecar(
++                _json_sidecar_path(output_path, "status"), {
++                    "status": STAGE_STATUS_FAILED,
++                    "stage": 5,
++                    "failed_operation": "invalid_lanczos_target",
++                    "reason": target_err,
++                    "impl": STAGE5_IMPL_VERSION,
++                })
++            return 86
++
+         if (lanczos_target and lanczos_target != "auto" and
+                 true_arr16 is not None):
+-            try:
+-                target_w, target_h = lanczos_target.split("x")
+-                target_w, target_h = int(target_w), int(target_h)
+-            except Exception as e:
+-                logger.warning("STAGE5_LANCZOS_PARAM",
+-                               f"Invalid lanczos_target {lanczos_target!r}: {e}")
+-                target_w = target_h = None
++            target_w, target_h = parse_lanczos_target(lanczos_target)[:2]
+             if target_w and target_h and (true_arr16.shape[1] != target_w or
+                                           true_arr16.shape[0] != target_h):
+                 resized, method = _resize_array_high_depth(
+@@ -1292,21 +1440,21 @@ def main():
+                                 f"Resized 16-bit array -> "
+                                 f"{target_w}x{target_h} via {method}")
+         elif lanczos_target and lanczos_target != "auto" and img_16bit is not None:
+-            try:
+-                target_w, target_h = lanczos_target.split("x")
+-                target_w, target_h = int(target_w), int(target_h)
+-                if img_16bit.width != target_w or img_16bit.height != target_h:
+-                    img_16bit = img_16bit.resize(
+-                        (target_w, target_h), Image.LANCZOS)
+-                    logger.info("STAGE5_LANCZOS",
+-                                f"Resized {img_16bit.width}x{img_16bit.height} "
+-                                f"-> {target_w}x{target_h}")
+-            except Exception as e:
+-                logger.warning("STAGE5_LANCZOS_WARN",
+-                              f"Lanczos resize skipped: {e}")
+-                # RV-06: 跳过了就必须登记，不能假装做过了
+-                if params.get("lanczos_target", "auto") not in (None, "auto", ""):
+-                    skipped_operations.append("lanczos_resize")
++            target_w, target_h = parse_lanczos_target(lanczos_target)[:2]
++            if target_w and target_h:
++                try:
++                    if img_16bit.width != target_w or img_16bit.height != target_h:
++                        img_16bit = img_16bit.resize(
++                            (target_w, target_h), Image.LANCZOS)
++                        logger.info("STAGE5_LANCZOS",
++                                    f"Resized {img_16bit.width}x{img_16bit.height} "
++                                    f"-> {target_w}x{target_h}")
++                except Exception as e:
++                    logger.warning("STAGE5_LANCZOS_WARN",
++                                  f"Lanczos resize skipped: {e}")
++                    # RV-06: 跳过了就必须登记，不能假装做过了
++                    if params.get("lanczos_target", "auto") not in (None, "auto", ""):
++                        skipped_operations.append("lanczos_resize")
+ 
+         # Selective local processing with region separation
+         # FIX-R13-2: Track image data as numpy array for 16-bit path
+@@ -1383,7 +1531,10 @@ def main():
+             # Pillow 的 Image.save() 无法从这种名字推断格式 → ValueError
+             # （Pillow 文档：format 缺省时按扩展名推断）。
+             color_match_temp = output_path + ".pre_color_match.tif"
+-            color_matched_out = output_path + ".color_matched.png"
++            # R2-02：匹配结果按真实位深写出（16-bit 走 TIFF），
++            # 因此扩展名必须是 .tif —— 旧代码固定 .png，配合 8-bit save
++            # 会把整图量化。
++            color_matched_out = output_path + ".color_matched.tif"
+             if current_arr is not None:
+                 # Save 16-bit array as TIFF for color matching
+                 arr_u16 = (current_arr * 65535.0).clip(0, 65535).astype(
+@@ -1561,6 +1712,7 @@ def main():
+                                "accepted via allow_stage5_degrade",
+                                skipped_operations=["grain_synthesis"])
+                 shutil.move(grain_temp, output_path)
++                _carry_icc_to_output(output_path, input_icc, logger)
+                 # 降级结果不写缓存身份：下次运行必须重跑完整处理，不能被复用
+                 _write_json_sidecar(
+                     _json_sidecar_path(output_path, "status"), {
+@@ -1575,6 +1727,8 @@ def main():
+                 return 0
+         else:
+             shutil.move(grain_temp, output_path)
++        # R2-02 / A03：源 ICC 必须跟着像素走到最终产物。
++        _carry_icc_to_output(output_path, input_icc, logger)
+ 
+         # FIX-V07: 只在完全成功后提交缓存身份（先验证产物可读）
+         if not _verify_output_readable(output_path):
+@@ -1589,6 +1743,9 @@ def main():
+                     "impl": STAGE5_IMPL_VERSION,
+                 })
+             return 86
++        # R2-03：缓存条目必须记录"哪些操作没做成"，否则降级结果与完整结果
++        # 在缓存层无法区分，依赖恢复后也不会重做。
++        cache_identity["skipped_operations"] = list(skipped_operations)
+         _write_json_sidecar(cache_meta_path, cache_identity)
+         _write_json_sidecar(
+             _json_sidecar_path(output_path, "status"), {
+diff --git a/photo_restoration_pipeline/stages/stage6_encode.py b/photo_restoration_pipeline/stages/stage6_encode.py
+index b35aaf6..e0939b3 100644
+--- a/photo_restoration_pipeline/stages/stage6_encode.py
++++ b/photo_restoration_pipeline/stages/stage6_encode.py
+@@ -176,6 +176,60 @@ def _color_skipped(color: Dict[str, Any]) -> List[str]:
+     return skipped
+ 
+ 
++class PublishAbort(Exception):
++    """R2-01: 成套提交过程中任一步失败 —— 必须整批回滚，不能留下半代。"""
++
++    def __init__(self, operation: str, reason: str):
++        super().__init__(f"{operation}: {reason}")
++        self.operation = operation
++        self.reason = reason
++
++
++def _snapshot_for_rollback(paths: List[str], backup_dir: str,
++                           logger=None) -> Dict[str, Optional[str]]:
++    """R2-01: 提交前先把**现存**产物复制到备份目录。
++
++    Returns ``{目标路径: 备份文件路径 或 None}``。``None`` 表示提交前该路径
++    不存在（回滚时应撤下本次新建的文件），或备份失败（无法恢复，必须留痕）。
++    """
++    snapshot: Dict[str, Optional[str]] = {}
++    for idx, path in enumerate([p for p in paths if p]):
++        if not os.path.isfile(path):
++            snapshot[path] = None
++            continue
++        try:
++            os.makedirs(backup_dir, exist_ok=True)
++            backup = os.path.join(backup_dir, f"{idx}_{os.path.basename(path)}")
++            shutil.copyfile(path, backup)
++            snapshot[path] = backup
++        except OSError as e:
++            snapshot[path] = None
++            if logger:
++                logger.error("STAGE6_ROLLBACK_BACKUP_FAIL",
++                             f"Cannot back up {path} before publishing: {e}. "
++                             "A later failure could NOT restore it.",
++                             path=path)
++    return snapshot
++
++
++def _rollback_publish(snapshot: Dict[str, Optional[str]], logger=None) -> None:
++    """R2-01: 把每个目标路径恢复成提交前的内容。
++
++    有备份 → 拷回；没备份（本次新建）→ 删除本次写入的文件。
++    目标是"最终只能看到完整旧代"，不能是混合代。
++    """
++    for path, backup in snapshot.items():
++        try:
++            if backup and os.path.isfile(backup):
++                shutil.copyfile(backup, path)
++            elif os.path.exists(path):
++                os.remove(path)
++        except OSError as e:
++            if logger:
++                logger.error("STAGE6_ROLLBACK_FAIL",
++                             f"Could not restore {path}: {e}", path=path)
++
++
+ def _fail(logger, status_path: str, operation: str, reason: str,
+           paths: Optional[List[str]] = None) -> None:
+     """RV-12: clean this run's temp artifacts and record an honest FAILED.
+@@ -419,7 +473,12 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
+                          "encode pixels that would be mislabelled as sRGB.")
+             return result
+         result["status"] = COLOR_DEGRADED
+-        result["cicp_override"] = "2/2/0"  # primaries+transfer unspecified
++        # R2-13：按**最终布局**选合法矩阵，不能硬写 identity 0。
++        # 常规 YUV420 下传 0 时 avifenc **不报错**，而是警告后自动改成 6，
++        # 于是契约（0）与真实文件头（6）不一致（A20 实测）。
++        result["cicp_override"] = (CICP_UNSPECIFIED_RGB444
++                                   if params.get("archival_mode", False)
++                                   else CICP_UNSPECIFIED_YUV)
+         result["reason"] = (result["reason"] or "no usable source ICC profile")
+         logger.warning("STAGE6_COLOR_DEGRADED",
+                        "Encoding without colour conversion; CICP set to "
+@@ -471,7 +530,14 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
+                          f"Mandatory colour conversion failed: {e}")
+             return result
+         result["status"] = COLOR_DEGRADED
+-        result["cicp_override"] = "2/2/0"
++        # R2-13：CICP 必须按**最终布局**选合法矩阵。
++        # 旧代码这里硬写 "2/2/0"（矩阵 0 = Identity）：在 RGB444 下合法，
++        # 但在常规 YUV420 下 avifenc 不会拒绝，而是**警告后自动把 0 改成 6**，
++        # 于是保存的契约（0）与真实文件头（6）不一致 —— 契约失真。
++        # 实测（A20）：avifdec 读回 Matrix Coeffs = 6，contract 仍写 0。
++        result["cicp_override"] = (CICP_UNSPECIFIED_RGB444
++                                   if params.get("archival_mode", False)
++                                   else CICP_UNSPECIFIED_YUV)
+         result["icc_path"] = source_icc_file
+         result["reason"] = f"colour conversion failed: {e}"
+         logger.warning("STAGE6_COLOR_DEGRADED",
+@@ -768,6 +834,7 @@ def main():
+     tiff_info: Dict[str, Any] = {"written": False}
+     work_tiff_path = ""
+     publish_tiff_path = ""
++    tmp_tiff = ""
+     # RV-12: 本轮已经"发布"的产物集合；失败时要整批撤下，不能留下
+     # "有母版、没 AVIF"这种半个提交。
+     round_artifacts: List[str] = []
+@@ -783,13 +850,12 @@ def main():
+                 delete_output=False, status_path=status_path)
+         tiff_info = write_archival_master(working_path, tmp_tiff, params, logger)
+         if tiff_info.get("written"):
+-            try:
+-                os.replace(tmp_tiff, work_tiff_path)
+-                tiff_info["master_path"] = work_tiff_path
+-                round_artifacts.append(work_tiff_path)
+-            except OSError as e:
+-                tiff_info["written"] = False
+-                tiff_info["error"] = f"publish failed: {e}"
++            # R2-01：母版**先留在暂存路径**，不在这里覆盖旧母版。
++            # 旧实现在此 `os.replace(tmp_tiff, work_tiff_path)` 直接盖掉上一代
++            # 母版，随后编码失败时 `_fail` 又把这个路径删掉 —— 实测结果是
++            # 旧 AVIF 还在、旧 TIFF 已丢失（A01）。移动动作推迟到提交阶段，
++            # 且提交阶段有备份可回滚。
++            tiff_info["staging_path"] = tmp_tiff
+         if not tiff_info.get("written") and params.get("archival_tiff_required", False):
+             logger.error("STAGE6_TIFF_REQUIRED_FAIL",
+                          "Archival TIFF master is required but could not be "
+@@ -862,59 +928,106 @@ def main():
+               paths=[tmp_avif] + round_artifacts)
+         return 84
+ 
+-    # --- RV-12: 原子发布（临时 → 发布路径）---
++    # --- R2-13: 发布前读回真实文件头，核对色彩标签 -----------------------
++    # 命令参数只是"意图"，编码器可能接受并改写（实测 identity 矩阵 0 → 6）。
++    # 这里用 avifdec 独立回读实际头部，与契约逐项比对并记录；不一致时按
++    # require_header_match 决定是否判失败，绝不默默把契约当事实。
++    try:
++        actual = media_io.read_avif_header(tmp_avif, capability=capability)
++    except Exception as e:  # 回读失败本身要留痕，但不能因此丢掉已经编好的产物
++        actual = {}
++        logger.warning("STAGE6_HEADER_READBACK_FAIL",
++                       f"Could not read back the encoded AVIF header: {e}",
++                       output=tmp_avif)
++    if actual:
++        contract["actual_header"] = actual
++        declared_matrix = media_io.cicp_matrix(contract.get("cicp"))
++        actual_matrix = actual.get("matrix")
++        contract["header_matches_contract"] = (
++            declared_matrix is not None
++            and actual_matrix is not None
++            and int(declared_matrix) == int(actual_matrix))
++        if not contract["header_matches_contract"]:
++            logger.warning(
++                "STAGE6_HEADER_MISMATCH",
++                "Encoder wrote different colour tags than the contract "
++                "claims (command arguments are intent, the file header is "
++                "fact)",
++                declared_cicp=contract.get("cicp"),
++                declared_matrix=declared_matrix,
++                actual_matrix=actual_matrix)
++            if params.get("require_header_match", False):
++                _fail(logger, status_path, "header_verification",
++                      f"encoded header matrix {actual_matrix} != contract "
++                      f"{declared_matrix}",
++                      paths=[tmp_avif] + round_artifacts)
++                return 86
++
++    # --- R2-01: 成套提交（备份旧代 → 逐个提交 → 任一步失败整批回滚）---
++    # 连续几次 os.replace **不等于**整组原子：AVIF 换成了新代、TIFF 回拷失败
++    # 时，磁盘上就是"新 AVIF + 旧 TIFF"的混合代（A02 实测）。
++    # 这里用"提交前整体备份 + 失败整体恢复"的协议，保证最终只会看到
++    # 完整旧代或完整新代。
++    commit_targets: List[str] = [work_output_path]
++    if tiff_info.get("written"):
++        commit_targets.append(work_tiff_path)
++    if original_output_path:
++        commit_targets.append(publish_output_path)
++        if tiff_info.get("written"):
++            commit_targets.append(publish_tiff_path)
++    backup_dir = work_output_path + ".pubbak"
++    snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
++
+     try:
+         os.replace(tmp_avif, work_output_path)
+         contract["published"] = True
+-    except OSError as e:
+-        logger.error("STAGE6_PUBLISH_FAIL",
+-                     f"Could not publish the encoded AVIF: {e}")
+-        _fail(logger, status_path, "publish", str(e),
+-              paths=[tmp_avif] + round_artifacts)
+-        return 82
+-
+-    # WSL redirect: copy back **each** required artifact, checking every result
+-    # RV-13: 源路径一律用工作路径（work_*），不再从已经换过的发布路径派生。
+-    if original_output_path:
+-        copied = wsl_copy_back(work_output_path, publish_output_path)
+-        if copied:
++        if tiff_info.get("written") and tmp_tiff:
++            os.replace(tmp_tiff, work_tiff_path)
++            tiff_info["master_path"] = work_tiff_path
++        if original_output_path:
++            # RV-13: 源路径一律用工作路径（work_*）
++            if not wsl_copy_back(work_output_path, publish_output_path):
++                raise PublishAbort("wsl_copyback",
++                                   f"copy back failed: {work_output_path}")
+             logger.info("STAGE6_WSL_COPYBACK",
+                         f"Copied result back to {publish_output_path}")
+-        else:
+-            logger.error("STAGE6_WSL_COPYBACK_FAIL",
+-                         f"Failed to copy {work_output_path} back to "
+-                         f"{publish_output_path}")
+-            _fail(logger, status_path, "wsl_copyback",
+-                  f"copy back failed: {work_output_path}",
+-                  paths=[tmp_avif] + round_artifacts)
+-            return 82
+-        if tiff_info.get("written") and work_tiff_path:
+-            if wsl_copy_back(work_tiff_path, publish_tiff_path):
++            if tiff_info.get("written") and work_tiff_path:
++                if not wsl_copy_back(work_tiff_path, publish_tiff_path):
++                    raise PublishAbort(
++                        "wsl_copyback_tiff",
++                        f"copy back failed: {work_tiff_path}")
+                 logger.info("STAGE6_WSL_COPYBACK_TIFF",
+                             f"Copied master back to {publish_tiff_path}")
+-            else:
+-                logger.error("STAGE6_WSL_COPYBACK_TIFF_FAIL",
+-                             f"Failed to copy {work_tiff_path} back to "
+-                             f"{publish_tiff_path}")
+-                _fail(logger, status_path, "wsl_copyback_tiff",
+-                      f"copy back failed: {work_tiff_path}",
+-                      paths=[tmp_avif] + round_artifacts)
+-                return 82
++        # 契约与状态必须**写成功**才算提交完成（A12：侧车写失败仍 rc=0 是错的）
++        if not _write_json_sidecar(contract_path, contract):
++            raise PublishAbort("contract",
++                               "could not write the encode contract sidecar")
++        if not _write_json_sidecar(status_path, {
++            "status": "SUCCESS",
++            "stage": 6,
++            "skipped_operations": _color_skipped(color),
++            "output_path": publish_output_path,
++            "published": True,
++        }):
++            raise PublishAbort("status",
++                               "could not write the SUCCESS status sidecar")
++    except PublishAbort as abort:
++        logger.error("STAGE6_PUBLISH_ABORT",
++                     f"Publish aborted at {abort.operation}: {abort.reason}; "
++                     "rolling the whole generation back",
++                     operation=abort.operation)
++        _rollback_publish(snapshot, logger)
++        logger.warning("STAGE6_PUBLISH_ROLLBACK",
++                       "Previous generation restored; no mixed-generation "
++                       "output is left behind")
++        _fail(logger, status_path, abort.operation, abort.reason, paths=[])
++        return 82
++    except OSError as e:
++        logger.error("STAGE6_PUBLISH_FAIL", f"Could not publish the output: {e}")
++        _rollback_publish(snapshot, logger)
++        _fail(logger, status_path, "publish", str(e), paths=[])
++        return 82
+ 
+-    # 落盘实际编码契约，供验收与上游读取
+-    try:
+-        _write_json_sidecar(contract_path, contract)
+-    except Exception as e:
+-        logger.warning("STAGE6_CONTRACT_WRITE_FAIL", f"Could not write contract sidecar: {e}")
+-    # RV-12: 成功必须留下 SUCCESS 状态侧车，否则上一次的 FAILED/cancelled
+-    # 侧车会与新的成品长期共存，下游无法判断当前文件是否有效。
+-    _write_json_sidecar(status_path, {
+-        "status": "SUCCESS",
+-        "stage": 6,
+-        "skipped_operations": _color_skipped(color),
+-        "output_path": publish_output_path,
+-        "published": True,
+-    })
+     # 已发布：守卫不再删除任何产物
+     if cancel_guard is not None:
+         cancel_guard.release_outputs()
+diff --git a/shared_modules/audio_utils.py b/shared_modules/audio_utils.py
+index 4c40c6f..4e23d73 100644
+--- a/shared_modules/audio_utils.py
++++ b/shared_modules/audio_utils.py
+@@ -4,6 +4,7 @@ Audio Restoration Utilities
+ Shared audio processing for both video and photo pipelines.
+ """
+ 
++import os
+ import sys
+ from pathlib import Path
+ import subprocess
+@@ -309,18 +310,57 @@ def _get_ffmpeg_version() -> Tuple[bool, str]:
+     return False, "unknown"
+ 
+ 
++# R2-09：FFmpeg 滤镜图有**两层**转义（doc/filters.texi
++# "Notes on filtergraph escaping"，2026-10-10 取自 FFmpeg 官方仓库）：
++#   第 1 层（filter option value）：\ ' : （: 用于分隔选项值）
++#   第 2 层（filter description，嵌入 filtergraph 时）：\ ' , [ ] ;
++# shell=False 只免掉第 3 层（shell），滤镜图内部的两层仍然生效。
++_LEVEL1_SPECIALS = "\\':"
++_LEVEL2_SPECIALS = "\\'[],;"
++
++
++def _escape_once(text: str, specials: str) -> str:
++    """按 FFmpeg 规则给特殊字符逐个前置反斜杠。"""
++    out = []
++    for ch in text:
++        if ch in specials:
++            out.append("\\")
++        out.append(ch)
++    return "".join(out)
++
++
+ def filter_option_path(path: str) -> str:
+-    """NEW-RV-06: escape a filesystem path for use **inside** an ffmpeg filter option.
++    """Escape a filesystem path for use **inside** an ffmpeg filter option.
++
++    历史（NEW-RV-06，第二轮）：只把 ``\\`` 换成正斜杠、把 ``:`` 转成 ``\\:``，
++    属于**只做了第 1 层**。真机实测（ffmpeg 2023-11-13 gyan 构建）证明这不够 ——
++    ``\\:`` 里的反斜杠会在第 2 层被吃掉，于是 ``E:\\...`` 的盘符冒号没有被转义，
++    ``:`` 被当成 arnndn 的 ``mix`` 选项分隔符。
++    R2-09 实测矩阵（相对/绝对/空格/中文/逗号/分号/方括号/单引号，共 8 种）：
+ 
+-    真机复现（Windows + ffmpeg 2023-11-13）：把 ``models\\std.rnnn`` 直接写进
+-    ``-af arnndn=m=...`` 后，ffmpeg 报
+-    ``Failed to open model file: modelsstd.rnnn`` —— 滤镜图解析器把 ``\\s`` 当成
+-    转义序列，反斜杠被吃掉，路径整个变形，stage7 因此 rc=84。
+-    修法：统一成正斜杠，并把滤镜语法里的分隔符 ``:`` 转义掉。
++    ==========================  ==========================================
++    方案                        真实 ffmpeg rc
++    ==========================  ==========================================
++    旧实现（只第 1 层）         absolute/comma/semicolon/bracket/quote 全失败
++    只第 1 层                   同上，仍全失败
++    第 1 层 + 第 2 层           8/8 rc=0
++    归一正斜杠 + 两层（本实现） 8/8 rc=0
++    ==========================  ==========================================
++
++    证据：`E:/codex/_repair_r3_20261010/evidence/a19_probe.json`。
++
++    Args:
++        path: 要嵌入滤镜选项值的路径。
++
++    Returns:
++        已按两层规则转义、可直接拼进 ``arnndn=m=<...>`` 的字符串。
+     """
+-    text = str(path).replace("\\", "/")
+-    # ffmpeg 滤镜选项里 ':' 是选项分隔符，必须转义
+-    return text.replace(":", r"\:")
++    text = str(path)
++    if os.sep == "\\":
++        # Windows：先把分隔符归一成正斜杠，避免反斜杠参与转义。
++        # POSIX 下反斜杠是合法文件名字符，不能替换，交给两层转义处理。
++        text = text.replace("\\", "/")
++    return _escape_once(_escape_once(text, _LEVEL1_SPECIALS), _LEVEL2_SPECIALS)
+ 
+ 
+ def _get_arnndn_model_path(config: Dict[str, Any], primary_freq: int) -> Optional[str]:
+diff --git a/shared_modules/cancel_guard.py b/shared_modules/cancel_guard.py
+index 3994e4a..ef0d646 100644
+--- a/shared_modules/cancel_guard.py
++++ b/shared_modules/cancel_guard.py
+@@ -247,6 +247,23 @@ class CancelGuard:
+         removed: List[str] = []
+         status_path: Optional[str] = None
+ 
++        # R2-01 / A13：已发布（release）之后，任何清理都不得再动产物。
++        # 旧实现 release 只清 _extra_paths/_processes，_output_path 仍在 targets
++        # 里 —— 实测 `watch → release → cleanup_and_record` 之后已完成的文件
++        # 被删除（A13）。发布是不可逆的成功事件，后续取消/清理必须直接退出。
++        if self._released:
++            if self._logger is not None:
++                try:
++                    self._logger.info(
++                        f"STAGE{self._stage if self._stage is not None else ''}"
++                        "_CLEANUP_SKIPPED",
++                        "Artifacts were already published (release called); "
++                        "cancellation cleanup skipped",
++                        output=self._output_path or "")
++                except BaseException:  # noqa: BLE001
++                    pass
++            return {"removed": [], "status_path": None, "released": True}
++
+         # RV-12: 先收子进程再删文件 —— 否则被杀掉的 stage 之外，编码器子进程
+         # 可能在我们清理完之后继续往产物路径写回。
+         for proc in list(self._processes):
+diff --git a/shared_modules/dependency_check.py b/shared_modules/dependency_check.py
+index 6ae28e8..4163985 100644
+--- a/shared_modules/dependency_check.py
++++ b/shared_modules/dependency_check.py
+@@ -22,6 +22,16 @@ import re
+ from pathlib import Path
+ from typing import List, Dict, Tuple, Optional, Any
+ 
++SCRIPT_DIR = Path(__file__).parent.resolve()
++if str(SCRIPT_DIR) not in sys.path:
++    sys.path.insert(0, str(SCRIPT_DIR))
++
++# R2-08: `arnndn=m=...` 的模型路径必须经 filter_option_path 转义（见
++# audio_utils 的 docstring）。此前该函数在本模块**被调用但未导入**，
++# 一旦 models/std.rnnn 存在、真正进入该分支就抛
++# `NameError: name 'filter_option_path' is not defined`（独立用例 A05 复现）。
++from audio_utils import filter_option_path  # noqa: E402
++
+ 
+ def run_cmd(cmd: List[str], capture: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+     """Run a command with shell=False."""
+diff --git a/shared_modules/manifest_loader.py b/shared_modules/manifest_loader.py
+index 72548b9..f9459f9 100644
+--- a/shared_modules/manifest_loader.py
++++ b/shared_modules/manifest_loader.py
+@@ -144,7 +144,52 @@ def _write_manifest_locked(manifest: Dict[str, Any], path: str) -> None:
+                     Path(cand).unlink(missing_ok=True)
+                 except Exception:
+                     pass
+-        raise RuntimeError(f"Failed to save manifest atomically: {e}") from e
++        # R2-06：保留原始异常类型与信息（调用方要据此区分"磁盘不可写"与
++        # "锁超时"），并用 `from e` 保留 __cause__ 链，不丢根因。
++        raise RuntimeError(
++            f"Failed to save manifest atomically ({type(e).__name__}): {e}"
++        ) from e
++
++
++def update_manifest_with_writer(path: str,
++                                mutator: Callable[[Dict[str, Any]], Any],
++                                writer=None,
++                                timeout: float = 30.0) -> bool:
++    """Same as :func:`update_manifest` but the write-back goes through ``writer``.
++
++    R2-04：启动期（FAILED 降级 / resume 决议）必须"锁内重新读取 + 只改目标 job"，
++    不能用本次进程开头读入的旧快照整表覆盖。同时，为了保持"所有写回都经过
++    同一个持久化入口"（便于诊断、日志与测试可观测），把写回函数做成可注入：
++    默认仍走 ``_write_manifest_locked``，调用方也可以传入
++    ``save_manifest`` —— **写回仍在锁内发生**，因此不存在中间态被覆盖的窗口。
++
++    Returns:
++        True 表示已写回；False 表示跳过（mutator 返回 False）或读写失败。
++    """
++    p = Path(path)
++    lock_path = p.parent / (p.name + ".lock")
++    with _file_lock(lock_path, timeout=timeout):
++        try:
++            manifest = load_manifest(path)
++        except Exception as e:
++            logging.error("MANIFEST_LOCKED_UPDATE_SKIP: cannot re-read %s: %s",
++                          path, e)
++            return False
++        if not isinstance(manifest, dict):
++            logging.error("MANIFEST_LOCKED_UPDATE_SKIP: %s is not a mapping",
++                          path)
++            return False
++        manifest.setdefault("jobs", [])
++        manifest.setdefault("meta", {})
++        result = mutator(manifest)
++        if result is False:
++            return False
++        _update_meta_counts(manifest)
++        if writer is not None:
++            writer(manifest, path)
++        else:
++            _write_manifest_locked(manifest, path)
++        return True
+ 
+ 
+ def update_manifest(path: str,
+diff --git a/shared_modules/media_io.py b/shared_modules/media_io.py
+index b020333..e531404 100644
+--- a/shared_modules/media_io.py
++++ b/shared_modules/media_io.py
+@@ -886,3 +886,82 @@ def prepare_encoder_input(path: str, workdir: str,
+                     dtype=result["source_dtype"],
+                     verification=result["verification"])
+     return result
++
++
++# --- R2-13: 真实头部回读 ----------------------------------------------------
++
++def _avifdec_binary(capability: Any = None) -> str:
++    """Locate avifdec (same search order the tests use: PATH, then tests/_out/tools)."""
++    import shutil
++    found = shutil.which("avifdec")
++    if found:
++        return found
++    here = Path(__file__).resolve().parent
++    for cand in (here.parent / "tests" / "_out" / "tools" / "avifdec.exe",
++                 here.parent / "tests" / "_out" / "tools" / "avifdec"):
++        if cand.exists():
++            return str(cand)
++    return "avifdec"
++
++
++def read_avif_header(path: str, capability: Any = None) -> Dict[str, Any]:
++    """R2-13: read back the **actual** AVIF header with avifdec.
++
++    命令参数是"意图"，编码器可能接受并改写。典型例子（A20 实测）：
++    常规 YUV420 路径传 ``--cicp 2/2/0``（矩阵 0 = Identity），avifenc 不报错，
++    而是**警告后自动改成 6**；``avifdec --info`` 读回 Matrix Coeffs = 6，
++    但保存的契约仍写着 0 —— 契约失真。因此发布前必须回读头部核对。
++
++    Returns:
++        解析出的头部字段（键：bit_depth / format / range / color_primaries /
++        transfer / matrix / icc_present ...）。回读失败返回空 dict。
++    """
++    import re
++    import subprocess
++
++    try:
++        r = subprocess.run(
++            [_avifdec_binary(capability), "--info", path],
++            capture_output=True, text=True, timeout=30, shell=False)
++    except Exception:
++        return {}
++    if r.returncode != 0:
++        return {}
++
++    text = (r.stdout or "") + "\n" + (r.stderr or "")
++
++    def _grab(label: str) -> Optional[str]:
++        m = re.search(rf"{re.escape(label)}\s*:\s*(\S+)", text)
++        return m.group(1) if m else None
++
++    def _as_int(value: Optional[str]) -> Optional[int]:
++        try:
++            return int(value)
++        except (TypeError, ValueError):
++            return None
++
++    header: Dict[str, Any] = {
++        "bit_depth": _as_int(_grab("Bit Depth")),
++        "format": _grab("Format"),
++        "range": _grab("Range"),
++        "color_primaries": _as_int(_grab("Color Primaries")),
++        "transfer": _as_int(_grab("Transfer Char.")),
++        "matrix": _as_int(_grab("Matrix Coeffs.")),
++        "icc_present": (_grab("ICC Profile") or "").lower() not in ("absent", ""),
++        "alpha_present": (_grab("Alpha") or "").lower() not in ("absent", ""),
++        "raw": text[:2000],
++    }
++    return header
++
++
++def cicp_matrix(cicp: Optional[str]) -> Optional[int]:
++    """Extract the matrix component from a ``p/t/m`` CICP string."""
++    if not cicp:
++        return None
++    parts = str(cicp).split("/")
++    if len(parts) < 3:
++        return None
++    try:
++        return int(parts[2])
++    except ValueError:
++        return None
+diff --git a/tests/test_rv_round2.py b/tests/test_rv_round2.py
+index c487a8a..1728f47 100644
+--- a/tests/test_rv_round2.py
++++ b/tests/test_rv_round2.py
+@@ -988,49 +988,132 @@ def test_new_rv07_sync_gate_measures_real_mkv(tmp_path):
+ # ---------------------------------------------------------------------------
+ 
+ def test_new_rv06_filter_option_path_survives_ffmpeg_escaping():
+-    """NEW-RV-06：滤镜选项里的 Windows 路径必须转义，否则反斜杠被吃掉。"""
++    """NEW-RV-06 → R2-09：滤镜选项里的路径必须按 FFmpeg **两层**转义。
++
++    契约变更说明（必须有理由，不能只改断言）：
++    第二轮只做了第 1 层（``\\`` → ``/``，``:`` → ``\\:``），这条断言当时是
++    ``E\\:/m/std.rnnn``。第三轮 R2-09 用真实 ffmpeg 实测证明该输出在
++    Windows 绝对路径上**会失败** —— ``\\:`` 的反斜杠在第 2 层被吃掉，
++    盘符冒号失去转义，被 arnndn 当成 ``mix`` 选项分隔符。
++    新契约是两层转义后的 ``E\\\\:/m/std.rnnn``，8 种路径实测全部 rc=0
++    （证据 `_repair_r3_20261010/evidence/a19_probe.json`）。
++    等价反例由下面的 `test_r2_09_real_ffmpeg_model_path_matrix` 承担
++    （真实 ffmpeg 调用，而不是字符串比对）。
++    """
+     sys.path.insert(0, SHARED)
+     import audio_utils  # noqa: E402
+ 
+-    # 真机报错：Failed to open model file: modelsstd.rnnn
++    # 真机报错（第二轮）：Failed to open model file: modelsstd.rnnn
+     assert audio_utils.filter_option_path("models\\std.rnnn") == "models/std.rnnn"
+-    # 盘符的 ':' 是滤镜选项分隔符，也必须转义
++    # 盘符的 ':' 是滤镜选项分隔符；第 1 层转义成 `\:` 后，第 2 层要把 `\` 再转义一次
+     win_path = "E:" + chr(92) + "m" + chr(92) + "std.rnnn"   # E:\m\std.rnnn
+-    assert audio_utils.filter_option_path(win_path) == "E" + chr(92) + ":/m/std.rnnn"
++    assert audio_utils.filter_option_path(win_path) == "E" + chr(92) * 2 + ":/m/std.rnnn"
++    # 第 2 层特殊字符：, ; [ ] '
++    assert audio_utils.filter_option_path("models/a,b.rnnn") == "models/a" + chr(92) + ",b.rnnn"
++    assert audio_utils.filter_option_path("models/a;b.rnnn") == "models/a" + chr(92) + ";b.rnnn"
++    assert audio_utils.filter_option_path("models/a[b].rnnn") == "models/a" + chr(92) + "[" + "b" + chr(92) + "].rnnn"
++    # 第 1 层+第 2 层都处理单引号：' → \' → \\'
++    assert audio_utils.filter_option_path("models/it's.rnnn") == \
++        "models/it" + chr(92) * 2 + chr(92) + "'s.rnnn"
+     # 正斜杠输入不应被二次破坏
+     assert audio_utils.filter_option_path("models/std.rnnn") == "models/std.rnnn"
+ 
+ 
+ def test_new_rv05_zscale_without_format_option_degrades_honestly(monkeypatch):
+-    """NEW-RV-05：zscale 没有 format= 时不得硬拼，必须走降级链。"""
+-    s7 = _load_stage7()
++    """NEW-RV-05 / R2-12：zscale 没有 format= 时不得硬拼，必须走降级链。
+ 
+-    class _R:
+-        def __init__(self, out, rc=0):
+-            self.stdout = out
+-            self.stderr = ""
+-            self.returncode = rc
++    契约变更说明：第二轮该用例断言事件名 `STAGE7_DITHER_DEGRADED`，
++    且日志声称"dither 不作用于降位深"。第三轮 R2-12 实测证明**这个说法是错的**
++    （dither=ordered/error_diffusion 与 none 相比确实改变像素），
++    因此事件改名为 `STAGE7_DITHER_FALLBACK_CHAIN`，日志改为陈述事实。
++    断言同步更新，并新增下面两条真实像素/限帧用例作为等价（更强）反例。
++    """
++    s7 = _load_stage7()
+ 
+     class _Log:
+         def __init__(self):
+             self.warnings = []
++            self.infos = []
+ 
+         def warning(self, event, message, **kw):
+             self.warnings.append((event, message))
+ 
+         def info(self, *a, **k):
+-            pass
++            self.infos.append((a[0] if a else "",))
+ 
+-    # 模拟"这个 ffmpeg 的 zscale 没有 format 选项"
+-    monkeypatch.setattr(
+-        s7, "_zscale_has_option",
+-        lambda expr: ("format=" not in expr))
++    monkeypatch.setattr(s7, "_zscale_probe", lambda expr: "unsupported")
++    monkeypatch.setattr(s7, "_zscale_has_option", lambda expr: False)
+     log = _Log()
+     filters = s7._zscale_dither_filters("ordered", log)
+     assert filters, "降级链必须给出可用的滤镜串，不能返回空"
+-    assert "format=" not in " ".join(filters) or True  # 允许 format 滤镜（非 zscale）
+-    assert any(ev == "STAGE7_DITHER_DEGRADED" for ev, _ in log.warnings), \
++    # 关键：绝不能把 zscale 不支持的 format= 拼进 zscale 里（NEW-RV-05）
++    assert not any(f.startswith("zscale=") and "format=" in f for f in filters), \
++        "又把 format= 拼进 zscale 了 —— 该构建会 rc=84"
++    assert any(ev == "STAGE7_DITHER_FALLBACK_CHAIN" for ev, _ in log.warnings), \
+         "降级了却没记录 —— 等于静默降级，正是 NEW-RV-05 要禁止的"
++    # R2-12：不能再声称"抖动无效"
++    joined = " ".join(m for _, m in log.warnings)
++    assert "does NOT apply" not in joined, (
++        "仍在声称 dither 不作用于降位深 —— 实测该说法错误（R2-12）")
++
++
++def test_r212_zscale_probe_is_bounded(monkeypatch):
++    """R2-12：能力探测必须限帧，不能靠超时兜底。
++
++    无限 lavfi color 源会让"支持的选项"跑到超时（实测 15s 才返回 False）。
++    这里断言探测命令里带 -frames:v，且限时内返回结论。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— R2-12 限帧探测记为未验收")
++    s7 = _load_stage7()
++    s7._ZSCALE_CAP_CACHE.clear()
++    s7._ZSCALE_CAP_REASON.clear()
++
++    seen = {}
++    orig_run = s7.subprocess.run      # 先取原函数，否则 spy 会递归调自己
++
++    def spy_run(cmd, *a, **kw):
++        seen["cmd"] = list(cmd)
++        return orig_run(cmd, *a, **kw)
++
++    monkeypatch.setattr(s7.subprocess, "run", spy_run)
++    start = time.time()
++    reason = s7._zscale_probe("dither=ordered")
++    elapsed = time.time() - start
++
++    assert reason == "supported", f"受支持的选项被判成 {reason}（限帧探测仍有误判）"
++    assert "-frames:v" in seen.get("cmd", []), \
++        "探测没有限帧 —— 无限 lavfi 源会靠超时兜底（实测 15s 判 False）"
++    assert elapsed < 10, f"限帧探测仍耗时 {elapsed:.1f}s，说明没有真正生效"
++
++
++def test_r212_dither_changes_pixels_in_fallback_chain(tmp_path):
++    """R2-12 真实负向对照：降级链里 dither 必须真的改变像素。
++
++    没有这条，"dither 有效/无效"都只是日志里的形容词。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— R2-12 像素对照记为未验收")
++
++    def run(dither: str) -> bytes:
++        vf = (f"format=yuv444p16,zscale=rangein=limited:range=limited:"
++              f"dither={dither},format=yuv444p10")
++        r = subprocess.run(
++            ["ffmpeg", "-v", "error", "-f", "lavfi",
++             "-i", "testsrc2=s=64x64:d=1:r=1", "-vf", vf,
++             "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p10le", "-"],
++            capture_output=True, timeout=60)
++        assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[:300]
++        return r.stdout
++
++    base = run("none")
++    assert base, "参考输出为空，对照不成立"
++    for dither in ("ordered", "error_diffusion"):
++        other = run(dither)
++        diff = sum(1 for a, b in zip(base, other) if a != b)
++        assert diff > 0, (
++            f"dither={dither} 与 none 的输出完全相同 —— "
++            "说明该链里抖动确实无效，日志/文档必须据此修正")
+ 
+ 
+ def test_new_rv04_real_stage7_with_audio_track(tmp_path):
+@@ -1154,3 +1237,313 @@ def test_rv08_real_multiprocess_stress_with_stale_late_writer(tmp_path):
+         f"并发写入丢更新，只落了 {by_status.get('DONE', 0)} 条 DONE：{by_status}")
+     leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+     assert not leftovers, f"残留临时文件：{leftovers}"
++
++
++# ---------------------------------------------------------------------------
++# R2-09：FFmpeg 模型路径两层转义 —— 真实 ffmpeg 矩阵（不是字符串比对）
++# ---------------------------------------------------------------------------
++
++_R209_CASES = ["relative", "absolute", "space", "chinese", "comma",
++               "semicolon", "bracket", "quote"]
++
++
++def test_r209_real_ffmpeg_model_path_matrix(tmp_path):
++    """R2-09：同一有效模型在 8 种路径下都必须经**真实 ffmpeg** 处理成功。
++
++    第二轮只做了一层转义，实测 5 种失败（absolute/comma/semicolon/bracket/quote）。
++    这里不做字符串比对，而是真的跑 ffmpeg 并断言 rc=0 —— 只断言"长得像转义过"
++    是自欺（交接明确禁止）。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— R2-09 真机部分记为未验收")
++    sys.path.insert(0, SHARED)
++    import audio_utils  # noqa: E402
++
++    model_src = os.path.join(ROOT, "models", "std.rnnn")
++    if not os.path.exists(model_src):
++        pytest.skip("仓库内没有 models/std.rnnn —— R2-09 真机部分记为未验收")
++
++    modeldir = tmp_path / "models"
++    modeldir.mkdir()
++    names = {
++        "relative": "std.rnnn",
++        "absolute": "std.rnnn",
++        "space": "my model.rnnn",
++        "chinese": "模型 中文.rnnn",
++        "comma": "a,b.rnnn",
++        "semicolon": "a;b.rnnn",
++        "bracket": "a[b].rnnn",
++        "quote": "it's.rnnn",
++    }
++    failures = {}
++    for kind in _R209_CASES:
++        model = modeldir / names[kind]
++        shutil.copyfile(model_src, str(model))
++        argument = str(model) if kind == "absolute" else "models/" + names[kind]
++        chain = "arnndn=m=" + audio_utils.filter_option_path(argument)
++        r = subprocess.run(
++            ["ffmpeg", "-v", "error", "-f", "lavfi",
++             "-i", "sine=duration=0.2:sample_rate=48000",
++             "-af", chain, "-f", "null", "-"],
++            cwd=str(tmp_path), capture_output=True, text=True, timeout=30)
++        if r.returncode != 0:
++            failures[kind] = {"argument": argument, "chain": chain,
++                              "stderr": (r.stderr or "")[:300]}
++    assert not failures, (
++        "R2-09：以下路径经真实 ffmpeg 失败（滤镜图两层转义不完整）："
++        + json.dumps(failures, ensure_ascii=False, indent=2))
++
++
++def test_r209_second_level_escape_is_actually_needed(tmp_path):
++    """负向对照：只做第 1 层转义时，真实 ffmpeg 必须失败 —— 证明两层是必要的。
++
++    没有这条，"两层转义"就可能只是把字符串改复杂了，而没解决任何真实缺陷。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— R2-09 负向对照记为未验收")
++    sys.path.insert(0, SHARED)
++    import audio_utils  # noqa: E402
++
++    model_src = os.path.join(ROOT, "models", "std.rnnn")
++    if not os.path.exists(model_src):
++        pytest.skip("仓库内没有 models/std.rnnn —— R2-09 负向对照记为未验收")
++
++    modeldir = tmp_path / "models"
++    modeldir.mkdir()
++    model = modeldir / "a,b.rnnn"      # 逗号只在第 2 层是特殊字符
++    shutil.copyfile(model_src, str(model))
++
++    # 只做第 1 层（逗号不是第 1 层特殊字符，等于原样）
++    only_l1 = "arnndn=m=models/a,b.rnnn"
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-f", "lavfi",
++         "-i", "sine=duration=0.2:sample_rate=48000",
++         "-af", only_l1, "-f", "null", "-"],
++        cwd=str(tmp_path), capture_output=True, text=True, timeout=30)
++    assert r.returncode != 0, (
++        "只做第 1 层转义居然通过了 —— 说明第 2 层转义可能并不需要，需要重新核对")
++
++
++# ---------------------------------------------------------------------------
++# R2-10：立体声内容保留（真实波形，不是只看声道数恢复成 2）
++# ---------------------------------------------------------------------------
++
++def _make_stereo_wav(path, seconds=1.0, rate=48000):
++    """左右**不同**频率的双声道素材：L=440Hz，R=880Hz。"""
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-y",
++         "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}:sample_rate={rate}",
++         "-f", "lavfi", "-i", f"sine=frequency=880:duration={seconds}:sample_rate={rate}",
++         "-filter_complex", "[0:a][1:a]join=inputs=2:channel_layout=stereo[a]",
++         "-map", "[a]", "-c:a", "pcm_s16le", str(path)],
++        capture_output=True, text=True, timeout=60)
++    if r.returncode != 0:
++        pytest.skip(f"无法合成双声道素材（未验收）：{r.stderr[:200]}")
++    return path
++
++
++def _extract_channel(path, index):
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-i", str(path), "-af",
++         f"pan=mono|c0=c{index}", "-f", "s16le", "-"],
++        capture_output=True, timeout=60)
++    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[:200]
++    return r.stdout
++
++
++def test_r210_stereo_information_survives_arnndn(tmp_path):
++    """R2-10：arnndn 之后左右声道**不得**变成同一份内容。
++
++    旧实现 `aformat=channel_layouts=mono → arnndn → aformat=...stereo`
++    会把左右下混成一个单声道再复制回去，声道数看起来还是 2，但内容已经合并。
++    实测（本机 ffmpeg）：旧链处理后 L 与 R **完全相同**。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— R2-10 声道保留记为未验收")
++    s7 = _load_stage7()
++    model = os.path.join(ROOT, "models", "std.rnnn")
++    if not os.path.exists(model):
++        pytest.skip("仓库内没有 models/std.rnnn —— R2-10 声道保留记为未验收")
++
++    sys.path.insert(0, SHARED)
++    from audio_utils import filter_option_path
++
++    src = _make_stereo_wav(tmp_path / "stereo.wav")
++    assert _extract_channel(src, 0) != _extract_channel(src, 1), \
++        "素材本身左右就相同，对照不成立"
++
++    chain = ",".join(s7._arnndn_filters(
++        model, {"channels": 2, "layout": "stereo"}, filter_option_path, None))
++    out = tmp_path / "denoised.wav"
++    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
++                        "-af", chain, "-f", "wav", str(out)],
++                       capture_output=True, text=True, timeout=60)
++    assert r.returncode == 0, f"逐声道 arnndn 链跑不起来：{r.stderr[:300]}"
++    left = _extract_channel(out, 0)
++    right = _extract_channel(out, 1)
++    assert left and right, "输出声道为空"
++    assert left != right, \
++        "arnndn 之后左右声道完全相同 —— 说明左右信息被下混合并了（R2-10）"
++
++
++def test_r210_old_mono_roundtrip_really_merges_channels(tmp_path):
++    """负向对照：旧的 mono 回绕链**必须**被判为合并。
++
++    没有这条，上一条可能只是"本来就没差异"，证明不了门有效。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— R2-10 负向对照记为未验收")
++    model = os.path.join(ROOT, "models", "std.rnnn")
++    if not os.path.exists(model):
++        pytest.skip("仓库内没有 models/std.rnnn —— R2-10 负向对照记为未验收")
++
++    sys.path.insert(0, SHARED)
++    from audio_utils import filter_option_path
++
++    src = _make_stereo_wav(tmp_path / "stereo.wav")
++    old_chain = (f"aformat=channel_layouts=mono,"
++                 f"arnndn=m={filter_option_path(model)},"
++                 f"aformat=channel_layouts=stereo")
++    out = tmp_path / "old.wav"
++    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
++                        "-af", old_chain, "-f", "wav", str(out)],
++                       capture_output=True, text=True, timeout=60)
++    if r.returncode != 0:
++        pytest.skip(f"旧链在本机跑不起来（未验收）：{r.stderr[:200]}")
++    assert _extract_channel(out, 0) == _extract_channel(out, 1), (
++        "旧 mono 回绕链居然没有合并左右 —— 那么上一条用例就没有证明力，"
++        "需要重新设计对照")
++
++
++# ---------------------------------------------------------------------------
++# R2-04 / R2-05：调度入口（视频不覆盖并发结果、照片完成顺序落盘）
++# ---------------------------------------------------------------------------
++
++def test_r204_video_startup_does_not_clobber_concurrent_done(tmp_path,
++                                                             monkeypatch):
++    """R2-04 等价反例：视频启动期不得用旧快照把并发写好的 DONE 盖回 PENDING。
++
++    与独立用例 A09 同一注入设置；这里不依赖"启动期一定会整表写盘"这一前提，
++    而是直接断言磁盘最终状态（因此更强）。
++    """
++    path = _cli_env(tmp_path, monkeypatch, 0)
++    original_load = vmain.load_manifest
++    injected = {"done": False}
++
++    def stale_load(p):
++        old = original_load(p)
++        if str(p) == path and not injected["done"]:
++            injected["done"] = True
++            gen = ml.acquire_run_ownership(path, ["j1"], owner="concurrent-A")
++            assert ml.save_manifest_job_result(
++                path, "j1", "DONE", owner="concurrent-A", generation=gen)
++        return old          # 本次进程拿到的是**注入前**的旧快照
++
++    # 必须在"作业真正被处理之前"停下来看磁盘：否则后面 job 处理完又会写一次
++    # DONE，把启动期的覆盖掩盖掉（第一版用例就是这样在基线上也通过的）。
++    class _Stop(Exception):
++        pass
++
++    def _boom(*_a, **_k):
++        raise _Stop()
++
++    monkeypatch.setattr(vmain, "load_manifest", stale_load)
++    monkeypatch.setattr(vmain, "process_job", _boom)
++    try:
++        vmain.main()
++    except _Stop:
++        pass
++    except SystemExit:
++        pass
++    final = ml.load_manifest(path)
++    assert final["jobs"][0]["status"] == "DONE", (
++        "视频启动期用旧快照整表覆盖，把并发运行的 DONE 打回 "
++        f"{final['jobs'][0]['status']}（R2-04）")
++
++
++def test_r205_photo_scheduler_persists_completed_job_without_waiting(
++        tmp_path, monkeypatch):
++    """R2-05：已完成的 job 不得被前面那个慢 job 挡住落盘。
++
++    驱动**真正的 photo main() 调度入口**：
++      * job A 在 worker 里阻塞（等事件）；job B 立即返回；
++      * A 只有在"读到磁盘上 B 已是 DONE"之后才放行 —— 这消除了竞态，
++        如果父进程是按提交顺序 future.get() 阻塞，A 永远等不到 B 落盘，
++        于是断言失败。
++    进程池换成线程池，是为了让父进程里替换的 _run_single_job 在 worker 中
++    可见（spawn 子进程看不到 monkeypatch）；被测对象是**父进程的收集逻辑**，
++    这正是 R2-05 的缺陷所在。
++    """
++    import importlib.util as _ilu
++    import multiprocessing as _mp
++    import multiprocessing.pool as _mppool
++    import threading
++
++    pmain_path = os.path.join(ROOT, "photo_restoration_pipeline", "main.py")
++    spec = _ilu.spec_from_file_location("photo_main_r205", pmain_path)
++    pmain = _ilu.module_from_spec(spec)
++    spec.loader.exec_module(pmain)
++
++    manifest_path = str(tmp_path / "m.jsonl")
++    jobs = [{"job_id": "A", "status": "PENDING", "input_path": "a.png",
++             "detected_class": "scan_print",
++             "output_path": str(tmp_path / "a.out")},
++            {"job_id": "B", "status": "PENDING", "input_path": "b.png",
++             "detected_class": "scan_print",
++             "output_path": str(tmp_path / "b.out")}]
++    with open(manifest_path, "w", encoding="utf-8") as f:
++        for j in jobs:
++            f.write(json.dumps(j) + "\n")
++    ml.write_meta(manifest_path, {"total": len(jobs)}) if hasattr(
++        ml, "write_meta") else None
++
++    cfg_path = tmp_path / "cfg.yaml"
++    cfg_path.write_text("global:/n  temp_dir: .\n", encoding="utf-8")
++
++    observed = {"b_done_before_a": False}
++    release = threading.Event()
++
++    def fake_run_single_job(job, config_path, config, cli_params):
++        if job["job_id"] == "A":
++            # 轮询等待：B 的结果必须**已经在磁盘上**才放行
++            deadline = time.time() + 20
++            while time.time() < deadline:
++                doc = ml.load_manifest(manifest_path)
++                hit = [j for j in doc["jobs"] if j["job_id"] == "B"]
++                if hit and hit[0].get("status") == "DONE":
++                    observed["b_done_before_a"] = True
++                    break
++                time.sleep(0.05)
++            return 0
++        rc = 0
++        return rc
++
++    class _ThreadContext:
++        def Pool(self, processes=None):
++            return _mppool.ThreadPool(processes=processes or 2)
++
++    class _FakeMp:
++        @staticmethod
++        def get_context(_name=None):
++            return _ThreadContext()
++
++    # photo main 在函数内部 `import multiprocessing as mp` 后调用
++    # `mp.get_context('spawn')`，因此要 patch multiprocessing 模块本身。
++    monkeypatch.setattr(pmain, "_run_single_job", fake_run_single_job)
++    monkeypatch.setattr(_mp, "get_context", _FakeMp.get_context)
++    monkeypatch.setattr(sys, "argv",
++                        ["main.py", "--manifest", manifest_path,
++                         "--config", str(cfg_path), "--workers", "2"])
++
++    try:
++        pmain.main()
++    except SystemExit as e:
++        assert e.code in (0, None, 3), f"photo main 退出码异常：{e.code}"
++
++    assert observed["b_done_before_a"], (
++        "R2-05：job B 已经完成，但在 job A 结束前它的结果没有被落盘 —— "
++        "说明父进程仍按提交顺序阻塞收集（此时调度器退出就会丢掉 B 的状态）")
++    final = ml.load_manifest(manifest_path)
++    statuses = {j["job_id"]: j["status"] for j in final["jobs"]}
++    assert statuses.get("B") == "DONE", f"B 最终状态不对：{statuses}"
++    assert statuses.get("A") == "DONE", f"A 最终状态不对：{statuses}"
+diff --git a/tests/test_stage6_encode_contract.py b/tests/test_stage6_encode_contract.py
+index 0a9f105..80aae5a 100644
+--- a/tests/test_stage6_encode_contract.py
++++ b/tests/test_stage6_encode_contract.py
+@@ -66,10 +66,38 @@ def test_v04_degraded_encode_marks_cicp_unspecified(tmp_path):
+                "allow_unconverted_colorspace": True},
+         str(tmp_path), "j2", "clip", log)
+     assert color["status"] == s6.COLOR_DEGRADED
+-    assert color["cicp_override"] == "2/2/0", "must not claim sRGB primaries"
++    # R2-13（第三轮）契约变更 + 理由：
++    # 旧断言是 "2/2/0"（矩阵 0 = Identity）。实测（独立用例 A20）证明在
++    # **常规 YUV420** 下 avifenc 不会拒绝，而是警告后把 identity 矩阵 0 自动
++    # 改成 6 —— 于是保存的契约与真实文件头不一致。因此降级 CICP 必须按最终
++    # 布局选：archival/RGB444 → 2/2/0，常规 YUV → 2/2/1。
++    # 这里 archical 未开启（默认 False），故应为 YUV 形式。
++    assert color["cicp_override"] == "2/2/1", (
++        "degraded non-archival (YUV) encode must not claim an identity "
++        "matrix; avifenc rewrites 0 to 6 and the contract would be a lie")
++    assert not color["cicp_override"].startswith("1/13"), \
++        "must not claim sRGB primaries"
+     assert any(name == "STAGE6_COLOR_DEGRADED" for name, _ in log.events)
+ 
+ 
++def test_r213_degraded_archival_keeps_identity_matrix(tmp_path):
++    """R2-13 配套：archival（RGB444）路径下 identity 矩阵是**合法**的。
++
++    上一条断言 YUV 用 2/2/1；这一条确认 RGB444 仍用 2/2/0，
++    避免把上一条理解成"identity 一律禁止"。
++    """
++    work = _working_png(tmp_path)
++    log = _Log()
++    color = s6.resolve_color_space(
++        work, {"input_color_space": "adobergb",
++               "allow_unconverted_colorspace": True,
++               "archival_mode": True},
++        str(tmp_path), "j2a", "clip", log)
++    assert color["status"] == s6.COLOR_DEGRADED
++    assert color["cicp_override"] == "2/2/0", \
++        "RGB444 (archival) may legitimately use the identity matrix"
++
++
+ def test_v04_real_profile_is_used_for_conversion(tmp_path):
+     """With a real (openable) profile the pixels are actually transformed.
+ 
+diff --git a/video_restoration_pipeline/main.py b/video_restoration_pipeline/main.py
+index 73225ac..0999040 100644
+--- a/video_restoration_pipeline/main.py
++++ b/video_restoration_pipeline/main.py
+@@ -30,7 +30,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+ from logger import get_logger  # noqa: E402
+ from manifest_loader import (  # noqa: E402
+     load_manifest, filter_jobs, save_manifest, update_job_status,
+-    save_manifest_job_result, acquire_run_ownership,
++    save_manifest_job_result, acquire_run_ownership, update_manifest_with_writer,
+ )
+ from checkpoint import cleanup_old_intermediates, check_wsl_space  # noqa: E402
+ 
+@@ -438,32 +438,62 @@ def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
+ 
+ # --- RV-09: 产物身份（resume 不能再"只看名字 + 能解码"）------------------
+ #: 实现/恢复契约版本。改动产物语义时必须升版本，否则旧产物的身份无法区分。
+-VIDEO_IMPL_VERSION = "video-pipeline/2.0-resume-identity"
++#: R2-07：输入摘要从"首/尾采样"改成"全内容流式哈希"，身份语义变了，
++#: 旧 marker 一律判为不属于当前实现（安全方向：重算，而不是错配）。
++VIDEO_IMPL_VERSION = "video-pipeline/3.0-r2-07-full-content-identity"
++
++
++def _input_identity_status(recorded: Any, current: Dict[str, Any]) -> str:
++    """Compare a recorded input identity with the current one.
++
++    Returns one of:
++      * ``"match"``    —— 两边都拿到了摘要且相等；
++      * ``"changed"``  —— 两边都拿到了摘要但不相等（源内容变了，禁止复用）；
++      * ``"unproven"`` —— 任一侧拿不到摘要（缺失/读取失败/旧格式）。
++        R2-07 要求这种情形**拒绝复用**，不能落回"文件名能对上"的猜测。
++    """
++    if not isinstance(recorded, dict) or not isinstance(current, dict):
++        return "unproven"
++    old_digest = recorded.get("digest")
++    new_digest = current.get("digest")
++    if not old_digest or not new_digest:
++        return "unproven"
++    return "match" if str(old_digest) == str(new_digest) else "changed"
+ 
+ 
+ def _chunked_sha256(path: str, chunk: int = 1 << 20) -> Optional[str]:
+-    """Content fingerprint: whole file when small, head+tail+size otherwise.
++    """Content fingerprint: SHA-256 over the **whole** file (streamed).
+ 
+     mtime 不能作为身份（复制/重写都会变），只用 size + 内容。
++
++    R2-07 / A10：旧实现只取首 1MiB，并且**仅当 size > 2MiB** 才补读尾 1MiB。
++    后果有两个盲区：
++      * 1–2MiB 的文件：第二个 1MiB 之后的任何改动都看不见
++        —— 实测 1.5MiB 文件在 1200KiB 处改 1024 字节，旧摘要**不变**；
++      * >2MiB 的文件：只采首尾，中部改动同样看不见。
++    采样指纹不能声称"内容未变"，这里改成流式全内容哈希。
++    代价：O(文件大小)；SHA-256 吞吐约数百 MB/s，对素材库可接受。
++    若将来确实需要性能折中，必须是显式开关 + 明确可靠性边界，不能默认采样。
+     """
+     try:
+-        size = os.path.getsize(path)
+         h = hashlib.sha256()
+         with open(path, "rb") as f:
+-            h.update(f.read(chunk))
+-            if size > 2 * chunk:
+-                f.seek(-chunk, os.SEEK_END)
+-                h.update(f.read(chunk))
+-        h.update(str(size).encode("ascii"))
++            for block in iter(lambda: f.read(chunk), b""):
++                h.update(block)
++        h.update(str(os.path.getsize(path)).encode("ascii"))
+         return h.hexdigest()
+     except Exception:
+         return None
+ 
+ 
++#: R2-07：身份算法模式。写进 marker，便于将来区分"全量哈希"与任何显式折中模式。
++IDENTITY_DIGEST_MODE = "full-stream-sha256"
++
++
+ def build_input_identity(input_path: str) -> Dict[str, Any]:
+-    """RV-09: identity of the *source* material an artifact was made from."""
++    """RV-09 / R2-07: identity of the *source* material an artifact was made from."""
+     ident: Dict[str, Any] = {"path": str(input_path), "size": None,
+-                             "digest": None}
++                             "digest": None, "mode": IDENTITY_DIGEST_MODE}
+     try:
+         st = os.stat(input_path)
+         ident["size"] = st.st_size
+@@ -546,9 +576,13 @@ def resume_artifact_matches(final_path: str, job: Dict[str, Any],
+                        f"not {job.get('job_id')!r}")
+     recorded = data.get("input_identity") or {}
+     current = build_input_identity(job.get("input_path", ""))
+-    if recorded.get("digest") and current.get("digest") and \
+-            recorded["digest"] != current["digest"]:
++    # R2-07：身份"拿不到"与"对不上"都要拒绝，不能因为缺摘要就放行。
++    status = _input_identity_status(recorded, current)
++    if status == "changed":
+         return False, "input content changed since the artifact was produced"
++    if status == "unproven":
++        return False, ("input identity cannot be verified (missing/unreadable "
++                       "on one side); refusing to reuse the artifact")
+     if str(data.get("params_identity", "")) and \
+             data["params_identity"] != build_params_identity(config, job, logger):
+         return False, "effective parameters changed since it was produced"
+@@ -987,6 +1021,97 @@ def aggregate_results(results: List[Dict[str, Any]], logger=None) -> int:
+     return worst if worst > 0 else 86
+ 
+ 
++def _apply_startup_job_decision(manifest_path: str, job_id: str,
++                                decision: Dict[str, Any],
++                                expect_statuses: Optional[list],
++                                logger=None) -> bool:
++    """R2-04 / A09: 启动期对**单个 job** 做锁内局部更新。
++
++    旧代码在启动期对整份 manifest 做 `save_manifest(manifest, ...)`，
++    而 `manifest` 是本次进程开头读入的**旧快照**：另一个运行在此期间写好的
++    DONE 会被整表覆盖回 PENDING，新 generation 也被抹掉（A09 实测）。
++
++    这里改成：
++      1. 锁内**重新读取**当前磁盘内容；
++      2. 只改这一个 job 的指定字段；
++      3. 若磁盘上该 job 已经不在预期状态（例如已经是 DONE），
++         **不写**。状态只能前进，不能靠旧快照倒退。
++
++    Returns:
++        True 表示写入成功；False 表示跳过或失败。
++    """
++    def mutator(doc):
++        for j in doc.get("jobs", []):
++            if str(j.get("job_id", "")) != str(job_id):
++                continue
++            current = str(j.get("status", ""))
++            if expect_statuses and current not in expect_statuses:
++                if logger:
++                    logger.info("STARTUP_DECISION_SKIPPED",
++                                f"Job {job_id} is now {current!r} on disk; "
++                                "not applying a decision made from a stale "
++                                "snapshot",
++                                job_id=job_id, on_disk_status=current,
++                                expected=list(expect_statuses))
++                return False
++            # 状态倒退保护：绝不能把 DONE/FAILED 的完成态退回 PENDING
++            new_status = str(decision.get("status", current))
++            if current in ("DONE",) and new_status in ("PENDING", "FAILED"):
++                if logger:
++                    logger.info("STARTUP_DECISION_SKIPPED",
++                                f"Refusing to move job {job_id} from DONE "
++                                f"back to {new_status}", job_id=job_id)
++                return False
++            j.update(decision)
++            return True
++        return False
++
++    try:
++        # 写回仍在锁内，且统一走 save_manifest 入口（便于诊断与可观测性）
++        return update_manifest_with_writer(manifest_path, mutator,
++                                           writer=save_manifest)
++    except Exception as e:
++        if logger:
++            logger.warning("STARTUP_DECISION_FAILED",
++                           f"Locked startup update failed for {job_id}: {e}",
++                           job_id=job_id)
++        return False
++
++
++def _persist_job_result(manifest_path: str, job_id: str, status: str,
++                        error_message: str = "", attempt: Optional[int] = None,
++                        attempt_group: Optional[str] = None,
++                        owner: Optional[str] = None,
++                        generation: Optional[int] = None,
++                        logger=None) -> Tuple[bool, str]:
++    """R2-06 / A08: 持久化边界统一处理。
++
++    `save_manifest_job_result` 的真实契约是"成功返回 True，失败返回 False 或
++    **抛异常**"（比如 `Path.replace` 被拒 → RuntimeError/PermissionError）。
++    旧代码只判断了返回值，异常直接穿透 worker 边界，调用方拿不到结构化的
++    `persist-failed`，更拿不到 82 —— 一次磁盘拒绝就变成了未分类崩溃。
++
++    这里把锁超时、写入、替换异常都收口，保留原始原因，统一返回
++    ``(ok, reason)``。磁盘彻底不可写时**不谎称**失败状态已落盘：
++    返回失败并把原因交给调用方写日志/标准错误。
++    """
++    try:
++        saved = save_manifest_job_result(
++            manifest_path, job_id, status, error_message=error_message,
++            attempt=attempt, attempt_group=attempt_group,
++            owner=owner, generation=generation)
++    except Exception as e:
++        reason = f"{type(e).__name__}: {e}"
++        if logger:
++            logger.error("JOB_RESULT_PERSIST_EXCEPTION",
++                         f"Persisting job {job_id} raised {reason}",
++                         job_id=job_id, status=status)
++        return False, reason
++    if not saved:
++        return False, "save_manifest_job_result returned False"
++    return True, ""
++
++
+ def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
+                     args, logger, manifest: Dict[str, Any], manifest_path: str,
+                     attempt_group: Optional[str] = None,
+@@ -1032,20 +1157,20 @@ def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
+     update_job_status(manifest, job_id, "DONE" if success else "FAILED",
+                       error_message=last_error)
+ 
+-    saved = save_manifest_job_result(manifest_path, job_id,
+-                                     "DONE" if success else "FAILED",
+-                                     error_message=last_error,
+-                                     attempt=final_attempt,
+-                                     attempt_group=attempt_group,
+-                                     owner=owner, generation=generation)
++    saved, save_reason = _persist_job_result(
++        manifest_path, job_id, "DONE" if success else "FAILED",
++        error_message=last_error, attempt=final_attempt,
++        attempt_group=attempt_group, owner=owner, generation=generation,
++        logger=logger)
+     if not saved:
+         # 结果没落盘 = 这次运行不能被算作完成：重跑时必须重新处理
+         logger.error("JOB_RESULT_PERSIST_FAILED",
+                      f"Job {job_id} result could not be written to the "
+                      "manifest; reporting it as NOT complete",
+-                     job_id=job_id, status=status)
++                     job_id=job_id, status=status, reason=save_reason)
+         return _result(job_id, JOB_PERSIST_FAILED, EXIT_PERSIST_FAILED,
+-                       last_error or "manifest save failed")
++                       (last_error or save_reason or "manifest save failed")
++                       + " | " + save_reason)
+     return _result(job_id, status, 0 if success else int(exit_code), last_error)
+ 
+ 
+@@ -1057,6 +1182,22 @@ def main():
+     logger = get_logger(log_dir=log_dir, level=gcfg.get("log_level", "INFO"))
+     logger.info("PIPELINE_START", "Video restoration pipeline starting")
+ 
++    # R2-07 / A11：CLI 覆盖必须在**任何身份/恢复判定之前**并入 config。
++    # 旧代码把 --ai-enabled 只交给 process_job 内部的 cli_overrides，
++    # 而 build_params_identity() 走的是 merge_params(job, config, {})，
++    # 于是"用 AI 关闭跑出来的旧产物"在加了 --ai-enabled 之后仍然被判为可复用
++    # （实测：执行函数调用次数为 0，直接标 DONE）。
++    if getattr(args, "ai_enabled", False):
++        ai_cfg = config.get("ai")
++        ai_cfg = dict(ai_cfg) if isinstance(ai_cfg, dict) else {}
++        if ai_cfg.get("enabled") is not True:
++            logger.info("CLI_CONFIG_OVERRIDE",
++                        "CLI --ai-enabled merged into config before identity "
++                        "checks", key="ai.enabled", old=ai_cfg.get("enabled"),
++                        new=True)
++        ai_cfg["enabled"] = True
++        config["ai"] = ai_cfg
++
+     # Dependency check
+     try:
+         from dependency_check import run_all_checks
+@@ -1302,13 +1443,18 @@ def main():
+                                 break
+                         if last_completed >= 0:
+                             break
+-            job["last_completed_stage"] = last_completed
+             if last_completed >= 0:
+                 logger.info("FAILED_DOWNGRADE",
+                            f"Job {job_id} has valid step{last_completed}, downgrading to PENDING "
+                            f"(will resume from stage {last_completed + 1})")
+-                job["status"] = "PENDING"
+-                job["resume_from_stage"] = last_completed + 1
++                # R2-04：锁内局部更新（不用开头的旧快照整表覆盖）
++                _apply_startup_job_decision(
++                    manifest_path, job_id,
++                    {"status": "PENDING",
++                     "last_completed_stage": last_completed,
++                     "resume_from_stage": last_completed + 1,
++                     "input_identity": current_ident},
++                    expect_statuses=["FAILED"], logger=logger)
+             else:
+                 # FIX-P5-2: 删除所有损坏的中间文件，并重新标记为 PENDING
+                 for stage_num in range(8):
+@@ -1319,11 +1465,15 @@ def main():
+                             logger.info("FAILED_CLEANUP", f"Removed corrupt intermediate: {fpath}")
+                         except Exception as e:
+                             logger.warning("FAILED_CLEANUP_FAIL", f"Could not remove {fpath}: {e}")
+-                job["status"] = "PENDING"
+-                job.pop("resume_from_stage", None)
+                 logger.info("FAILED_DOWNGRADE",
+                            f"Job {job_id} no valid intermediates, cleaned up and downgraded to PENDING")
+-        save_manifest(manifest, manifest_path)
++                _apply_startup_job_decision(
++                    manifest_path, job_id,
++                    {"status": "PENDING",
++                     "last_completed_stage": -1,
++                     "resume_from_stage": 0,
++                     "input_identity": current_ident},
++                    expect_statuses=["FAILED"], logger=logger)
+     except Exception as e:
+         logger.warning("FAILED_CHECK", f"FAILED job check skipped: {e}")
+ 
+@@ -1362,24 +1512,61 @@ def main():
+                     logger.info("RESUME_DONE",
+                                 f"Job {job_id} has a verified final output "
+                                 f"{cand}, marking DONE", candidate=cand)
+-                    job["status"] = "DONE"
++                    # R2-04：锁内把这一个 job 置为 DONE（不用旧快照整表覆盖）
++                    _apply_startup_job_decision(
++                        manifest_path, job_id,
++                        {"status": "DONE",
++                         "input_identity": build_input_identity(input_path)},
++                        expect_statuses=["PENDING", "FAILED"], logger=logger)
+                     break
+                 if not step7_done:
++                    # R2-07 / A17：部分恢复**先过源身份门**。
++                    # 旧代码只做"中间文件存在 + 能解码"，素材换了照样从 stage7 接着跑。
++                    # 中间产物名字里只有 job_id/stem/stage，无法证明它属于当前输入，
++                    # 因此必须以 job 记录的 input_identity 为准；记录缺失或读不出来
++                    # 时按 "unproven" 拒绝复用（安全方向：重算）。
++                    current_ident = build_input_identity(input_path)
++                    ident_status = _input_identity_status(
++                        job.get("input_identity"), current_ident)
++                    if ident_status == "changed":
++                        logger.info("RESUME_INPUT_CHANGED",
++                                    f"Job {job_id}: input content changed; "
++                                    "old intermediates are not reused",
++                                    input=input_path)
++                    elif ident_status == "unproven":
++                        logger.info("RESUME_IDENTITY_UNPROVEN",
++                                    f"Job {job_id}: cannot prove the existing "
++                                    "intermediates were made from this input; "
++                                    "recomputing from scratch",
++                                    input=input_path)
++                    job["input_identity"] = current_ident
+                     # Determine highest valid completed stage for partial resume
+                     last_completed = -1
+-                    for stage_num in range(6, -1, -1):
+-                        candidates = find_stage_artifacts(temp_dir, job_id,
+-                                                          input_path, stage_num)
+-                        if candidates:
+-                            if verify_ffprobe_decodeable(candidates[0]):
+-                                last_completed = stage_num
+-                                break
+-                    job["last_completed_stage"] = last_completed
++                    if ident_status == "match":
++                        for stage_num in range(6, -1, -1):
++                            candidates = find_stage_artifacts(temp_dir, job_id,
++                                                              input_path, stage_num)
++                            if candidates:
++                                if verify_ffprobe_decodeable(candidates[0]):
++                                    last_completed = stage_num
++                                    break
+                     if last_completed >= 0:
+-                        job["resume_from_stage"] = last_completed + 1
+                         logger.info("RESUME_PARTIAL",
+                                    f"Job {job_id} resuming from stage {last_completed + 1}")
+-            save_manifest(manifest, manifest_path)
++                        # R2-04：锁内逐 job 局部更新
++                        _apply_startup_job_decision(
++                            manifest_path, job_id,
++                            {"last_completed_stage": last_completed,
++                             "resume_from_stage": last_completed + 1,
++                             "input_identity": current_ident},
++                            expect_statuses=["PENDING"], logger=logger)
++                    else:
++                        _apply_startup_job_decision(
++                            manifest_path, job_id,
++                            {"last_completed_stage": -1,
++                             "resume_from_stage": 0,
++                             "input_identity": current_ident},
++                            expect_statuses=["PENDING"], logger=logger)
+         except Exception as e:
+             logger.warning("RESUME_CHECK", f"Resume check skipped: {e}")
+ 
+diff --git a/video_restoration_pipeline/stages/stage7_encode.py b/video_restoration_pipeline/stages/stage7_encode.py
+index 70089cd..976ac2c 100644
+--- a/video_restoration_pipeline/stages/stage7_encode.py
++++ b/video_restoration_pipeline/stages/stage7_encode.py
+@@ -19,7 +19,7 @@ import argparse
+ import subprocess
+ import datetime
+ import re
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, Optional, Tuple
+ from pathlib import Path
+ 
+ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+@@ -52,6 +52,93 @@ def _get_audio_layout(audio_path: str) -> dict:
+     return {"channels": 2, "layout": "stereo"}
+ 
+ 
++def _arnndn_filters(model: str, audio_layout: dict, escape,
++                    logger=None) -> List[str]:
++    """R2-10: build the arnndn filter chain **without merging channels**.
++
++    旧实现（``aformat=channel_layouts=mono`` → arnndn → ``aformat=...stereo``）
++    会把左右声道**下混成同一个单声道**再复制回去，左右差异永久丢失。
++    实测（L=440Hz / R=880Hz 的立体声，本机 ffmpeg）：
++
++    ==============================  ==========================
++    链                              处理后 L 与 R 是否相同
++    ==============================  ==========================
++    mono→arnndn→stereo（旧）        **相同**（信息已合并）
++    直接 arnndn（立体声）           不同
++    channelsplit→逐声道→join（采用） 不同
++    ==============================  ==========================
++
++    采用逐声道方案而不是"直接喂立体声"，因为后者依赖 arnndn 对多声道的支持，
++    各版本不一致；channelsplit 保证每个分支拿到的都是单声道，行为稳定。
++
++    >2 声道：逐声道 arnndn **未实现**（需要按 layout 生成 N 组标签，本机无
++    5.1 素材可验证），改用 afftdn（其内部按声道处理）并明确记录降级原因。
++    """
++    layout = (audio_layout or {}).get("layout", "stereo")
++    channels = int((audio_layout or {}).get("channels", 1) or 1)
++    arg = escape(model)
++
++    if channels <= 1:
++        return [f"arnndn=m={arg}"]
++
++    if channels == 2:
++        return [f"channelsplit=channel_layout={layout}[_dnL][_dnR];"
++                f"[_dnL]arnndn=m={arg}[_dnLo];"
++                f"[_dnR]arnndn=m={arg}[_dnRo];"
++                f"[_dnLo][_dnRo]join=inputs=2:channel_layout={layout}"]
++
++    if logger:
++        logger.warning("STAGE7_ARNNDN_MULTICHANNEL_DEGRADED",
++                       f"per-channel arnndn for {channels}ch is not "
++                       "implemented (needs per-layout labels and could not be "
++                       "verified here); using afftdn, which processes channels "
++                       "independently", channels=channels)
++    return ["afftdn=nr=12:nf=-50"]
++
++
++def _resolve_audio_denoise(params: dict) -> Tuple[str, str]:
++    """R2-10: resolve the *effective* audio denoise choice.
++
++    旧实现只看 ``params["noise_reduction"]``（默认 True），再按"模型在不在"选算法，
++    于是主入口已经合并好的 ``audio_denoise=False`` 与 ``audio_denoise="afftdn"``
++    都被忽略（独立用例 A18 复现：两种设置下链里都出现 arnndn）。
++
++    优先级：``audio_denoise`` > ``noise_reduction``（旧别名）。
++    取值语义：
++      * ``False`` / ``"false"`` / ``"off"`` / ``"none"`` / ``0``  → ``"off"``
++      * ``"arnndn"`` / ``"afftdn"``                               → 指定算法
++      * ``True`` / ``"true"`` / ``1``                             → 默认策略
++        （arnndn 模型可用则用 arnndn，否则 afftdn）
++
++    Returns:
++        ``(algorithm, source)``，algorithm ∈ {"off", "arnndn", "afftdn", "auto"}。
++    """
++    raw = None
++    source = ""
++    if "audio_denoise" in params:
++        raw = params.get("audio_denoise")
++        source = "audio_denoise"
++    elif "noise_reduction" in params:
++        raw = params.get("noise_reduction")
++        source = "noise_reduction(legacy alias)"
++
++    if raw is None:
++        return "auto", "unset"
++    if isinstance(raw, bool):
++        return ("auto" if raw else "off"), source
++    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
++        return ("auto" if raw else "off"), source
++    text = str(raw).strip().lower()
++    if text in ("", "false", "off", "none", "no", "0"):
++        # 空串按"未设置"处理（与主入口的合并语义一致），其余都是明确关闭
++        return ("auto" if text == "" else "off"), source
++    if text in ("arnndn", "afftdn"):
++        return text, source
++    if text in ("true", "on", "yes", "1"):
++        return "auto", source
++    return "auto", source
++
++
+ def _build_audio_filter(audio_path: str, params: dict, logger=None,
+                           tempo_ratio: float = 1.0,
+                           audio_layout: dict = None) -> str:
+@@ -204,15 +291,10 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
+                                f"FFmpeg <4.4, arnndn requires mono input, cannot "
+                                f"remove {detected_freq}Hz hum from {num_ch}ch. "
+                                f"afftdn will provide general noise reduction only.")
+-            elif num_ch == 2:
+-                audio_filters.append("aformat=channel_layouts=mono")
+-                # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
+-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
+-                layout = audio_layout.get("layout", "stereo")
+-                audio_filters.append(f"aformat=channel_layouts={layout}")
+             else:
+-                # Mono: use arnndn directly
+-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
++                # R2-10：立体声同样不能用 mono 回绕，否则左右被下混成同一份。
++                audio_filters.extend(_arnndn_filters(
++                    arnndn_model, audio_layout, _fpath, logger))
+             logger.info("STAGE7_HUM_ARNNDN",
+                         f"FFmpeg <4.4, using arnndn for {detected_freq}Hz hum removal",
+                         model=arnndn_model)
+@@ -223,46 +305,64 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
+                            f"afftdn will provide general noise reduction only. "
+                            f"Download arnndn models from https://github.com/richardpl/arnndn-models (std.rnnn)")
+ 
+-    # Noise reduction AFTER bandreject
+-    noise_reduction = params.get("noise_reduction", True)
+-    if noise_reduction:
+-        # FIX-R7-S7-A2: reuse audio_utils._get_arnndn_model_path (consistent with
+-        # hum branch and audio_utils.process_audio L545-548).
++    # R2-10: 消费真正合并后的降噪选择，而不是"默认 True + 看模型在不在"。
++    choice, choice_source = _resolve_audio_denoise(params)
++    if logger:
++        logger.info("STAGE7_DENOISE_CHOICE",
++                    f"audio denoise resolved to {choice!r}",
++                    source=choice_source,
++                    audio_denoise=params.get("audio_denoise", "<unset>"),
++                    noise_reduction=params.get("noise_reduction", "<unset>"))
++
++    if choice == "off":
++        # 明确关闭降噪：后面 compand / tempo / asetpts 仍然要照常走。
++        if logger:
++            logger.info("STAGE7_DENOISE_OFF",
++                        "audio denoise disabled by effective config; no "
++                        "arnndn/afftdn will be added", source=choice_source)
++    else:
+         from audio_utils import _get_arnndn_model_path, filter_option_path as _fpath
+         arnndn_model = _get_arnndn_model_path(params, detected_freq or 0)
+         if not arnndn_model:
+             arnndn_model = params.get("arnndn_model", "")
+         if audio_layout is None:
+             audio_layout = _get_audio_layout(audio_path)
+-        num_channels = audio_layout.get("channels", 2)
+-
+-        if arnndn_model and Path(arnndn_model).exists():
+-            # FIX-P7-3: Per v7.32 §3.10.9 "严禁混缩为立体声":
+-            # - Mono: use arnndn directly (no layout change needed)
+-            # - Stereo: aformat=mono → arnndn → restore (acceptable per §7.30
+-            #   mono input recommendation, preserves stereo on output)
+-            # - Multi-channel (>2): use afftdn instead to avoid downmix;
+-            #   arnndn requires mono which would destroy spatial info in 5.1/7.1
+-            # ORIGINAL: always used aformat=mono → arnndn for all channel counts,
+-            # which downmixes multi-channel audio violating the spec.
+-            if num_channels > 2:
+-                logger.warning("STAGE7_ARNNDN_MULTICHANNEL_SKIP",
+-                               f"arnndn requires mono input, would downmix "
+-                               f"{num_channels}ch audio. Using afftdn instead "
+-                               f"per v7.32 §3.10.9 (no downmix allowed).")
++        model_exists = bool(arnndn_model) and Path(arnndn_model).exists()
++
++        if choice == "afftdn":
++            # 用户明确指定 afftdn：模型存在也不许换成 arnndn。
++            audio_filters.append(f"afftdn=nr={params.get('afftdn_nr', 12)}:"
++                                 f"nf={params.get('afftdn_nf', -50)}")
++            if logger:
++                logger.info("STAGE7_DENOISE_AFFTDN",
++                            "afftdn applied as explicitly requested")
++        elif choice == "arnndn":
++            if model_exists:
++                audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
++                                                     _fpath, logger))
++            elif params.get("allow_audio_degrade", False):
+                 audio_filters.append("afftdn=nr=12:nf=-50")
+-            elif num_channels == 2:
+-                # Stereo: arnndn mono limitation, restore after processing
+-                audio_filters.append("aformat=channel_layouts=mono")
+-                # FIX-P7-7: No single-quote wrapping per v6.32 §7.30
+-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
+-                layout = audio_layout.get("layout", "stereo")
+-                audio_filters.append(f"aformat=channel_layouts={layout}")
++                if logger:
++                    logger.warning("STAGE7_DENOISE_DEGRADED",
++                                   "arnndn requested but model not found; "
++                                   "degraded to afftdn because "
++                                   "allow_audio_degrade is set",
++                                   model=arnndn_model)
+             else:
+-                # Mono: use arnndn directly
+-                audio_filters.append(f"arnndn=m={_fpath(arnndn_model)}")
+-        else:
+-            audio_filters.append("afftdn=nr=12:nf=-50")
++                if logger:
++                    logger.error("STAGE7_DENOISE_UNAVAILABLE",
++                                 "arnndn requested but model not found and no "
++                                 "degradation is authorized; skipping denoise",
++                                 model=arnndn_model)
++        else:  # "auto"
++            if model_exists:
++                audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
++                                                     _fpath, logger))
++            else:
++                audio_filters.append("afftdn=nr=12:nf=-50")
++                if logger:
++                    logger.info("STAGE7_DENOISE_AFFTDN",
++                                "no arnndn model available; using afftdn")
+ 
+     # V-P-053 fix: compand dynamic range compression
+     # FIX-P7-8: Default changed to False per v7.32 §3.10.9 (not mandatory)
+@@ -444,29 +544,52 @@ def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
+ 
+ 
+ _ZSCALE_CAP_CACHE: Dict[str, bool] = {}
++#: R2-12：探测结论（用于日志区分"不支持 / 超时 / 工具缺失"）
++_ZSCALE_CAP_REASON: Dict[str, str] = {}
++#: R2-12：探测必须**限制帧数**。lavfi 的 color/testsrc 源是无限的，
++#: 不限制的话 ffmpeg 会一直跑到 timeout —— 实测同一被支持的选项要 15.031s
++#: 才返回 False（超时被当成"不支持"），加 -frames:v 1 后约 0.063s 返回 0。
++_ZSCALE_PROBE_FRAMES = "1"
++
++
++def _zscale_probe(option_expr: str) -> str:
++    """Probe an option and report *why*: supported / unsupported / timeout / missing."""
++    if option_expr in _ZSCALE_CAP_REASON:
++        return _ZSCALE_CAP_REASON[option_expr]
++    reason = "unsupported"
++    try:
++        probe = subprocess.run(
++            ["ffmpeg", "-hide_banner", "-v", "error", "-f", "lavfi", "-i",
++             "color=c=black:s=64x64", "-frames:v", _ZSCALE_PROBE_FRAMES,
++             "-vf", f"zscale={option_expr}", "-f", "null", "-"],
++            capture_output=True, shell=False, timeout=15)
++        if probe.returncode == 0:
++            reason = "supported"
++    except subprocess.TimeoutExpired:
++        reason = "timeout"
++    except FileNotFoundError:
++        reason = "missing"
++    except Exception:
++        reason = "unsupported"
++    _ZSCALE_CAP_REASON[option_expr] = reason
++    return reason
+ 
+ 
+ def _zscale_has_option(option_expr: str) -> bool:
+-    """NEW-RV-05: probe whether the installed ffmpeg's zscale accepts an option.
++    """NEW-RV-05 / R2-12: probe whether the installed ffmpeg's zscale accepts an option.
+ 
+     真机复现（ffmpeg 2023-11-13 gyan 构建）：``zscale=...:format=yuv444p10``
+     直接失败 —— "Error applying option 'format' to filter 'zscale': Option not
+     found"，stage7 因此 rc=84。该构建的 zscale 只有 w/h/size/dither/filter/
+     out_range… 没有 format。
+     选项是否可用必须**运行时探测**，不能写死（不同 ffmpeg/zimg 版本差异很大）。
++
++    R2-12：探测必须限帧，否则无限 lavfi 源会跑到超时，
++    "超时"被误记成"不支持"（实测 15.031s 判 False，限帧后 0.063s 判 True）。
+     """
+     if option_expr in _ZSCALE_CAP_CACHE:
+         return _ZSCALE_CAP_CACHE[option_expr]
+-    available = False
+-    try:
+-        probe = subprocess.run(
+-            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i",
+-             "color=c=black:s=64x64", "-vf", f"zscale={option_expr}",
+-             "-f", "null", "-"],
+-            capture_output=True, shell=False, timeout=15)
+-        available = (probe.returncode == 0)
+-    except Exception:
+-        available = False
++    available = (_zscale_probe(option_expr) == "supported")
+     _ZSCALE_CAP_CACHE[option_expr] = available
+     return available
+ 
+@@ -477,18 +600,32 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
+     if _zscale_has_option("format=yuv444p10"):
+         filters.append(f"zscale=rangein=limited:range=limited:"
+                        f"dither={dither}:format=yuv444p10")
++        if logger:
++            logger.info("STAGE7_DITHER_MODE",
++                        "zscale performs the 16→10 bit reduction with the "
++                        "requested dither", dither=dither)
+     else:
+-        # 该构建没有 zscale 的 format 选项：降位深只能交给 format 滤镜，
+-        # 于是**抖动并不作用在降位深这一步** —— 必须如实记录，不能假装做了。
++        # 该构建没有 zscale 的 format 选项：降位深由后面的 format 滤镜完成。
++        #
++        # R2-12 修正：第二轮曾在这里断言"抖动不作用于降位深"，**这是错的**。
++        # 实测（本机 ffmpeg，16-bit 梯度 → 10-bit，与 dither=none 逐字节比对）：
++        #   ordered          → 1750 字节不同
++        #   error_diffusion  → 1069 字节不同
++        # 即所选抖动**确实改变了最终像素**。能确定的是像素层面可观察到差异；
++        # 其内部作用点（zscale 内还是相邻 format 滤镜协商后）未进一步拆解，
++        # 不作为结论。日志只陈述事实，不再声称"无效"。
++        reason = _zscale_probe("format=yuv444p10")
+         filters.append(f"zscale=rangein=limited:range=limited:dither={dither}")
+         filters.append("format=yuv444p10")
+         if logger:
+             logger.warning(
+-                "STAGE7_DITHER_DEGRADED",
+-                "This ffmpeg's zscale has no 'format' option; the 16→10 bit "
+-                "reduction is done by the format filter, so the requested "
+-                f"{dither} dithering does NOT apply to the depth reduction",
+-                dither=dither)
++                "STAGE7_DITHER_FALLBACK_CHAIN",
++                "This ffmpeg's zscale has no 'format' option "
++                f"(probe: {reason}); the 16→10 bit reduction is done by the "
++                "format filter after zscale. The requested dither still changes "
++                "the output pixels (measured: ordered/error_diffusion differ "
++                "from none), but the reduction itself is not performed inside "
++                "zscale", dither=dither, zscale_format_probe=reason)
+     filters.append("format=yuv420p10le")
+     return filters
+ 
+@@ -544,6 +681,67 @@ def _get_source_color_info(video_path: str) -> tuple:
+     return "limited", "NTSC", False, False
+ 
+ 
++def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
++    """Return a stream's start time in seconds, or None.
++
++    R2-11：同步不能只比"时长"。MKV 的 `stream=start_time` 能真实反映
++    `-itsoffset` 造成的偏移（实测：video 0.000000 / audio 1.000000），
++    比逐 packet 便宜得多，因此作为首选；拿不到时再退回 packet 首时间戳。
++    """
++    try:
++        r = subprocess.run(
++            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
++             "-show_entries", "stream=start_time",
++             "-of", "default=noprint_wrappers=1:nokey=1", path],
++            capture_output=True, text=True, timeout=30, shell=False)
++        if r.returncode == 0:
++            txt = r.stdout.strip()
++            if txt and txt != "N/A":
++                return float(txt)
++    except Exception:
++        pass
++    # 退回：packet 的最小 pts
++    try:
++        r = subprocess.run(
++            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
++             "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
++            capture_output=True, text=True, timeout=300, shell=False)
++        if r.returncode == 0:
++            vals = []
++            for line in r.stdout.splitlines():
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    vals.append(float(line))
++                except ValueError:
++                    continue
++            if vals:
++                return min(vals)
++    except Exception:
++        pass
++    return None
++
++
++def _probe_audio_presence(path: str) -> str:
++    """三态：``"present"`` / ``"absent"`` / ``"unknown"``。
++
++    必须区分这三种，否则会把"文件不存在 / ffprobe 失败"误判成"本来就没音轨"，
++    于是探测失败又变成静默通过（A07 就是这条路径）。
++    """
++    try:
++        r = subprocess.run(
++            ["ffprobe", "-v", "error", "-select_streams", "a:0",
++             "-show_entries", "stream=codec_type",
++             "-of", "default=noprint_wrappers=1:nokey=1", path],
++            capture_output=True, text=True, timeout=30, shell=False)
++    except Exception:
++        return "unknown"
++    if r.returncode != 0:
++        return "unknown"
++    return "present" if r.stdout.strip() else "absent"
++
++
+ def _validate_av_sync(muxed_path: str, logger) -> int:
+     """Validate A/V sync on the final muxed output file.
+ 
+@@ -551,34 +749,85 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
+     - diff > 100ms: WARNING
+     - diff > 300ms: sync processing needed
+     - diff > 500ms: ERROR/FAILED (return 86)
++
++    R2-11：旧实现只比 `视频时长` 与 `音频时长` 的**差值**，因此"两边一样长、
++    但整条音轨晚 1 秒"这种固定偏移会被判为同步（实测 A16：video [0,2] /
++    audio [1,3]，旧门返回 0）。而且取不到时长时记一条 SKIP 就返回 0，
++    等于"测不出来就算通过"（A07）。
++
++    现在同时检查三件事：
++      1. 起点差 start_diff —— 固定偏移只能靠它发现；
++      2. 终点差 end_diff；
++      3. 持续时长漂移 dur_diff —— 随时间线性漂移只能靠它发现。
++    三者取最大值按阈值判定。取不到**任何**一侧区间时返回 86（未验收），
++    不再静默放行；容器**根本没有音轨**是另一种情形，由输入契约决定是否允许，
++    这里记录后返回 0，不与"探测失败"共用同一个 0 语义。
+     """
+-    video_dur = _get_stream_duration(muxed_path, "v")
+-    audio_dur = _get_stream_duration(muxed_path, "a")
++    presence = _probe_audio_presence(muxed_path)
++    if presence == "unknown":
++        # 探测本身就失败了 —— 这**不是**"没有音轨"，不能放行。
++        logger.error("STAGE7_SYNC_UNMEASURABLE",
++                     "Cannot probe the muxed output; refusing to claim the "
++                     "output is in sync (not a pass)", path=muxed_path)
++        return 86
++    if presence == "absent":
++        logger.warning("STAGE7_SYNC_NO_AUDIO",
++                       "No audio stream in the muxed output; sync check not "
++                       "applicable (allowed only if the input contract says the "
++                       "source has no audio)")
++        return 0
++
++    intervals = {}
++    for st in ("v", "a"):
++        start = _probe_stream_start(muxed_path, st)
++        span = _get_stream_duration(muxed_path, st)
++        if start is None or not span:
++            intervals[st] = None
++        else:
++            intervals[st] = (start, start + span)
++
++    if intervals.get("v") is None or intervals.get("a") is None:
++        logger.error("STAGE7_SYNC_UNMEASURABLE",
++                     "Cannot determine one or both stream intervals; refusing "
++                     "to claim the output is in sync (not a pass)",
++                     video_interval=intervals.get("v"),
++                     audio_interval=intervals.get("a"))
++        return 86
+ 
+-    if video_dur == 0 or audio_dur == 0:
+-        logger.warning("STAGE7_SYNC_SKIP", "Cannot determine durations for sync check")
+-        return 0  # Continue anyway
++    v_start, v_end = intervals["v"]
++    a_start, a_end = intervals["a"]
++    start_diff = abs(v_start - a_start)
++    end_diff = abs(v_end - a_end)
++    dur_diff = abs((v_end - v_start) - (a_end - a_start))
++    diff_ms = max(start_diff, end_diff, dur_diff) * 1000
+ 
+-    diff_ms = abs(video_dur - audio_dur) * 1000
++    def _detail():
++        return dict(video_start=v_start, video_end=v_end,
++                    audio_start=a_start, audio_end=a_end,
++                    start_diff_ms=start_diff * 1000,
++                    end_diff_ms=end_diff * 1000,
++                    duration_drift_ms=dur_diff * 1000)
+ 
+     if diff_ms > 500:
+         logger.error("STAGE7_SYNC_FAIL",
+-                    f"AV sync difference {diff_ms:.0f}ms exceeds 500ms threshold",
+-                    video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
++                     f"AV sync difference {diff_ms:.0f}ms exceeds 500ms threshold "
++                     f"(start {start_diff * 1000:.0f}ms / end {end_diff * 1000:.0f}ms "
++                     f"/ drift {dur_diff * 1000:.0f}ms)", **_detail())
+         return 86
+     elif diff_ms > 300:
+         logger.warning("STAGE7_SYNC_WARN",
+-                      f"AV sync difference {diff_ms:.0f}ms exceeds 300ms threshold, sync processing recommended",
+-                      video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
++                       f"AV sync difference {diff_ms:.0f}ms exceeds 300ms threshold, "
++                       "sync processing recommended", **_detail())
+         return 0  # Continue but warn
+     elif diff_ms > 100:
+-        # FIX-R7-S7-11: >100ms must be WARNING per v7.32 §3.10.9 ("音视频时长
+-        # 差值 > 100ms 触发 WARNING"). ORIGINAL logged INFO.
++        # FIX-R7-S7-11: >100ms must be WARNING per v7.32 §3.10.9.
+         logger.warning("STAGE7_SYNC_WARN_100",
+-                      f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
+-                      video_duration=video_dur, audio_duration=audio_dur, diff_ms=diff_ms)
++                       f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
++                       **_detail())
+         return 0  # Continue
+ 
++    logger.info("STAGE7_SYNC_OK",
++                f"AV sync within tolerance ({diff_ms:.0f}ms)", **_detail())
+     return 0
+ 
+ 
+@@ -826,17 +1075,15 @@ def main():
+         logger.warning("STAGE7_16BIT_QUANT",
+                        "16bit limited range (black=4096/white=60160) is industry "
+                        "convention, NOT ITU standard (per v7.32 §3.10.26)")
+-        # Check if zscale supports error_diffusion dithering
+-        _zscale_ed_available = False
+-        try:
+-            _zd = subprocess.run(
+-                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "color=c=black:s=64x64",
+-                 "-vf", "zscale=dither=error_diffusion", "-f", "null", "-"],
+-                capture_output=True, shell=False, timeout=10
+-            )
+-            _zscale_ed_available = (_zd.returncode == 0)
+-        except Exception:
+-            pass
++        # Check if zscale supports error_diffusion dithering.
++        # R2-12：这里原来是**无限** lavfi color 源 + timeout=10 ——
++        # 实测要跑满 10 秒才把它判成"不支持"。改用统一限帧探测函数。
++        _ed_probe = _zscale_probe("dither=error_diffusion")
++        _zscale_ed_available = (_ed_probe == "supported")
++        if _ed_probe in ("timeout", "missing"):
++            logger.warning("STAGE7_ZSCALE_PROBE_INCONCLUSIVE",
++                           "error_diffusion probe was inconclusive; treating as "
++                           "unavailable", reason=_ed_probe)
+ 
+         if _zscale_ed_available:
+             # Per v6.32 §阶段3: error_diffusion dithering in YUV444 space
