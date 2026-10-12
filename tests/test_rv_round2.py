@@ -1547,3 +1547,361 @@ def test_r205_photo_scheduler_persists_completed_job_without_waiting(
     statuses = {j["job_id"]: j["status"] for j in final["jobs"]}
     assert statuses.get("B") == "DONE", f"B 最终状态不对：{statuses}"
     assert statuses.get("A") == "DONE", f"A 最终状态不对：{statuses}"
+
+
+# ---------------------------------------------------------------------------
+# R2-10 扩展：>2 声道逐声道处理（原列为未完成，现补实测）
+# ---------------------------------------------------------------------------
+
+def _make_multichannel_wav(path, freqs=(220, 330, 440, 550, 660, 770),
+                           layout="5.1", seconds=1.0, rate=48000):
+    """合成 N 声道素材：每个声道放**不同**频率，便于检测是否被合并。"""
+    cmd = ["ffmpeg", "-v", "error", "-y"]
+    for f in freqs:
+        cmd += ["-f", "lavfi", "-i",
+                f"sine=frequency={f}:duration={seconds}:sample_rate={rate}"]
+    cmd += ["-filter_complex",
+            "".join(f"[{i}:a]" for i in range(len(freqs)))
+            + f"join=inputs={len(freqs)}:channel_layout={layout}[a]",
+            "-map", "[a]", "-c:a", "pcm_s16le", str(path)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        pytest.skip(f"无法合成多声道素材（未验收）：{r.stderr[:200]}")
+    return path
+
+
+def test_r210_multichannel_arnndn_keeps_channels_distinct(tmp_path):
+    """>2 声道：逐声道 arnndn 后各声道**不得**被合并。
+
+    之前 >2ch 直接退回 afftdn；现在实现了 channelsplit → 逐声道 → join。
+    实测（5.1，六声道不同频率）：rc=0 且六个声道仍两两不同。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— 多声道逐声道记为未验收")
+    s7 = _load_stage7()
+    model = os.path.join(ROOT, "models", "std.rnnn")
+    if not os.path.exists(model):
+        pytest.skip("仓库内没有 models/std.rnnn —— 多声道逐声道记为未验收")
+
+    sys.path.insert(0, SHARED)
+    from audio_utils import filter_option_path
+
+    src = _make_multichannel_wav(tmp_path / "src51.wav")
+    src_ch = [_extract_channel(src, i) for i in range(6)]
+    assert len(set(src_ch)) == 6, "素材本身声道就相同，对照不成立"
+
+    chain = ",".join(s7._arnndn_filters(
+        model, {"channels": 6, "layout": "5.1"}, filter_option_path, None))
+    assert "channelsplit" in chain and "join=" in chain, (
+        ">2 声道没有走逐声道方案：" + chain)
+    out = tmp_path / "denoised51.wav"
+    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
+                        "-af", chain, "-f", "wav", str(out)],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, f"逐声道 arnndn 链跑不起来：{r.stderr[:300]}"
+    got = [_extract_channel(out, i) for i in range(6)]
+    assert len(set(got)) == 6, (
+        "处理之后声道被合并了（应保留 6 个互不相同的声道）")
+
+
+def test_r207_intermediate_without_identity_is_not_reused(tmp_path):
+    """R2-07 补完：没有身份侧车的中间产物**不得**被复用。
+
+    "能解码"只证明文件没坏，证明不了它属于本次输入/参数/实现。
+    """
+    art = tmp_path / "j1_clip_step6_grain.mkv"
+    art.write_bytes(b"OLD-INTERMEDIATE")
+    job = {"job_id": "j1", "input_path": str(tmp_path / "src.mkv")}
+    (tmp_path / "src.mkv").write_bytes(b"SOURCE")
+    ok, why = vmain.intermediate_identity_matches(str(art), job, {}, None)
+    assert not ok, "没有身份侧车却被判为可复用"
+    assert "identity" in why.lower() or "sidecar" in why.lower(), why
+
+
+def test_r207_intermediate_identity_detects_source_change(tmp_path):
+    """R2-07 补完：源内容变了，已登记身份的中间产物必须失效。"""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"SOURCE-V1")
+    job = {"job_id": "j1", "input_path": str(src)}
+    art = tmp_path / "j1_clip_step6_grain.mkv"
+    art.write_bytes(b"INTERMEDIATE")
+    assert vmain.record_stage_artifact_identity(
+        str(art), job, {}, 6, str(src), None)
+    ok1, _ = vmain.intermediate_identity_matches(str(art), job, {}, None)
+    assert ok1, "同一输入下已登记的产物应当可复用"
+
+    src.write_bytes(b"SOURCE-V2-CHANGED")
+    ok2, why = vmain.intermediate_identity_matches(str(art), job, {}, None)
+    assert not ok2, f"源变了却仍判定可复用：{why}"
+
+
+def test_r207_intermediate_identity_detects_size_change(tmp_path):
+    """R2-07 补完：产物自身大小与登记不符时拒绝（防半截文件）。"""
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"SOURCE")
+    job = {"job_id": "j1", "input_path": str(src)}
+    art = tmp_path / "j1_clip_step6_grain.mkv"
+    art.write_bytes(b"INTERMEDIATE")
+    assert vmain.record_stage_artifact_identity(
+        str(art), job, {}, 6, str(src), None)
+    art.write_bytes(b"INTERMEDIATE-TRUNCATED-OR-REWRITTEN")
+    ok, why = vmain.intermediate_identity_matches(str(art), job, {}, None)
+    assert not ok, f"产物大小变了却仍判定可复用：{why}"
+
+
+# ---------------------------------------------------------------------------
+# R2-04 补完：多个 worker **争抢同一批 job** 的完整并发压测
+# ---------------------------------------------------------------------------
+
+def _contend_worker(path, owner, barrier):
+    """子进程：和别人**争抢同一批** job（不是各写各的集合）。"""
+    import conftest  # noqa: F401  (sys.path bootstrap)
+    import manifest_loader as m
+
+    barrier.wait()                      # 尽量同时开抢，制造真实竞争
+    gen = m.acquire_run_ownership(path, owner=owner)
+    if gen is None:
+        return []
+    written = []
+    doc = m.load_manifest(path)
+    for job in doc.get("jobs", []):
+        ok = m.save_manifest_job_result(path, job["job_id"], "DONE",
+                                        owner=owner, generation=gen)
+        written.append((job["job_id"], ok, gen, owner))
+    return written
+
+
+def test_r204_workers_contending_for_the_same_jobs_stay_consistent(tmp_path):
+    """R2-04 补完：8 个 worker 争抢**同一批** job，结果必须自洽。
+
+    交接指出旧压测让新旧 run 写**不相交**的集合，证明不了竞争场景。
+    这里让所有 worker 争抢同一批 job，并用 Barrier 尽量同时开抢，然后逐 job
+    断言：状态不丢、归属唯一、generation 一致、meta 计数正确。
+    """
+    import multiprocessing
+
+    job_ids = [f"j{i:02d}" for i in range(12)]
+    path = _manifest_with_jobs(tmp_path / "contend.jsonl", job_ids)
+
+    workers = 8
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(workers)
+    procs = []
+    for i in range(workers):
+        p = ctx.Process(target=_contend_worker,
+                        args=(path, f"worker-{i}", barrier))
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join(timeout=180)
+        assert p.exitcode == 0, f"worker 失败：exitcode={p.exitcode}"
+
+    final = ml.load_manifest(path)
+    jobs = final["jobs"]
+    assert len(jobs) == len(job_ids)
+
+    statuses = {j["status"] for j in jobs}
+    assert statuses == {"DONE"}, f"并发争抢后有 job 没落盘：{statuses}"
+
+    owners = {str(j.get("run_owner")) for j in jobs}
+    assert len(owners) == 1, (
+        f"同一批 job 出现了多个归属 —— 竞争下归属不唯一：{owners}")
+
+    gens = {j.get("run_generation") for j in jobs}
+    assert len(gens) == 1, (
+        f"同一批 job 的 generation 不一致（可能混代）：{gens}")
+
+    # 代际必须单调：最终 generation 不小于任务数（每个 worker 领取都会递增）
+    assert final["meta"].get("done") == len(job_ids), (
+        f"meta.done 与实际不符：{final['meta'].get('done')}")
+    leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+    assert not leftovers, f"残留临时文件：{leftovers}"
+
+
+# ---------------------------------------------------------------------------
+# R2-11 补完：内容级同步（首/中/尾已知 flash / click 事件）
+# ---------------------------------------------------------------------------
+
+_EVENT_TIMES = [0.5, 1.5, 2.5]      # 秒：首 / 中 / 尾
+
+
+def _build_flash_click(tmp_path, audio_offset: float):
+    """合成"已知事件"素材：视频在这些时刻白闪，音频在同一时刻脉冲。
+
+    audio_offset > 0 表示音轨整体延后（制造不同步）。
+    """
+    import struct
+    duration = 3.0
+    fps = 25
+    sr = 48000
+
+    # --- 视频：黑底 + 指定时刻画白框 ---
+    video = tmp_path / "v.mkv"
+    vf = ",".join(
+        f"drawbox=x=0:y=0:w=64:h=64:color=white@1:t=fill:"
+        f"enable='between(t,{t},{t + 0.08})'" for t in _EVENT_TIMES)
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"color=c=black:s=64x64:d={duration}:r={fps}",
+         "-vf", vf, "-c:v", "ffv1", "-pix_fmt", "yuv420p", str(video)],
+        capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        pytest.skip(f"无法合成 flash 素材（未验收）：{r.stderr[:200]}")
+
+    # --- 音频：静音 + 指定时刻脉冲（用 numpy 直接写 PCM，最可靠）---
+    import numpy as _np
+    n = int(duration * sr)
+    pcm = _np.zeros(n, dtype=_np.int16)
+    for t in _EVENT_TIMES:
+        start = int(t * sr)
+        pcm[start:start + int(0.02 * sr)] = 30000
+    raw = tmp_path / "a.pcm"
+    raw.write_bytes(pcm.tobytes())
+
+    out = tmp_path / "av.mkv"
+    # 注意：`-itsoffset` 必须放在它要作用的那个 `-i` **之前**，
+    # 放到 -i 之后不会生效（第一版就写错了位置，导致这条用例被 skip）。
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(video)]
+    if audio_offset:
+        cmd += ["-itsoffset", str(audio_offset)]
+    cmd += ["-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", str(raw),
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le",
+            str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        pytest.skip(f"无法合成 A/V 素材（未验收）：{r.stderr[:200]}")
+    return out, fps, sr
+
+
+def _first_packet_pts(path, stream):
+    """容器里该流第一个 packet 的 pts_time。
+
+    **方法学要点**：把流解码成 raw PCM / rawvideo 后，输出只是字节流，
+    **容器里的时间偏移会丢掉**（第一版检测就栽在这里：音轨延后 0.5s，
+    raw 解码测出的脉冲位置却几乎没变）。因此必须把首 packet 的 pts 加回去，
+    raw 里测到的只是"流内相对时间"。
+    """
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", stream,
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
+        capture_output=True, text=True, timeout=60)
+    vals = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            vals.append(float(line))
+        except ValueError:
+            continue
+    return min(vals) if vals else 0.0
+
+
+def _video_event_times(path, fps):
+    """逐帧求平均亮度，找白闪帧的时间戳（已加回流起始 pts）。"""
+    import numpy as _np
+    base = _first_packet_pts(path, "v:0")
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-vf", "format=gray",
+         "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        capture_output=True, timeout=120)
+    assert r.returncode == 0, r.stderr[:200]
+    frames = _np.frombuffer(r.stdout, dtype=_np.uint8).reshape(-1, 64 * 64)
+    mean = frames.mean(axis=1)
+    bright = _np.where(mean > 128)[0]
+    if bright.size == 0:
+        return []
+    # 把连续帧聚成事件
+    events, run = [], [bright[0]]
+    for idx in bright[1:]:
+        if idx - run[-1] <= 2:
+            run.append(idx)
+        else:
+            events.append(run[0]); run = [idx]
+    events.append(run[0])
+    return [round(base + e / fps, 4) for e in events]
+
+
+def _audio_event_times(path, sr):
+    """逐样本求绝对值，找脉冲的时间戳（已加回流起始 pts）。"""
+    import numpy as _np
+    base = _first_packet_pts(path, "a:0")
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-vn",
+         "-f", "s16le", "-ac", "1", "-ar", str(sr), "-"],
+        capture_output=True, timeout=120)
+    assert r.returncode == 0, r.stderr[:200]
+    pcm = _np.frombuffer(r.stdout, dtype=_np.int16).astype(_np.int32)
+    loud = _np.where(_np.abs(pcm) > 20000)[0]
+    if loud.size == 0:
+        return []
+    events, run = [], [loud[0]]
+    for idx in loud[1:]:
+        if idx - run[-1] <= sr // 10:      # 同一脉冲内
+            run.append(idx)
+        else:
+            events.append(run[0]); run = [idx]
+    events.append(run[0])
+    return [round(base + e / sr, 4) for e in events]
+
+
+def test_r211_content_events_align_when_in_sync(tmp_path):
+    """R2-11 补完：内容级验证 —— 同步时，flash 与 click 应在同一时刻。
+
+    这是"真正同步"而不是"时长接近"：直接比对已知事件的内容时间戳。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— 内容级同步记为未验收")
+    av, fps, sr = _build_flash_click(tmp_path, audio_offset=0.0)
+    v_t = _video_event_times(av, fps)
+    a_t = _audio_event_times(av, sr)
+    assert len(v_t) >= 2 and len(a_t) >= 2, f"事件没被检出：v={v_t} a={a_t}"
+
+    deltas = []
+    for vt in v_t:
+        if not a_t:
+            break
+        nearest = min(a_t, key=lambda x: abs(x - vt))
+        deltas.append(abs(nearest - vt))
+    worst = max(deltas)
+    assert worst < 0.1, (
+        f"同步素材里 flash 与 click 的最大时间差 {worst:.3f}s 超过 100ms "
+        f"(video={v_t} audio={a_t})")
+
+
+def test_r211_content_events_reveal_real_offset(tmp_path):
+    """负向对照：音轨整体延后 0.5s 时，内容事件必须**暴露**出来。
+
+    没有这条，"内容级验证"就没有证明力 —— 它可能对真正的错位也报 OK。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— 内容级同步负向对照记为未验收")
+    s7 = _load_stage7()
+    # 用 0.8s 而不是 0.5s：规范的失败阈值是 "> 500ms"，0.5s 正好卡在边界上
+    # （第一版用 0.5s，门按规范只 warn 不 fail，看起来像漏判）。
+    # 边界口径见 修复清单.md §12.14：正好 500ms 按规范不判失败。
+    offset = 0.8
+    av, fps, sr = _build_flash_click(tmp_path, audio_offset=offset)
+    v_t = _video_event_times(av, fps)
+    a_t = _audio_event_times(av, sr)
+    assert len(v_t) >= 2 and len(a_t) >= 2, f"事件没被检出：v={v_t} a={a_t}"
+
+    deltas = [min(abs(a - vt) for a in a_t) for vt in v_t]
+    worst = max(deltas)
+    assert worst > 0.3, (
+        f"音轨延后 {offset}s，内容事件却只差 {worst:.3f}s —— 检测没有暴露错位")
+
+    # 现有包头级同步门对这种固定偏移也应当判失败
+    class _Log:
+        def __init__(self):
+            self.events = []
+
+        def _rec(self, ev, msg, **kw):
+            self.events.append(ev)
+
+        info = warning = error = debug = critical = _rec
+
+    log = _Log()
+    rc = s7._validate_av_sync(str(av), log)
+    assert rc != 0, f"音轨延后 {offset}s，包头级同步门仍判定通过"

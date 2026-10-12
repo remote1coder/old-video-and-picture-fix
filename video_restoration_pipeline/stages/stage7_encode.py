@@ -52,6 +52,11 @@ def _get_audio_layout(audio_path: str) -> dict:
     return {"channels": 2, "layout": "stereo"}
 
 
+#: 逐声道 arnndn 支持的声道数上限。超过这个数（罕见的多声道素材）退回
+#: afftdn，因为每组都要起一个 arnndn 实例，实例数与声道数成正比。
+_MAX_PER_CHANNEL_ARNNDN = 8
+
+
 def _arnndn_filters(model: str, audio_layout: dict, escape,
                     logger=None) -> List[str]:
     """R2-10: build the arnndn filter chain **without merging channels**.
@@ -71,8 +76,8 @@ def _arnndn_filters(model: str, audio_layout: dict, escape,
     采用逐声道方案而不是"直接喂立体声"，因为后者依赖 arnndn 对多声道的支持，
     各版本不一致；channelsplit 保证每个分支拿到的都是单声道，行为稳定。
 
-    >2 声道：逐声道 arnndn **未实现**（需要按 layout 生成 N 组标签，本机无
-    5.1 素材可验证），改用 afftdn（其内部按声道处理）并明确记录降级原因。
+    >2 声道：第三轮已实现逐声道处理（实测 5.1 rc=0 且六声道仍互不相同）。
+    仅当声道数超过 `_MAX_PER_CHANNEL_ARNNDN`(8) 时才退回 afftdn 并记降级原因。
     """
     layout = (audio_layout or {}).get("layout", "stereo")
     channels = int((audio_layout or {}).get("channels", 1) or 1)
@@ -81,11 +86,24 @@ def _arnndn_filters(model: str, audio_layout: dict, escape,
     if channels <= 1:
         return [f"arnndn=m={arg}"]
 
-    if channels == 2:
-        return [f"channelsplit=channel_layout={layout}[_dnL][_dnR];"
-                f"[_dnL]arnndn=m={arg}[_dnLo];"
-                f"[_dnR]arnndn=m={arg}[_dnRo];"
-                f"[_dnLo][_dnRo]join=inputs=2:channel_layout={layout}"]
+    if channels <= _MAX_PER_CHANNEL_ARNNDN:
+        # 任意声道数都按"逐声道"处理：split → 每个声道各自 arnndn → join 回原布局。
+        # 第三轮实测（合成 5.1，六声道各放 220/330/440/550/660/770 Hz）：
+        # rc=0，处理后 6 个声道**仍两两不同**（未发生合并）。
+        labels = [f"_dn{i}" for i in range(channels)]
+        outs = [f"{lab}o" for lab in labels]
+        chain = (
+            f"channelsplit=channel_layout={layout}"
+            + "".join(f"[{lab}]" for lab in labels) + ";"
+            + "".join(f"[{lab}]arnndn=m={arg}[{out}];"
+                      for lab, out in zip(labels, outs))
+            + "".join(f"[{out}]" for out in outs)
+            + f"join=inputs={channels}:channel_layout={layout}")
+        if logger:
+            logger.info("STAGE7_ARNNDN_PER_CHANNEL",
+                        "arnndn applied per channel (no downmix)",
+                        channels=channels, layout=layout)
+        return [chain]
 
     if logger:
         logger.warning("STAGE7_ARNNDN_MULTICHANNEL_DEGRADED",
@@ -681,6 +699,48 @@ def _get_source_color_info(video_path: str) -> tuple:
     return "limited", "NTSC", False, False
 
 
+def _probe_encoder_priming(path: str, stream_type: str = "a") -> float:
+    """Return the encoder's declared priming (seconds, >= 0) for a stream.
+
+    第三轮实测拆解 66/86ms 残差：AAC 编码器插入
+    ``initial_padding = 1024`` 样本。44.1kHz 下 = **23.22ms**，ffprobe 因此把
+    音频流的 ``start_time`` 报成 **-0.023** —— 这是编码器 priming，
+    播放器靠 edit list / skip_samples 跳过它，**听感上并不偏移**。
+    若不归一，一个真实的内容偏移会被这段 priming 掩盖（交接明确禁止
+    "把所有起点强制归零来隐藏内容偏移"，这里是按编码器声明值归一，
+    不是强制归零，且 end_diff / 漂移两个独立判据仍然保留）。
+    """
+    if stream_type != "a":
+        return 0.0
+    try:
+        # 必须按**字段名**取值：`nokey=1` 的输出顺序不保证等于请求顺序。
+        # 第一版按位置读，把 (sample_rate, initial_padding) 读成了
+        # (padding, rate) = (44100, 1024)，算出 43.07 秒的"priming"，
+        # 于是同步门把正常产物判成 43 秒错位（自测暴露）。
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=initial_padding,sample_rate",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30, shell=False)
+        if r.returncode != 0:
+            return 0.0
+        streams = (json.loads(r.stdout or "{}").get("streams") or [])
+        if not streams:
+            return 0.0
+        stream = streams[0]
+        padding = stream.get("initial_padding")
+        rate = stream.get("sample_rate")
+        if padding is None or rate is None:
+            return 0.0
+        padding = float(padding)
+        rate = float(rate)
+        if rate <= 0:
+            return 0.0
+        return max(0.0, padding / rate)
+    except Exception:
+        return 0.0
+
+
 def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
     """Return a stream's start time in seconds, or None.
 
@@ -688,6 +748,9 @@ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
     `-itsoffset` 造成的偏移（实测：video 0.000000 / audio 1.000000），
     比逐 packet 便宜得多，因此作为首选；拿不到时再退回 packet 首时间戳。
     """
+    # AAC priming 归一：报出来的负起点是编码器 padding，不是内容偏移
+    priming = _probe_encoder_priming(path, stream_type)
+
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
@@ -697,7 +760,7 @@ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
         if r.returncode == 0:
             txt = r.stdout.strip()
             if txt and txt != "N/A":
-                return float(txt)
+                return float(txt) + priming
     except Exception:
         pass
     # 退回：packet 的最小 pts
@@ -717,7 +780,7 @@ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
                 except ValueError:
                     continue
             if vals:
-                return min(vals)
+                return min(vals) + priming
     except Exception:
         pass
     return None
@@ -777,6 +840,10 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
                        "source has no audio)")
         return 0
 
+    # 编码器 priming（AAC 常见 1024 样本）已在上游探测时归一；这里只用于日志，
+    # 说明"容器时长膨胀"中有多少是编码固有、不是内容错位。
+    priming_ms = _probe_encoder_priming(muxed_path, "a") * 1000
+
     intervals = {}
     for st in ("v", "a"):
         start = _probe_stream_start(muxed_path, st)
@@ -806,7 +873,8 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
                     audio_start=a_start, audio_end=a_end,
                     start_diff_ms=start_diff * 1000,
                     end_diff_ms=end_diff * 1000,
-                    duration_drift_ms=dur_diff * 1000)
+                    duration_drift_ms=dur_diff * 1000,
+                    encoder_priming_ms=priming_ms)
 
     if diff_ms > 500:
         logger.error("STAGE7_SYNC_FAIL",
