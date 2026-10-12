@@ -780,6 +780,20 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
+            # R2-07 补完：给本 stage 刚产出的中间产物登记身份（源 + 参数 + 实现）。
+            # stage7 的最终产物另有 completion marker，不重复登记。
+            if stage_num != 7:
+                try:
+                    _td = params.get("temp_dir", "./temp")
+                    for _art in find_stage_artifacts(_td, job_id, input_path,
+                                                     stage_num):
+                        record_stage_artifact_identity(
+                            _art, job, config, stage_num, input_path,
+                            job_logger)
+                except Exception as e:
+                    job_logger.warning(
+                        "STAGE_IDENTITY_SKIP",
+                        f"Could not register artifact identity: {e}")
             # FIX-P3-6: Per v7.32 §3.8: Auto-generate forced-upscale comparison
             # frames after stage3 AI upscale completes successfully
             if stage_num == 3 and force_allow:
@@ -1019,6 +1033,86 @@ def aggregate_results(results: List[Dict[str, Any]], logger=None) -> int:
     # 取最严重（数值最大）的失败码；未知时落到 86（校验/处理失败）
     worst = max(codes) if codes else 0
     return worst if worst > 0 else 86
+
+
+def intermediate_identity_path(artifact: str) -> str:
+    return str(artifact) + ".identity.json"
+
+
+def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
+                                   config: Dict[str, Any], stage_num: int,
+                                   input_path: str, logger=None) -> bool:
+    """R2-07 补完：给**每个中间产物**写身份侧车。
+
+    之前 resume 只能"按文件名找到 + 能解码"就复用（A17 复现的缺陷）。
+    现在每个 stage 成功后由调度器登记：源身份 + 有效参数身份 + 实现版本 +
+    job_id + 产物自身大小。校验发生在 resume 时（见
+    :func:`intermediate_identity_matches`）。
+    """
+    payload = {
+        "impl": VIDEO_IMPL_VERSION,
+        "job_id": job.get("job_id", ""),
+        "stage": stage_num,
+        "artifact": str(artifact),
+        "artifact_size": (os.path.getsize(artifact)
+                          if os.path.exists(artifact) else None),
+        "source_identity": build_input_identity(input_path),
+        "params_identity": build_params_identity(config, job, logger),
+        "recorded_at": datetime.now().astimezone().isoformat(),
+    }
+    try:
+        path = intermediate_identity_path(artifact)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE_IDENTITY_WRITE_FAIL",
+                           f"Could not record identity for {artifact}: {e}")
+        return False
+
+
+def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
+                                  config: Dict[str, Any],
+                                  logger=None) -> Tuple[bool, str]:
+    """R2-07 补完：这个中间产物**是不是**本次 job / 本次输入 / 本次参数产出的。
+
+    "能解码"只证明文件没坏，证明不了它属于本次任务。
+    返回 ``(ok, reason)``；侧车缺失或读不出来一律按 **unproven** 拒绝
+    （安全方向：重算，不是错配）。
+    """
+    path = intermediate_identity_path(artifact)
+    if not os.path.exists(path):
+        return False, ("intermediate has no identity sidecar (produced by an "
+                       "older implementation or an interrupted run)")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"unreadable identity sidecar: {e}"
+    if str(data.get("impl", "")) != VIDEO_IMPL_VERSION:
+        return False, (f"produced by implementation {data.get('impl')!r}, "
+                       f"current is {VIDEO_IMPL_VERSION!r}")
+    if str(data.get("job_id", "")) != str(job.get("job_id", "")):
+        return False, f"belongs to job {data.get('job_id')!r}, not this one"
+    recorded_src = data.get("source_identity") or {}
+    current_src = build_input_identity(job.get("input_path", ""))
+    status = _input_identity_status(recorded_src, current_src)
+    if status == "changed":
+        return False, "source content changed since this intermediate was made"
+    if status == "unproven":
+        return False, "source identity cannot be verified for this intermediate"
+    recorded_params = data.get("params_identity")
+    if recorded_params and recorded_params != build_params_identity(
+            config, job, logger):
+        return False, "effective parameters changed since it was produced"
+    size = data.get("artifact_size")
+    if size is not None and os.path.exists(artifact) and \
+            int(size) != os.path.getsize(artifact):
+        return False, "artifact size differs from what was recorded"
+    return True, "identity-match"
 
 
 def _apply_startup_job_decision(manifest_path: str, job_id: str,
@@ -1546,10 +1640,23 @@ def main():
                         for stage_num in range(6, -1, -1):
                             candidates = find_stage_artifacts(temp_dir, job_id,
                                                               input_path, stage_num)
-                            if candidates:
-                                if verify_ffprobe_decodeable(candidates[0]):
+                            for cand in candidates:
+                                # R2-07 补完：解码成功只说明文件没坏，
+                                # 还要证明它属于**本次**输入/参数/实现。
+                                ok_id, why = intermediate_identity_matches(
+                                    cand, job, config, logger)
+                                if not ok_id:
+                                    logger.info(
+                                        "RESUME_ARTIFACT_IDENTITY_REJECTED",
+                                        f"Job {job_id}: {cand} cannot be "
+                                        f"bound to this run ({why})",
+                                        candidate=cand)
+                                    continue
+                                if verify_ffprobe_decodeable(cand):
                                     last_completed = stage_num
                                     break
+                            if last_completed >= 0:
+                                break
                     if last_completed >= 0:
                         logger.info("RESUME_PARTIAL",
                                    f"Job {job_id} resuming from stage {last_completed + 1}")
