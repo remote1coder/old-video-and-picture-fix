@@ -185,49 +185,99 @@ class PublishAbort(Exception):
         self.reason = reason
 
 
-def _snapshot_for_rollback(paths: List[str], backup_dir: str,
-                           logger=None) -> Dict[str, Optional[str]]:
-    """R2-01: 提交前先把**现存**产物复制到备份目录。
+# R3-03 / B03：提交前每个目标路径的状态必须**三态可区分**。
+# 旧实现用 None 同时表示"原先不存在"和"备份失败"，于是回滚把"备份失败"的
+# 路径直接**删除** —— 旧产物被销毁，且日志还声称"完整旧代已恢复"。
+BACKUP_ABSENT = "absent"        # 提交前不存在 → 回滚时撤下本次新建的文件
+BACKUP_OK = "backed_up"         # 已备份 → 回滚时拷回
+BACKUP_FAILED = "backup_failed"  # 备份失败 → 回滚时**绝不能动**
 
-    Returns ``{目标路径: 备份文件路径 或 None}``。``None`` 表示提交前该路径
-    不存在（回滚时应撤下本次新建的文件），或备份失败（无法恢复，必须留痕）。
+
+def _snapshot_for_rollback(paths: List[str], backup_dir: str,
+                           logger=None) -> Dict[str, Dict[str, Optional[str]]]:
+    """R3-03: 提交前把**现存**产物复制到备份目录，并明确记录每个目标的状态。
+
+    Returns ``{目标路径: {"state": ..., "backup": 备份路径 或 None}}``。
     """
-    snapshot: Dict[str, Optional[str]] = {}
+    snapshot: Dict[str, Dict[str, Optional[str]]] = {}
     for idx, path in enumerate([p for p in paths if p]):
         if not os.path.isfile(path):
-            snapshot[path] = None
+            snapshot[path] = {"state": BACKUP_ABSENT, "backup": None}
             continue
         try:
             os.makedirs(backup_dir, exist_ok=True)
             backup = os.path.join(backup_dir, f"{idx}_{os.path.basename(path)}")
+            # R3-03：必须**真实复制**，不能图快用硬链接。
+            # 实测（本机）：os.link(path, backup) 之后若调用方**原地写**
+            # path（open(path,'w') / write_bytes），备份文件的內容也会跟着变，
+            # 于是回滚恢复出来的就是被改坏的数据 —— 等于没有备份。
+            # 提交阶段虽然主要用 os.replace 换 inode，但无法强制所有调用方
+            # 都这样做，备份必须自己站得住。
             shutil.copyfile(path, backup)
-            snapshot[path] = backup
+            snapshot[path] = {"state": BACKUP_OK, "backup": backup}
         except OSError as e:
-            snapshot[path] = None
+            snapshot[path] = {"state": BACKUP_FAILED, "backup": None}
             if logger:
                 logger.error("STAGE6_ROLLBACK_BACKUP_FAIL",
                              f"Cannot back up {path} before publishing: {e}. "
-                             "A later failure could NOT restore it.",
+                             "This path will NOT be touched on rollback.",
                              path=path)
     return snapshot
 
 
-def _rollback_publish(snapshot: Dict[str, Optional[str]], logger=None) -> None:
-    """R2-01: 把每个目标路径恢复成提交前的内容。
+def _snapshot_has_failure(snapshot: Dict[str, Dict[str, Optional[str]]]) -> bool:
+    """R3-03: 有任何一个目标备份失败 → 提交必须先停，不能动旧产物。"""
+    return any(entry.get("state") == BACKUP_FAILED
+               for entry in snapshot.values())
 
-    有备份 → 拷回；没备份（本次新建）→ 删除本次写入的文件。
-    目标是"最终只能看到完整旧代"，不能是混合代。
+
+def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
+                      logger=None) -> None:
+    """R3-03: 把每个目标路径恢复成提交前的内容。
+
+    * ``backed_up``  → 从备份拷回；
+    * ``absent``     → 删除本次新建的文件；
+    * ``backup_failed`` → **不动**（没有备份可恢复，删掉就等于销毁旧产物），
+      并记 `STAGE6_RESTORE_IMPOSSIBLE`，绝不声称"完整旧代已恢复"。
     """
-    for path, backup in snapshot.items():
+    restored = 0
+    impossible = 0
+    for path, entry in snapshot.items():
+        state = entry.get("state")
+        backup = entry.get("backup")
         try:
-            if backup and os.path.isfile(backup):
+            if state == BACKUP_OK and backup and os.path.isfile(backup):
+                # R3-03 / B14：优先 `os.replace` —— 单次系统调用、原子，
+                # 比 copyfile 的失败面小得多。取消处理器里做文件 I/O 有额外
+                # 风险（Windows 实测会再抛 KeyboardInterrupt），
+                # 越少的系统调用越好；跨卷失败时再退回复制。
+                try:
+                    os.replace(backup, path)
+                    restored += 1
+                    continue
+                except OSError:
+                    pass
                 shutil.copyfile(backup, path)
-            elif os.path.exists(path):
+                restored += 1
+            elif state == BACKUP_ABSENT and os.path.exists(path):
                 os.remove(path)
+            elif state == BACKUP_FAILED:
+                impossible += 1
         except OSError as e:
             if logger:
                 logger.error("STAGE6_ROLLBACK_FAIL",
                              f"Could not restore {path}: {e}", path=path)
+    if impossible and logger:
+        logger.error("STAGE6_RESTORE_IMPOSSIBLE",
+                     f"{impossible} path(s) had no usable backup and were left "
+                     "untouched; the previous generation could NOT be fully "
+                     "restored — do not report a clean rollback",
+                     impossible_paths=[p for p, e in snapshot.items()
+                                       if e.get("state") == BACKUP_FAILED])
+    if logger:
+        logger.info("STAGE6_PUBLISH_ROLLBACK",
+                    f"Rollback finished: {restored} restored, "
+                    f"{impossible} impossible")
 
 
 def _fail(logger, status_path: str, operation: str, reason: str,
@@ -939,8 +989,26 @@ def main():
         logger.warning("STAGE6_HEADER_READBACK_FAIL",
                        f"Could not read back the encoded AVIF header: {e}",
                        output=tmp_avif)
+    if not actual:
+        # R3-09 / B07：回读失败/结果未知 —— 严格模式下**不能当作验收通过**。
+        # 旧实现 `if actual:` 一跳而过，于是 require_header_match=True 时
+        # 未知结果照样发布、rc=0（实测 B07）。
+        logger.warning("STAGE6_HEADER_UNKNOWN",
+                       "Could not determine the encoded file's real header; "
+                       "the contract is NOT verified",
+                       output=tmp_avif)
+        contract["actual_header"] = None
+        contract["header_matches_contract"] = None      # 未知 ≠ 一致
+        contract["header_verification"] = "unknown"
+        if params.get("require_header_match", False):
+            _fail(logger, status_path, "header_verification_unknown",
+                  "the encoded header could not be read back; strict mode "
+                  "refuses to publish an unverified product",
+                  paths=[tmp_avif])
+            return 86
     if actual:
         contract["actual_header"] = actual
+        contract["header_verification"] = "checked"
         declared_matrix = media_io.cicp_matrix(contract.get("cicp"))
         actual_matrix = actual.get("matrix")
         contract["header_matches_contract"] = (
@@ -975,8 +1043,31 @@ def main():
         commit_targets.append(publish_output_path)
         if tiff_info.get("written"):
             commit_targets.append(publish_tiff_path)
+    # R3-03 / B04：**契约和状态也属于这一代**。
+    # 旧实现只快照媒体文件，于是状态写失败回滚后 —— 媒体恢复了旧代，
+    # 但 encode_contract 仍是新代且 published=true（实测 B04）。
+    # 契约是下一次 resume/验收的依据，与媒体不同代会让下游读到自相矛盾的记录。
+    commit_targets.append(contract_path)
+    commit_targets.append(status_path)
     backup_dir = work_output_path + ".pubbak"
     snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
+    # R3-03 / B14：进入发布临界区前把"成套回滚"挂到取消路径上。
+    # 取消处理器最后是 os._exit，普通 try/finally 根本跑不到，
+    # 所以必须注册为取消钩子；提交成功后由 release_outputs() 清除。
+    if cancel_guard is not None:
+        cancel_guard.add_cancel_hook(
+            lambda: _rollback_publish(snapshot, logger))
+    # R3-03 / B03：任一目标备份失败 → **在改动任何旧产物之前停止**。
+    if _snapshot_has_failure(snapshot):
+        logger.error("STAGE6_PUBLISH_BACKUP_INCOMPLETE",
+                     "Cannot back up every artifact of the current generation; "
+                     "refusing to start the commit (a later failure could "
+                     "destroy the previous generation)",
+                     failed=[p for p, e in snapshot.items()
+                             if e.get("state") == BACKUP_FAILED])
+        _fail(logger, status_path, "publish_backup",
+              "incomplete backup; commit not started", paths=[])
+        return 82
 
     try:
         os.replace(tmp_avif, work_output_path)

@@ -26,7 +26,7 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from checkpoint import wsl_redirect_path  # FIX-P9-3: WSL2 redirect per v7.32 §3.10.10
+from checkpoint import wsl_redirect_path, select_media_candidates  # FIX-P9-3 / R3-01
 
 
 def _build_vs_script(input_source: str, vs_format: str,
@@ -210,17 +210,17 @@ def main() -> int:
         # aborting the whole pipeline with return 82.
         expected_stage = "step5_face"
         pattern5 = f"{job_id}_{input_name}_step5_face*"
-        candidates = glob.glob(os.path.join(temp_dir, pattern5))
-        if candidates:
-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            input_source = candidates[0]
+        # R3-01：只接受媒体产物，排除同前缀侧车
+        cands = select_media_candidates(glob.glob(os.path.join(temp_dir, pattern5)))
+        if cands:
+            input_source = str(cands[0])
         if not input_source:
             # Fallback to stage4 output
             pattern4 = f"{job_id}_{input_name}_step4_postprocess*"
-            candidates4 = glob.glob(os.path.join(temp_dir, pattern4))
-            if candidates4:
-                candidates4.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                input_source = candidates4[0]
+            cands4 = select_media_candidates(
+                glob.glob(os.path.join(temp_dir, pattern4)))
+            if cands4:
+                input_source = str(cands4[0])
                 expected_stage = "step4_postprocess(fallback)"
                 logger.warning("STAGE6_FALLBACK_STEP4",
                                "face_restore enabled but no stage5 output "
@@ -236,10 +236,10 @@ def main() -> int:
         # Face restore disabled: MUST use stage4 output
         expected_stage = "step4_postprocess"
         pattern = f"{job_id}_{input_name}_step4_postprocess*"
-        candidates = glob.glob(os.path.join(temp_dir, pattern))
-        if candidates:
-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            input_source = candidates[0]
+        # R3-01：只接受媒体产物，排除同前缀侧车
+        cands = select_media_candidates(glob.glob(os.path.join(temp_dir, pattern)))
+        if cands:
+            input_source = str(cands[0])
         if not input_source:
             logger.error("STAGE6_INPUT_ERROR",
                         f"No stage4 output found. Expected pattern: {pattern}",

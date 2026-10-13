@@ -26,7 +26,8 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
+from checkpoint import (wsl_redirect_path, wsl_copy_back,
+                        select_media_candidates)  # noqa: E402
 
 
 def _get_audio_layout(audio_path: str) -> dict:
@@ -367,11 +368,15 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                                    "allow_audio_degrade is set",
                                    model=arnndn_model)
             else:
+                # R3-08 / B12：明确要求的算法不可用且**不许降级** ——
+                # 只记日志等于没失败（实测：日志出现 STAGE7_DENOISE_UNAVAILABLE
+                # 之后照样 STAGE7_DONE、rc=0）。必须把结果传回主流程。
                 if logger:
                     logger.error("STAGE7_DENOISE_UNAVAILABLE",
                                  "arnndn requested but model not found and no "
-                                 "degradation is authorized; skipping denoise",
+                                 "degradation is authorized; failing the stage",
                                  model=arnndn_model)
+                return "__DENOISE_UNAVAILABLE__"
         else:  # "auto"
             if model_exists:
                 audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
@@ -632,6 +637,11 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
         # 即所选抖动**确实改变了最终像素**。能确定的是像素层面可观察到差异；
         # 其内部作用点（zscale 内还是相邻 format 滤镜协商后）未进一步拆解，
         # 不作为结论。日志只陈述事实，不再声称"无效"。
+        # R3-12 措辞修正：第二轮写的是"dither 不作用于降位深"（错），
+        # 第三轮改成了"降位深由 zscale 之后的 format 滤镜完成"（也不严谨 ——
+        # zscale 的输出格式由**相邻滤镜协商**决定，它会按协商结果执行转换，
+        # 见 FFmpeg zscale 文档）。这里只陈述**实测事实**，不再断言
+        # "转换发生在哪个滤镜内部"。
         reason = _zscale_probe("format=yuv444p10")
         filters.append(f"zscale=rangein=limited:range=limited:dither={dither}")
         filters.append("format=yuv444p10")
@@ -639,11 +649,13 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
             logger.warning(
                 "STAGE7_DITHER_FALLBACK_CHAIN",
                 "This ffmpeg's zscale has no 'format' option "
-                f"(probe: {reason}); the 16→10 bit reduction is done by the "
-                "format filter after zscale. The requested dither still changes "
-                "the output pixels (measured: ordered/error_diffusion differ "
-                "from none), but the reduction itself is not performed inside "
-                "zscale", dither=dither, zscale_format_probe=reason)
+                f"(probe: {reason}); the 16→10 bit reduction happens on the "
+                "format negotiated between zscale and the following format "
+                "filter. Measured: the requested dither DOES change the output "
+                "pixels (ordered/error_diffusion differ from none), so dither "
+                "is effective here; which filter performs the reduction "
+                "internally is not asserted.", dither=dither,
+                zscale_format_probe=reason)
     filters.append("format=yuv420p10le")
     return filters
 
@@ -741,15 +753,56 @@ def _probe_encoder_priming(path: str, stream_type: str = "a") -> float:
         return 0.0
 
 
+def _source_has_audio_stream(path: str) -> bool:
+    """R3-08 / B11: does the **source** file have an audio stream?
+
+    "temp 里没有中间音轨"不能等同于"原片没有音轨"。B11 实测：源片明确含
+    PCM 音轨，只因 temp 里没有 `.mka`，stage7 就记 "Source has no audio
+    stream" 并加 `-an`，产物是静音视频且 rc=0。
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30, shell=False)
+        return r.returncode == 0 and bool((r.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def _extract_audio_from_source(source: str, dest: str, logger=None) -> Optional[str]:
+    """R3-08 / B11: extract the audio track straight from the source file."""
+    try:
+        import os as _os
+        _os.makedirs(str(Path(dest).parent), exist_ok=True)
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", source, "-vn",
+             "-c:a", "pcm_s16le", dest],
+            capture_output=True, text=True, timeout=120, shell=False)
+        if r.returncode != 0 or not _os.path.isfile(dest) or \
+                _os.path.getsize(dest) == 0:
+            return None
+        return dest
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE7_AUDIO_EXTRACT_FAIL",
+                           f"Could not extract audio from the source: {e}")
+        return None
+
+
 def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
-    """Return a stream's start time in seconds, or None.
+    """Return a stream's **raw** start time in seconds, or None.
 
     R2-11：同步不能只比"时长"。MKV 的 `stream=start_time` 能真实反映
     `-itsoffset` 造成的偏移（实测：video 0.000000 / audio 1.000000），
     比逐 packet 便宜得多，因此作为首选；拿不到时再退回 packet 首时间戳。
+
+    R3-10：这里返回的是**原始**起点（含编码器 priming 的负值）。
+    第三轮曾在这里直接把 priming 加进去，导致后面 `end = start + span`
+    把末端也整体平移 —— 原始 packet 区间与"有效内容区间"混在一起。
+    现在由调用方（:func:`_validate_av_sync`）显式区分两者。
     """
-    # AAC priming 归一：报出来的负起点是编码器 padding，不是内容偏移
-    priming = _probe_encoder_priming(path, stream_type)
 
     try:
         r = subprocess.run(
@@ -760,7 +813,7 @@ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
         if r.returncode == 0:
             txt = r.stdout.strip()
             if txt and txt != "N/A":
-                return float(txt) + priming
+                return float(txt)
     except Exception:
         pass
     # 退回：packet 的最小 pts
@@ -780,7 +833,7 @@ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
                 except ValueError:
                     continue
             if vals:
-                return min(vals) + priming
+                return min(vals)
     except Exception:
         pass
     return None
@@ -840,18 +893,30 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
                        "source has no audio)")
         return 0
 
-    # 编码器 priming（AAC 常见 1024 样本）已在上游探测时归一；这里只用于日志，
-    # 说明"容器时长膨胀"中有多少是编码固有、不是内容错位。
+    # 编码器 priming（AAC 常见 1024 样本）：说明"容器时长膨胀"中有多少是
+    # 编码固有、不是内容错位。start 用它归一，end/跨度用原始区间，两者分开。
     priming_ms = _probe_encoder_priming(muxed_path, "a") * 1000
 
     intervals = {}
     for st in ("v", "a"):
-        start = _probe_stream_start(muxed_path, st)
+        raw_start = _probe_stream_start(muxed_path, st)
         span = _get_stream_duration(muxed_path, st)
-        if start is None or not span:
+        if raw_start is None or not span:
             intervals[st] = None
         else:
-            intervals[st] = (start, start + span)
+            # R3-10：明确区分两种区间，不再把 priming 混进末端。
+            #   * raw 区间：[raw_start, raw_start + span] —— 用于末端与跨度判定；
+            #   * content 起点：raw_start + priming —— 用于起点判定
+            #     （编码器声明的 priming 会被播放器丢弃，不是内容偏移）。
+            # 第三轮把 priming 加进 start 后又用它拼 end，末端被整体平移了。
+            priming = _probe_encoder_priming(muxed_path, st)
+            intervals[st] = {
+                "raw_start": raw_start,
+                "raw_end": raw_start + span,
+                "raw_span": span,
+                "content_start": raw_start + priming,
+                "priming": priming,
+            }
 
     if intervals.get("v") is None or intervals.get("a") is None:
         logger.error("STAGE7_SYNC_UNMEASURABLE",
@@ -861,16 +926,19 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
                      audio_interval=intervals.get("a"))
         return 86
 
-    v_start, v_end = intervals["v"]
-    a_start, a_end = intervals["a"]
+    v = intervals["v"]
+    a = intervals["a"]
+    v_start, a_start = v["content_start"], a["content_start"]
+    v_end, a_end = v["raw_end"], a["raw_end"]
     start_diff = abs(v_start - a_start)
     end_diff = abs(v_end - a_end)
-    dur_diff = abs((v_end - v_start) - (a_end - a_start))
+    dur_diff = abs(v["raw_span"] - a["raw_span"])
     diff_ms = max(start_diff, end_diff, dur_diff) * 1000
 
     def _detail():
-        return dict(video_start=v_start, video_end=v_end,
-                    audio_start=a_start, audio_end=a_end,
+        return dict(video_content_start=v_start, video_raw_end=v_end,
+                    audio_content_start=a_start, audio_raw_end=a_end,
+                    video_raw_span=v["raw_span"], audio_raw_span=a["raw_span"],
                     start_diff_ms=start_diff * 1000,
                     end_diff_ms=end_diff * 1000,
                     duration_drift_ms=dur_diff * 1000,
@@ -926,9 +994,9 @@ def main():
                 "step2_traditional*", "step1_preprocess*"]:
         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
         # ORIGINAL: glob.glob(os.path.join(temp_dir, pattern))
-        candidates = list(Path(temp_dir).glob(pattern))
+        # R3-01：只接受媒体产物，排除同前缀的身份/契约/状态侧车（B10）
+        candidates = select_media_candidates(Path(temp_dir).glob(pattern))
         if candidates:
-            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             input_source = str(candidates[0])
             break
 
@@ -1219,6 +1287,12 @@ def main():
         if audio_filter == "__INVALID_TEMPO__":
             logger.error("STAGE7_AUDIO_FAIL", "Invalid tempo ratio, cannot process audio")
             return 86
+        # R3-08 / B12：明确要求的降噪算法不可用且不许降级 -> 阻断
+        if audio_filter == "__DENOISE_UNAVAILABLE__":
+            logger.error("STAGE7_DENOISE_FAIL",
+                         "Required denoise algorithm is unavailable and "
+                         "degradation is not authorized")
+            return 86
 
         multichannel_preserve = params.get("multichannel_preserve", True)
         if multichannel_preserve and channels > 2:
@@ -1250,9 +1324,61 @@ def main():
             if audio_bitrate:
                 output_opts.extend(["-b:a", audio_bitrate])
     else:
-        # FIX-P7-8: Log when source has no audio stream
-        logger.info("STAGE7_NO_AUDIO", "Source has no audio stream, outputting video only")
-        output_opts.append("-an")
+        # R3-08 / B11：**缺临时音轨 ≠ 原片没有音轨**。
+        # 旧实现只检查 temp 里的中间音轨，缺了就记"Source has no audio stream"
+        # 并加 `-an` —— 实测源片明确含 PCM 音轨，产物却被 ffprobe 读成
+        # `streams=[]`（静音视频），stage7 仍 rc=0。
+        # 现在先核对源片本身：源片有声 → 直接从源片提取音轨；
+        # 提取也失败 → 按 allow_silent_output 决定，默认**不允许**静默丢音轨。
+        source_has_audio = _source_has_audio_stream(args.input)
+        if source_has_audio:
+            logger.warning("STAGE7_AUDIO_INTERMEDIATE_MISSING",
+                           "No intermediate audio track in temp, but the "
+                           "source has an audio stream; extracting it from "
+                           "the source instead of dropping audio",
+                           source=args.input)
+            extracted = _extract_audio_from_source(
+                args.input, str(Path(temp_dir) / f"{job_id}_{input_name}.mka"),
+                logger)
+            if extracted:
+                audio_path = extracted
+                audio_layout = _get_audio_layout(audio_path)
+                audio_filter = _build_audio_filter(
+                    audio_path, params, logger, tempo_ratio=tempo_ratio,
+                    audio_layout=audio_layout)
+                if audio_filter == "__INVALID_TEMPO__":
+                    logger.error("STAGE7_AUDIO_FAIL",
+                                 "Invalid tempo ratio, cannot process audio")
+                    return 86
+                if audio_filter == "__DENOISE_UNAVAILABLE__":
+                    logger.error("STAGE7_DENOISE_FAIL",
+                                 "Required denoise algorithm is unavailable "
+                                 "and degradation is not authorized")
+                    return 86
+                video_cmd.extend(["-i", audio_path])
+                output_opts.extend([
+                    "-af", audio_filter,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                ])
+                output_opts.extend(["-c:a", params.get("audio_codec", "aac"),
+                                    "-b:a",
+                                    params.get("audio_bitrate", "320k")])
+            elif not params.get("allow_silent_output", False):
+                logger.error("STAGE7_AUDIO_REQUIRED_FAIL",
+                             "The source has audio but no usable audio track "
+                             "could be prepared; refusing to publish a silent "
+                             "video (set allow_silent_output=true to accept)")
+                return 86
+            else:
+                logger.warning("STAGE7_SILENT_OUTPUT_ALLOWED",
+                               "Publishing without audio because "
+                               "allow_silent_output=true")
+                output_opts.append("-an")
+        else:
+            logger.info("STAGE7_NO_AUDIO",
+                        "Source has no audio stream, outputting video only")
+            output_opts.append("-an")
 
     # Color metadata (v6.3: double marking)
     # SVT-AV1 uses numeric values, not string names

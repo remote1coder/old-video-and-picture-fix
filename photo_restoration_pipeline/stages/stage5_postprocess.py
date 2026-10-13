@@ -446,28 +446,58 @@ def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
 
 def _carry_icc_to_output(output_path: str, icc: Optional[bytes],
                          logger=None) -> bool:
-    """R2-02 / A03: attach the source ICC to the stage5 output.
+    """R3-07 / B06: attach the source ICC to the stage5 output **and verify it**.
 
     stage5 不做色彩空间转换，因此"未变化的 profile"应当原样带下去。
-    实测（A03）：输入 RGB16 PNG 带 588 字节 sRGB ICC，
-    真实 stage5 子进程 rc=0、像素一致，但输出 TIFF 的 34675 标签是 0 字节。
-    失败只记 warning，不因此让已经产出的像素作废。
+    实测（A03）：输入 RGB16 PNG 带 588 字节 sRGB ICC，真实 stage5 子进程
+    rc=0、像素一致，但输出 TIFF 的 34675 标签是 0 字节。
+
+    R3-07：第三轮只把失败记成 warning，调用方也不看返回值 ——
+    注入真实嵌入失败后 stage5 仍然 rc=0、输出没有 ICC（实测 B06）。
+    现在：写入后**回读验证**字节一致；不成功就是失败，由调用方决定
+    （默认 `require_icc_preserved=True` → 不写 SUCCESS）。
+
+    Returns:
+        True 表示已嵌入且回读一致。
     """
     if not icc:
         return False
     if _media_io is None:
         return False
+    ok = False
     try:
-        ok = _media_io.embed_icc_in_tiff(output_path, icc)
+        ok = bool(_media_io.embed_icc_in_tiff(output_path, icc))
     except Exception as e:
         ok = False
         if logger:
-            logger.warning("STAGE5_ICC_EMBED_FAIL",
-                           f"Could not embed the source ICC: {e}",
-                           output=output_path)
+            logger.error("STAGE5_ICC_EMBED_FAIL",
+                         f"Could not embed the source ICC: {e}",
+                         output=output_path)
+    if ok:
+        # 写成功不等于真的写进去了 —— 回读核对字节
+        try:
+            _arr, meta = _media_io.read_image_array(output_path)
+            written = (meta or {}).get("icc_profile")
+            if not written or bytes(written) != bytes(icc):
+                ok = False
+                if logger:
+                    logger.error(
+                        "STAGE5_ICC_VERIFY_FAIL",
+                        "ICC was written but the file does not read back with "
+                        "the same profile bytes",
+                        expected_bytes=len(icc),
+                        read_back_bytes=(len(written) if written else 0),
+                        output=output_path)
+        except Exception as e:
+            ok = False
+            if logger:
+                logger.error("STAGE5_ICC_VERIFY_FAIL",
+                             f"Could not read back the output to verify the "
+                             f"ICC: {e}", output=output_path)
     if ok and logger:
         logger.info("STAGE5_ICC_CARRIED",
-                    "Source ICC carried through stage5 into the output",
+                    "Source ICC carried through stage5 and verified by "
+                    "reading the output back",
                     icc_bytes=len(icc), output=output_path)
     return bool(ok)
 
@@ -530,7 +560,13 @@ def _match_portrait_color(image_path: str, face_boxes: list,
             _arr = np.stack([_arr] * 3, axis=2)
         source_dtype = getattr(_arr, "dtype", None)
         _scale_max = 65535.0 if source_dtype == np.uint16 else 255.0
-        img_arr = _arr[:, :, :3].astype(np.float32)
+        # R3-02 / B05：cv2 对 **float32** 的非线性色彩空间转换（RGB↔Lab 等）
+        # 规定输入范围为 **0–1**（见 OpenCV cvtColor 文档，2026-10-13 核对）。
+        # 第三轮只把整数转成 float32 就送进去（16-bit 时值是 0–65535），
+        # 逆转换之后又没乘回 —— 实测脸内 [30000,20000,10000] 变成 [1,1,0]，
+        # 8-bit 的 [150,100,50] 同样变成 [1,1,0]，而函数仍返回 applied=True。
+        # 这里统一：进入 LAB 前除以 _scale_max 归一，回到 RGB 后再乘回来。
+        img_arr = _arr[:, :, :3].astype(np.float32) / _scale_max
         h_img, w_img = img_arr.shape[:2]
 
         # Build a combined mask for all face regions
@@ -639,9 +675,11 @@ def _match_portrait_color(image_path: str, face_boxes: list,
 
         blended = mask_smooth * corrected + (1.0 - mask_smooth) * img_arr
         # R2-02 / A15：按**输入真实位深**回写，不能一律压成 uint8。
-        blended = np.clip(blended, 0, _scale_max)
+        # R3-02：corrected / img_arr 都在 0–1 域；先按 0–1 裁剪，再乘回真实
+        # 位深并就近取整（不能靠 astype 截断，否则暗部整体偏暗 0.5 LSB）。
+        blended = np.clip(blended, 0.0, 1.0) * _scale_max
         out_dtype = np.uint16 if source_dtype == np.uint16 else np.uint8
-        out_arr = blended.astype(out_dtype)
+        out_arr = np.rint(blended).astype(out_dtype)
         _write_color_matched(output_path, out_arr)
         return {"applied": True, "skipped": False, "reason": ""}
     except Exception as e:
@@ -1017,7 +1055,13 @@ STAGE5_CACHE_PARAM_KEYS = (
 # FIX-V07: 实现/模型版本。任何会改变本阶段像素输出的实现调整都应递增，
 # 否则旧产物会被当成"同一实现"而错误复用。
 # RV-11/RV-06: 缓存身份与操作语义都变了，升版本以免误用旧 cache sidecar。
-STAGE5_IMPL_VERSION = "photo-stage5-postprocess/3.0-rv06-rv11"
+# R3-07 / B13：实现/缓存契约版本。**旧版本产出的坏缓存必须失效**。
+# 实测：用第三轮修复**之前**的 stage5 生成一份丢 ICC 的缓存，
+# 再让修复后的 stage5 处理完全相同的输入/参数 —— 旧缓存照样命中
+# （返回 3、输出字节不变、ICC 仍不存在），修复逻辑根本没机会执行。
+# 缓存身份里包含 impl，因此升版本即可让旧坏缓存全部重算。
+# 语义变化点：ICC 贯穿 + 写后回读校验、人像色彩匹配量纲修正（R3-02）。
+STAGE5_IMPL_VERSION = "photo-stage5-postprocess/4.0-r3-02-r3-07-icc-verified"
 
 
 def _json_sidecar_path(artifact_path: str, kind: str) -> str:
@@ -1727,8 +1771,25 @@ def main():
                 return 0
         else:
             shutil.move(grain_temp, output_path)
-        # R2-02 / A03：源 ICC 必须跟着像素走到最终产物。
-        _carry_icc_to_output(output_path, input_icc, logger)
+        # R3-07 / B06：源 ICC 必须跟着像素走到最终产物；写不进去（或回读
+        # 不一致）就不能算成功。默认 require_icc_preserved=True。
+        if input_icc:
+            icc_ok = _carry_icc_to_output(output_path, input_icc, logger)
+            if not icc_ok and params.get("require_icc_preserved", True):
+                logger.error("STAGE5_ICC_REQUIRED_FAIL",
+                             "Source ICC could not be preserved in the output; "
+                             "failing instead of reporting success "
+                             "(set require_icc_preserved=false to accept it)")
+                _discard_partial_output(output_path, [cache_meta_path])
+                _write_json_sidecar(
+                    _json_sidecar_path(output_path, "status"), {
+                        "status": STAGE_STATUS_FAILED,
+                        "stage": 5,
+                        "failed_operation": "icc_preservation",
+                        "reason": "source ICC could not be preserved",
+                        "impl": STAGE5_IMPL_VERSION,
+                    })
+                return 86
 
         # FIX-V07: 只在完全成功后提交缓存身份（先验证产物可读）
         if not _verify_output_readable(output_path):
