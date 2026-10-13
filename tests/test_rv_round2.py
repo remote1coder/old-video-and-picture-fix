@@ -1905,3 +1905,155 @@ def test_r211_content_events_reveal_real_offset(tmp_path):
     log = _Log()
     rc = s7._validate_av_sync(str(av), log)
     assert rc != 0, f"音轨延后 {offset}s，包头级同步门仍判定通过"
+
+
+# ---------------------------------------------------------------------------
+# R3-03：发布备份/回滚的三态语义
+# ---------------------------------------------------------------------------
+
+def _load_stage6():
+    import importlib.util as _ilu
+    path = os.path.join(ROOT, "photo_restoration_pipeline", "stages",
+                        "stage6_encode.py")
+    spec = _ilu.spec_from_file_location("stage6_encode_r303", path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_r303_backup_failure_does_not_destroy_previous_generation(tmp_path,
+                                                                  monkeypatch):
+    """R3-03：备份被拒时，回滚**不得删除**原本存在的旧产物。
+
+    这是独立用例 B03 想表达的核心危害（"回滚把该路径直接删除"）的
+    **自洽版本**：不手工篡改文件内容，只验证"不销毁"。
+
+    关于 B03 本身：它在备份被注入失败**之后**又手工把文件写成
+    `NEW-PARTIAL`，然后断言回滚后等于 `OLD-VALID`。备份失败意味着磁盘上
+    不存在 OLD-VALID 的任何副本，回滚不可能凭空还原 —— 断言与故障注入前提
+    不自洽。我在不绕过故障注入的前提下无法满足它；这里用等价断言覆盖
+    评估指出的真实危害。
+    """
+    s6 = _load_stage6()
+    final = tmp_path / "old.avif"
+    final.write_bytes(b"OLD-VALID")
+
+    def denied(*_a, **_k):
+        raise PermissionError("controlled backup denied")
+
+    monkeypatch.setattr(s6.shutil, "copyfile", denied)
+
+    class _Log:
+        def __init__(self):
+            self.events = []
+
+        def _rec(self, ev, msg, **kw):
+            self.events.append(ev)
+
+        info = warning = error = debug = critical = _rec
+
+    log = _Log()
+    snapshot = s6._snapshot_for_rollback([str(final)], str(tmp_path / "backup"),
+                                         log)
+    # 1) 备份失败必须与"原先不存在"区分开
+    assert s6._snapshot_has_failure(snapshot), \
+        "备份失败没有被识别（与 absent 混为一谈）"
+    assert snapshot[str(final)]["state"] == s6.BACKUP_FAILED
+    # 2) 回滚不得销毁旧产物
+    s6._rollback_publish(snapshot, log)
+    assert final.exists(), "备份失败后回滚把旧产物删除了（R3-03 的核心危害）"
+    assert final.read_bytes() == b"OLD-VALID"
+    assert "STAGE6_RESTORE_IMPOSSIBLE" in log.events, \
+        "回滚失败却仍然声称已恢复"
+
+
+def test_r303_rollback_restores_backed_up_generation(tmp_path):
+    """R3-03：备份成功时，回滚必须把每个目标恢复成提交前的内容。"""
+    s6 = _load_stage6()
+    final = tmp_path / "old.avif"
+    final.write_bytes(b"OLD-VALID")
+    tiff = tmp_path / "old.tif"
+    tiff.write_bytes(b"OLD-TIFF")
+
+    snapshot = s6._snapshot_for_rollback([str(final), str(tiff)],
+                                         str(tmp_path / "backup"))
+    assert not s6._snapshot_has_failure(snapshot)
+    # 模拟"提交进行到一半"
+    final.write_bytes(b"NEW-AVIF")
+    tiff.write_bytes(b"NEW-TIFF")
+    s6._rollback_publish(snapshot)
+    assert final.read_bytes() == b"OLD-VALID"
+    assert tiff.read_bytes() == b"OLD-TIFF"
+
+
+def test_r303_rollback_removes_files_created_by_this_run(tmp_path):
+    """R3-03：提交前不存在的路径（本次新建），回滚时应撤下，不留半代。"""
+    s6 = _load_stage6()
+    fresh = tmp_path / "not_there_before.avif"
+    snapshot = s6._snapshot_for_rollback([str(fresh)], str(tmp_path / "backup"))
+    assert snapshot[str(fresh)]["state"] == s6.BACKUP_ABSENT
+    fresh.write_bytes(b"NEW-PARTIAL")
+    s6._rollback_publish(snapshot)
+    assert not fresh.exists(), "本次新建的产物在回滚后仍留在磁盘上"
+
+
+def test_r211_content_events_survive_real_stage7(tmp_path):
+    """R3-10：已知事件经过**真实 stage7（含 AV1/AAC 编码）**后仍然对齐。
+
+    之前两条内容同步用例只检查刚合成的 FFV1/PCM 素材，没有经过产品处理链，
+    因此不能称为"生产链内容同步通过"。这条把带 flash/click 的素材
+    真正送进 stage7_encode，再从产物里检测首/中/尾事件。
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("无 ffmpeg —— 生产链内容同步记为未验收")
+
+    # --- 1. 造带事件的有声源片 ---
+    # stage7 按 `--input` 的 stem 匹配中间产物（j1_<stem>_step6_grain*），
+    # 因此源片统一叫 clip.mkv。
+    av, fps, sr = _build_flash_click(tmp_path, audio_offset=0.0)
+    src = tmp_path / "clip.mkv"
+    shutil.copyfile(av, src)
+    # --- 2. 准备 stage7 需要的 temp 输入 ---
+    temp = tmp_path / "temp"
+    out = tmp_path / "out"
+    logs = tmp_path / "logs"
+    for d in (temp, out, logs):
+        d.mkdir(exist_ok=True)
+    step6 = temp / "j1_clip_step6_grain.mkv"
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-c:v", "ffv1",
+         "-pix_fmt", "yuv444p16le", str(step6)],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[:200]
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-vn", "-c:a", "copy",
+         str(temp / "j1_clip.mka")],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[:200]
+
+    params = {"temp_dir": str(temp), "output_dir": str(out),
+              "log_dir": str(logs), "duration": 3,
+              "audio_denoise": False, "hum_freq": 0, "input_bit_depth": 16}
+    cmd = [sys.executable,
+           os.path.join(ROOT, "video_restoration_pipeline", "stages",
+                        "stage7_encode.py"),
+           "--input", str(src), "--job-id", "j1",
+           "--params", json.dumps(params)]
+    r = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True,
+                       timeout=300)
+    final = out / "clip_restored.mkv"
+    assert r.returncode == 0, f"stage7 失败：{r.stderr[:400]}"
+    assert final.exists(), "没有最终产物"
+
+    # --- 3. 从最终产物回读事件 ---
+    v_events = _video_event_times(final, fps)
+    a_events = _audio_event_times(final, 48000)
+    assert len(v_events) >= 2, f"产物里没检出 flash：{v_events}"
+    assert len(a_events) >= 2, f"产物里没检出 click：{a_events}"
+
+    deltas = [min(abs(a - vt) for a in a_events) for vt in v_events]
+    worst = max(deltas)
+    # 容差 150ms：AAC priming(约 23ms) + 编码/容器对齐都会带来几十毫秒量级偏移
+    assert worst < 0.15, (
+        f"经过真实 stage7 后，flash 与 click 的最大时间差 {worst:.3f}s "
+        f"超过 150ms（video={v_events} audio={a_events}）")

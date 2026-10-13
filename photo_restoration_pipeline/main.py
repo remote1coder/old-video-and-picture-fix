@@ -1217,11 +1217,19 @@ def main():
         # 结果不会覆盖本次结果，也不会出现"末尾整份旧快照回写"。
         from manifest_loader import acquire_run_ownership
         run_owner = f"photo-run-{os.getpid()}"
+        _claim_ids = [j.get("job_id") for j in jobs]
+        if not _claim_ids:
+            # R3-05：本次没有任务 → 零领取，不动别人的 owner/generation
+            print("No jobs to process.")
+            return
         run_generation = acquire_run_ownership(
-            args.manifest, [j.get("job_id") for j in jobs], owner=run_owner)
+            args.manifest, _claim_ids, owner=run_owner)
         if run_generation is None:
-            print("WARNING: could not claim the run in the manifest; results "
-                  "may not be persisted", file=sys.stderr)
+            # R3-11：领取失败 = 结果无处可写。不能照常产出并报成功。
+            print("ERROR: could not claim this run's jobs in the manifest; "
+                  "not producing artifacts that cannot be recorded.",
+                  file=sys.stderr)
+            sys.exit(82)
 
         results = []
         failures: List[tuple] = []

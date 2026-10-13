@@ -253,6 +253,32 @@ def build_intermediate_name(job_id: str,
     return f"{job_id}_{safe_name}_step{step}_{operation}_p{param_hash}.{ext}"
 
 
+def unlink_artifact_with_sidecars(path) -> None:
+    """R3-01: 删除媒体产物时**连带删除它的侧车**。
+
+    侧车（`<媒体>.identity.json` 等）不能比它描述的媒体活得更久：
+    媒体被清理后残留的侧车会让"按侧车判断可复用"的逻辑失去依据，
+    也会在目录里堆积孤儿 JSON。
+    """
+    from pathlib import Path as _P
+    target = _P(path)
+    try:
+        target.unlink()
+    except OSError:
+        return
+    for suffix in (".identity.json", ".encode_contract.json", ".status.json",
+                   ".cache.json", ".done.json"):
+        try:
+            _P(str(target) + suffix).unlink(missing_ok=True)
+        except (OSError, TypeError):
+            try:
+                side = _P(str(target) + suffix)
+                if side.exists():
+                    side.unlink()
+            except OSError:
+                pass
+
+
 def cleanup_old_intermediates(temp_dir: str,
                               job_id: str,
                               keep_steps: int = 2,
@@ -282,9 +308,13 @@ def cleanup_old_intermediates(temp_dir: str,
         return
 
     # Collect intermediate files for this job
+    # R3-01：侧车不算"一个阶段"，否则按个数保留/删除会数错，
+    # 也可能把侧车当成阶段产物保留下来（媒体已被删，侧车变成孤儿）。
     intermediates = []
     for f in temp.iterdir():
         if f.is_file() and f.name.startswith(f"{job_id}_"):
+            if not is_media_artifact(f):
+                continue
             # FIX-CK-R2-01: Use anchored regex for step number, consistent with
             # manifest_loader.py. ORIGINAL: split("_") + p.startswith("step")
             # mis-parsed input_names containing "step" (e.g. "step3_ceremony"
@@ -300,10 +330,7 @@ def cleanup_old_intermediates(temp_dir: str,
                 m_hash = re.search(r'_p([0-9a-f]+)\.', f.name)
                 f_hash = m_hash.group(1) if m_hash else None
                 if f_hash and f_hash != current_param_hash:
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+                    unlink_artifact_with_sidecars(f)
                     continue
 
             intermediates.append((step, f))
@@ -318,18 +345,12 @@ def cleanup_old_intermediates(temp_dir: str,
         # BUG-058 fix: When called without current_step, keep the most recent
         # keep_steps files and delete everything else.
         for _, f in intermediates[keep_steps:]:
-            try:
-                f.unlink()
-            except OSError:
-                pass
+            unlink_artifact_with_sidecars(f)
     else:
         steps_to_keep = {s for s, _ in intermediates[:keep_steps]}
         for step, f in intermediates:
             if step not in steps_to_keep and step < current_step:
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
+                unlink_artifact_with_sidecars(f)
 
 
 def cleanup_all_intermediates(temp_dir: str, job_id: str) -> None:
@@ -345,10 +366,14 @@ def cleanup_all_intermediates(temp_dir: str, job_id: str) -> None:
         return
     for f in temp.iterdir():
         if f.is_file() and f.name.startswith(f"{job_id}_"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
+            # R3-01：媒体产物连同侧车一起删；纯侧车（媒体已不在）也要清掉
+            if is_media_artifact(f):
+                unlink_artifact_with_sidecars(f)
+            else:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
 
 def _read_frame_info(filepath: str, position: float) -> Optional[Dict[str, Any]]:
@@ -1300,3 +1325,42 @@ def check_wsl_space(params: Dict[str, Any],
             logger.error("DISK_SPACE_CHECK",
                          f"Disk space check failed (treating as insufficient): {e}")
         return False
+
+
+# --- R3-01：媒体产物枚举的统一规则 ---------------------------------------
+
+#: 中间产物的媒体后缀白名单。
+#: 第三轮新增了 `<媒体>.identity.json` 侧车，它与媒体文件**同名前缀、同一目录**，
+#: 而下游仍用 `step6_grain*` 之类的通配按 mtime 选最新文件 —— 结果侧车被当成
+#: 视频送进 ffmpeg，真实 stage7 直接 Invalid data / rc=84（独立用例 B10 复现）。
+#: 因此枚举必须按后缀白名单过滤：侧车、契约、状态 JSON 都不算媒体产物。
+MEDIA_SUFFIXES = frozenset({
+    ".mkv", ".mp4", ".mov", ".avi", ".webm", ".m2ts", ".ts",
+    ".mka", ".wav", ".flac", ".aac", ".ac3",
+    ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp",
+    ".y4m", ".yuv", ".raw",
+})
+
+
+def is_media_artifact(path) -> bool:
+    """R3-01: whether *path* looks like a media artifact (not a sidecar)."""
+    try:
+        from pathlib import Path as _P
+        return _P(path).suffix.lower() in MEDIA_SUFFIXES
+    except Exception:
+        return False
+
+
+def select_media_candidates(candidates, newest_first: bool = True):
+    """R3-01: filter a glob result down to media artifacts and sort by mtime.
+
+    所有"按通配找上游产物"的地方都应走这里，避免各处各写一套过滤。
+    返回 Path 列表（新→旧 或 旧→新）。
+    """
+    from pathlib import Path as _P
+    media = [p for p in (_P(c) for c in candidates) if is_media_artifact(p)]
+    try:
+        media.sort(key=lambda p: p.stat().st_mtime, reverse=newest_first)
+    except OSError:
+        pass
+    return media

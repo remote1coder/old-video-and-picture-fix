@@ -315,9 +315,23 @@ def acquire_run_ownership(path: str,
 
     Returns the generation, or None when the claim could not be written
     (in that case the caller must not report success either).
+
+    R3-05: ``job_ids`` 的语义必须区分三态：
+      * ``None``  —— 未指定集合：领取 manifest 里**全部**任务；
+      * ``[]``    —— 空集合：**零领取**，且不递增全局代际；
+      * 非空列表 —— 只领取列出的任务。
+
+    旧实现 ``wanted = None if not job_ids else ...`` 把 ``None`` 和 ``[]``
+    混为一谈，于是"本次没有任务可跑"会变成"领取全部任务" —— 实测 B09：
+    manifest 有 j1/j2，调用 ``acquire_run_ownership(path, [])`` 后两条任务
+    都被写上该 owner 和新 generation，会影响其他运行正在做的工作。
     """
     owner = owner or f"pid-{os.getpid()}"
     state: Dict[str, Any] = {"generation": None, "claimed": 0}
+
+    # 空集合：直接返回，不写盘、不动代际、不碰任何 job 的 owner。
+    if job_ids is not None and len(job_ids) == 0:
+        return None
 
     def _mutate(manifest: Dict[str, Any]) -> bool:
         meta = manifest.setdefault("meta", {})
@@ -328,7 +342,8 @@ def acquire_run_ownership(path: str,
         meta["run_generation"] = generation
         meta["last_run_owner"] = owner
         claimed_at = datetime.now().astimezone().isoformat()
-        wanted = None if not job_ids else {str(j) for j in job_ids}
+        # R3-05：走到这里 job_ids 要么是 None（全部），要么是非空列表
+        wanted = None if job_ids is None else {str(j) for j in job_ids}
         for job in manifest.get("jobs", []):
             if wanted is not None and str(job.get("job_id")) not in wanted:
                 continue

@@ -104,6 +104,8 @@ class CancelGuard:
         # "stage 已经退出，avifenc 还在往回写"的孤儿进程。
         self._processes: List[Any] = []
         self._released: bool = False
+        # R3-03: 取消时必须先跑的收尾（例如成套发布回滚）
+        self._cancel_hooks: List[Any] = []
 
     # ------------------------------------------------------------------ setup
     def install(self, stage: Optional[int] = None, logger: Any = None) -> bool:
@@ -205,6 +207,27 @@ class CancelGuard:
         self._released = True
         self._extra_paths = []
         self._processes = []
+        # R3-03: 提交已完成，取消钩子（发布回滚）不再需要。
+        self._cancel_hooks = []
+
+    # ------------------------------------------------------- cancel hooks
+    def add_cancel_hook(self, hook) -> None:
+        """R3-03: register a callback that must run **before** cleanup.
+
+        发布临界区（AVIF 已替换、TIFF 还没换完）被中断时，
+        单纯"删掉半成品"会留下 **新 AVIF + 旧 TIFF** 的混合代（实测 B14）。
+        这类收尾必须能执行**成套回滚**，因此挂在取消路径上，
+        且在 `_fire` 的 `os._exit` 之前运行（普通 try/finally 绕不过它）。
+        """
+        if callable(hook):
+            self._cancel_hooks.append(hook)
+
+    def _run_cancel_hooks(self) -> None:
+        for hook in list(self._cancel_hooks):
+            try:
+                hook()
+            except BaseException:  # noqa: BLE001 - 处理器内不允许再抛出
+                continue
 
     # ------------------------------------------------------------- behaviour
     def _fire(self, signum: int, frame: Any) -> None:
@@ -278,6 +301,12 @@ class CancelGuard:
             except BaseException:  # noqa: BLE001
                 continue
         self._processes = []
+
+        # R3-03 / B14：取消发生在发布临界区时，**先成套回滚**再清理，
+        # 否则会留下"新 AVIF + 旧 TIFF"的混合代。钩子必须在
+        # `os._exit` 之前跑，所以放在这里而不是普通 try/finally。
+        if not self._released:
+            self._run_cancel_hooks()
 
         targets: List[str] = []
         if self._output_path and self._delete_output:
@@ -392,6 +421,20 @@ def watch_process(proc: Any) -> None:
 def unwatch_process(proc: Any) -> None:
     """Stop tracking a child process that finished normally."""
     guard.unwatch_process(proc)
+
+
+def add_cancel_hook(hook) -> None:
+    """R3-03: 注册"取消时必须先跑"的收尾（见 :meth:`CancelGuard.add_cancel_hook`）。
+
+    发布临界区被中断时要成套回滚，而取消处理器最后会 `os._exit`，
+    普通 try/finally 跑不到 —— 只能通过这里注册。
+    """
+    guard.add_cancel_hook(hook)
+
+
+def clear_cancel_hooks() -> None:
+    """R3-03: 提交成功后清除回滚钩子（产物已发布，不能再回滚）。"""
+    guard._cancel_hooks = []
 
 
 def release_outputs() -> None:

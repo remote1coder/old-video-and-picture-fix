@@ -428,12 +428,16 @@ def _safe_input_stem(input_path: str) -> str:
 
 def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
                          stage_num: int) -> List[str]:
-    """Return existing artifacts of (job_id, stage_num), newest first."""
+    """Return existing **media** artifacts of (job_id, stage_num), newest first.
+
+    R3-01：按后缀白名单过滤侧车。第三轮新增的 `<媒体>.identity.json` 与媒体
+    同名前缀、同目录，若不过滤会被下游当成视频输入（B10：真实 stage7 rc=84）。
+    """
     import glob
+    from checkpoint import select_media_candidates
     pattern = str(Path(temp_dir) / f"{job_id}_{_safe_input_stem(input_path)}_step{stage_num}*")
     candidates = glob.glob(pattern)
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates
+    return [str(p) for p in select_media_candidates(candidates)]
 
 
 # --- RV-09: 产物身份（resume 不能再"只看名字 + 能解码"）------------------
@@ -1035,6 +1039,23 @@ def aggregate_results(results: List[Dict[str, Any]], logger=None) -> int:
     return worst if worst > 0 else 86
 
 
+def _artifact_digest(artifact: str) -> Optional[str]:
+    """R3-06 / B08: 产物内容摘要（流式全内容 SHA-256）。
+
+    只比对 size 时，等长替换（FIRST -> OTHER）判定不出来。
+    """
+    try:
+        if not os.path.isfile(artifact):
+            return None
+        h = hashlib.sha256()
+        with open(artifact, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 def intermediate_identity_path(artifact: str) -> str:
     return str(artifact) + ".identity.json"
 
@@ -1056,6 +1077,9 @@ def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
         "artifact": str(artifact),
         "artifact_size": (os.path.getsize(artifact)
                           if os.path.exists(artifact) else None),
+        # R3-06 / B08：只记 size 挡不住**等长替换**（实测 5 字节 FIRST→OTHER
+        # 仍判定 identity-match）。身份必须绑定**内容摘要**。
+        "artifact_digest": _artifact_digest(artifact),
         "source_identity": build_input_identity(input_path),
         "params_identity": build_params_identity(config, job, logger),
         "recorded_at": datetime.now().astimezone().isoformat(),
@@ -1108,6 +1132,15 @@ def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
     if recorded_params and recorded_params != build_params_identity(
             config, job, logger):
         return False, "effective parameters changed since it was produced"
+    # R3-06 / B08：内容摘要必须一致（等长替换也要能发现）；
+    # 任一侧拿不到摘要 → unproven，拒绝复用。
+    recorded_digest = data.get("artifact_digest")
+    current_digest = _artifact_digest(artifact)
+    if not recorded_digest or not current_digest:
+        return False, ("artifact content digest missing on one side; refusing "
+                       "to reuse an unverified intermediate")
+    if str(recorded_digest) != str(current_digest):
+        return False, "artifact content changed since it was recorded"
     size = data.get("artifact_size")
     if size is not None and os.path.exists(artifact) and \
             int(size) != os.path.getsize(artifact):
@@ -1161,9 +1194,13 @@ def _apply_startup_job_decision(manifest_path: str, job_id: str,
         return False
 
     try:
-        # 写回仍在锁内，且统一走 save_manifest 入口（便于诊断与可观测性）
-        return update_manifest_with_writer(manifest_path, mutator,
-                                           writer=save_manifest)
+        # R3-04 / B01：**不能再把 save_manifest 当 writer 传进去**。
+        # update_manifest_with_writer 已经在锁内，而 save_manifest 内部又会去
+        # 获取同一把（非重入的）文件锁 —— 于是自己等自己超时，返回 False、
+        # 磁盘保持 PENDING、还记一条 STARTUP_DECISION_FAILED（实测 B01）。
+        # 第三轮传 save_manifest 是为了"所有写回经过同一入口"，但这在持锁
+        # 上下文中是错的。锁内必须用**不再加锁**的写入函数（默认即如此）。
+        return update_manifest_with_writer(manifest_path, mutator)
     except Exception as e:
         if logger:
             logger.warning("STARTUP_DECISION_FAILED",
@@ -1530,13 +1567,22 @@ def main():
                 for stage_num in range(7, -1, -1):
                     candidates = find_stage_artifacts(temp_dir, job_id, input_path,
                                                       stage_num)
-                    if candidates:
-                        for cand in candidates:
-                            if verify_ffprobe_decodeable(cand):
-                                last_completed = stage_num
-                                break
-                        if last_completed >= 0:
+                    for cand in candidates:
+                        # R3-06：FAILED 恢复入口同样必须过逐产物身份门 ——
+                        # 只查"能解码"会把别的输入/参数产出的文件当成自己的成果。
+                        ok_id, why = intermediate_identity_matches(
+                            cand, job, config, logger)
+                        if not ok_id:
+                            logger.info(
+                                "RESUME_ARTIFACT_IDENTITY_REJECTED",
+                                f"Job {job_id}: {cand} cannot be bound to "
+                                f"this run ({why})", candidate=cand)
+                            continue
+                        if verify_ffprobe_decodeable(cand):
+                            last_completed = stage_num
                             break
+                    if last_completed >= 0:
+                        break
             if last_completed >= 0:
                 logger.info("FAILED_DOWNGRADE",
                            f"Job {job_id} has valid step{last_completed}, downgrading to PENDING "
@@ -1677,6 +1723,17 @@ def main():
         except Exception as e:
             logger.warning("RESUME_CHECK", f"Resume check skipped: {e}")
 
+    # R3-04 / B02：启动期的降级与 resume 决议可能已经把某些任务改成 DONE，
+    # 而 `manifest` 是本次进程开头读入的**旧快照**。若直接拿它筛选，
+    # 磁盘上已经完成的任务会被再执行一次（实测：磁盘已 DONE，
+    # process_job 仍被调用 1 次，传入的 job 还是 PENDING）。
+    # 执行列表必须来自**最新**的磁盘状态。
+    try:
+        manifest = load_manifest(manifest_path)
+    except Exception as e:
+        logger.warning("MANIFEST_REREAD_FAILED",
+                       f"Could not re-read the manifest before scheduling: {e}; "
+                       "falling back to the startup snapshot")
     jobs = filter_jobs(manifest, target_statuses)
     if args.job_id:
         jobs = [j for j in jobs if j.get("job_id") == args.job_id]
@@ -1759,12 +1816,25 @@ def main():
     # 会被 manifest_loader 拒绝；attempt_group 只是 UUID，没有时间顺序。
     # 必须在串行/并行两条路径**之前**完成，否则串行分支拿不到凭据。
     run_owner = f"video-run-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    _claimed_ids = [j.get("job_id") for j in jobs]
+    if not _claimed_ids:
+        # R3-05：本次没有任务 —— 既不能领取别人的任务，也不必递增代际。
+        logger.info("RUN_CLAIM_SKIPPED",
+                    "No jobs selected for this run; not claiming anything "
+                    "and not bumping the global generation")
+        print("No jobs to process.")
+        return
     run_generation = acquire_run_ownership(
-        manifest_path, [j.get("job_id") for j in jobs], owner=run_owner)
+        manifest_path, _claimed_ids, owner=run_owner)
     if run_generation is None:
+        # R3-11：领取失败意味着"结果无处可写"，必须停止，不能照常执行并报成功。
         logger.error("RUN_CLAIM_FAILED",
                      "Could not claim this run's jobs in the manifest; "
                      "refusing to report success later")
+        print("ERROR: could not claim this run's jobs in the manifest; "
+              "not producing artifacts that cannot be recorded.",
+              file=sys.stderr)
+        sys.exit(82)
 
     # Parallel worker pool
     workers = max(1, args.workers)
@@ -1818,12 +1888,20 @@ def main():
                 except Exception as e:
                     logger.error("WORKER_ERROR", f"Job {ctx['job']['job_id']} failed in worker: {e}")
                     update_job_status(manifest, ctx["job"]["job_id"], "FAILED")
-                    # FIX-V08: 锁定单任务更新，不再整份快照回写
-                    saved = save_manifest_job_result(
+                    # R3-11：父进程兜底也必须走统一收口 ——
+                    # save_manifest_job_result 会抛异常（磁盘拒绝写入等），
+                    # 直接调用会让 WORKBENCH 的兜底自己崩掉，
+                    # 既没有 persist-failed 也没有 82。
+                    saved, save_reason = _persist_job_result(
                         manifest_path, ctx["job"]["job_id"], "FAILED",
                         error_message=str(e)[:2000],
                         attempt_group=run_attempt_group,
-                        owner=run_owner, generation=run_generation)
+                        owner=run_owner, generation=run_generation,
+                        logger=logger)
+                    if not saved:
+                        logger.error("WORKER_PERSIST_FAILED",
+                                     f"Could not record the failure of job "
+                                     f"{ctx['job']['job_id']}: {save_reason}")
                     results.append(_result(
                         ctx["job"]["job_id"],
                         JOB_FAILED if saved else JOB_PERSIST_FAILED,

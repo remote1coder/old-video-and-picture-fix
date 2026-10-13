@@ -1,0 +1,1854 @@
+diff --git a/photo_restoration_pipeline/main.py b/photo_restoration_pipeline/main.py
+index 60f093c..1dae4eb 100644
+--- a/photo_restoration_pipeline/main.py
++++ b/photo_restoration_pipeline/main.py
+@@ -1217,11 +1217,19 @@ def main():
+         # 结果不会覆盖本次结果，也不会出现"末尾整份旧快照回写"。
+         from manifest_loader import acquire_run_ownership
+         run_owner = f"photo-run-{os.getpid()}"
++        _claim_ids = [j.get("job_id") for j in jobs]
++        if not _claim_ids:
++            # R3-05：本次没有任务 → 零领取，不动别人的 owner/generation
++            print("No jobs to process.")
++            return
+         run_generation = acquire_run_ownership(
+-            args.manifest, [j.get("job_id") for j in jobs], owner=run_owner)
++            args.manifest, _claim_ids, owner=run_owner)
+         if run_generation is None:
+-            print("WARNING: could not claim the run in the manifest; results "
+-                  "may not be persisted", file=sys.stderr)
++            # R3-11：领取失败 = 结果无处可写。不能照常产出并报成功。
++            print("ERROR: could not claim this run's jobs in the manifest; "
++                  "not producing artifacts that cannot be recorded.",
++                  file=sys.stderr)
++            sys.exit(82)
+ 
+         results = []
+         failures: List[tuple] = []
+diff --git a/photo_restoration_pipeline/stages/stage5_postprocess.py b/photo_restoration_pipeline/stages/stage5_postprocess.py
+index 7093bac..83bfd18 100644
+--- a/photo_restoration_pipeline/stages/stage5_postprocess.py
++++ b/photo_restoration_pipeline/stages/stage5_postprocess.py
+@@ -446,28 +446,58 @@ def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
+ 
+ def _carry_icc_to_output(output_path: str, icc: Optional[bytes],
+                          logger=None) -> bool:
+-    """R2-02 / A03: attach the source ICC to the stage5 output.
++    """R3-07 / B06: attach the source ICC to the stage5 output **and verify it**.
+ 
+     stage5 不做色彩空间转换，因此"未变化的 profile"应当原样带下去。
+-    实测（A03）：输入 RGB16 PNG 带 588 字节 sRGB ICC，
+-    真实 stage5 子进程 rc=0、像素一致，但输出 TIFF 的 34675 标签是 0 字节。
+-    失败只记 warning，不因此让已经产出的像素作废。
++    实测（A03）：输入 RGB16 PNG 带 588 字节 sRGB ICC，真实 stage5 子进程
++    rc=0、像素一致，但输出 TIFF 的 34675 标签是 0 字节。
++
++    R3-07：第三轮只把失败记成 warning，调用方也不看返回值 ——
++    注入真实嵌入失败后 stage5 仍然 rc=0、输出没有 ICC（实测 B06）。
++    现在：写入后**回读验证**字节一致；不成功就是失败，由调用方决定
++    （默认 `require_icc_preserved=True` → 不写 SUCCESS）。
++
++    Returns:
++        True 表示已嵌入且回读一致。
+     """
+     if not icc:
+         return False
+     if _media_io is None:
+         return False
++    ok = False
+     try:
+-        ok = _media_io.embed_icc_in_tiff(output_path, icc)
++        ok = bool(_media_io.embed_icc_in_tiff(output_path, icc))
+     except Exception as e:
+         ok = False
+         if logger:
+-            logger.warning("STAGE5_ICC_EMBED_FAIL",
+-                           f"Could not embed the source ICC: {e}",
+-                           output=output_path)
++            logger.error("STAGE5_ICC_EMBED_FAIL",
++                         f"Could not embed the source ICC: {e}",
++                         output=output_path)
++    if ok:
++        # 写成功不等于真的写进去了 —— 回读核对字节
++        try:
++            _arr, meta = _media_io.read_image_array(output_path)
++            written = (meta or {}).get("icc_profile")
++            if not written or bytes(written) != bytes(icc):
++                ok = False
++                if logger:
++                    logger.error(
++                        "STAGE5_ICC_VERIFY_FAIL",
++                        "ICC was written but the file does not read back with "
++                        "the same profile bytes",
++                        expected_bytes=len(icc),
++                        read_back_bytes=(len(written) if written else 0),
++                        output=output_path)
++        except Exception as e:
++            ok = False
++            if logger:
++                logger.error("STAGE5_ICC_VERIFY_FAIL",
++                             f"Could not read back the output to verify the "
++                             f"ICC: {e}", output=output_path)
+     if ok and logger:
+         logger.info("STAGE5_ICC_CARRIED",
+-                    "Source ICC carried through stage5 into the output",
++                    "Source ICC carried through stage5 and verified by "
++                    "reading the output back",
+                     icc_bytes=len(icc), output=output_path)
+     return bool(ok)
+ 
+@@ -530,7 +560,13 @@ def _match_portrait_color(image_path: str, face_boxes: list,
+             _arr = np.stack([_arr] * 3, axis=2)
+         source_dtype = getattr(_arr, "dtype", None)
+         _scale_max = 65535.0 if source_dtype == np.uint16 else 255.0
+-        img_arr = _arr[:, :, :3].astype(np.float32)
++        # R3-02 / B05：cv2 对 **float32** 的非线性色彩空间转换（RGB↔Lab 等）
++        # 规定输入范围为 **0–1**（见 OpenCV cvtColor 文档，2026-10-13 核对）。
++        # 第三轮只把整数转成 float32 就送进去（16-bit 时值是 0–65535），
++        # 逆转换之后又没乘回 —— 实测脸内 [30000,20000,10000] 变成 [1,1,0]，
++        # 8-bit 的 [150,100,50] 同样变成 [1,1,0]，而函数仍返回 applied=True。
++        # 这里统一：进入 LAB 前除以 _scale_max 归一，回到 RGB 后再乘回来。
++        img_arr = _arr[:, :, :3].astype(np.float32) / _scale_max
+         h_img, w_img = img_arr.shape[:2]
+ 
+         # Build a combined mask for all face regions
+@@ -639,9 +675,11 @@ def _match_portrait_color(image_path: str, face_boxes: list,
+ 
+         blended = mask_smooth * corrected + (1.0 - mask_smooth) * img_arr
+         # R2-02 / A15：按**输入真实位深**回写，不能一律压成 uint8。
+-        blended = np.clip(blended, 0, _scale_max)
++        # R3-02：corrected / img_arr 都在 0–1 域；先按 0–1 裁剪，再乘回真实
++        # 位深并就近取整（不能靠 astype 截断，否则暗部整体偏暗 0.5 LSB）。
++        blended = np.clip(blended, 0.0, 1.0) * _scale_max
+         out_dtype = np.uint16 if source_dtype == np.uint16 else np.uint8
+-        out_arr = blended.astype(out_dtype)
++        out_arr = np.rint(blended).astype(out_dtype)
+         _write_color_matched(output_path, out_arr)
+         return {"applied": True, "skipped": False, "reason": ""}
+     except Exception as e:
+@@ -1017,7 +1055,13 @@ STAGE5_CACHE_PARAM_KEYS = (
+ # FIX-V07: 实现/模型版本。任何会改变本阶段像素输出的实现调整都应递增，
+ # 否则旧产物会被当成"同一实现"而错误复用。
+ # RV-11/RV-06: 缓存身份与操作语义都变了，升版本以免误用旧 cache sidecar。
+-STAGE5_IMPL_VERSION = "photo-stage5-postprocess/3.0-rv06-rv11"
++# R3-07 / B13：实现/缓存契约版本。**旧版本产出的坏缓存必须失效**。
++# 实测：用第三轮修复**之前**的 stage5 生成一份丢 ICC 的缓存，
++# 再让修复后的 stage5 处理完全相同的输入/参数 —— 旧缓存照样命中
++# （返回 3、输出字节不变、ICC 仍不存在），修复逻辑根本没机会执行。
++# 缓存身份里包含 impl，因此升版本即可让旧坏缓存全部重算。
++# 语义变化点：ICC 贯穿 + 写后回读校验、人像色彩匹配量纲修正（R3-02）。
++STAGE5_IMPL_VERSION = "photo-stage5-postprocess/4.0-r3-02-r3-07-icc-verified"
+ 
+ 
+ def _json_sidecar_path(artifact_path: str, kind: str) -> str:
+@@ -1727,8 +1771,25 @@ def main():
+                 return 0
+         else:
+             shutil.move(grain_temp, output_path)
+-        # R2-02 / A03：源 ICC 必须跟着像素走到最终产物。
+-        _carry_icc_to_output(output_path, input_icc, logger)
++        # R3-07 / B06：源 ICC 必须跟着像素走到最终产物；写不进去（或回读
++        # 不一致）就不能算成功。默认 require_icc_preserved=True。
++        if input_icc:
++            icc_ok = _carry_icc_to_output(output_path, input_icc, logger)
++            if not icc_ok and params.get("require_icc_preserved", True):
++                logger.error("STAGE5_ICC_REQUIRED_FAIL",
++                             "Source ICC could not be preserved in the output; "
++                             "failing instead of reporting success "
++                             "(set require_icc_preserved=false to accept it)")
++                _discard_partial_output(output_path, [cache_meta_path])
++                _write_json_sidecar(
++                    _json_sidecar_path(output_path, "status"), {
++                        "status": STAGE_STATUS_FAILED,
++                        "stage": 5,
++                        "failed_operation": "icc_preservation",
++                        "reason": "source ICC could not be preserved",
++                        "impl": STAGE5_IMPL_VERSION,
++                    })
++                return 86
+ 
+         # FIX-V07: 只在完全成功后提交缓存身份（先验证产物可读）
+         if not _verify_output_readable(output_path):
+diff --git a/photo_restoration_pipeline/stages/stage6_encode.py b/photo_restoration_pipeline/stages/stage6_encode.py
+index e0939b3..bff265d 100644
+--- a/photo_restoration_pipeline/stages/stage6_encode.py
++++ b/photo_restoration_pipeline/stages/stage6_encode.py
+@@ -185,49 +185,99 @@ class PublishAbort(Exception):
+         self.reason = reason
+ 
+ 
++# R3-03 / B03：提交前每个目标路径的状态必须**三态可区分**。
++# 旧实现用 None 同时表示"原先不存在"和"备份失败"，于是回滚把"备份失败"的
++# 路径直接**删除** —— 旧产物被销毁，且日志还声称"完整旧代已恢复"。
++BACKUP_ABSENT = "absent"        # 提交前不存在 → 回滚时撤下本次新建的文件
++BACKUP_OK = "backed_up"         # 已备份 → 回滚时拷回
++BACKUP_FAILED = "backup_failed"  # 备份失败 → 回滚时**绝不能动**
++
++
+ def _snapshot_for_rollback(paths: List[str], backup_dir: str,
+-                           logger=None) -> Dict[str, Optional[str]]:
+-    """R2-01: 提交前先把**现存**产物复制到备份目录。
++                           logger=None) -> Dict[str, Dict[str, Optional[str]]]:
++    """R3-03: 提交前把**现存**产物复制到备份目录，并明确记录每个目标的状态。
+ 
+-    Returns ``{目标路径: 备份文件路径 或 None}``。``None`` 表示提交前该路径
+-    不存在（回滚时应撤下本次新建的文件），或备份失败（无法恢复，必须留痕）。
++    Returns ``{目标路径: {"state": ..., "backup": 备份路径 或 None}}``。
+     """
+-    snapshot: Dict[str, Optional[str]] = {}
++    snapshot: Dict[str, Dict[str, Optional[str]]] = {}
+     for idx, path in enumerate([p for p in paths if p]):
+         if not os.path.isfile(path):
+-            snapshot[path] = None
++            snapshot[path] = {"state": BACKUP_ABSENT, "backup": None}
+             continue
+         try:
+             os.makedirs(backup_dir, exist_ok=True)
+             backup = os.path.join(backup_dir, f"{idx}_{os.path.basename(path)}")
++            # R3-03：必须**真实复制**，不能图快用硬链接。
++            # 实测（本机）：os.link(path, backup) 之后若调用方**原地写**
++            # path（open(path,'w') / write_bytes），备份文件的內容也会跟着变，
++            # 于是回滚恢复出来的就是被改坏的数据 —— 等于没有备份。
++            # 提交阶段虽然主要用 os.replace 换 inode，但无法强制所有调用方
++            # 都这样做，备份必须自己站得住。
+             shutil.copyfile(path, backup)
+-            snapshot[path] = backup
++            snapshot[path] = {"state": BACKUP_OK, "backup": backup}
+         except OSError as e:
+-            snapshot[path] = None
++            snapshot[path] = {"state": BACKUP_FAILED, "backup": None}
+             if logger:
+                 logger.error("STAGE6_ROLLBACK_BACKUP_FAIL",
+                              f"Cannot back up {path} before publishing: {e}. "
+-                             "A later failure could NOT restore it.",
++                             "This path will NOT be touched on rollback.",
+                              path=path)
+     return snapshot
+ 
+ 
+-def _rollback_publish(snapshot: Dict[str, Optional[str]], logger=None) -> None:
+-    """R2-01: 把每个目标路径恢复成提交前的内容。
++def _snapshot_has_failure(snapshot: Dict[str, Dict[str, Optional[str]]]) -> bool:
++    """R3-03: 有任何一个目标备份失败 → 提交必须先停，不能动旧产物。"""
++    return any(entry.get("state") == BACKUP_FAILED
++               for entry in snapshot.values())
++
++
++def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
++                      logger=None) -> None:
++    """R3-03: 把每个目标路径恢复成提交前的内容。
+ 
+-    有备份 → 拷回；没备份（本次新建）→ 删除本次写入的文件。
+-    目标是"最终只能看到完整旧代"，不能是混合代。
++    * ``backed_up``  → 从备份拷回；
++    * ``absent``     → 删除本次新建的文件；
++    * ``backup_failed`` → **不动**（没有备份可恢复，删掉就等于销毁旧产物），
++      并记 `STAGE6_RESTORE_IMPOSSIBLE`，绝不声称"完整旧代已恢复"。
+     """
+-    for path, backup in snapshot.items():
++    restored = 0
++    impossible = 0
++    for path, entry in snapshot.items():
++        state = entry.get("state")
++        backup = entry.get("backup")
+         try:
+-            if backup and os.path.isfile(backup):
++            if state == BACKUP_OK and backup and os.path.isfile(backup):
++                # R3-03 / B14：优先 `os.replace` —— 单次系统调用、原子，
++                # 比 copyfile 的失败面小得多。取消处理器里做文件 I/O 有额外
++                # 风险（Windows 实测会再抛 KeyboardInterrupt），
++                # 越少的系统调用越好；跨卷失败时再退回复制。
++                try:
++                    os.replace(backup, path)
++                    restored += 1
++                    continue
++                except OSError:
++                    pass
+                 shutil.copyfile(backup, path)
+-            elif os.path.exists(path):
++                restored += 1
++            elif state == BACKUP_ABSENT and os.path.exists(path):
+                 os.remove(path)
++            elif state == BACKUP_FAILED:
++                impossible += 1
+         except OSError as e:
+             if logger:
+                 logger.error("STAGE6_ROLLBACK_FAIL",
+                              f"Could not restore {path}: {e}", path=path)
++    if impossible and logger:
++        logger.error("STAGE6_RESTORE_IMPOSSIBLE",
++                     f"{impossible} path(s) had no usable backup and were left "
++                     "untouched; the previous generation could NOT be fully "
++                     "restored — do not report a clean rollback",
++                     impossible_paths=[p for p, e in snapshot.items()
++                                       if e.get("state") == BACKUP_FAILED])
++    if logger:
++        logger.info("STAGE6_PUBLISH_ROLLBACK",
++                    f"Rollback finished: {restored} restored, "
++                    f"{impossible} impossible")
+ 
+ 
+ def _fail(logger, status_path: str, operation: str, reason: str,
+@@ -939,8 +989,26 @@ def main():
+         logger.warning("STAGE6_HEADER_READBACK_FAIL",
+                        f"Could not read back the encoded AVIF header: {e}",
+                        output=tmp_avif)
++    if not actual:
++        # R3-09 / B07：回读失败/结果未知 —— 严格模式下**不能当作验收通过**。
++        # 旧实现 `if actual:` 一跳而过，于是 require_header_match=True 时
++        # 未知结果照样发布、rc=0（实测 B07）。
++        logger.warning("STAGE6_HEADER_UNKNOWN",
++                       "Could not determine the encoded file's real header; "
++                       "the contract is NOT verified",
++                       output=tmp_avif)
++        contract["actual_header"] = None
++        contract["header_matches_contract"] = None      # 未知 ≠ 一致
++        contract["header_verification"] = "unknown"
++        if params.get("require_header_match", False):
++            _fail(logger, status_path, "header_verification_unknown",
++                  "the encoded header could not be read back; strict mode "
++                  "refuses to publish an unverified product",
++                  paths=[tmp_avif])
++            return 86
+     if actual:
+         contract["actual_header"] = actual
++        contract["header_verification"] = "checked"
+         declared_matrix = media_io.cicp_matrix(contract.get("cicp"))
+         actual_matrix = actual.get("matrix")
+         contract["header_matches_contract"] = (
+@@ -975,8 +1043,31 @@ def main():
+         commit_targets.append(publish_output_path)
+         if tiff_info.get("written"):
+             commit_targets.append(publish_tiff_path)
++    # R3-03 / B04：**契约和状态也属于这一代**。
++    # 旧实现只快照媒体文件，于是状态写失败回滚后 —— 媒体恢复了旧代，
++    # 但 encode_contract 仍是新代且 published=true（实测 B04）。
++    # 契约是下一次 resume/验收的依据，与媒体不同代会让下游读到自相矛盾的记录。
++    commit_targets.append(contract_path)
++    commit_targets.append(status_path)
+     backup_dir = work_output_path + ".pubbak"
+     snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
++    # R3-03 / B14：进入发布临界区前把"成套回滚"挂到取消路径上。
++    # 取消处理器最后是 os._exit，普通 try/finally 根本跑不到，
++    # 所以必须注册为取消钩子；提交成功后由 release_outputs() 清除。
++    if cancel_guard is not None:
++        cancel_guard.add_cancel_hook(
++            lambda: _rollback_publish(snapshot, logger))
++    # R3-03 / B03：任一目标备份失败 → **在改动任何旧产物之前停止**。
++    if _snapshot_has_failure(snapshot):
++        logger.error("STAGE6_PUBLISH_BACKUP_INCOMPLETE",
++                     "Cannot back up every artifact of the current generation; "
++                     "refusing to start the commit (a later failure could "
++                     "destroy the previous generation)",
++                     failed=[p for p, e in snapshot.items()
++                             if e.get("state") == BACKUP_FAILED])
++        _fail(logger, status_path, "publish_backup",
++              "incomplete backup; commit not started", paths=[])
++        return 82
+ 
+     try:
+         os.replace(tmp_avif, work_output_path)
+diff --git a/shared_modules/cancel_guard.py b/shared_modules/cancel_guard.py
+index ef0d646..325c120 100644
+--- a/shared_modules/cancel_guard.py
++++ b/shared_modules/cancel_guard.py
+@@ -104,6 +104,8 @@ class CancelGuard:
+         # "stage 已经退出，avifenc 还在往回写"的孤儿进程。
+         self._processes: List[Any] = []
+         self._released: bool = False
++        # R3-03: 取消时必须先跑的收尾（例如成套发布回滚）
++        self._cancel_hooks: List[Any] = []
+ 
+     # ------------------------------------------------------------------ setup
+     def install(self, stage: Optional[int] = None, logger: Any = None) -> bool:
+@@ -205,6 +207,27 @@ class CancelGuard:
+         self._released = True
+         self._extra_paths = []
+         self._processes = []
++        # R3-03: 提交已完成，取消钩子（发布回滚）不再需要。
++        self._cancel_hooks = []
++
++    # ------------------------------------------------------- cancel hooks
++    def add_cancel_hook(self, hook) -> None:
++        """R3-03: register a callback that must run **before** cleanup.
++
++        发布临界区（AVIF 已替换、TIFF 还没换完）被中断时，
++        单纯"删掉半成品"会留下 **新 AVIF + 旧 TIFF** 的混合代（实测 B14）。
++        这类收尾必须能执行**成套回滚**，因此挂在取消路径上，
++        且在 `_fire` 的 `os._exit` 之前运行（普通 try/finally 绕不过它）。
++        """
++        if callable(hook):
++            self._cancel_hooks.append(hook)
++
++    def _run_cancel_hooks(self) -> None:
++        for hook in list(self._cancel_hooks):
++            try:
++                hook()
++            except BaseException:  # noqa: BLE001 - 处理器内不允许再抛出
++                continue
+ 
+     # ------------------------------------------------------------- behaviour
+     def _fire(self, signum: int, frame: Any) -> None:
+@@ -279,6 +302,12 @@ class CancelGuard:
+                 continue
+         self._processes = []
+ 
++        # R3-03 / B14：取消发生在发布临界区时，**先成套回滚**再清理，
++        # 否则会留下"新 AVIF + 旧 TIFF"的混合代。钩子必须在
++        # `os._exit` 之前跑，所以放在这里而不是普通 try/finally。
++        if not self._released:
++            self._run_cancel_hooks()
++
+         targets: List[str] = []
+         if self._output_path and self._delete_output:
+             targets.append(self._output_path)
+@@ -394,6 +423,20 @@ def unwatch_process(proc: Any) -> None:
+     guard.unwatch_process(proc)
+ 
+ 
++def add_cancel_hook(hook) -> None:
++    """R3-03: 注册"取消时必须先跑"的收尾（见 :meth:`CancelGuard.add_cancel_hook`）。
++
++    发布临界区被中断时要成套回滚，而取消处理器最后会 `os._exit`，
++    普通 try/finally 跑不到 —— 只能通过这里注册。
++    """
++    guard.add_cancel_hook(hook)
++
++
++def clear_cancel_hooks() -> None:
++    """R3-03: 提交成功后清除回滚钩子（产物已发布，不能再回滚）。"""
++    guard._cancel_hooks = []
++
++
+ def release_outputs() -> None:
+     """RV-12: artifacts are published; stop guarding them."""
+     guard.release()
+diff --git a/shared_modules/checkpoint.py b/shared_modules/checkpoint.py
+index 8d9c7c9..e523927 100644
+--- a/shared_modules/checkpoint.py
++++ b/shared_modules/checkpoint.py
+@@ -253,6 +253,32 @@ def build_intermediate_name(job_id: str,
+     return f"{job_id}_{safe_name}_step{step}_{operation}_p{param_hash}.{ext}"
+ 
+ 
++def unlink_artifact_with_sidecars(path) -> None:
++    """R3-01: 删除媒体产物时**连带删除它的侧车**。
++
++    侧车（`<媒体>.identity.json` 等）不能比它描述的媒体活得更久：
++    媒体被清理后残留的侧车会让"按侧车判断可复用"的逻辑失去依据，
++    也会在目录里堆积孤儿 JSON。
++    """
++    from pathlib import Path as _P
++    target = _P(path)
++    try:
++        target.unlink()
++    except OSError:
++        return
++    for suffix in (".identity.json", ".encode_contract.json", ".status.json",
++                   ".cache.json", ".done.json"):
++        try:
++            _P(str(target) + suffix).unlink(missing_ok=True)
++        except (OSError, TypeError):
++            try:
++                side = _P(str(target) + suffix)
++                if side.exists():
++                    side.unlink()
++            except OSError:
++                pass
++
++
+ def cleanup_old_intermediates(temp_dir: str,
+                               job_id: str,
+                               keep_steps: int = 2,
+@@ -282,9 +308,13 @@ def cleanup_old_intermediates(temp_dir: str,
+         return
+ 
+     # Collect intermediate files for this job
++    # R3-01：侧车不算"一个阶段"，否则按个数保留/删除会数错，
++    # 也可能把侧车当成阶段产物保留下来（媒体已被删，侧车变成孤儿）。
+     intermediates = []
+     for f in temp.iterdir():
+         if f.is_file() and f.name.startswith(f"{job_id}_"):
++            if not is_media_artifact(f):
++                continue
+             # FIX-CK-R2-01: Use anchored regex for step number, consistent with
+             # manifest_loader.py. ORIGINAL: split("_") + p.startswith("step")
+             # mis-parsed input_names containing "step" (e.g. "step3_ceremony"
+@@ -300,10 +330,7 @@ def cleanup_old_intermediates(temp_dir: str,
+                 m_hash = re.search(r'_p([0-9a-f]+)\.', f.name)
+                 f_hash = m_hash.group(1) if m_hash else None
+                 if f_hash and f_hash != current_param_hash:
+-                    try:
+-                        f.unlink()
+-                    except OSError:
+-                        pass
++                    unlink_artifact_with_sidecars(f)
+                     continue
+ 
+             intermediates.append((step, f))
+@@ -318,18 +345,12 @@ def cleanup_old_intermediates(temp_dir: str,
+         # BUG-058 fix: When called without current_step, keep the most recent
+         # keep_steps files and delete everything else.
+         for _, f in intermediates[keep_steps:]:
+-            try:
+-                f.unlink()
+-            except OSError:
+-                pass
++            unlink_artifact_with_sidecars(f)
+     else:
+         steps_to_keep = {s for s, _ in intermediates[:keep_steps]}
+         for step, f in intermediates:
+             if step not in steps_to_keep and step < current_step:
+-                try:
+-                    f.unlink()
+-                except OSError:
+-                    pass
++                unlink_artifact_with_sidecars(f)
+ 
+ 
+ def cleanup_all_intermediates(temp_dir: str, job_id: str) -> None:
+@@ -345,10 +366,14 @@ def cleanup_all_intermediates(temp_dir: str, job_id: str) -> None:
+         return
+     for f in temp.iterdir():
+         if f.is_file() and f.name.startswith(f"{job_id}_"):
+-            try:
+-                f.unlink()
+-            except OSError:
+-                pass
++            # R3-01：媒体产物连同侧车一起删；纯侧车（媒体已不在）也要清掉
++            if is_media_artifact(f):
++                unlink_artifact_with_sidecars(f)
++            else:
++                try:
++                    f.unlink()
++                except OSError:
++                    pass
+ 
+ 
+ def _read_frame_info(filepath: str, position: float) -> Optional[Dict[str, Any]]:
+@@ -1300,3 +1325,42 @@ def check_wsl_space(params: Dict[str, Any],
+             logger.error("DISK_SPACE_CHECK",
+                          f"Disk space check failed (treating as insufficient): {e}")
+         return False
++
++
++# --- R3-01：媒体产物枚举的统一规则 ---------------------------------------
++
++#: 中间产物的媒体后缀白名单。
++#: 第三轮新增了 `<媒体>.identity.json` 侧车，它与媒体文件**同名前缀、同一目录**，
++#: 而下游仍用 `step6_grain*` 之类的通配按 mtime 选最新文件 —— 结果侧车被当成
++#: 视频送进 ffmpeg，真实 stage7 直接 Invalid data / rc=84（独立用例 B10 复现）。
++#: 因此枚举必须按后缀白名单过滤：侧车、契约、状态 JSON 都不算媒体产物。
++MEDIA_SUFFIXES = frozenset({
++    ".mkv", ".mp4", ".mov", ".avi", ".webm", ".m2ts", ".ts",
++    ".mka", ".wav", ".flac", ".aac", ".ac3",
++    ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp",
++    ".y4m", ".yuv", ".raw",
++})
++
++
++def is_media_artifact(path) -> bool:
++    """R3-01: whether *path* looks like a media artifact (not a sidecar)."""
++    try:
++        from pathlib import Path as _P
++        return _P(path).suffix.lower() in MEDIA_SUFFIXES
++    except Exception:
++        return False
++
++
++def select_media_candidates(candidates, newest_first: bool = True):
++    """R3-01: filter a glob result down to media artifacts and sort by mtime.
++
++    所有"按通配找上游产物"的地方都应走这里，避免各处各写一套过滤。
++    返回 Path 列表（新→旧 或 旧→新）。
++    """
++    from pathlib import Path as _P
++    media = [p for p in (_P(c) for c in candidates) if is_media_artifact(p)]
++    try:
++        media.sort(key=lambda p: p.stat().st_mtime, reverse=newest_first)
++    except OSError:
++        pass
++    return media
+diff --git a/shared_modules/manifest_loader.py b/shared_modules/manifest_loader.py
+index f9459f9..1ebf85c 100644
+--- a/shared_modules/manifest_loader.py
++++ b/shared_modules/manifest_loader.py
+@@ -315,10 +315,24 @@ def acquire_run_ownership(path: str,
+ 
+     Returns the generation, or None when the claim could not be written
+     (in that case the caller must not report success either).
++
++    R3-05: ``job_ids`` 的语义必须区分三态：
++      * ``None``  —— 未指定集合：领取 manifest 里**全部**任务；
++      * ``[]``    —— 空集合：**零领取**，且不递增全局代际；
++      * 非空列表 —— 只领取列出的任务。
++
++    旧实现 ``wanted = None if not job_ids else ...`` 把 ``None`` 和 ``[]``
++    混为一谈，于是"本次没有任务可跑"会变成"领取全部任务" —— 实测 B09：
++    manifest 有 j1/j2，调用 ``acquire_run_ownership(path, [])`` 后两条任务
++    都被写上该 owner 和新 generation，会影响其他运行正在做的工作。
+     """
+     owner = owner or f"pid-{os.getpid()}"
+     state: Dict[str, Any] = {"generation": None, "claimed": 0}
+ 
++    # 空集合：直接返回，不写盘、不动代际、不碰任何 job 的 owner。
++    if job_ids is not None and len(job_ids) == 0:
++        return None
++
+     def _mutate(manifest: Dict[str, Any]) -> bool:
+         meta = manifest.setdefault("meta", {})
+         try:
+@@ -328,7 +342,8 @@ def acquire_run_ownership(path: str,
+         meta["run_generation"] = generation
+         meta["last_run_owner"] = owner
+         claimed_at = datetime.now().astimezone().isoformat()
+-        wanted = None if not job_ids else {str(j) for j in job_ids}
++        # R3-05：走到这里 job_ids 要么是 None（全部），要么是非空列表
++        wanted = None if job_ids is None else {str(j) for j in job_ids}
+         for job in manifest.get("jobs", []):
+             if wanted is not None and str(job.get("job_id")) not in wanted:
+                 continue
+diff --git a/tests/test_rv_round2.py b/tests/test_rv_round2.py
+index 1728f47..2cba651 100644
+--- a/tests/test_rv_round2.py
++++ b/tests/test_rv_round2.py
+@@ -1547,3 +1547,513 @@ def test_r205_photo_scheduler_persists_completed_job_without_waiting(
+     statuses = {j["job_id"]: j["status"] for j in final["jobs"]}
+     assert statuses.get("B") == "DONE", f"B 最终状态不对：{statuses}"
+     assert statuses.get("A") == "DONE", f"A 最终状态不对：{statuses}"
++
++
++# ---------------------------------------------------------------------------
++# R2-10 扩展：>2 声道逐声道处理（原列为未完成，现补实测）
++# ---------------------------------------------------------------------------
++
++def _make_multichannel_wav(path, freqs=(220, 330, 440, 550, 660, 770),
++                           layout="5.1", seconds=1.0, rate=48000):
++    """合成 N 声道素材：每个声道放**不同**频率，便于检测是否被合并。"""
++    cmd = ["ffmpeg", "-v", "error", "-y"]
++    for f in freqs:
++        cmd += ["-f", "lavfi", "-i",
++                f"sine=frequency={f}:duration={seconds}:sample_rate={rate}"]
++    cmd += ["-filter_complex",
++            "".join(f"[{i}:a]" for i in range(len(freqs)))
++            + f"join=inputs={len(freqs)}:channel_layout={layout}[a]",
++            "-map", "[a]", "-c:a", "pcm_s16le", str(path)]
++    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
++    if r.returncode != 0:
++        pytest.skip(f"无法合成多声道素材（未验收）：{r.stderr[:200]}")
++    return path
++
++
++def test_r210_multichannel_arnndn_keeps_channels_distinct(tmp_path):
++    """>2 声道：逐声道 arnndn 后各声道**不得**被合并。
++
++    之前 >2ch 直接退回 afftdn；现在实现了 channelsplit → 逐声道 → join。
++    实测（5.1，六声道不同频率）：rc=0 且六个声道仍两两不同。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— 多声道逐声道记为未验收")
++    s7 = _load_stage7()
++    model = os.path.join(ROOT, "models", "std.rnnn")
++    if not os.path.exists(model):
++        pytest.skip("仓库内没有 models/std.rnnn —— 多声道逐声道记为未验收")
++
++    sys.path.insert(0, SHARED)
++    from audio_utils import filter_option_path
++
++    src = _make_multichannel_wav(tmp_path / "src51.wav")
++    src_ch = [_extract_channel(src, i) for i in range(6)]
++    assert len(set(src_ch)) == 6, "素材本身声道就相同，对照不成立"
++
++    chain = ",".join(s7._arnndn_filters(
++        model, {"channels": 6, "layout": "5.1"}, filter_option_path, None))
++    assert "channelsplit" in chain and "join=" in chain, (
++        ">2 声道没有走逐声道方案：" + chain)
++    out = tmp_path / "denoised51.wav"
++    r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src),
++                        "-af", chain, "-f", "wav", str(out)],
++                       capture_output=True, text=True, timeout=180)
++    assert r.returncode == 0, f"逐声道 arnndn 链跑不起来：{r.stderr[:300]}"
++    got = [_extract_channel(out, i) for i in range(6)]
++    assert len(set(got)) == 6, (
++        "处理之后声道被合并了（应保留 6 个互不相同的声道）")
++
++
++def test_r207_intermediate_without_identity_is_not_reused(tmp_path):
++    """R2-07 补完：没有身份侧车的中间产物**不得**被复用。
++
++    "能解码"只证明文件没坏，证明不了它属于本次输入/参数/实现。
++    """
++    art = tmp_path / "j1_clip_step6_grain.mkv"
++    art.write_bytes(b"OLD-INTERMEDIATE")
++    job = {"job_id": "j1", "input_path": str(tmp_path / "src.mkv")}
++    (tmp_path / "src.mkv").write_bytes(b"SOURCE")
++    ok, why = vmain.intermediate_identity_matches(str(art), job, {}, None)
++    assert not ok, "没有身份侧车却被判为可复用"
++    assert "identity" in why.lower() or "sidecar" in why.lower(), why
++
++
++def test_r207_intermediate_identity_detects_source_change(tmp_path):
++    """R2-07 补完：源内容变了，已登记身份的中间产物必须失效。"""
++    src = tmp_path / "src.mkv"
++    src.write_bytes(b"SOURCE-V1")
++    job = {"job_id": "j1", "input_path": str(src)}
++    art = tmp_path / "j1_clip_step6_grain.mkv"
++    art.write_bytes(b"INTERMEDIATE")
++    assert vmain.record_stage_artifact_identity(
++        str(art), job, {}, 6, str(src), None)
++    ok1, _ = vmain.intermediate_identity_matches(str(art), job, {}, None)
++    assert ok1, "同一输入下已登记的产物应当可复用"
++
++    src.write_bytes(b"SOURCE-V2-CHANGED")
++    ok2, why = vmain.intermediate_identity_matches(str(art), job, {}, None)
++    assert not ok2, f"源变了却仍判定可复用：{why}"
++
++
++def test_r207_intermediate_identity_detects_size_change(tmp_path):
++    """R2-07 补完：产物自身大小与登记不符时拒绝（防半截文件）。"""
++    src = tmp_path / "src.mkv"
++    src.write_bytes(b"SOURCE")
++    job = {"job_id": "j1", "input_path": str(src)}
++    art = tmp_path / "j1_clip_step6_grain.mkv"
++    art.write_bytes(b"INTERMEDIATE")
++    assert vmain.record_stage_artifact_identity(
++        str(art), job, {}, 6, str(src), None)
++    art.write_bytes(b"INTERMEDIATE-TRUNCATED-OR-REWRITTEN")
++    ok, why = vmain.intermediate_identity_matches(str(art), job, {}, None)
++    assert not ok, f"产物大小变了却仍判定可复用：{why}"
++
++
++# ---------------------------------------------------------------------------
++# R2-04 补完：多个 worker **争抢同一批 job** 的完整并发压测
++# ---------------------------------------------------------------------------
++
++def _contend_worker(path, owner, barrier):
++    """子进程：和别人**争抢同一批** job（不是各写各的集合）。"""
++    import conftest  # noqa: F401  (sys.path bootstrap)
++    import manifest_loader as m
++
++    barrier.wait()                      # 尽量同时开抢，制造真实竞争
++    gen = m.acquire_run_ownership(path, owner=owner)
++    if gen is None:
++        return []
++    written = []
++    doc = m.load_manifest(path)
++    for job in doc.get("jobs", []):
++        ok = m.save_manifest_job_result(path, job["job_id"], "DONE",
++                                        owner=owner, generation=gen)
++        written.append((job["job_id"], ok, gen, owner))
++    return written
++
++
++def test_r204_workers_contending_for_the_same_jobs_stay_consistent(tmp_path):
++    """R2-04 补完：8 个 worker 争抢**同一批** job，结果必须自洽。
++
++    交接指出旧压测让新旧 run 写**不相交**的集合，证明不了竞争场景。
++    这里让所有 worker 争抢同一批 job，并用 Barrier 尽量同时开抢，然后逐 job
++    断言：状态不丢、归属唯一、generation 一致、meta 计数正确。
++    """
++    import multiprocessing
++
++    job_ids = [f"j{i:02d}" for i in range(12)]
++    path = _manifest_with_jobs(tmp_path / "contend.jsonl", job_ids)
++
++    workers = 8
++    ctx = multiprocessing.get_context("spawn")
++    barrier = ctx.Barrier(workers)
++    procs = []
++    for i in range(workers):
++        p = ctx.Process(target=_contend_worker,
++                        args=(path, f"worker-{i}", barrier))
++        p.start()
++        procs.append(p)
++    for p in procs:
++        p.join(timeout=180)
++        assert p.exitcode == 0, f"worker 失败：exitcode={p.exitcode}"
++
++    final = ml.load_manifest(path)
++    jobs = final["jobs"]
++    assert len(jobs) == len(job_ids)
++
++    statuses = {j["status"] for j in jobs}
++    assert statuses == {"DONE"}, f"并发争抢后有 job 没落盘：{statuses}"
++
++    owners = {str(j.get("run_owner")) for j in jobs}
++    assert len(owners) == 1, (
++        f"同一批 job 出现了多个归属 —— 竞争下归属不唯一：{owners}")
++
++    gens = {j.get("run_generation") for j in jobs}
++    assert len(gens) == 1, (
++        f"同一批 job 的 generation 不一致（可能混代）：{gens}")
++
++    # 代际必须单调：最终 generation 不小于任务数（每个 worker 领取都会递增）
++    assert final["meta"].get("done") == len(job_ids), (
++        f"meta.done 与实际不符：{final['meta'].get('done')}")
++    leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
++    assert not leftovers, f"残留临时文件：{leftovers}"
++
++
++# ---------------------------------------------------------------------------
++# R2-11 补完：内容级同步（首/中/尾已知 flash / click 事件）
++# ---------------------------------------------------------------------------
++
++_EVENT_TIMES = [0.5, 1.5, 2.5]      # 秒：首 / 中 / 尾
++
++
++def _build_flash_click(tmp_path, audio_offset: float):
++    """合成"已知事件"素材：视频在这些时刻白闪，音频在同一时刻脉冲。
++
++    audio_offset > 0 表示音轨整体延后（制造不同步）。
++    """
++    import struct
++    duration = 3.0
++    fps = 25
++    sr = 48000
++
++    # --- 视频：黑底 + 指定时刻画白框 ---
++    video = tmp_path / "v.mkv"
++    vf = ",".join(
++        f"drawbox=x=0:y=0:w=64:h=64:color=white@1:t=fill:"
++        f"enable='between(t,{t},{t + 0.08})'" for t in _EVENT_TIMES)
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
++         "-i", f"color=c=black:s=64x64:d={duration}:r={fps}",
++         "-vf", vf, "-c:v", "ffv1", "-pix_fmt", "yuv420p", str(video)],
++        capture_output=True, text=True, timeout=120)
++    if r.returncode != 0:
++        pytest.skip(f"无法合成 flash 素材（未验收）：{r.stderr[:200]}")
++
++    # --- 音频：静音 + 指定时刻脉冲（用 numpy 直接写 PCM，最可靠）---
++    import numpy as _np
++    n = int(duration * sr)
++    pcm = _np.zeros(n, dtype=_np.int16)
++    for t in _EVENT_TIMES:
++        start = int(t * sr)
++        pcm[start:start + int(0.02 * sr)] = 30000
++    raw = tmp_path / "a.pcm"
++    raw.write_bytes(pcm.tobytes())
++
++    out = tmp_path / "av.mkv"
++    # 注意：`-itsoffset` 必须放在它要作用的那个 `-i` **之前**，
++    # 放到 -i 之后不会生效（第一版就写错了位置，导致这条用例被 skip）。
++    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(video)]
++    if audio_offset:
++        cmd += ["-itsoffset", str(audio_offset)]
++    cmd += ["-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", str(raw),
++            "-map", "0:v", "-map", "1:a",
++            "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le",
++            str(out)]
++    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
++    if r.returncode != 0:
++        pytest.skip(f"无法合成 A/V 素材（未验收）：{r.stderr[:200]}")
++    return out, fps, sr
++
++
++def _first_packet_pts(path, stream):
++    """容器里该流第一个 packet 的 pts_time。
++
++    **方法学要点**：把流解码成 raw PCM / rawvideo 后，输出只是字节流，
++    **容器里的时间偏移会丢掉**（第一版检测就栽在这里：音轨延后 0.5s，
++    raw 解码测出的脉冲位置却几乎没变）。因此必须把首 packet 的 pts 加回去，
++    raw 里测到的只是"流内相对时间"。
++    """
++    r = subprocess.run(
++        ["ffprobe", "-v", "error", "-select_streams", stream,
++         "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
++        capture_output=True, text=True, timeout=60)
++    vals = []
++    for line in (r.stdout or "").splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        try:
++            vals.append(float(line))
++        except ValueError:
++            continue
++    return min(vals) if vals else 0.0
++
++
++def _video_event_times(path, fps):
++    """逐帧求平均亮度，找白闪帧的时间戳（已加回流起始 pts）。"""
++    import numpy as _np
++    base = _first_packet_pts(path, "v:0")
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-i", str(path), "-vf", "format=gray",
++         "-f", "rawvideo", "-pix_fmt", "gray", "-"],
++        capture_output=True, timeout=120)
++    assert r.returncode == 0, r.stderr[:200]
++    frames = _np.frombuffer(r.stdout, dtype=_np.uint8).reshape(-1, 64 * 64)
++    mean = frames.mean(axis=1)
++    bright = _np.where(mean > 128)[0]
++    if bright.size == 0:
++        return []
++    # 把连续帧聚成事件
++    events, run = [], [bright[0]]
++    for idx in bright[1:]:
++        if idx - run[-1] <= 2:
++            run.append(idx)
++        else:
++            events.append(run[0]); run = [idx]
++    events.append(run[0])
++    return [round(base + e / fps, 4) for e in events]
++
++
++def _audio_event_times(path, sr):
++    """逐样本求绝对值，找脉冲的时间戳（已加回流起始 pts）。"""
++    import numpy as _np
++    base = _first_packet_pts(path, "a:0")
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-i", str(path), "-vn",
++         "-f", "s16le", "-ac", "1", "-ar", str(sr), "-"],
++        capture_output=True, timeout=120)
++    assert r.returncode == 0, r.stderr[:200]
++    pcm = _np.frombuffer(r.stdout, dtype=_np.int16).astype(_np.int32)
++    loud = _np.where(_np.abs(pcm) > 20000)[0]
++    if loud.size == 0:
++        return []
++    events, run = [], [loud[0]]
++    for idx in loud[1:]:
++        if idx - run[-1] <= sr // 10:      # 同一脉冲内
++            run.append(idx)
++        else:
++            events.append(run[0]); run = [idx]
++    events.append(run[0])
++    return [round(base + e / sr, 4) for e in events]
++
++
++def test_r211_content_events_align_when_in_sync(tmp_path):
++    """R2-11 补完：内容级验证 —— 同步时，flash 与 click 应在同一时刻。
++
++    这是"真正同步"而不是"时长接近"：直接比对已知事件的内容时间戳。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— 内容级同步记为未验收")
++    av, fps, sr = _build_flash_click(tmp_path, audio_offset=0.0)
++    v_t = _video_event_times(av, fps)
++    a_t = _audio_event_times(av, sr)
++    assert len(v_t) >= 2 and len(a_t) >= 2, f"事件没被检出：v={v_t} a={a_t}"
++
++    deltas = []
++    for vt in v_t:
++        if not a_t:
++            break
++        nearest = min(a_t, key=lambda x: abs(x - vt))
++        deltas.append(abs(nearest - vt))
++    worst = max(deltas)
++    assert worst < 0.1, (
++        f"同步素材里 flash 与 click 的最大时间差 {worst:.3f}s 超过 100ms "
++        f"(video={v_t} audio={a_t})")
++
++
++def test_r211_content_events_reveal_real_offset(tmp_path):
++    """负向对照：音轨整体延后 0.5s 时，内容事件必须**暴露**出来。
++
++    没有这条，"内容级验证"就没有证明力 —— 它可能对真正的错位也报 OK。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— 内容级同步负向对照记为未验收")
++    s7 = _load_stage7()
++    # 用 0.8s 而不是 0.5s：规范的失败阈值是 "> 500ms"，0.5s 正好卡在边界上
++    # （第一版用 0.5s，门按规范只 warn 不 fail，看起来像漏判）。
++    # 边界口径见 修复清单.md §12.14：正好 500ms 按规范不判失败。
++    offset = 0.8
++    av, fps, sr = _build_flash_click(tmp_path, audio_offset=offset)
++    v_t = _video_event_times(av, fps)
++    a_t = _audio_event_times(av, sr)
++    assert len(v_t) >= 2 and len(a_t) >= 2, f"事件没被检出：v={v_t} a={a_t}"
++
++    deltas = [min(abs(a - vt) for a in a_t) for vt in v_t]
++    worst = max(deltas)
++    assert worst > 0.3, (
++        f"音轨延后 {offset}s，内容事件却只差 {worst:.3f}s —— 检测没有暴露错位")
++
++    # 现有包头级同步门对这种固定偏移也应当判失败
++    class _Log:
++        def __init__(self):
++            self.events = []
++
++        def _rec(self, ev, msg, **kw):
++            self.events.append(ev)
++
++        info = warning = error = debug = critical = _rec
++
++    log = _Log()
++    rc = s7._validate_av_sync(str(av), log)
++    assert rc != 0, f"音轨延后 {offset}s，包头级同步门仍判定通过"
++
++
++# ---------------------------------------------------------------------------
++# R3-03：发布备份/回滚的三态语义
++# ---------------------------------------------------------------------------
++
++def _load_stage6():
++    import importlib.util as _ilu
++    path = os.path.join(ROOT, "photo_restoration_pipeline", "stages",
++                        "stage6_encode.py")
++    spec = _ilu.spec_from_file_location("stage6_encode_r303", path)
++    mod = _ilu.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def test_r303_backup_failure_does_not_destroy_previous_generation(tmp_path,
++                                                                  monkeypatch):
++    """R3-03：备份被拒时，回滚**不得删除**原本存在的旧产物。
++
++    这是独立用例 B03 想表达的核心危害（"回滚把该路径直接删除"）的
++    **自洽版本**：不手工篡改文件内容，只验证"不销毁"。
++
++    关于 B03 本身：它在备份被注入失败**之后**又手工把文件写成
++    `NEW-PARTIAL`，然后断言回滚后等于 `OLD-VALID`。备份失败意味着磁盘上
++    不存在 OLD-VALID 的任何副本，回滚不可能凭空还原 —— 断言与故障注入前提
++    不自洽。我在不绕过故障注入的前提下无法满足它；这里用等价断言覆盖
++    评估指出的真实危害。
++    """
++    s6 = _load_stage6()
++    final = tmp_path / "old.avif"
++    final.write_bytes(b"OLD-VALID")
++
++    def denied(*_a, **_k):
++        raise PermissionError("controlled backup denied")
++
++    monkeypatch.setattr(s6.shutil, "copyfile", denied)
++
++    class _Log:
++        def __init__(self):
++            self.events = []
++
++        def _rec(self, ev, msg, **kw):
++            self.events.append(ev)
++
++        info = warning = error = debug = critical = _rec
++
++    log = _Log()
++    snapshot = s6._snapshot_for_rollback([str(final)], str(tmp_path / "backup"),
++                                         log)
++    # 1) 备份失败必须与"原先不存在"区分开
++    assert s6._snapshot_has_failure(snapshot), \
++        "备份失败没有被识别（与 absent 混为一谈）"
++    assert snapshot[str(final)]["state"] == s6.BACKUP_FAILED
++    # 2) 回滚不得销毁旧产物
++    s6._rollback_publish(snapshot, log)
++    assert final.exists(), "备份失败后回滚把旧产物删除了（R3-03 的核心危害）"
++    assert final.read_bytes() == b"OLD-VALID"
++    assert "STAGE6_RESTORE_IMPOSSIBLE" in log.events, \
++        "回滚失败却仍然声称已恢复"
++
++
++def test_r303_rollback_restores_backed_up_generation(tmp_path):
++    """R3-03：备份成功时，回滚必须把每个目标恢复成提交前的内容。"""
++    s6 = _load_stage6()
++    final = tmp_path / "old.avif"
++    final.write_bytes(b"OLD-VALID")
++    tiff = tmp_path / "old.tif"
++    tiff.write_bytes(b"OLD-TIFF")
++
++    snapshot = s6._snapshot_for_rollback([str(final), str(tiff)],
++                                         str(tmp_path / "backup"))
++    assert not s6._snapshot_has_failure(snapshot)
++    # 模拟"提交进行到一半"
++    final.write_bytes(b"NEW-AVIF")
++    tiff.write_bytes(b"NEW-TIFF")
++    s6._rollback_publish(snapshot)
++    assert final.read_bytes() == b"OLD-VALID"
++    assert tiff.read_bytes() == b"OLD-TIFF"
++
++
++def test_r303_rollback_removes_files_created_by_this_run(tmp_path):
++    """R3-03：提交前不存在的路径（本次新建），回滚时应撤下，不留半代。"""
++    s6 = _load_stage6()
++    fresh = tmp_path / "not_there_before.avif"
++    snapshot = s6._snapshot_for_rollback([str(fresh)], str(tmp_path / "backup"))
++    assert snapshot[str(fresh)]["state"] == s6.BACKUP_ABSENT
++    fresh.write_bytes(b"NEW-PARTIAL")
++    s6._rollback_publish(snapshot)
++    assert not fresh.exists(), "本次新建的产物在回滚后仍留在磁盘上"
++
++
++def test_r211_content_events_survive_real_stage7(tmp_path):
++    """R3-10：已知事件经过**真实 stage7（含 AV1/AAC 编码）**后仍然对齐。
++
++    之前两条内容同步用例只检查刚合成的 FFV1/PCM 素材，没有经过产品处理链，
++    因此不能称为"生产链内容同步通过"。这条把带 flash/click 的素材
++    真正送进 stage7_encode，再从产物里检测首/中/尾事件。
++    """
++    if shutil.which("ffmpeg") is None:
++        pytest.skip("无 ffmpeg —— 生产链内容同步记为未验收")
++
++    # --- 1. 造带事件的有声源片 ---
++    # stage7 按 `--input` 的 stem 匹配中间产物（j1_<stem>_step6_grain*），
++    # 因此源片统一叫 clip.mkv。
++    av, fps, sr = _build_flash_click(tmp_path, audio_offset=0.0)
++    src = tmp_path / "clip.mkv"
++    shutil.copyfile(av, src)
++    # --- 2. 准备 stage7 需要的 temp 输入 ---
++    temp = tmp_path / "temp"
++    out = tmp_path / "out"
++    logs = tmp_path / "logs"
++    for d in (temp, out, logs):
++        d.mkdir(exist_ok=True)
++    step6 = temp / "j1_clip_step6_grain.mkv"
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-c:v", "ffv1",
++         "-pix_fmt", "yuv444p16le", str(step6)],
++        capture_output=True, text=True, timeout=60)
++    assert r.returncode == 0, r.stderr[:200]
++    r = subprocess.run(
++        ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-vn", "-c:a", "copy",
++         str(temp / "j1_clip.mka")],
++        capture_output=True, text=True, timeout=60)
++    assert r.returncode == 0, r.stderr[:200]
++
++    params = {"temp_dir": str(temp), "output_dir": str(out),
++              "log_dir": str(logs), "duration": 3,
++              "audio_denoise": False, "hum_freq": 0, "input_bit_depth": 16}
++    cmd = [sys.executable,
++           os.path.join(ROOT, "video_restoration_pipeline", "stages",
++                        "stage7_encode.py"),
++           "--input", str(src), "--job-id", "j1",
++           "--params", json.dumps(params)]
++    r = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True,
++                       timeout=300)
++    final = out / "clip_restored.mkv"
++    assert r.returncode == 0, f"stage7 失败：{r.stderr[:400]}"
++    assert final.exists(), "没有最终产物"
++
++    # --- 3. 从最终产物回读事件 ---
++    v_events = _video_event_times(final, fps)
++    a_events = _audio_event_times(final, 48000)
++    assert len(v_events) >= 2, f"产物里没检出 flash：{v_events}"
++    assert len(a_events) >= 2, f"产物里没检出 click：{a_events}"
++
++    deltas = [min(abs(a - vt) for a in a_events) for vt in v_events]
++    worst = max(deltas)
++    # 容差 150ms：AAC priming(约 23ms) + 编码/容器对齐都会带来几十毫秒量级偏移
++    assert worst < 0.15, (
++        f"经过真实 stage7 后，flash 与 click 的最大时间差 {worst:.3f}s "
++        f"超过 150ms（video={v_events} audio={a_events}）")
+diff --git a/video_restoration_pipeline/main.py b/video_restoration_pipeline/main.py
+index 0999040..c78d592 100644
+--- a/video_restoration_pipeline/main.py
++++ b/video_restoration_pipeline/main.py
+@@ -428,12 +428,16 @@ def _safe_input_stem(input_path: str) -> str:
+ 
+ def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
+                          stage_num: int) -> List[str]:
+-    """Return existing artifacts of (job_id, stage_num), newest first."""
++    """Return existing **media** artifacts of (job_id, stage_num), newest first.
++
++    R3-01：按后缀白名单过滤侧车。第三轮新增的 `<媒体>.identity.json` 与媒体
++    同名前缀、同目录，若不过滤会被下游当成视频输入（B10：真实 stage7 rc=84）。
++    """
+     import glob
++    from checkpoint import select_media_candidates
+     pattern = str(Path(temp_dir) / f"{job_id}_{_safe_input_stem(input_path)}_step{stage_num}*")
+     candidates = glob.glob(pattern)
+-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+-    return candidates
++    return [str(p) for p in select_media_candidates(candidates)]
+ 
+ 
+ # --- RV-09: 产物身份（resume 不能再"只看名字 + 能解码"）------------------
+@@ -780,6 +784,20 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
+         exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
+         if exit_code == 0:
+             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
++            # R2-07 补完：给本 stage 刚产出的中间产物登记身份（源 + 参数 + 实现）。
++            # stage7 的最终产物另有 completion marker，不重复登记。
++            if stage_num != 7:
++                try:
++                    _td = params.get("temp_dir", "./temp")
++                    for _art in find_stage_artifacts(_td, job_id, input_path,
++                                                     stage_num):
++                        record_stage_artifact_identity(
++                            _art, job, config, stage_num, input_path,
++                            job_logger)
++                except Exception as e:
++                    job_logger.warning(
++                        "STAGE_IDENTITY_SKIP",
++                        f"Could not register artifact identity: {e}")
+             # FIX-P3-6: Per v7.32 §3.8: Auto-generate forced-upscale comparison
+             # frames after stage3 AI upscale completes successfully
+             if stage_num == 3 and force_allow:
+@@ -1021,6 +1039,115 @@ def aggregate_results(results: List[Dict[str, Any]], logger=None) -> int:
+     return worst if worst > 0 else 86
+ 
+ 
++def _artifact_digest(artifact: str) -> Optional[str]:
++    """R3-06 / B08: 产物内容摘要（流式全内容 SHA-256）。
++
++    只比对 size 时，等长替换（FIRST -> OTHER）判定不出来。
++    """
++    try:
++        if not os.path.isfile(artifact):
++            return None
++        h = hashlib.sha256()
++        with open(artifact, "rb") as f:
++            for block in iter(lambda: f.read(1 << 20), b""):
++                h.update(block)
++        return h.hexdigest()
++    except Exception:
++        return None
++
++
++def intermediate_identity_path(artifact: str) -> str:
++    return str(artifact) + ".identity.json"
++
++
++def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
++                                   config: Dict[str, Any], stage_num: int,
++                                   input_path: str, logger=None) -> bool:
++    """R2-07 补完：给**每个中间产物**写身份侧车。
++
++    之前 resume 只能"按文件名找到 + 能解码"就复用（A17 复现的缺陷）。
++    现在每个 stage 成功后由调度器登记：源身份 + 有效参数身份 + 实现版本 +
++    job_id + 产物自身大小。校验发生在 resume 时（见
++    :func:`intermediate_identity_matches`）。
++    """
++    payload = {
++        "impl": VIDEO_IMPL_VERSION,
++        "job_id": job.get("job_id", ""),
++        "stage": stage_num,
++        "artifact": str(artifact),
++        "artifact_size": (os.path.getsize(artifact)
++                          if os.path.exists(artifact) else None),
++        # R3-06 / B08：只记 size 挡不住**等长替换**（实测 5 字节 FIRST→OTHER
++        # 仍判定 identity-match）。身份必须绑定**内容摘要**。
++        "artifact_digest": _artifact_digest(artifact),
++        "source_identity": build_input_identity(input_path),
++        "params_identity": build_params_identity(config, job, logger),
++        "recorded_at": datetime.now().astimezone().isoformat(),
++    }
++    try:
++        path = intermediate_identity_path(artifact)
++        tmp = path + ".tmp"
++        with open(tmp, "w", encoding="utf-8") as f:
++            json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
++        os.replace(tmp, path)
++        return True
++    except Exception as e:
++        if logger:
++            logger.warning("STAGE_IDENTITY_WRITE_FAIL",
++                           f"Could not record identity for {artifact}: {e}")
++        return False
++
++
++def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
++                                  config: Dict[str, Any],
++                                  logger=None) -> Tuple[bool, str]:
++    """R2-07 补完：这个中间产物**是不是**本次 job / 本次输入 / 本次参数产出的。
++
++    "能解码"只证明文件没坏，证明不了它属于本次任务。
++    返回 ``(ok, reason)``；侧车缺失或读不出来一律按 **unproven** 拒绝
++    （安全方向：重算，不是错配）。
++    """
++    path = intermediate_identity_path(artifact)
++    if not os.path.exists(path):
++        return False, ("intermediate has no identity sidecar (produced by an "
++                       "older implementation or an interrupted run)")
++    try:
++        with open(path, "r", encoding="utf-8") as f:
++            data = json.load(f)
++    except Exception as e:
++        return False, f"unreadable identity sidecar: {e}"
++    if str(data.get("impl", "")) != VIDEO_IMPL_VERSION:
++        return False, (f"produced by implementation {data.get('impl')!r}, "
++                       f"current is {VIDEO_IMPL_VERSION!r}")
++    if str(data.get("job_id", "")) != str(job.get("job_id", "")):
++        return False, f"belongs to job {data.get('job_id')!r}, not this one"
++    recorded_src = data.get("source_identity") or {}
++    current_src = build_input_identity(job.get("input_path", ""))
++    status = _input_identity_status(recorded_src, current_src)
++    if status == "changed":
++        return False, "source content changed since this intermediate was made"
++    if status == "unproven":
++        return False, "source identity cannot be verified for this intermediate"
++    recorded_params = data.get("params_identity")
++    if recorded_params and recorded_params != build_params_identity(
++            config, job, logger):
++        return False, "effective parameters changed since it was produced"
++    # R3-06 / B08：内容摘要必须一致（等长替换也要能发现）；
++    # 任一侧拿不到摘要 → unproven，拒绝复用。
++    recorded_digest = data.get("artifact_digest")
++    current_digest = _artifact_digest(artifact)
++    if not recorded_digest or not current_digest:
++        return False, ("artifact content digest missing on one side; refusing "
++                       "to reuse an unverified intermediate")
++    if str(recorded_digest) != str(current_digest):
++        return False, "artifact content changed since it was recorded"
++    size = data.get("artifact_size")
++    if size is not None and os.path.exists(artifact) and \
++            int(size) != os.path.getsize(artifact):
++        return False, "artifact size differs from what was recorded"
++    return True, "identity-match"
++
++
+ def _apply_startup_job_decision(manifest_path: str, job_id: str,
+                                 decision: Dict[str, Any],
+                                 expect_statuses: Optional[list],
+@@ -1067,9 +1194,13 @@ def _apply_startup_job_decision(manifest_path: str, job_id: str,
+         return False
+ 
+     try:
+-        # 写回仍在锁内，且统一走 save_manifest 入口（便于诊断与可观测性）
+-        return update_manifest_with_writer(manifest_path, mutator,
+-                                           writer=save_manifest)
++        # R3-04 / B01：**不能再把 save_manifest 当 writer 传进去**。
++        # update_manifest_with_writer 已经在锁内，而 save_manifest 内部又会去
++        # 获取同一把（非重入的）文件锁 —— 于是自己等自己超时，返回 False、
++        # 磁盘保持 PENDING、还记一条 STARTUP_DECISION_FAILED（实测 B01）。
++        # 第三轮传 save_manifest 是为了"所有写回经过同一入口"，但这在持锁
++        # 上下文中是错的。锁内必须用**不再加锁**的写入函数（默认即如此）。
++        return update_manifest_with_writer(manifest_path, mutator)
+     except Exception as e:
+         if logger:
+             logger.warning("STARTUP_DECISION_FAILED",
+@@ -1436,13 +1567,22 @@ def main():
+                 for stage_num in range(7, -1, -1):
+                     candidates = find_stage_artifacts(temp_dir, job_id, input_path,
+                                                       stage_num)
+-                    if candidates:
+-                        for cand in candidates:
+-                            if verify_ffprobe_decodeable(cand):
+-                                last_completed = stage_num
+-                                break
+-                        if last_completed >= 0:
++                    for cand in candidates:
++                        # R3-06：FAILED 恢复入口同样必须过逐产物身份门 ——
++                        # 只查"能解码"会把别的输入/参数产出的文件当成自己的成果。
++                        ok_id, why = intermediate_identity_matches(
++                            cand, job, config, logger)
++                        if not ok_id:
++                            logger.info(
++                                "RESUME_ARTIFACT_IDENTITY_REJECTED",
++                                f"Job {job_id}: {cand} cannot be bound to "
++                                f"this run ({why})", candidate=cand)
++                            continue
++                        if verify_ffprobe_decodeable(cand):
++                            last_completed = stage_num
+                             break
++                    if last_completed >= 0:
++                        break
+             if last_completed >= 0:
+                 logger.info("FAILED_DOWNGRADE",
+                            f"Job {job_id} has valid step{last_completed}, downgrading to PENDING "
+@@ -1546,10 +1686,23 @@ def main():
+                         for stage_num in range(6, -1, -1):
+                             candidates = find_stage_artifacts(temp_dir, job_id,
+                                                               input_path, stage_num)
+-                            if candidates:
+-                                if verify_ffprobe_decodeable(candidates[0]):
++                            for cand in candidates:
++                                # R2-07 补完：解码成功只说明文件没坏，
++                                # 还要证明它属于**本次**输入/参数/实现。
++                                ok_id, why = intermediate_identity_matches(
++                                    cand, job, config, logger)
++                                if not ok_id:
++                                    logger.info(
++                                        "RESUME_ARTIFACT_IDENTITY_REJECTED",
++                                        f"Job {job_id}: {cand} cannot be "
++                                        f"bound to this run ({why})",
++                                        candidate=cand)
++                                    continue
++                                if verify_ffprobe_decodeable(cand):
+                                     last_completed = stage_num
+                                     break
++                            if last_completed >= 0:
++                                break
+                     if last_completed >= 0:
+                         logger.info("RESUME_PARTIAL",
+                                    f"Job {job_id} resuming from stage {last_completed + 1}")
+@@ -1570,6 +1723,17 @@ def main():
+         except Exception as e:
+             logger.warning("RESUME_CHECK", f"Resume check skipped: {e}")
+ 
++    # R3-04 / B02：启动期的降级与 resume 决议可能已经把某些任务改成 DONE，
++    # 而 `manifest` 是本次进程开头读入的**旧快照**。若直接拿它筛选，
++    # 磁盘上已经完成的任务会被再执行一次（实测：磁盘已 DONE，
++    # process_job 仍被调用 1 次，传入的 job 还是 PENDING）。
++    # 执行列表必须来自**最新**的磁盘状态。
++    try:
++        manifest = load_manifest(manifest_path)
++    except Exception as e:
++        logger.warning("MANIFEST_REREAD_FAILED",
++                       f"Could not re-read the manifest before scheduling: {e}; "
++                       "falling back to the startup snapshot")
+     jobs = filter_jobs(manifest, target_statuses)
+     if args.job_id:
+         jobs = [j for j in jobs if j.get("job_id") == args.job_id]
+@@ -1652,12 +1816,25 @@ def main():
+     # 会被 manifest_loader 拒绝；attempt_group 只是 UUID，没有时间顺序。
+     # 必须在串行/并行两条路径**之前**完成，否则串行分支拿不到凭据。
+     run_owner = f"video-run-{os.getpid()}-{uuid.uuid4().hex[:8]}"
++    _claimed_ids = [j.get("job_id") for j in jobs]
++    if not _claimed_ids:
++        # R3-05：本次没有任务 —— 既不能领取别人的任务，也不必递增代际。
++        logger.info("RUN_CLAIM_SKIPPED",
++                    "No jobs selected for this run; not claiming anything "
++                    "and not bumping the global generation")
++        print("No jobs to process.")
++        return
+     run_generation = acquire_run_ownership(
+-        manifest_path, [j.get("job_id") for j in jobs], owner=run_owner)
++        manifest_path, _claimed_ids, owner=run_owner)
+     if run_generation is None:
++        # R3-11：领取失败意味着"结果无处可写"，必须停止，不能照常执行并报成功。
+         logger.error("RUN_CLAIM_FAILED",
+                      "Could not claim this run's jobs in the manifest; "
+                      "refusing to report success later")
++        print("ERROR: could not claim this run's jobs in the manifest; "
++              "not producing artifacts that cannot be recorded.",
++              file=sys.stderr)
++        sys.exit(82)
+ 
+     # Parallel worker pool
+     workers = max(1, args.workers)
+@@ -1711,12 +1888,20 @@ def main():
+                 except Exception as e:
+                     logger.error("WORKER_ERROR", f"Job {ctx['job']['job_id']} failed in worker: {e}")
+                     update_job_status(manifest, ctx["job"]["job_id"], "FAILED")
+-                    # FIX-V08: 锁定单任务更新，不再整份快照回写
+-                    saved = save_manifest_job_result(
++                    # R3-11：父进程兜底也必须走统一收口 ——
++                    # save_manifest_job_result 会抛异常（磁盘拒绝写入等），
++                    # 直接调用会让 WORKBENCH 的兜底自己崩掉，
++                    # 既没有 persist-failed 也没有 82。
++                    saved, save_reason = _persist_job_result(
+                         manifest_path, ctx["job"]["job_id"], "FAILED",
+                         error_message=str(e)[:2000],
+                         attempt_group=run_attempt_group,
+-                        owner=run_owner, generation=run_generation)
++                        owner=run_owner, generation=run_generation,
++                        logger=logger)
++                    if not saved:
++                        logger.error("WORKER_PERSIST_FAILED",
++                                     f"Could not record the failure of job "
++                                     f"{ctx['job']['job_id']}: {save_reason}")
+                     results.append(_result(
+                         ctx["job"]["job_id"],
+                         JOB_FAILED if saved else JOB_PERSIST_FAILED,
+diff --git a/video_restoration_pipeline/stages/stage6_grain_synthesis.py b/video_restoration_pipeline/stages/stage6_grain_synthesis.py
+index cfdb2c8..60f9c0a 100644
+--- a/video_restoration_pipeline/stages/stage6_grain_synthesis.py
++++ b/video_restoration_pipeline/stages/stage6_grain_synthesis.py
+@@ -26,7 +26,7 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+ 
+ from logger import get_logger  # noqa: E402
+-from checkpoint import wsl_redirect_path  # FIX-P9-3: WSL2 redirect per v7.32 §3.10.10
++from checkpoint import wsl_redirect_path, select_media_candidates  # FIX-P9-3 / R3-01
+ 
+ 
+ def _build_vs_script(input_source: str, vs_format: str,
+@@ -210,17 +210,17 @@ def main() -> int:
+         # aborting the whole pipeline with return 82.
+         expected_stage = "step5_face"
+         pattern5 = f"{job_id}_{input_name}_step5_face*"
+-        candidates = glob.glob(os.path.join(temp_dir, pattern5))
+-        if candidates:
+-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+-            input_source = candidates[0]
++        # R3-01：只接受媒体产物，排除同前缀侧车
++        cands = select_media_candidates(glob.glob(os.path.join(temp_dir, pattern5)))
++        if cands:
++            input_source = str(cands[0])
+         if not input_source:
+             # Fallback to stage4 output
+             pattern4 = f"{job_id}_{input_name}_step4_postprocess*"
+-            candidates4 = glob.glob(os.path.join(temp_dir, pattern4))
+-            if candidates4:
+-                candidates4.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+-                input_source = candidates4[0]
++            cands4 = select_media_candidates(
++                glob.glob(os.path.join(temp_dir, pattern4)))
++            if cands4:
++                input_source = str(cands4[0])
+                 expected_stage = "step4_postprocess(fallback)"
+                 logger.warning("STAGE6_FALLBACK_STEP4",
+                                "face_restore enabled but no stage5 output "
+@@ -236,10 +236,10 @@ def main() -> int:
+         # Face restore disabled: MUST use stage4 output
+         expected_stage = "step4_postprocess"
+         pattern = f"{job_id}_{input_name}_step4_postprocess*"
+-        candidates = glob.glob(os.path.join(temp_dir, pattern))
+-        if candidates:
+-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+-            input_source = candidates[0]
++        # R3-01：只接受媒体产物，排除同前缀侧车
++        cands = select_media_candidates(glob.glob(os.path.join(temp_dir, pattern)))
++        if cands:
++            input_source = str(cands[0])
+         if not input_source:
+             logger.error("STAGE6_INPUT_ERROR",
+                         f"No stage4 output found. Expected pattern: {pattern}",
+diff --git a/video_restoration_pipeline/stages/stage7_encode.py b/video_restoration_pipeline/stages/stage7_encode.py
+index 976ac2c..7064e15 100644
+--- a/video_restoration_pipeline/stages/stage7_encode.py
++++ b/video_restoration_pipeline/stages/stage7_encode.py
+@@ -26,7 +26,8 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+ 
+ from logger import get_logger  # noqa: E402
+-from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
++from checkpoint import (wsl_redirect_path, wsl_copy_back,
++                        select_media_candidates)  # noqa: E402
+ 
+ 
+ def _get_audio_layout(audio_path: str) -> dict:
+@@ -52,6 +53,11 @@ def _get_audio_layout(audio_path: str) -> dict:
+     return {"channels": 2, "layout": "stereo"}
+ 
+ 
++#: 逐声道 arnndn 支持的声道数上限。超过这个数（罕见的多声道素材）退回
++#: afftdn，因为每组都要起一个 arnndn 实例，实例数与声道数成正比。
++_MAX_PER_CHANNEL_ARNNDN = 8
++
++
+ def _arnndn_filters(model: str, audio_layout: dict, escape,
+                     logger=None) -> List[str]:
+     """R2-10: build the arnndn filter chain **without merging channels**.
+@@ -71,8 +77,8 @@ def _arnndn_filters(model: str, audio_layout: dict, escape,
+     采用逐声道方案而不是"直接喂立体声"，因为后者依赖 arnndn 对多声道的支持，
+     各版本不一致；channelsplit 保证每个分支拿到的都是单声道，行为稳定。
+ 
+-    >2 声道：逐声道 arnndn **未实现**（需要按 layout 生成 N 组标签，本机无
+-    5.1 素材可验证），改用 afftdn（其内部按声道处理）并明确记录降级原因。
++    >2 声道：第三轮已实现逐声道处理（实测 5.1 rc=0 且六声道仍互不相同）。
++    仅当声道数超过 `_MAX_PER_CHANNEL_ARNNDN`(8) 时才退回 afftdn 并记降级原因。
+     """
+     layout = (audio_layout or {}).get("layout", "stereo")
+     channels = int((audio_layout or {}).get("channels", 1) or 1)
+@@ -81,11 +87,24 @@ def _arnndn_filters(model: str, audio_layout: dict, escape,
+     if channels <= 1:
+         return [f"arnndn=m={arg}"]
+ 
+-    if channels == 2:
+-        return [f"channelsplit=channel_layout={layout}[_dnL][_dnR];"
+-                f"[_dnL]arnndn=m={arg}[_dnLo];"
+-                f"[_dnR]arnndn=m={arg}[_dnRo];"
+-                f"[_dnLo][_dnRo]join=inputs=2:channel_layout={layout}"]
++    if channels <= _MAX_PER_CHANNEL_ARNNDN:
++        # 任意声道数都按"逐声道"处理：split → 每个声道各自 arnndn → join 回原布局。
++        # 第三轮实测（合成 5.1，六声道各放 220/330/440/550/660/770 Hz）：
++        # rc=0，处理后 6 个声道**仍两两不同**（未发生合并）。
++        labels = [f"_dn{i}" for i in range(channels)]
++        outs = [f"{lab}o" for lab in labels]
++        chain = (
++            f"channelsplit=channel_layout={layout}"
++            + "".join(f"[{lab}]" for lab in labels) + ";"
++            + "".join(f"[{lab}]arnndn=m={arg}[{out}];"
++                      for lab, out in zip(labels, outs))
++            + "".join(f"[{out}]" for out in outs)
++            + f"join=inputs={channels}:channel_layout={layout}")
++        if logger:
++            logger.info("STAGE7_ARNNDN_PER_CHANNEL",
++                        "arnndn applied per channel (no downmix)",
++                        channels=channels, layout=layout)
++        return [chain]
+ 
+     if logger:
+         logger.warning("STAGE7_ARNNDN_MULTICHANNEL_DEGRADED",
+@@ -349,11 +368,15 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
+                                    "allow_audio_degrade is set",
+                                    model=arnndn_model)
+             else:
++                # R3-08 / B12：明确要求的算法不可用且**不许降级** ——
++                # 只记日志等于没失败（实测：日志出现 STAGE7_DENOISE_UNAVAILABLE
++                # 之后照样 STAGE7_DONE、rc=0）。必须把结果传回主流程。
+                 if logger:
+                     logger.error("STAGE7_DENOISE_UNAVAILABLE",
+                                  "arnndn requested but model not found and no "
+-                                 "degradation is authorized; skipping denoise",
++                                 "degradation is authorized; failing the stage",
+                                  model=arnndn_model)
++                return "__DENOISE_UNAVAILABLE__"
+         else:  # "auto"
+             if model_exists:
+                 audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
+@@ -614,6 +637,11 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
+         # 即所选抖动**确实改变了最终像素**。能确定的是像素层面可观察到差异；
+         # 其内部作用点（zscale 内还是相邻 format 滤镜协商后）未进一步拆解，
+         # 不作为结论。日志只陈述事实，不再声称"无效"。
++        # R3-12 措辞修正：第二轮写的是"dither 不作用于降位深"（错），
++        # 第三轮改成了"降位深由 zscale 之后的 format 滤镜完成"（也不严谨 ——
++        # zscale 的输出格式由**相邻滤镜协商**决定，它会按协商结果执行转换，
++        # 见 FFmpeg zscale 文档）。这里只陈述**实测事实**，不再断言
++        # "转换发生在哪个滤镜内部"。
+         reason = _zscale_probe("format=yuv444p10")
+         filters.append(f"zscale=rangein=limited:range=limited:dither={dither}")
+         filters.append("format=yuv444p10")
+@@ -621,11 +649,13 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
+             logger.warning(
+                 "STAGE7_DITHER_FALLBACK_CHAIN",
+                 "This ffmpeg's zscale has no 'format' option "
+-                f"(probe: {reason}); the 16→10 bit reduction is done by the "
+-                "format filter after zscale. The requested dither still changes "
+-                "the output pixels (measured: ordered/error_diffusion differ "
+-                "from none), but the reduction itself is not performed inside "
+-                "zscale", dither=dither, zscale_format_probe=reason)
++                f"(probe: {reason}); the 16→10 bit reduction happens on the "
++                "format negotiated between zscale and the following format "
++                "filter. Measured: the requested dither DOES change the output "
++                "pixels (ordered/error_diffusion differ from none), so dither "
++                "is effective here; which filter performs the reduction "
++                "internally is not asserted.", dither=dither,
++                zscale_format_probe=reason)
+     filters.append("format=yuv420p10le")
+     return filters
+ 
+@@ -681,13 +711,99 @@ def _get_source_color_info(video_path: str) -> tuple:
+     return "limited", "NTSC", False, False
+ 
+ 
++def _probe_encoder_priming(path: str, stream_type: str = "a") -> float:
++    """Return the encoder's declared priming (seconds, >= 0) for a stream.
++
++    第三轮实测拆解 66/86ms 残差：AAC 编码器插入
++    ``initial_padding = 1024`` 样本。44.1kHz 下 = **23.22ms**，ffprobe 因此把
++    音频流的 ``start_time`` 报成 **-0.023** —— 这是编码器 priming，
++    播放器靠 edit list / skip_samples 跳过它，**听感上并不偏移**。
++    若不归一，一个真实的内容偏移会被这段 priming 掩盖（交接明确禁止
++    "把所有起点强制归零来隐藏内容偏移"，这里是按编码器声明值归一，
++    不是强制归零，且 end_diff / 漂移两个独立判据仍然保留）。
++    """
++    if stream_type != "a":
++        return 0.0
++    try:
++        # 必须按**字段名**取值：`nokey=1` 的输出顺序不保证等于请求顺序。
++        # 第一版按位置读，把 (sample_rate, initial_padding) 读成了
++        # (padding, rate) = (44100, 1024)，算出 43.07 秒的"priming"，
++        # 于是同步门把正常产物判成 43 秒错位（自测暴露）。
++        r = subprocess.run(
++            ["ffprobe", "-v", "error", "-select_streams", "a:0",
++             "-show_entries", "stream=initial_padding,sample_rate",
++             "-of", "json", path],
++            capture_output=True, text=True, timeout=30, shell=False)
++        if r.returncode != 0:
++            return 0.0
++        streams = (json.loads(r.stdout or "{}").get("streams") or [])
++        if not streams:
++            return 0.0
++        stream = streams[0]
++        padding = stream.get("initial_padding")
++        rate = stream.get("sample_rate")
++        if padding is None or rate is None:
++            return 0.0
++        padding = float(padding)
++        rate = float(rate)
++        if rate <= 0:
++            return 0.0
++        return max(0.0, padding / rate)
++    except Exception:
++        return 0.0
++
++
++def _source_has_audio_stream(path: str) -> bool:
++    """R3-08 / B11: does the **source** file have an audio stream?
++
++    "temp 里没有中间音轨"不能等同于"原片没有音轨"。B11 实测：源片明确含
++    PCM 音轨，只因 temp 里没有 `.mka`，stage7 就记 "Source has no audio
++    stream" 并加 `-an`，产物是静音视频且 rc=0。
++    """
++    try:
++        r = subprocess.run(
++            ["ffprobe", "-v", "error", "-select_streams", "a:0",
++             "-show_entries", "stream=codec_type",
++             "-of", "default=noprint_wrappers=1:nokey=1", path],
++            capture_output=True, text=True, timeout=30, shell=False)
++        return r.returncode == 0 and bool((r.stdout or "").strip())
++    except Exception:
++        return False
++
++
++def _extract_audio_from_source(source: str, dest: str, logger=None) -> Optional[str]:
++    """R3-08 / B11: extract the audio track straight from the source file."""
++    try:
++        import os as _os
++        _os.makedirs(str(Path(dest).parent), exist_ok=True)
++        r = subprocess.run(
++            ["ffmpeg", "-v", "error", "-y", "-i", source, "-vn",
++             "-c:a", "pcm_s16le", dest],
++            capture_output=True, text=True, timeout=120, shell=False)
++        if r.returncode != 0 or not _os.path.isfile(dest) or \
++                _os.path.getsize(dest) == 0:
++            return None
++        return dest
++    except Exception as e:
++        if logger:
++            logger.warning("STAGE7_AUDIO_EXTRACT_FAIL",
++                           f"Could not extract audio from the source: {e}")
++        return None
++
++
+ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
+-    """Return a stream's start time in seconds, or None.
++    """Return a stream's **raw** start time in seconds, or None.
+ 
+     R2-11：同步不能只比"时长"。MKV 的 `stream=start_time` 能真实反映
+     `-itsoffset` 造成的偏移（实测：video 0.000000 / audio 1.000000），
+     比逐 packet 便宜得多，因此作为首选；拿不到时再退回 packet 首时间戳。
++
++    R3-10：这里返回的是**原始**起点（含编码器 priming 的负值）。
++    第三轮曾在这里直接把 priming 加进去，导致后面 `end = start + span`
++    把末端也整体平移 —— 原始 packet 区间与"有效内容区间"混在一起。
++    现在由调用方（:func:`_validate_av_sync`）显式区分两者。
+     """
++
+     try:
+         r = subprocess.run(
+             ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+@@ -777,14 +893,30 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
+                        "source has no audio)")
+         return 0
+ 
++    # 编码器 priming（AAC 常见 1024 样本）：说明"容器时长膨胀"中有多少是
++    # 编码固有、不是内容错位。start 用它归一，end/跨度用原始区间，两者分开。
++    priming_ms = _probe_encoder_priming(muxed_path, "a") * 1000
++
+     intervals = {}
+     for st in ("v", "a"):
+-        start = _probe_stream_start(muxed_path, st)
++        raw_start = _probe_stream_start(muxed_path, st)
+         span = _get_stream_duration(muxed_path, st)
+-        if start is None or not span:
++        if raw_start is None or not span:
+             intervals[st] = None
+         else:
+-            intervals[st] = (start, start + span)
++            # R3-10：明确区分两种区间，不再把 priming 混进末端。
++            #   * raw 区间：[raw_start, raw_start + span] —— 用于末端与跨度判定；
++            #   * content 起点：raw_start + priming —— 用于起点判定
++            #     （编码器声明的 priming 会被播放器丢弃，不是内容偏移）。
++            # 第三轮把 priming 加进 start 后又用它拼 end，末端被整体平移了。
++            priming = _probe_encoder_priming(muxed_path, st)
++            intervals[st] = {
++                "raw_start": raw_start,
++                "raw_end": raw_start + span,
++                "raw_span": span,
++                "content_start": raw_start + priming,
++                "priming": priming,
++            }
+ 
+     if intervals.get("v") is None or intervals.get("a") is None:
+         logger.error("STAGE7_SYNC_UNMEASURABLE",
+@@ -794,19 +926,23 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
+                      audio_interval=intervals.get("a"))
+         return 86
+ 
+-    v_start, v_end = intervals["v"]
+-    a_start, a_end = intervals["a"]
++    v = intervals["v"]
++    a = intervals["a"]
++    v_start, a_start = v["content_start"], a["content_start"]
++    v_end, a_end = v["raw_end"], a["raw_end"]
+     start_diff = abs(v_start - a_start)
+     end_diff = abs(v_end - a_end)
+-    dur_diff = abs((v_end - v_start) - (a_end - a_start))
++    dur_diff = abs(v["raw_span"] - a["raw_span"])
+     diff_ms = max(start_diff, end_diff, dur_diff) * 1000
+ 
+     def _detail():
+-        return dict(video_start=v_start, video_end=v_end,
+-                    audio_start=a_start, audio_end=a_end,
++        return dict(video_content_start=v_start, video_raw_end=v_end,
++                    audio_content_start=a_start, audio_raw_end=a_end,
++                    video_raw_span=v["raw_span"], audio_raw_span=a["raw_span"],
+                     start_diff_ms=start_diff * 1000,
+                     end_diff_ms=end_diff * 1000,
+-                    duration_drift_ms=dur_diff * 1000)
++                    duration_drift_ms=dur_diff * 1000,
++                    encoder_priming_ms=priming_ms)
+ 
+     if diff_ms > 500:
+         logger.error("STAGE7_SYNC_FAIL",
+@@ -858,9 +994,9 @@ def main():
+                 "step2_traditional*", "step1_preprocess*"]:
+         pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
+         # ORIGINAL: glob.glob(os.path.join(temp_dir, pattern))
+-        candidates = list(Path(temp_dir).glob(pattern))
++        # R3-01：只接受媒体产物，排除同前缀的身份/契约/状态侧车（B10）
++        candidates = select_media_candidates(Path(temp_dir).glob(pattern))
+         if candidates:
+-            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+             input_source = str(candidates[0])
+             break
+ 
+@@ -1151,6 +1287,12 @@ def main():
+         if audio_filter == "__INVALID_TEMPO__":
+             logger.error("STAGE7_AUDIO_FAIL", "Invalid tempo ratio, cannot process audio")
+             return 86
++        # R3-08 / B12：明确要求的降噪算法不可用且不许降级 -> 阻断
++        if audio_filter == "__DENOISE_UNAVAILABLE__":
++            logger.error("STAGE7_DENOISE_FAIL",
++                         "Required denoise algorithm is unavailable and "
++                         "degradation is not authorized")
++            return 86
+ 
+         multichannel_preserve = params.get("multichannel_preserve", True)
+         if multichannel_preserve and channels > 2:
+@@ -1182,9 +1324,61 @@ def main():
+             if audio_bitrate:
+                 output_opts.extend(["-b:a", audio_bitrate])
+     else:
+-        # FIX-P7-8: Log when source has no audio stream
+-        logger.info("STAGE7_NO_AUDIO", "Source has no audio stream, outputting video only")
+-        output_opts.append("-an")
++        # R3-08 / B11：**缺临时音轨 ≠ 原片没有音轨**。
++        # 旧实现只检查 temp 里的中间音轨，缺了就记"Source has no audio stream"
++        # 并加 `-an` —— 实测源片明确含 PCM 音轨，产物却被 ffprobe 读成
++        # `streams=[]`（静音视频），stage7 仍 rc=0。
++        # 现在先核对源片本身：源片有声 → 直接从源片提取音轨；
++        # 提取也失败 → 按 allow_silent_output 决定，默认**不允许**静默丢音轨。
++        source_has_audio = _source_has_audio_stream(args.input)
++        if source_has_audio:
++            logger.warning("STAGE7_AUDIO_INTERMEDIATE_MISSING",
++                           "No intermediate audio track in temp, but the "
++                           "source has an audio stream; extracting it from "
++                           "the source instead of dropping audio",
++                           source=args.input)
++            extracted = _extract_audio_from_source(
++                args.input, str(Path(temp_dir) / f"{job_id}_{input_name}.mka"),
++                logger)
++            if extracted:
++                audio_path = extracted
++                audio_layout = _get_audio_layout(audio_path)
++                audio_filter = _build_audio_filter(
++                    audio_path, params, logger, tempo_ratio=tempo_ratio,
++                    audio_layout=audio_layout)
++                if audio_filter == "__INVALID_TEMPO__":
++                    logger.error("STAGE7_AUDIO_FAIL",
++                                 "Invalid tempo ratio, cannot process audio")
++                    return 86
++                if audio_filter == "__DENOISE_UNAVAILABLE__":
++                    logger.error("STAGE7_DENOISE_FAIL",
++                                 "Required denoise algorithm is unavailable "
++                                 "and degradation is not authorized")
++                    return 86
++                video_cmd.extend(["-i", audio_path])
++                output_opts.extend([
++                    "-af", audio_filter,
++                    "-map", "0:v:0",
++                    "-map", "1:a:0",
++                ])
++                output_opts.extend(["-c:a", params.get("audio_codec", "aac"),
++                                    "-b:a",
++                                    params.get("audio_bitrate", "320k")])
++            elif not params.get("allow_silent_output", False):
++                logger.error("STAGE7_AUDIO_REQUIRED_FAIL",
++                             "The source has audio but no usable audio track "
++                             "could be prepared; refusing to publish a silent "
++                             "video (set allow_silent_output=true to accept)")
++                return 86
++            else:
++                logger.warning("STAGE7_SILENT_OUTPUT_ALLOWED",
++                               "Publishing without audio because "
++                               "allow_silent_output=true")
++                output_opts.append("-an")
++        else:
++            logger.info("STAGE7_NO_AUDIO",
++                        "Source has no audio stream, outputting video only")
++            output_opts.append("-an")
+ 
+     # Color metadata (v6.3: double marking)
+     # SVT-AV1 uses numeric values, not string names
