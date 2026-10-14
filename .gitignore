@@ -33,3 +33,6 @@ CLAUDE.md
 !readme.md
 !PROJECT_MANUAL.md
 !architecture.md
+# 第四轮：真实环境依赖（工具与venv，体积大，不入库）
+tools_r4/
+.venv_r4/

@@ -14,6 +14,7 @@ import json
 import logging
 import subprocess
 from pathlib import Path
+from typing import Any, Dict, Optional  # R4: 真实运行时 NameError: Dict 未导入
 
 
 def run_exiftool(input_path: str) -> Dict[str, str]:

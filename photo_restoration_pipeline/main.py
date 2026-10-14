@@ -319,6 +319,14 @@ def _run_stage(script_name: str,
 
     # BUG-057 fix: if params JSON exceeds ~30000 chars,
     # write to temp file
+    # R4: 重试标记放进 params（而不是未定义的 `--is-retry` 开关）——
+    # 见下方 `_is_retry` 的说明，必须在 params_json 生成**之前**设置。
+    if is_retry:
+        try:
+            params = dict(params or {})
+            params["_is_retry"] = True
+        except Exception:
+            pass
     params_json = json.dumps(params)
     params_file_path = None
     if len(params_json) > 30000:
@@ -348,8 +356,9 @@ def _run_stage(script_name: str,
             "--config", config_path,
             "--params", params_json,
         ]
+    # R4: 上面的 params 已带 `_is_retry`，这里不需要再追加命令行开关。
     if is_retry:
-        cmd.append("--is-retry")
+        pass
 
     # Dynamic timeout calculation
     timeout = _calculate_timeout(
