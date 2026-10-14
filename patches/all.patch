@@ -6343,10 +6343,10 @@ index 0000000..352ad86
 +    assert a["impl"] == s5.STAGE5_IMPL_VERSION
 diff --git a/tests/test_rv_round2.py b/tests/test_rv_round2.py
 new file mode 100644
-index 0000000..2cba651
+index 0000000..37eee97
 --- /dev/null
 +++ b/tests/test_rv_round2.py
-@@ -0,0 +1,2059 @@
+@@ -0,0 +1,2183 @@
 +"""第二轮复核 RV-01 … RV-14 的反例回归测试。
 +
 +设计原则（来自复核报告 §5）：
@@ -8406,6 +8406,130 @@ index 0000000..2cba651
 +    assert worst < 0.15, (
 +        f"经过真实 stage7 后，flash 与 click 的最大时间差 {worst:.3f}s "
 +        f"超过 150ms（video={v_events} audio={a_events}）")
++
++
++# ---------------------------------------------------------------------------
++# 第四轮交付要求：阶段衔接 / 正式 CLI 联动 / 真实产物并发归属
++# ---------------------------------------------------------------------------
++
++def test_r301_stage_artifact_roundtrip_not_confused_by_sidecars(tmp_path):
++    """阶段衔接：**stage 产物 → 登记侧车 → 下游消费 → 清理** 全链路。
++
++    B10 只证明了"stage7 不被侧车骗到"；这条把调度器侧也纳入：
++    登记会产生侧车，下游枚举必须仍然只看媒体，清理时两者一起消失。
++    """
++    import checkpoint
++    temp = tmp_path / "temp"
++    temp.mkdir()
++    src = tmp_path / "src.mkv"
++    src.write_bytes(b"SOURCE")
++    art = temp / "j1_src_step6_grain.mkv"
++    art.write_bytes(b"MEDIA-CONTENT")
++    job = {"job_id": "j1", "input_path": str(src)}
++
++    # 1) 登记侧车
++    assert vmain.record_stage_artifact_identity(str(art), job, {}, 6, str(src))
++    sidecar = vmain.intermediate_identity_path(str(art))
++    assert os.path.exists(sidecar)
++
++    # 2) 下游枚举不得选中侧车，且仍能选中媒体
++    found = vmain.find_stage_artifacts(str(temp), "j1", str(src), 6)
++    assert found == [str(art)], f"下游枚举选中了非媒体文件：{found}"
++
++    # 3) 侧车必须与媒体匹配（同一输入/参数下）
++    ok, _why = vmain.intermediate_identity_matches(str(art), job, {})
++    assert ok, "刚登记的身份却在校验时被拒"
++
++    # 4) 清理：媒体与侧车一起消失，不留孤儿 JSON
++    checkpoint.cleanup_all_intermediates(str(temp), "j1")
++    assert not art.exists()
++    assert not os.path.exists(sidecar), "媒体已删但侧车残留（孤儿 JSON）"
++    assert not any(p.suffix == ".json" for p in temp.iterdir()), \
++        "清理后仍有 JSON 残留"
++
++
++def test_r304_startup_decision_prevents_reexecution(tmp_path, monkeypatch):
++    """正式 CLI 联动：启动期把任务判成 DONE 后，不得再执行它。
++
++    B02 用受控替换隔离了根因；这条跑**真正的 vmain.main()**，
++    验证"重新读取 manifest"这条修复在实际调度路径上生效。
++    """
++    path = _cli_env(tmp_path, monkeypatch, 0)
++
++    # 启动期决议（与 resume/FAILED 降级同一入口）把它置为 DONE
++    assert vmain._apply_startup_job_decision(
++        path, "j1", {"status": "DONE"}, ["PENDING"]), \
++        "启动期决议没有写成功"
++
++    calls = []
++
++    def process(job, *_a, **_k):
++        calls.append(dict(job))
++        return 0, ""
++
++    monkeypatch.setattr(vmain, "process_job", process)
++    try:
++        vmain.main()
++    except SystemExit:
++        pass
++    assert calls == [], f"磁盘已 DONE 的任务仍被送进 process_job：{calls}"
++
++
++def _contend_artifact_worker(path, owner, artifact, barrier):
++    """子进程：争抢同一 job，并把**自己的 owner 写进真实产物**。"""
++    import conftest  # noqa: F401
++    import manifest_loader as m
++
++    barrier.wait()
++    gen = m.acquire_run_ownership(path, owner=owner)
++    if gen is None:
++        return None
++    # 真实产物：内容标出是谁写的
++    tmp = artifact + f".{owner}.tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(f"PRODUCED-BY-{owner}")
++    import os as _os
++    _os.replace(tmp, artifact)
++    m.save_manifest_job_result(path, "j1", "DONE", owner=owner,
++                               generation=gen)
++    return owner
++
++
++def test_r204_contending_workers_artifact_belongs_to_winner(tmp_path):
++    """真实产物归属：并发争抢后，磁盘上的产物必须属于胜出的 owner。
++
++    已有的 `..._stay_consistent` 只验证 manifest 字段；评估指出那不足以
++    证明**真实媒体产物**与合法 owner 一致。这条让每个 worker 把可识别的
++    内容写进产物，最后核对"文件里的 owner == manifest 里的 owner"。
++    """
++    import multiprocessing
++
++    path = _manifest_with_jobs(tmp_path / "m.yaml", ["j1"])
++    artifact = str(tmp_path / "j1_product.bin")
++
++    workers = 4
++    ctx = multiprocessing.get_context("spawn")
++    barrier = ctx.Barrier(workers)
++    procs = []
++    for i in range(workers):
++        p = ctx.Process(target=_contend_artifact_worker,
++                        args=(path, f"w{i}", artifact, barrier))
++        p.start()
++        procs.append(p)
++    for p in procs:
++        p.join(timeout=180)
++        assert p.exitcode == 0, f"worker 失败：exitcode={p.exitcode}"
++
++    final = ml.load_manifest(path)
++    job = final["jobs"][0]
++    assert job["status"] == "DONE"
++    owner = str(job.get("run_owner"))
++
++    with open(artifact, encoding="utf-8") as f:
++        content = f.read()
++    assert content == f"PRODUCED-BY-{owner}", (
++        f"产物内容（{content}）与 manifest 记录的 owner（{owner}）不一致 —— "
++        "最终文件不是合法 owner 产出的")
 diff --git a/tests/test_stage6_encode_contract.py b/tests/test_stage6_encode_contract.py
 new file mode 100644
 index 0000000..80aae5a
