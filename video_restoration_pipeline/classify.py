@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple  # R4: 真实运行时 NameError: Dict/Any/Tuple 未导入
 
 import numpy as np
 

@@ -25,6 +25,7 @@ import subprocess
 import shutil
 import re
 from pathlib import Path
+from typing import Optional  # R4: 真实运行时 NameError: Optional 未导入
 
 import numpy as np
 
@@ -274,6 +275,48 @@ def _validate_gmic_path(path: str, wl_re) -> str:
     return p
 
 
+_GMIC_MAJOR_CACHE: dict = {}
+
+
+def _gmic_major_version() -> Optional[int]:
+    """Return the installed G'MIC major version, or None when unknown.
+
+    R4：G'MIC 4.0 起 **`-type` 命令被移除**（实测 4.0.5：
+    `Unknown command or filename '-type'`），且像素类型名从 `ushort` 改为
+    `uint16`。而在 3.x 里 `-type ushort` 是标准写法。
+    版本差异必须探测而不是猜，否则换台机器就会挂。
+    """
+    if "major" in _GMIC_MAJOR_CACHE:
+        return _GMIC_MAJOR_CACHE["major"]
+    major = None
+    try:
+        r = subprocess.run(["gmic", "-version"], capture_output=True,
+                           text=True, timeout=30, shell=False)
+        out = (r.stdout or "") + "\n" + (r.stderr or "")
+        m = re.search(r"G'MIC interpreter \(v\.(\d+)\.", out) or \
+            re.search(r"[Vv]ersion:?\s*(\d+)\.(\d+)", out)
+        if m:
+            major = int(m.group(1))
+    except Exception:
+        major = None
+    _GMIC_MAJOR_CACHE["major"] = major
+    return major
+
+
+def _gmic_16bit_output_args(output_path: str) -> list:
+    """R4: build the G'MIC args that produce a 16-bit output file.
+
+    实测（G'MIC 4.0.5）：
+      * `-o X.tif` 默认输出 **float32**（不符合 16-bit 处理要求）；
+      * `-o X.tif,uint16` 输出 **uint16** ✅
+      * `-type ushort` 已移除。
+    G'MIC 3.x 仍用 `-type ushort`。因此按版本选择，两者都能跑通。
+    """
+    if (_gmic_major_version() or 3) >= 4:
+        return ["-o", f"{output_path},uint16"]
+    return ["-type", "ushort", "-o", output_path]
+
+
 def run_gmic(input_path: str, output_path: str, *gmic_args,
              params: dict = None) -> tuple:
     """Run G'MIC with shell=False safety.
@@ -290,7 +333,11 @@ def run_gmic(input_path: str, output_path: str, *gmic_args,
         return False, str(e)
     cmd = ["gmic", safe_in]
     cmd.extend(list(gmic_args))
-    cmd.extend(["-o", safe_out])
+    # R4：输出也必须显式指定 16-bit。G'MIC 4.x 的 `-o` 若不指定像素类型会写出
+    # **float32 TIFF**，而 Pillow 读不了 float TIFF —— 实测表现为
+    # `UnidentifiedImageError` → OUTPUT_CORRUPT → 阻塞后续 AI 阶段。
+    # 3.x 默认沿用输入类型，所以这个问题只在升级后暴露。
+    cmd.extend(_gmic_16bit_output_args(safe_out))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=False)
         if r.returncode != 0 and r.stderr:
@@ -1082,12 +1129,9 @@ def main():
 
     # BUG-049 fix: Explicitly check gmic returncode
     try:
-        r = subprocess.run(
-            ["gmic", working_input,
-             "-type", "ushort",
-             "-o", working_path],
-            capture_output=True, timeout=120, shell=False
-        )
+        # R4：`-type ushort` 在 G'MIC 4.x 已移除，改为按版本选择 16-bit 输出写法
+        cmd = ["gmic", working_input] + _gmic_16bit_output_args(working_path)
+        r = subprocess.run(cmd, capture_output=True, timeout=120, shell=False)
         if r.returncode != 0:
             stderr = (r.stderr or b"").decode("utf-8", errors="replace")[:500]
             logger.error("STAGE1_CONVERT_FAIL", f"gmic exited with code {r.returncode}: {stderr}")
