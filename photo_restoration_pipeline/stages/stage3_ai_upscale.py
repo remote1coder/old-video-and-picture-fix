@@ -133,6 +133,40 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
         safe_model_path = json.dumps(model_path)
         safe_input_path = json.dumps(input_path)
         safe_output_path = json.dumps(output_path)
+        # R4: 必须**显式构造架构**再传给 RealESRGANer。
+        # 实测（realesrgan 0.3.0）：不传 model= 时自动推断对
+        # realesr-general-x4v3 返回 None，随后
+        # `None.load_state_dict(...)` -> AttributeError，
+        # 而这里 `except Exception: return False` 会把它**完全吞掉**，
+        # 表现为 primary 与所有 fallback 都"静默失败"，
+        # 最终输出未经超分的传统结果（真实素材仍是 240x320）。
+        # realesr-general 是 4× 的 SRVGGNetCompact，需按 netscale=4 推理
+        # 再下采样到目标倍数（v7.32 §3.1 / FIX-P1-15）。
+        family_now = _get_model_basename(model)
+        if family_now == "realesr-general":
+            netscale = 4
+            arch_code = (
+                "from realesrgan.archs.srvgg_arch import SRVGGNetCompact; "
+                "net = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, "
+                "num_feat=64, num_conv=32, upscale=4, act_type='prelu')")
+        else:
+            netscale = scale
+            arch_code = (
+                "from basicsr.archs.rrdbnet_arch import RRDBNet; "
+                f"net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, "
+                f"num_block=23, num_grow_ch=32, scale={scale})")
+        # 推理倍数与目标倍数不同时，用 Lanczos 下采样到目标尺寸
+        if netscale != scale:
+            resample_code = (
+                f"if output.shape[0] and {netscale} != {scale}:\n"
+                f"    from PIL import Image as _I; "
+                f"_h, _w = output.shape[:2]; "
+                f"output = np.array(_I.fromarray(output).resize("
+                f"(_w * {scale} // {netscale}, _h * {scale} // {netscale}), "
+                f"_I.LANCZOS))\n"
+            )
+        else:
+            resample_code = ""
         # FIX-P12-3: 16-bit output save logic
         # FIX-P12-6: PIL I;16 only supports 2D arrays; for 3-channel 16-bit,
         # use tifffile to save as TIFF (PIL cannot save RGB uint16 directly).
@@ -152,20 +186,42 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
         ) if bit_depth == 16 else f"Image.fromarray(output).save({safe_output_path})"
         cmd = [
             sys.executable, "-c",
-            f"from realesrgan import RealESRGANer; "
-            f"from basicsr.utils.download_util import load_file_from_url; "
-            f"import torch; "
-            f"model = RealESRGANer(scale={scale}, model_path={safe_model_path}, "
-            f"prepad=10, half={'False' if not use_gpu else 'not torch.cuda.is_available()'}); "
-            f"from PIL import Image; "
-            f"img = Image.open({safe_input_path}).convert('RGB'); "
-            f"import numpy as np; "
-            f"output, _ = model.enhance(np.array(img)); "
-            f"{save_code}",
+            # R4：**必须用换行，不能用 `;` 串成一行**。
+            # Python 语法不允许在分号后接复合语句（if / for / try）：
+            # `x=1; if True: pass` 直接 SyntaxError。
+            # 而下面的 resample / save 都含 if / try，于是整个子程序
+            # 一直是语法错误 —— 这就是"AI 后端全部静默失败"的真正原因
+            # （真实素材跑出来仍是没有超分的 240x320）。
+            chr(10).join([
+                "from realesrgan import RealESRGANer",
+                "from basicsr.utils.download_util import load_file_from_url",
+                "import torch",
+                arch_code,
+                f"model = RealESRGANer(scale={netscale}, "
+                f"model_path={safe_model_path}, model=net, "
+                f"pre_pad=10, "
+                f"half={'False' if not use_gpu else 'not torch.cuda.is_available()'})",
+                "from PIL import Image",
+                "import numpy as np",
+                f"img = Image.open({safe_input_path}).convert('RGB')",
+                "output, _ = model.enhance(np.array(img))",
+                resample_code,
+                save_code,
+            ]),
         ]
         r = subprocess.run(cmd, capture_output=True, timeout=1800, shell=False)
+        if r.returncode != 0:
+            # R4: 不能静默吞掉。子进程的报错是唯一能定位"AI 全部失败"的线索。
+            # 取 **尾部**：Python traceback 在末尾，取开头只会被命令本身占满
+            # （这次就是因此白跑了好几轮）。
+            _err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            sys.stderr.write(
+                "RealESRGAN python backend failed "
+                f"(model={model}): {_err[-800:]}\n")
         return r.returncode == 0
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(
+            f"RealESRGAN python backend error (model={model}): {e}\n")
         return False
 
 
@@ -818,7 +874,13 @@ def main():
                 break
 
     if success and os.path.exists(output_file):
-        import shutil
+        # R4: 这里原来有一句**函数内** `import shutil`，它会让 shutil 成为本函数的
+        # 局部变量并遮蔽文件顶部（第 19 行）的全局 import。于是当 AI 全部失败、
+        # 走到"回退输出传统结果"分支（下面的 shutil.copyfile）时，
+        # 该局部变量尚未绑定 → UnboundLocalError: cannot access local variable
+        # 'shutil' where it is not associated with a value
+        # （真实素材跑 AI 链必现，且掩盖了 AI 后端失败的真正原因）。
+        # 顶部已有 import shutil，直接删掉局部 import 即可。
         # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
         shutil.copyfile(output_file, output_path)
         logger.info("STAGE3_DONE", "Upscale complete",
