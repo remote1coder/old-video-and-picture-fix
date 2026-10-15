@@ -288,7 +288,28 @@ def run_stage2_ai_pre(input_path: str, output_path: str,
     ref_ch = linear[:, :, ref_idx]
 
     corrected = linear.copy()
-    for c in degraded_channels:
+    for entry in degraded_channels:
+        # R4: `degraded_channels` 有**两种**历史结构，直接拿元素当索引会崩：
+        #   * 来自 stage1 的 channel_meta.json → **dict 列表**，
+        #     索引在 'channel' 字段（实测：{'channel': 0, 'mean': ..., ...}）；
+        #   * 来自 detect_channel_degradation() → **整数列表**。
+        # 真实素材走的是 stage1 sidecar 那条路，于是 `linear[:, :, c]`
+        # 拿到 dict → IndexError → stage2 exit 1 → 被映射成 86。
+        # 这里统一规范成整数索引。
+        raw = entry.get("channel") if isinstance(entry, dict) else entry
+        try:
+            c = int(raw)
+        except (TypeError, ValueError):
+            if logger:
+                logger.warning(
+                    "STAGE2_CHANNEL_INDEX_INVALID",
+                    f"Skipping unrecognised channel descriptor: {entry!r}")
+            continue
+        if not 0 <= c < 3:
+            if logger:
+                logger.warning("STAGE2_CHANNEL_INDEX_RANGE",
+                               f"Skipping out-of-range channel index: {c}")
+            continue
         if c == ref_idx:
             continue
         if logger:
