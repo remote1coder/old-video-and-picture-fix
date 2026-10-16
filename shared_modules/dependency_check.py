@@ -378,25 +378,37 @@ def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
                 plugin_versions[name] = str(ver)
                 plugin_versions[namespace] = str(ver)
 
+        # R4: 对齐**现代 namespace**。这些别名是实测得到的
+        # （VapourSynth R72 + 当前 vsrepo 包），不是凭印象改的：
+        #   knlmeanscl -> knlm | addgrainc -> grain | removegrain -> rgvs
+        #   dftest -> dfttest | rgtools -> rgvs/rgsf
+        # 原来的名字在当前生态里一个都匹配不上，于是"明明装了却报缺失"。
         required = {
-            "QTGMC": ["qtgmc"],
-            "TemporalDegrain2": ["temporaldegrain2"],
             "VIVTC": ["vivtc"],
             "Deblock_QED": ["deblock_qed", "deblock"],
-            "KNLMeansCL": ["knlmeanscl"],
-            "GrainFactory3": ["grainfactory3"],
+            "KNLMeansCL": ["knlmeanscl", "knlm"],
             "MVTools2": ["mvtools2", "mv"],
-            "MaskTools2": ["masktools2", "mt"],
             "NNEDI3": ["nnedi3"],
             "NNEDI3CL": ["nnedi3cl"],
-            "RgTools": ["rgtools"],
-            "Zs_RF_Shared": ["zs_rf_shared"],
+            "RgTools": ["rgtools", "rgvs", "rgsf"],
             "TCanny": ["tcanny"],
-            "havsfunc": ["havsfunc"],
             "FFT3DFilter": ["fft3dfilter", "neo-fft3d"],
-            "AddGrainC": ["addgrainc"],
-            "RemoveGrain": ["removegrain"],
-            "DFTTest": ["dftest"],
+            "AddGrainC": ["addgrainc", "grain"],
+            "RemoveGrain": ["removegrain", "rgvs"],
+            "DFTTest": ["dftest", "dfttest"],
+        }
+
+        # R4: 这几项是 **Python 脚本/函数**，不是 VS 插件 namespace，
+        # 用 namespace 查永远查不到 —— 必须按模块 + 函数存在性检查。
+        py_scripts = {
+            "havsfunc": ("havsfunc", ["QTGMC", "GrainFactory3", "SMDegrain"]),
+            "QTGMC": ("havsfunc", ["QTGMC"]),
+            "GrainFactory3": ("havsfunc", ["GrainFactory3"]),
+            "TemporalDegrain2": (
+                # VS 版 TemporalDegrain2 由 **G41Fun** 提供（havsfunc 里没有，
+                # 实测 havsfunc r33 只有 SMDegrain）；G41Fun 不在 vsrepo 上，
+                # 需从 GitHub 获取。
+                "G41Fun", ["TemporalDegrain2"]),
         }
 
         for plugin, aliases in required.items():
@@ -413,6 +425,21 @@ def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
                     missing.append(
                         f"  - VS Plugin '{plugin}' version {actual} < {min_ver}"
                     )
+        # R4: Python 脚本类依赖按模块检查（namespace 里根本不会有它们）
+        for label, (mod_name, funcs) in py_scripts.items():
+            try:
+                mod = __import__(mod_name)
+            except Exception:
+                missing.append(
+                    f"  - VS script '{label}' (python module '{mod_name}' "
+                    f"not importable)")
+                continue
+            absent = [f for f in funcs if not hasattr(mod, f)]
+            if absent:
+                missing.append(
+                    f"  - VS script '{label}' (module '{mod_name}' lacks "
+                    f"function(s): {', '.join(absent)})")
+
     except ImportError:
         missing.append("  - vapoursynth Python package not installed")
     except Exception as e:
@@ -456,7 +483,12 @@ def check_havsfunc_version() -> Tuple[bool, str]:
 
     # Fallback: function-existence test (r33 has __version__ absent, but has
     # the full function set; r34 lacks some functions).
-    required_funcs = ["QTGMC", "GrainFactory3", "TemporalDegrain", "srestore", "DepanStabilize"]
+    # R4: 判据必须换成 **r33 实际拥有** 的函数。
+    # 实测 havsfunc r33：QTGMC / GrainFactory3 / SMDegrain / srestore 都有，
+    # 但 **TemporalDegrain 与 DepanStabilize 并不存在**（r31 之后移除）。
+    # 于是原判据连"正确版本 r33"都会判失败 —— 这不是放宽，是修正判据：
+    # r34 移除了 99% 的函数（官方 release note），这四个同样不会有。
+    required_funcs = ["QTGMC", "GrainFactory3", "SMDegrain", "srestore"]
     missing_funcs = [f for f in required_funcs if not hasattr(haf, f)]
     if missing_funcs:
         return False, (f"havsfunc missing functions {missing_funcs} (likely r34 which is "
