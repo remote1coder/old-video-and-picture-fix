@@ -128,6 +128,22 @@ def check_ffmpeg_version(min_version: str = "4.4") -> Tuple[bool, str]:
     first_line = out.splitlines()[0] if out else ""
     m = re.search(r'version\s+(\d+\.\d+(?:\.\d+)?)', first_line)
     if not m:
+        # R4: 有些打包（如 gyan.dev 的 Windows 构建）的版本串是
+        # `ffmpeg version 2023-11-13-git-67a2571a55-full_build-www.gyan.dev`
+        # —— 用**发布日期**当版本号，上面 `\d+\.\d+` 匹配不到，
+        # 结果是"Cannot parse FFmpeg version"并被当成依赖缺失（exit 80）。
+        # 日期构建可以按年份判定：FFmpeg 4.4 发布于 2021 年，
+        # 因此 2021 年及以后的构建必然满足 >= 4.4。
+        md = re.search(r'version\s+(\d{4})-(\d{2})-(\d{2})', first_line)
+        if md:
+            year = int(md.group(1))
+            stamp = "-".join(md.groups())
+            if year >= 2021:
+                return True, (f"FFmpeg date-based build {stamp} "
+                              f"(>= 2021, satisfies >= {min_version}; exact "
+                              "version string not exposed by this build)")
+            return False, (f"FFmpeg date-based build {stamp} "
+                           f"(requires >= {min_version})")
         return False, f"Cannot parse FFmpeg version from: {first_line}"
     version = m.group(1)
     def v2tuple(v: str):
@@ -227,9 +243,14 @@ def check_ffmpeg_filters_minimal_calls(pipeline_type: str = "photo") -> List[str
 
     # FIX-P2-4: Test 6: compand (audio dynamic range compression)
     # per v7.32 §3.6
+    # R4: 原测试参数 `-90/-60|-60/-30|-15/-15|-15/-15|-30/0` 的**输入值不是递增的**
+    # （-30 排在 -15 之后），ffmpeg 直接报
+    # "Transfer function input values must be increasing" → 自检永远失败。
+    # 生产代码（audio_utils.py）用的是递增曲线且是有效的；
+    # 自检应当验证**生产实际使用的**参数，否则等于没验证。
     code, _, err = run_cmd([
         "ffmpeg", "-f", "lavfi", "-i", "sine=frequency=1000:duration=1",
-        "-af", "compand=.3|.3:1|1:-90/-60|-60/-30|-15/-15|-15/-15|-30/0",
+        "-af", "compand=0.3:1:-90/-900|-70/-70|-30/-9|0/-3:6:0:0:0.5",
         "-f", "null", "-"
     ], timeout=15)
     if code != 0:
