@@ -401,7 +401,12 @@ def check_vs_plugins(pipeline_type: str = "photo") -> List[str]:
         # R4: 这几项是 **Python 脚本/函数**，不是 VS 插件 namespace，
         # 用 namespace 查永远查不到 —— 必须按模块 + 函数存在性检查。
         py_scripts = {
-            "havsfunc": ("havsfunc", ["QTGMC", "GrainFactory3", "SMDegrain"]),
+            "havsfunc": ("havsfunc", ["QTGMC", "GrainFactory3", "SMDegrain", "Stab"]),
+            # R4: 默认 denoise="TemporalDegrain"（v1）由 fvsfunc 提供
+            # （havsfunc r33 没有这个函数），所以它是默认路径的必需依赖。
+            "fvsfunc": ("fvsfunc", ["TemporalDegrain"]),
+            # R4: 默认 stabilize="DepanStabilize" 走 haf.Stab（内部即 mvtools depan）
+            "Stab": ("havsfunc", ["Stab"]),
             "QTGMC": ("havsfunc", ["QTGMC"]),
             "GrainFactory3": ("havsfunc", ["GrainFactory3"]),
             "TemporalDegrain2": (
