@@ -1048,7 +1048,10 @@ def _check_spawn_targets_ast(path: str, label: str,
     if not path or not Path(path).exists():
         return
     try:
-        content = Path(path).read_text(encoding="utf-8")
+        # R4: 必须容错。实测扫描中遇到非 UTF-8 的 .py（byte 0xfc）会抛
+        # UnicodeDecodeError，直接把 run_all_checks 整个带崩，
+        # 表现为依赖检查失败 -> exit 80，真正的问题反而看不到。
+        content = Path(path).read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(content, filename=path)
     except SyntaxError:
         # If file has syntax errors, skip AST analysis (line-based check
@@ -1090,7 +1093,13 @@ def check_spawn_compliance(target_script: Optional[str] = None,
     def _check_single_file(path: str, label: str) -> None:
         if not path or not Path(path).exists():
             return
-        content = Path(path).read_text(encoding="utf-8")
+        # R4: 必须容错。实测扫描中遇到非 UTF-8 的 .py（byte 0xfc）会抛
+        # UnicodeDecodeError，直接把 run_all_checks 整个带崩，
+        # 表现为依赖检查失败 -> exit 80，真正的问题反而看不到。
+        try:
+            content = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
         lines = content.splitlines()
         in_main = False
         # FIX-P4-2: Track triple-quoted string state instead of the old
