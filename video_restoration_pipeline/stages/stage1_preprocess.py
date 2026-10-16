@@ -300,6 +300,15 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     lines = []
     lines.append("import vapoursynth as vs")
     lines.append("import havsfunc as haf")
+    # R4: havsfunc r33 **没有** TemporalDegrain / DepanStabilize（实测 101 个函数里
+    # 都没有），直接调用会 AttributeError。按实际可得性追加模块：
+    #   TemporalDegrain2 -> G41Fun（doom9 实测其效果优于 v1：失焦区颗粒去得更干净
+    #                      且保留对焦细节，v1 在运动场景会丢矢量抹掉细节）
+    #   TemporalDegrain  -> fvsfunc（Avisynth TemporalDegrain 的 VS 移植）
+    if denoise == "TemporalDegrain2":
+        lines.append("import G41Fun")
+    elif denoise == "TemporalDegrain":
+        lines.append("import fvsfunc as fvf")
     lines.append("core = vs.core")
     lines.append("")
 
@@ -502,12 +511,34 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     # FIX-P1-9: havsfunc VS function is TemporalDegrain (no "2" suffix);
     # r33 params are sigma/blockWidth (NOT degrainTR/grainLevel which are
     # AviSynth TemporalDegrain2 params).
-    if denoise in ("TemporalDegrain", "TemporalDegrain2"):
+    # R4: 原来无论配置 TemporalDegrain 还是 TemporalDegrain2，都生成
+    # `haf.TemporalDegrain(...)`，而 havsfunc r33 并没有这个函数 ——
+    # 两个配置都会 AttributeError，且 TD2 被错误地降级成效果更差的 v1。
+    if denoise == "TemporalDegrain2":
+        # G41Fun 的 VS 版 TemporalDegrain2（havsfunc 里没有，r33 只有 SMDegrain）
+        # R4: 实测 G41Fun 的签名为
+        #   (clip, degrainTR=2, degrainPlane=4, meAlg=5, ..., postFFT=0,
+        #    postTR=1, postSigma=1, ...)
+        # **没有 grainLevel**（那是 Hybrid/Selur 分支版的写法）——
+        # 传 grainLevel 会 TypeError。这里只传确定存在的参数。
+        degrain_tr = max(0, min(int(denoise_params.get("degrainTR", 2)), 3))
+        degrain_plane = int(denoise_params.get("degrainPlane", 4))
+        lines.append("# Temporal denoising (TemporalDegrain2)")
+        lines.append(f"clip = G41Fun.TemporalDegrain2(clip, "
+                    f"degrainTR={degrain_tr}, degrainPlane={degrain_plane})")
+        lines.append("")
+    elif denoise == "TemporalDegrain":
+        # v1 由 fvsfunc 提供（Avisynth TemporalDegrain 的 VS 移植）。
+        # R4: fvsfunc 的签名是 (input_, sigma, bw, bh, ...)，
+        # **没有 blockWidth** —— 实测传 blockWidth 会
+        # TypeError: unexpected keyword argument 'blockWidth'。
+        # 这里同时接受新名 bw/bh 与旧配置名 blockWidth。
         sigma = denoise_params.get("sigma", 16)
-        block_width = denoise_params.get("blockWidth", 16)
-        lines.append("# Temporal denoising")
-        lines.append(f"clip = haf.TemporalDegrain(clip, "
-                    f"sigma={sigma}, blockWidth={block_width})")
+        bw = denoise_params.get("bw", denoise_params.get("blockWidth", 16))
+        bh = denoise_params.get("bh", 16)
+        lines.append("# Temporal denoising (TemporalDegrain v1)")
+        lines.append(f"clip = fvf.TemporalDegrain(clip, "
+                    f"sigma={sigma}, bw={bw}, bh={bh})")
         lines.append("")
 
     # Deblocking
@@ -536,10 +567,16 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
 
     # Stabilization
     if stabilize == "DepanStabilize":
+        # R4: havsfunc r33 **没有** DepanStabilize。但 depan 防抖本身是可得的：
+        #   * core.mv.DepanEstimate/DepanStabilise 都在 mvtools 里（英式拼写 -ise）
+        #   * havsfunc 的 haf.Stab 内部用的就是 mvtools 的 depan
+        #     （r31 release note: "Stab: Use depan filters in mvtools plugin"）
+        # 且 haf.Stab 签名恰为 (clp, dxmax, dymax, mirror) —— 与这里要传的
+        # dxmax/dymax 完全对应，所以改用 haf.Stab 是等价且改动最小的做法。
         dxmax = max(0, min(stabilize_params.get("dxmax", 10), 20))  # FIX-P6-9
         dymax = max(0, min(stabilize_params.get("dymax", 10), 20))  # FIX-P6-9
-        lines.append("# Temporal stabilization")
-        lines.append(f"clip = haf.DepanStabilize(clip, dxmax={dxmax}, dymax={dymax})")
+        lines.append("# Temporal stabilization (depan via havsfunc Stab)")
+        lines.append(f"clip = haf.Stab(clip, dxmax={dxmax}, dymax={dymax})")
         lines.append("")
     elif stabilize == "Stab":
         # FIX-W16: Provide Stab as a lightweight stabilization alternative per
@@ -551,7 +588,10 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         _amp = stabilize_params.get("amp", 10)
         _dxmax = max(0, min(stabilize_params.get("dxmax", 10), 20))
         lines.append("# Temporal stabilization (Stab lightweight alternative)")
-        lines.append(f"clip = haf.Stab(clip, amp={_amp}, dxmax={_dxmax})")
+        # R4: haf.Stab 签名是 (clp, dxmax=4, dymax=4, mirror=0)，**没有 amp
+        # 参数**，原来的 amp= 会直接 TypeError。改为实际支持的 dxmax/dymax。
+        _dymax = max(0, min(stabilize_params.get("dymax", 10), 20))
+        lines.append(f"clip = haf.Stab(clip, dxmax={_dxmax}, dymax={_dymax})")
         lines.append("")
 
     # Color space conversion: BT.601 -> BT.709
