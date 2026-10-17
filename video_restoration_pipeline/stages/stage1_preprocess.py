@@ -221,6 +221,13 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
                        crop_info: Optional[dict] = None,
                        ivtc_stats: Optional[dict] = None) -> str:
     """Generate VapourSynth script content."""
+    # FIX-R5-06: vspipe 会**临时把 cwd 切到 vpy 脚本所在目录**（R55+ 默认，
+    # 官方文档见 vspipe `-c/--preserve-cwd`："Don't temporarily change the
+    # working directory to the script directory (R54 compatibility)"）。
+    # 因此 vpy 里 `core.ffms2.Source(source=...)` 的相对路径按 **vpy 目录**
+    # 解析而非进程 cwd。main.py 目前传的是绝对路径所以没暴露，但一旦传相对
+    # 路径就会 `Index: Can't open`。这里统一转绝对路径防御。
+    input_path = os.path.abspath(input_path)
     field_order = params.get("field_order", "tt")
     needs_ivtc = params.get("needs_ivtc", False)
     is_psf = params.get("is_psf", False)
@@ -654,7 +661,14 @@ def _check_combed_and_fallback(vs_path: Path, params: dict, logger) -> bool:
     Uses the _Combed diagnostic block embedded in the .vpy script.
     Runs a quick vspipe pass (first 300 frames) to populate sidecar JSON.
     """
-    combed_stats_path = vs_path.with_suffix(".combed.json")
+    # FIX-R5-06: 这个 sidecar 是**由 vpy 脚本自己用 open() 写的**，而 vspipe
+    # 会把 cwd 切到 vpy 所在目录（R55+ 默认行为）。原来传相对路径时会落到
+    # `<temp>/<temp>/xxx.combed.json`（目录不存在 -> vpy 里
+    # `except Exception: pass` 把异常吞掉），统计永远不落盘，
+    # 于是 IVTC_COMBED_FAIL 的 sRestore 回退决策**从来没触发过**。
+    # 必须传绝对路径。
+    combed_stats_path = Path(os.path.abspath(str(vs_path))).with_suffix(
+        ".combed.json")
     env = {**os.environ, "VS_COMBED_STATS": str(combed_stats_path)}
 
     # Quick diagnostic pass: request frames 0-299 to populate sidecar
@@ -930,7 +944,11 @@ def main():
 
     # Render with vspipe -> ffmpeg
     try:
-        vspipe_cmd = ["vspipe", "--y4m", vs_path, "-"]
+        # R4（关键修复）：**`--y4m` 这个参数根本不存在** —— 实测
+        # VSPipe R72 与 R81 的 help 都是 `-c, --container <y4m/wav/w64/mkv>`。
+        # 原写法让 vspipe 直接 "Unknown argument: --y4m" 退出 1，
+        # 无任何 y4m 输出，ffmpeg 读 "-" 拿到无效数据 -> exit 84。
+        vspipe_cmd = ["vspipe", "-c", "y4m", vs_path, "-"]
         ffmpeg_cmd = [
             "ffmpeg", "-hide_banner", "-v", "error",
             "-thread_queue_size", "1024",
@@ -939,13 +957,35 @@ def main():
             "-an", "-y", inter_path
         ]
 
+        # R4（关键修复）：原来给 vspipe 的 stderr 开了 subprocess.PIPE
+        # 却**从未读取**它。vspipe 会持续往 stderr 写警告（本次实测每条
+        # Cache/转义警告都会累积），管道缓冲区（约 64KB）一满 vspipe 就阻塞，
+        # 不再向 stdout 输出 —— 于是 ffmpeg 从 "-" 读到无效数据：
+        #   "Error opening input file -. Invalid data found when processing input"
+        # 表现为 stage1 渲染失败 exit 84，而**单独跑 vspipe 却是成功的**，
+        # 极容易误判成 VS 脚本有问题。
+        # 修法：把 stderr 重定向到日志文件，既不阻塞又保留诊断信息。
+        _vs_pipe_log = Path(vs_path).with_suffix(".vspipe.log")
+        try:
+            _vp_err = open(_vs_pipe_log, "wb")
+        except Exception:
+            _vp_err = subprocess.DEVNULL
         vp = subprocess.Popen(vspipe_cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, shell=False)
+                             stderr=_vp_err, shell=False)
         ff = subprocess.Popen(ffmpeg_cmd, stdin=vp.stdout,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, shell=False)
         vp.stdout.close()
         _, stderr = ff.communicate(timeout=7200)
+        _vp_rc = vp.wait(timeout=60)
+        try:
+            if _vp_err is not subprocess.DEVNULL:
+                _vp_err.close()
+        except Exception:
+            pass
+        if _vp_rc != 0 and logger:
+            logger.warning("VSPIPE_RC",
+                           f"vspipe exited {_vp_rc}; see {_vs_pipe_log}")
 
         if ff.returncode == 0 and Path(inter_path).exists():
             # V-P-022 fix: IVTC auto-fallback check
@@ -988,7 +1028,8 @@ def main():
                         "-c:v", "ffv1",
                         "-an", "-y", srestore_inter_path
                     ]
-                    vp2 = subprocess.Popen(["vspipe", "--y4m", vs_path_srestore, "-"],
+                    # R4: 同上，`--y4m` 不存在，应为 `-c y4m`
+                    vp2 = subprocess.Popen(["vspipe", "-c", "y4m", vs_path_srestore, "-"],
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
                     ff2 = subprocess.Popen(ffmpeg_cmd_srestore, stdin=vp2.stdout,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)

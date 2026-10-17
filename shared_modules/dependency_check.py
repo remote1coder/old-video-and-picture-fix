@@ -537,17 +537,21 @@ def check_vs_minimal_calls() -> Tuple[List[str], List[str]]:
         except Exception as e:
             errors.append(f"  - QTGMC InputType=0 test failed: {e}")
 
-        # Test 3: TemporalDegrain (r33 function name; no "2" suffix)
-        # FIX-P1-9: r33 signature is TemporalDegrain(inpClip, sigma=16, blockWidth=16, ...)
-        # — NO degrainTR/grainLevel params (those are AviSynth TemporalDegrain2).
+        # Test 3: TemporalDegrain
+        # R4: havsfunc r33 **没有** TemporalDegrain（实测），v1 由 **fvsfunc**
+        # 提供、且参数名是 bw/bh（不是 blockWidth）。
+        # 原判据既找错库又传错参数，必然报"not found"并阻断启动。
         try:
+            import fvsfunc as fvf
             clip3 = core.std.BlankClip(format=vs.YUV420P16, width=720, height=480, length=60)
-            result3 = haf.TemporalDegrain(clip3, sigma=16, blockWidth=16)
+            result3 = fvf.TemporalDegrain(clip3, sigma=16, bw=16, bh=16)
             if result3 is None:
                 errors.append("  - TemporalDegrain returned None")
+        except ImportError:
+            errors.append("  - fvsfunc not installed (provides TemporalDegrain v1; "
+                          "install: vsrepo install fvsfunc)")
         except AttributeError:
-            errors.append("  - TemporalDegrain not found (havsfunc may be r34 with "
-                          "incomplete functions; install r33: pip install 'havsfunc==33')")
+            errors.append("  - fvsfunc has no TemporalDegrain")
         except Exception as e:
             errors.append(f"  - TemporalDegrain test failed: {e}")
 
@@ -558,9 +562,14 @@ def check_vs_minimal_calls() -> Tuple[List[str], List[str]]:
         # MDepan. So here we only check attribute existence, not a full call.
         try:
             mv = getattr(core, "mv", None)
-            if mv is None or not hasattr(mv, "DepanStabilize"):
-                errors.append("  - DepanStabilize not found in core.mv "
-                              "(mvtools plugin missing; haf.DepanStabilize needs it)")
+            # R4: mvtools 里的名字是 **DepanStabilise**（英式拼写 -ise），
+            # 原判据找 DepanStabilize 永远找不到，白白阻断启动。
+            # （havsfunc 侧则由 haf.Stab 提供，stage1 已改走 Stab。）
+            if mv is None or not (hasattr(mv, "DepanStabilise")
+                                  or hasattr(mv, "DepanStabilize")):
+                errors.append("  - DepanStabilise not found in core.mv "
+                              "(mvtools plugin missing; note the British "
+                              "spelling '-ise')")
         except Exception as e:
             errors.append(f"  - DepanStabilize attribute check failed: {e}")
 
@@ -892,8 +901,15 @@ def check_arnndn_models(config: Optional[Dict] = None, ffmpeg_version_ok: bool =
         if audio_cfg.get("enabled", False) is False:
             return []
     
-    models_dir = config.get("arnndn_model_dir", "./models")
+    # R4: 原来是 "./models" —— 只在 cwd 恰好是项目根时才成立。
+    # 实测：在别的工作目录跑流水线时，明明存在的 models/std.rnnn
+    # 被报成 "not found"，进而阻断启动（exit 80）。
+    # 改为相对**本项目根**解析（dependency_check.py 在 shared_modules/ 下）。
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    models_dir = config.get("arnndn_model_dir", "") or "models"
     models_path = Path(models_dir)
+    if not models_path.is_absolute():
+        models_path = _PROJECT_ROOT / models_path
     missing = []
     # FIX-P1-8: arnndn uses official std.rnnn (Xiph RNNoise original generic
     # model from richardpl/arnndn-models, .rnnn format — NOT .pb). The old
@@ -1121,11 +1137,24 @@ def check_spawn_compliance(target_script: Optional[str] = None,
     _VALID_TOP_LEVEL_PREFIXES = (
         "#", "import", "from", "def ", "class ",
         "__", '"""', "'''", " ", "\t", "@",
+        # R4: 下面两类被原白名单漏掉，导致项目自己的每个 stage 都被报违规，
+        # 900+ 条噪音把真实问题完全淹没（并阻断启动 exit 80）：
+        # * sys.path.insert(...) —— AGENTS.md §3.1 明确要求每个 stage 脚本
+        #   都这样把 shared_modules 加进 sys.path；它是**导入路径设置**，
+        #   且 spawn 子进程重新执行模块顶层时必须有它，否则 import 直接失败。
+        "sys.path.insert",
+        # * 纯语法结构，本身不执行任何东西（块内代码由后续行继续检查）
+        "try:", "except", "else:", "finally:",
     )
     # FIX-P2-3: Distinguish constant assignments from executable assignments
     # per v7.32 §3.10.18 constraint 2
-    _TOP_LEVEL_ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\s*=\s')
-    _TOP_LEVEL_EXECUTABLE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\s*=\s.*\(')
+    # R4: 两个正则都要允许**类型注解**（`NAME: Type = ...`）和下标
+    # （`NAME[x] = ...`），否则这类常量定义匹配不到 assignment 分支，
+    # 反而落到下面的 else 被报成 "potential top-level executable code"。
+    _TOP_LEVEL_ASSIGNMENT = re.compile(
+        r'^[A-Za-z_][A-Za-z0-9_]*\s*(?:\[[^\]]*\]|\:[^=]+)?\s*=\s')
+    _TOP_LEVEL_EXECUTABLE = re.compile(
+        r'^[A-Za-z_][A-Za-z0-9_]*\s*(?:\[[^\]]*\]|\:[^=]+)?\s*=\s.*\(')
 
     def _check_single_file(path: str, label: str) -> None:
         if not path or not Path(path).exists():
@@ -1146,7 +1175,21 @@ def check_spawn_compliance(target_script: Optional[str] = None,
         in_triple = False
         triple_tok = ""
         for i, line in enumerate(lines):
+            # R4（关键修复）：这个检查要找的是**顶层**可执行代码，
+            # 但原实现逐行匹配却**完全不看缩进**，于是把
+            #   * 函数体里的 `r = subprocess.run(`
+            #   * 类方法里的 `self.video_path = video_path`
+            #   * 多行 import / 函数签名的续行 `g1str: float, g2str: float,`
+            # 统统当成顶层代码报违规 —— 900+ 条噪音，且阻断启动（exit 80）。
+            # 真正的顶层代码缩进必为 0，所以先跳过任何有缩进的行。
+            # （这样连"续行"和函数/类体一并解决，不必再单独跟踪括号平衡。）
+            if line[:1] in (" ", "\t"):
+                continue
             stripped = line.strip()
+            # R4: 多行常量定义/调用的收尾行（`]` `}` `)`）缩进为 0，
+            # 但本身不是可执行语句，一并跳过。
+            if stripped[:1] in ("]", "}", ")"):
+                continue
             if stripped.startswith("if __name__"):
                 in_main = True
                 continue
@@ -1174,6 +1217,19 @@ def check_spawn_compliance(target_script: Optional[str] = None,
                 if _TOP_LEVEL_ASSIGNMENT.match(stripped):
                     # Flag executable assignments (X = func())
                     if _TOP_LEVEL_EXECUTABLE.match(stripped):
+                        # R4: 全大写的模块级常量（如
+                        # `SCRIPT_DIR = Path(__file__).parent.parent.resolve()`）
+                        # 按 PEP8 是**常量定义**，不是"顶层可执行代码"。
+                        # 原判据只要右侧含 `(` 就报违规，结果把项目自己的
+                        # 9 个 stage 全报成违规（900+ 条），真实问题被淹没。
+                        # 变量名要**先去掉类型注解**再判大小写，否则
+                        # `_SIGNAL_NAMES: List[str] = [...]` 这种带注解的
+                        # 常量定义会被 `: List[str]` 干扰而漏判。
+                        _name = stripped.split("=", 1)[0].split(":")[0].strip()
+                        if _name.isupper() or (
+                                "_" in _name
+                                and _name.replace("_", "").isupper()):
+                            continue
                         issues.append(
                             f"  - {label}: top-level executable assignment "
                             f"at line {i+1}: {stripped[:60]}"

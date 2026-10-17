@@ -276,6 +276,22 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
             logger.info("PARAM_OVERRIDE",
                        f"{entry['key']}: {entry['old']} -> {entry['new']} (source={entry['source']})")
 
+    # FIX-R5-07: job 级落盘目录也必须进 params。
+    # 原来这里只注入分类字段，temp_dir/log_dir 默默沿用 config global 的
+    # 相对 "./temp"/"./logs"，按**进程 cwd** 解析——manifest 里 FIX-L9
+    # 记的 job 级 temp_dir 只有 loader 用，执行链根本不用。后果：
+    #   1) 扫描后换 cwd 执行，中间产物/日志散落到新 cwd 下（实测 1.1GB
+    #      落进仓库 temp/，而 .gitignore 只有 /temp1/ 没有 /temp/）；
+    #   2) 换 config 执行时，loader 按 manifest 的 temp_dir 找产物、
+    #      stage 按 config 的 temp_dir 写产物，两边对不上 -> resume 失效。
+    # output_path 在 process_job 里已从 job 注入（main.py:732），这里补齐
+    # 另外两个；job 字段优先于 config global，与 FIX-L9 的设计意图一致；
+    # 但执行期 CLI 若显式给了同名键（未来加 --temp-dir 之类），CLI 优先。
+    if job.get("temp_dir") and "temp_dir" not in cli_overrides:
+        params["temp_dir"] = job["temp_dir"]
+    if job.get("log_path") and "log_dir" not in cli_overrides:
+        params["log_dir"] = str(Path(job["log_path"]).parent)
+
     return params
 
 
@@ -331,7 +347,15 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     cmd.extend(["--config", config_path])
 
     # Add flags
-    if params.get("no_wsl_redirect", False):
+    # R4（关键修复）：只有下面这两个 stage 会真正做 WSL 路径重定向决策
+    # （它们内部调用 wsl_redirect_path），其余 stage **并没有定义
+    # --no-wsl-redirect**。原来无条件给所有 stage 传该参数，
+    # 于是 stage2 起全被 argparse 判为未知参数 -> sys.exit(2)，
+    # 表现为 "Stage 2 failed: 2"，Windows（无 WSL）下视频链根本跑不完。
+    _STAGES_WITH_WSL_REDIRECT = {"stage0_audio_extract.py",
+                                 "stage1_preprocess.py"}
+    if (params.get("no_wsl_redirect", False)
+            and script_name in _STAGES_WITH_WSL_REDIRECT):
         cmd.append("--no-wsl-redirect")
     if params.get("cleanup_intermediates", True):
         cmd.append("--cleanup-intermediates")
@@ -398,7 +422,12 @@ def _verify_stage2_output(job_id: str, input_path: str,
     import glob
     input_stem = Path(input_path).stem
     pattern = f"{temp_dir}/{job_id}_{input_stem}_step2*"
-    candidates = glob.glob(pattern)
+    # R4（关键修复）：与 stage2 内那个 glob 完全同类的问题 ——
+    # 通配 `_step2*` 同样命中 sidecar（`...step2_traditional.mkv.identity.json`），
+    # 而 sidecar 写在 mkv 之后、mtime 更晚，于是 candidates[0] 选中的是
+    # 那个 .json，ffprobe 自然解不出 -> "Stage 2 output not decodeable"。
+    candidates = [c for c in glob.glob(pattern)
+                  if not c.endswith((".json", ".log", ".vpy", ".txt"))]
     if not candidates:
         return False, "Stage 2 output file missing"
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -1374,8 +1403,13 @@ def main():
         from manifest_generate import generate_manifest
         # FIX-P5-4: Pass --incremental flag to generate_manifest per v7.32 §3.3
         incremental = getattr(args, 'incremental', False)
+        # FIX-R5-07: 把 --output 传给扫描器，manifest 的 output_path 才会
+        # 落在用户指定的目录（绝对路径）。原来扫描忽略 --output，manifest
+        # 记的是 config 的相对 "./output"，执行时按 cwd 解析 -> 落错地方
+        # 或 stage7 直接 exit 84（目录不存在）。
         generate_manifest(args.input, manifest_path, config, "video",
-                          incremental=incremental)
+                          incremental=incremental,
+                          cli_output_dir=getattr(args, 'output', None))
         logger.info("SCAN_DONE", f"Manifest saved to {manifest_path}")
         print(f"Scan complete. Manifest saved to {manifest_path}")
         print("Next: Review with --edit-manifest, then execute with --mode batch")
@@ -1398,7 +1432,8 @@ def main():
             sys.exit(81)
         manifest_path = str(SCRIPT_DIR / "batch_manifest_quick.yaml")
         from manifest_generate import generate_manifest
-        generate_manifest(args.input, manifest_path, config, "video")
+        generate_manifest(args.input, manifest_path, config, "video",
+                          cli_output_dir=getattr(args, 'output', None))
         # FIX-W7: wrap execution in try/finally so the temporary quick manifest
         # is removed even if a job crashes mid-batch. ORIGINAL only unlinked on
         # the happy path, leaving batch_manifest_quick.yaml behind on crash.
