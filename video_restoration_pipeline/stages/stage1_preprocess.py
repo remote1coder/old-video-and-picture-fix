@@ -561,8 +561,25 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
 
     # Chroma shift
     if chroma_shift:
-        lines.append("# Chroma shift correction")
-        lines.append("clip = haf.ChromaShift(clip, cx=2)")
+        # R4: **havsfunc r33 并没有 ChromaShift**（实测 8 个 haf.* 调用里它是
+        # 缺失项之一），原来这行一执行就 AttributeError。
+        # 改用 **VS 原生**实现，等价于 Avisynth 的 ChromaShiftSP
+        # （doom9 上 DJATOM 给出的官方等价写法）：抽出 Y 平面，对整帧用
+        # resize 的 src_left/src_top 做亚像素平移，再合并回 YUV。
+        # 好处是不再依赖任何外部脚本，且支持亚像素精度。
+        cx = float(params.get("chroma_shift_cx", 2))
+        cy = float(params.get("chroma_shift_cy", 0))
+        lines.append("# Chroma shift correction (VS-native, no havsfunc dependency)")
+        lines.append("_cs_y = core.std.ShufflePlanes(clip, planes=0, "
+                    "colorfamily=vs.GRAY)")
+        lines.append(f"_cs_shift = core.resize.Spline16("
+                    f"clip, width=clip.width, height=clip.height, "
+                    f"src_left={cx}, src_top={cy}, "
+                    f"src_width=clip.width + {cx}, "
+                    f"src_height=clip.height + {cy})")
+        lines.append("clip = core.std.ShufflePlanes("
+                    "clips=[_cs_y, _cs_shift], planes=[0, 1, 2], "
+                    "colorfamily=vs.YUV)")
         lines.append("")
 
     # Stabilization
