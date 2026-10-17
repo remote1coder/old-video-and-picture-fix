@@ -1313,13 +1313,23 @@ def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
     status = JOB_DONE if success else JOB_FAILED
     if not success and exit_code == EXIT_INTERRUPTED:
         status = JOB_CANCELLED
+    # NEW-V-06: manifest 的持久状态词表只有 PENDING/DONE/FAILED/SKIP
+    # （manifest_loader.VALID_STATUSES，update_job_status 对越界值抛
+    # ValueError）。取消**不**写成新状态：写成 FAILED，下次运行才会重试
+    # 它——取消不是内容性失败，不该把 job 永久晾着。但"被取消过"必须留在
+    # 持久审计里，所以 error_message 带 `cancelled:` 前缀；内存态 status
+    # 仍是 JOB_CANCELLED（_result / BATCH_SUMMARY / 退出码 88 可见）。
+    persist_status = "DONE" if success else "FAILED"
+    audit_error = last_error
+    if status == JOB_CANCELLED:
+        audit_error = f"cancelled: {last_error}" if last_error else "cancelled"
     # 内存快照同步（供本次进程内后续逻辑读取）；落盘由下面的锁定单任务更新完成
-    update_job_status(manifest, job_id, "DONE" if success else "FAILED",
-                      error_message=last_error)
+    update_job_status(manifest, job_id, persist_status,
+                      error_message=audit_error)
 
     saved, save_reason = _persist_job_result(
-        manifest_path, job_id, "DONE" if success else "FAILED",
-        error_message=last_error, attempt=final_attempt,
+        manifest_path, job_id, persist_status,
+        error_message=audit_error, attempt=final_attempt,
         attempt_group=attempt_group, owner=owner, generation=generation,
         logger=logger)
     if not saved:

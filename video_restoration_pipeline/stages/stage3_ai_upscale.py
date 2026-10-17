@@ -47,6 +47,13 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
 
+try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
+    # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
+    # 半截 mkv 留在 temp 里被下游 stage 复用）
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
 
 def estimate_gpu_memory(width: int, height: int, scale: int,
                         model_name: str) -> int:
@@ -680,6 +687,10 @@ def main():
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
+    # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED）。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=3, logger=logger)
+
     # Check AI settings
     ai_enabled = params.get("ai_enabled", False)
     if not ai_enabled:
@@ -1213,6 +1224,11 @@ def main():
 
     output_path = str(Path(temp_dir) / f"{inter_name}.mkv")
 
+    # NEW-V-06: 编码开始前登记产物——取消时删掉半截 mkv，否则下游 stage
+    # 的 exists()>0 缓存检查会把它当成功产物复用。
+    if _cancel_guard is not None:
+        _cancel_guard.watch_outputs(output_path, logger=logger, stage=3)
+
     # FIX-P8-8: VFR PTS preservation using concat demuxer
     # ORIGINAL: CFR encoding only (lost VFR timestamps)
     # Per v6.32 §4B: VFR support required
@@ -1267,8 +1283,15 @@ def main():
         ]
 
     try:
-        r = subprocess.run(encode_cmd, capture_output=True, text=True,
-                          timeout=3600, shell=False)
+        # NEW-V-06/RV-12: 受管子进程——取消时 ffmpeg 一起收掉，
+        # 否则守卫删掉的半截 mkv 会被孤儿 ffmpeg 重新写回来。
+        if _cancel_guard is not None:
+            r = _cancel_guard.run_managed(encode_cmd, capture_output=True,
+                                          text=True, timeout=3600,
+                                          shell=False, logger=logger)
+        else:  # pragma: no cover - 守卫缺失时退回原行为
+            r = subprocess.run(encode_cmd, capture_output=True, text=True,
+                               timeout=3600, shell=False)
         if r.returncode != 0 or not Path(output_path).exists():
             logger.error("STAGE3_ENCODE_FAIL",
                          f"Failed to encode MKV: {r.stderr[:300]}")
@@ -1336,6 +1359,9 @@ def main():
 
     logger.info("STAGE3_DONE", "AI upscaling complete",
                 total_frames=len(output_frames), output_path=output_path)
+    # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
+    if _cancel_guard is not None:
+        _cancel_guard.release_outputs()
     return 0
 
 

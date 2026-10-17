@@ -61,6 +61,7 @@ __all__ = [
     "watch_process",
     "unwatch_process",
     "release_outputs",
+    "run_managed",
     "guard",
 ]
 
@@ -440,3 +441,73 @@ def clear_cancel_hooks() -> None:
 def release_outputs() -> None:
     """RV-12: artifacts are published; stop guarding them."""
     guard.release()
+
+
+def _kill_quietly(proc: Any) -> None:
+    """Kill a child process and reap it; never raises."""
+    try:
+        poll = getattr(proc, "poll", None)
+        if poll is not None and poll() is None:
+            proc.kill()
+    except BaseException:  # noqa: BLE001
+        pass
+    try:
+        proc.wait(timeout=10)
+    except BaseException:  # noqa: BLE001
+        pass
+
+
+def run_managed(cmd, timeout=None, logger=None, **kwargs):
+    """Run a child process under cancel-guard supervision.
+
+    ``subprocess.run`` cannot be interrupted: a cancellation kills only the
+    Python stage while the child (ffmpeg/vspipe/avifenc...) keeps writing —
+    the guard would delete the partial artifact and the orphan would recreate
+    it (RV-12). Here the child is registered with the guard, so cancellation
+    kills it *before* the artifact cleanup runs.
+
+    Semantics deliberately mirror ``subprocess.run`` so existing call sites
+    behave identically:
+
+    * success  -> ``CompletedProcess`` with decoded stdout/stderr when
+      ``text=True`` was passed;
+    * timeout  -> child killed and reaped, then ``TimeoutExpired`` is
+      **re-raised** (call sites' ``except subprocess.TimeoutExpired`` keeps
+      working);
+    * ``BaseException`` (e.g. ``KeyboardInterrupt`` when the guard is not
+      installed) -> child killed and reaped, then re-raised.
+    """
+    import subprocess
+
+    capture = kwargs.pop("capture_output", False)
+    text = kwargs.pop("text", False)
+    if capture:
+        kwargs.setdefault("stdout", subprocess.PIPE)
+        kwargs.setdefault("stderr", subprocess.PIPE)
+    kwargs.setdefault("shell", False)
+    try:  # Windows: 独立进程组，便于 CTRL_BREAK_EVENT
+        kwargs.setdefault("creationflags",
+                          subprocess.CREATE_NEW_PROCESS_GROUP)
+    except Exception:  # pragma: no cover - 非 Windows 平台无此属性
+        pass
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    guard.watch_process(proc)
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_quietly(proc)
+            raise
+        returncode = proc.returncode
+    except BaseException:
+        # 取消/中断/超时都已先收掉子进程，再按原语义向上传递
+        _kill_quietly(proc)
+        raise
+    finally:
+        guard.unwatch_process(proc)
+
+    if text:
+        out = (out or b"").decode("utf-8", "replace")
+        err = (err or b"").decode("utf-8", "replace")
+    return subprocess.CompletedProcess(cmd, returncode, out, err)

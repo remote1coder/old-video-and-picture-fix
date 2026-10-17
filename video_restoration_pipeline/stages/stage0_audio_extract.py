@@ -19,6 +19,13 @@ from logger import get_logger  # noqa: E402
 from audio_utils import extract_audio  # noqa: E402
 from checkpoint import wsl_redirect_path  # noqa: E402
 
+try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
+    # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
+    # 半截 .mka 留在 temp 里被后续 stage 当成有效产物复用）
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
 
 def _load_params(args):
     if getattr(args, "params_file", None):
@@ -41,6 +48,11 @@ def main():
     params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+
+    # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED，
+    # 见其 aggregate_results 的 cancelled 分支）。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=0, logger=logger)
 
     # Determine output path
     temp_dir = params.get("temp_dir", "./temp")
@@ -87,10 +99,16 @@ def main():
         return 0
 
     output_audio = str(output_audio_obj)
+    # NEW-V-06: 写任何字节之前登记产物——取消时删掉半截 .mka，
+    # 否则 stage0 的 exists()>0 缓存检查会把它当成功产物跳过。
+    if _cancel_guard is not None:
+        _cancel_guard.watch_outputs(output_audio, logger=logger, stage=0)
     success = extract_audio(args.input, output_audio, codec="copy")
 
     if success:
         logger.info("STAGE0_DONE", "Audio extracted", output=output_audio)
+        if _cancel_guard is not None:
+            _cancel_guard.release_outputs()
         return 0
     else:
         logger.error("STAGE0_FAILED", "Audio extraction failed")

@@ -29,6 +29,13 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 from checkpoint import wsl_redirect_path  # FIX-P9-3: WSL2 redirect per v7.32 §3.10.10
 
+try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
+    # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
+    # 半截 mkv 留在 temp 里被下游 stage 复用）
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
 
 # ---------------------------------------------------------------------------
 # P9-ARCH: Streaming infrastructure classes
@@ -183,10 +190,17 @@ class StreamingEncoder:
         ]
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+        # NEW-V-06/RV-12: 流式编码器是独立子进程，必须登记——取消时只杀
+        # Python stage 的话，ffmpeg 会继续把半截数据写回 output_path
+        # （守卫刚删掉的文件被孤儿进程重新创建，取消就白做了）。
+        if _cancel_guard is not None:
+            _cancel_guard.watch_process(self._proc)
         return self
 
     def __exit__(self, *args):
         if self._proc:
+            if _cancel_guard is not None:
+                _cancel_guard.unwatch_process(self._proc)
             self._proc.stdin.close()
             self._proc.stderr.close()
             self._proc.wait()
@@ -1591,6 +1605,9 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                 "Streaming face restore complete",
                 output=output_path,
                 restored_count=len(restored_frames))
+    # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
+    if _cancel_guard is not None:
+        _cancel_guard.release_outputs()
     return 0
 
 
@@ -1614,6 +1631,10 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+
+    # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED）。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=5, logger=logger)
 
     face_restore = params.get("face_restore", "")
     ai_enabled = params.get("ai_enabled", False)
@@ -1753,6 +1774,12 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
         temp_dir,
         f"{job_id}_{Path(args.input).stem}_step5_face_p{param_hash}.mkv"
     )
+
+    # NEW-V-06: 写任何字节之前登记产物（legacy 帧目录编码与 streaming
+    # 两条路径共用）——取消时删掉半截 mkv，否则下游 stage 的
+    # exists()>0 缓存检查会把它当成功产物复用。
+    if _cancel_guard is not None:
+        _cancel_guard.watch_outputs(output_path, logger=logger, stage=5)
 
     # P9-ARCH: disk pre-check and path selection
     # Per P9-ARCH spec: when video > 5 min or > 10000 frames, use streaming
@@ -1955,8 +1982,15 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     ]
 
     try:
-        r = subprocess.run(encode_cmd, capture_output=True,
-                           timeout=3600, shell=False)
+        # NEW-V-06/RV-12: 受管子进程——取消时 ffmpeg 一起收掉，
+        # 否则守卫删掉的半截 mkv 会被孤儿 ffmpeg 重新写回来。
+        if _cancel_guard is not None:
+            r = _cancel_guard.run_managed(encode_cmd, capture_output=True,
+                                          timeout=3600, shell=False,
+                                          logger=logger)
+        else:  # pragma: no cover - 守卫缺失时退回原行为
+            r = subprocess.run(encode_cmd, capture_output=True,
+                               timeout=3600, shell=False)
         if (r.returncode == 0 and os.path.exists(output_path)
                 and os.path.getsize(output_path) > 0):
             logger.info("STAGE5_DONE",
@@ -1966,6 +2000,9 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
             shutil.rmtree(all_frames_dir, ignore_errors=True)
             shutil.rmtree(face_frames_dir, ignore_errors=True)
             shutil.rmtree(face_output_dir, ignore_errors=True)
+            # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
+            if _cancel_guard is not None:
+                _cancel_guard.release_outputs()
             return 0
         else:
             err = (r.stderr.decode("utf-8", errors="replace")
