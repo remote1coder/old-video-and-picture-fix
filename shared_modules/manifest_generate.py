@@ -16,7 +16,7 @@ import yaml  # type: ignore[import-untyped]
 import importlib.util
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -205,7 +205,8 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                       config: Dict[str, Any],
                       pipeline_type: str = "video",
                       incremental: bool = False,
-                      config_path: str = "") -> str:
+                      config_path: str = "",
+                      cli_output_dir: Optional[str] = None) -> str:
     """Generate manifest from input directories.
 
     Args:
@@ -213,6 +214,10 @@ def generate_manifest(input_dirs: List[str], output_path: str,
         output_path: Output manifest path
         config: Loaded config
         pipeline_type: "video" or "photo"
+        cli_output_dir: FIX-R5-07 — 扫描时 --output 指定的输出目录，
+            优先于 config 的 global.output_dir。原来扫描完全忽略
+            --output，manifest 里记的是 config 的相对 "./output"，
+            执行时按进程 cwd 解析，换 cwd 就落错地方甚至直接崩。
 
     Returns:
         Path to generated manifest
@@ -261,12 +266,25 @@ def generate_manifest(input_dirs: List[str], output_path: str,
     else:
         exts = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
 
-    output_dir = config.get("global", {}).get("output_dir", "./output")
+    # FIX-R5-07: --output 优先于 config 的 global.output_dir；两者都缺省
+    # 才用 "./output"。原来扫描忽略 --output，用户传了也不生效。
+    output_dir = (cli_output_dir
+                  or config.get("global", {}).get("output_dir", "./output"))
     log_dir = config.get("global", {}).get("log_dir", "./logs")
     # FIX-L9: record temp_dir on each job so manifest_loader can locate
     # intermediates when the user used --temp-dir or a non-default config
     # (otherwise loader falls back to ./temp and silently misses them).
     temp_dir = config.get("global", {}).get("temp_dir", "./temp")
+
+    # FIX-R5-07: manifest 是**持久产物**，扫描后可能换 cwd/换机器再执行，
+    # 所有落盘路径必须写绝对路径（input_path 上面已经 resolve 过，这三个
+    # 原来却是相对的，正是本轮 stage7 exit 84 的根因：
+    # cwd=仓库根时 "output\\xxx_restored.mkv" 落到仓库根的 output\ 下，
+    # 目录不存在 -> ffmpeg "No such file or directory"）。
+    # 基准 = 扫描进程的 cwd，与 input_path 的 resolve 基准一致。
+    output_dir_abs = str(Path(output_dir).resolve())
+    log_dir_abs = str(Path(log_dir).resolve())
+    temp_dir_abs = str(Path(temp_dir).resolve())
 
     job_id = 0
     for inp_dir in input_dirs:
@@ -328,7 +346,8 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                     out_name += ".mkv"
                 else:
                     out_name += ".avif"
-                job_out_path = str(Path(output_dir) / out_name)
+                # FIX-R5-07: 绝对路径，见上面 output_dir_abs 注释
+                job_out_path = str(Path(output_dir_abs) / out_name)
 
                 # ISSUE-V-MGEN-002 / BUG-045: ensure duration is populated
                 duration = _get_duration(input_str, classification)
@@ -348,8 +367,8 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                     "recommended_params": path_params,
                     "user_overrides": {},
                     "output_path": job_out_path,
-                    "temp_dir": temp_dir,  # FIX-L9: per-job temp_dir for loader
-                    "log_path": str(Path(log_dir) / f"job_{job_id:03d}.log"),
+                    "temp_dir": temp_dir_abs,  # FIX-L9+FIX-R5-07: per-job temp_dir (absolute) for loader
+                    "log_path": str(Path(log_dir_abs) / f"job_{job_id:03d}.log"),
                     "error_message": "",
                     "skip_reason": skip_reason,  # FIX-P4-13: v7.32 §3.4.3
                     "created_at": now_iso(),

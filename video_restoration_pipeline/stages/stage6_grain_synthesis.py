@@ -241,15 +241,46 @@ def main() -> int:
         if cands:
             input_source = str(cands[0])
         if not input_source:
-            logger.error("STAGE6_INPUT_ERROR",
-                        f"No stage4 output found. Expected pattern: {pattern}",
-                        temp_dir=temp_dir)
-            return 82
+            # R4（关键修复）：**AI 关闭时 main 根本不会调度 stage3/stage4**
+            # （见 main.py 里 stages 的构造：stage3/4 仅在 ai_enabled 时 append）。
+            # 此时传统链的最后产物是 **stage2** 的输出，而这里原来只认
+            # stage4、没有回退，于是 AI 关闭跑视频链必然
+            # "No stage4 output found" -> return 82，整链断在这里。
+            pattern2 = f"{job_id}_{input_name}_step2_traditional*"
+            cands2 = select_media_candidates(
+                glob.glob(os.path.join(temp_dir, pattern2)))
+            if cands2:
+                input_source = str(cands2[0])
+                expected_stage = "step2_traditional(fallback: AI disabled)"
+                logger.warning("STAGE6_FALLBACK_STEP2",
+                               "stage4 absent because AI stages are disabled; "
+                               "using stage2 output as the traditional-chain "
+                               "result instead")
+            else:
+                logger.error("STAGE6_INPUT_ERROR",
+                            f"No stage4 output found (and no stage2 fallback). "
+                            f"Patterns: {pattern} / {pattern2}",
+                            temp_dir=temp_dir)
+                return 82
 
     if not input_source:
         logger.error("STAGE6_NO_INPUT", "No valid input found",
                      expected_stage=expected_stage)
         return 82
+
+    # FIX-R5-06（关键）: vspipe 会**临时把工作目录切到 vpy 脚本所在目录**
+    # —— R55 起的默认行为，官方文档原文（vspipe 的 `-c/--preserve-cwd` 项）:
+    #   "Don't temporarily change the working directory to the script
+    #    directory (R54 compatibility)"
+    # 所以 vpy 里 `core.ffms2.Source(source=...)` 的相对路径是按 **vpy 所在
+    # 目录**解析的，而不是进程 cwd。上面 glob 出来的 input_source 是相对
+    # temp_dir 的（如 `temp\job_001_clip15_step2_traditional.mkv`），写进
+    # `temp\job_001_clip15_grain.vpy` 后被解析成
+    # `temp\temp\job_001_clip15_step2_traditional.mkv` ->
+    # `vapoursynth.Error: Index: Can't open ...`（实测复现：同一个文件换成
+    # 绝对路径立刻能打开，前向/后向斜杠、加不加 `./` 都一样失败）。
+    # ffprobe 用绝对路径同样无害，故统一在这里转绝对路径。
+    input_source = os.path.abspath(input_source)
 
     logger.info("STAGE6_INPUT", f"Using {expected_stage} output",
                 input=input_source)
@@ -283,9 +314,14 @@ def main() -> int:
 
     # FIX-P9-4: output filename must include param_hash per v7.3 §3.10.19
     param_hash = params.get("param_hash", job_id)
-    output_path = os.path.join(
-        temp_dir,
-        f"{job_id}_{input_name}_step6_grain_p{param_hash}.mkv"
+    # FIX-R5-06: 同 input_source，输出路径也转绝对路径。ffmpeg 按进程 cwd
+    # 解析相对路径本来是对的，但转绝对后可彻底摆脱 cwd 依赖（vspipe 的
+    # chdir 不影响 ffmpeg，这里是防御性的）。
+    output_path = os.path.abspath(
+        os.path.join(
+            temp_dir,
+            f"{job_id}_{input_name}_step6_grain_p{param_hash}.mkv"
+        )
     )
 
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
@@ -358,7 +394,10 @@ def main() -> int:
         vs_format = "vs.YUV420P8"
         pix_fmt = "yuv420p"
 
-    vs_path = os.path.join(temp_dir, f"{job_id}_{input_name}_grain.vpy")
+    # FIX-R5-06: vpy 路径同样转绝对路径。vspipe 找到脚本后会 chdir 到脚本
+    # 所在目录，路径确定后这个 chdir 目标才可控（脚本里已无相对路径依赖）。
+    vs_path = os.path.abspath(
+        os.path.join(temp_dir, f"{job_id}_{input_name}_grain.vpy"))
     # FIX-P9-4: pass addgrainc_after_gf3 so AddGrainC can stack after GrainFactory3
     vs_script = _build_vs_script(
         input_source, vs_format, g1str, g2str, g3str,

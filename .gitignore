@@ -1,4 +1,10 @@
 /temp1/
+# FIX-R5-07: /temp/ 原来是漏的（只有 /temp1/）。视频链 config 的
+# global.temp_dir="./temp" 按 cwd 解析，从仓库根跑一次验收就会往
+# 仓库里落 1GB+ 中间产物且处于未跟踪状态，极易被误提交。
+/temp/
+# 同上：config global.output_dir="./output" 曾把成品写进仓库根
+/output/
 /logs/
 *_output.txt
 __pycache__/
@@ -38,3 +44,5 @@ tools_r4/
 .venv_r4/
 # 所有 venv 变体（本轮新增的 VS 环境；漏了就会把几万文件提交进仓库）
 .venv*/
+# 扫描/跑批产物：manifest 是每次扫描重新生成的，不入库
+video_restoration_pipeline/batch_manifest*.yaml

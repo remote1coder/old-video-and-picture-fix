@@ -1011,6 +1011,20 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = str(output_dir / f"{Path(input_name).stem}_restored.mkv")
 
+    # FIX-R5-07: output_path 无论来自 manifest 还是上面兜底生成，都必须
+    # 1) 转绝对路径 —— 相对路径按**进程 cwd** 解析，而 manifest 是持久产物：
+    #    扫描时 cwd=A、执行时 cwd=B，产物就会落到 B 下（find_final_output 的
+    #    os.path.exists(explicit) 同样按 cwd 解析，resume 直接找不到成品）。
+    # 2) 建父目录 —— 原来只有兜底分支 mkdir，manifest 显式路径分支不建。
+    #    实测（真实素材验收）：manifest 的 output_path 是 config 里的相对
+    #    路径 "./output"（manifest_generate 从 config 读，且忽略 --output），
+    #    cwd 又是仓库根 -> ffmpeg 报
+    #    "Error opening output output\real_seg_restored.mkv:
+    #     No such file or directory" -> exit 84。整链 stage0→6 全绿、
+    #    零 temp 零日志，只死在最后一步落盘，极难排查。
+    output_path = str(Path(output_path).resolve())
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
     # WSL2 redirect: if running in WSL and Windows tools need Windows paths
     no_wsl_redirect = params.get("no_wsl_redirect", False)
     platform = params.get("platform", "auto")

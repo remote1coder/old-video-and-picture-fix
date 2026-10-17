@@ -48,7 +48,13 @@ def main():
 
     # Find stage1 output - sort by mtime for deterministic selection
     pattern = f"{job_id}_{Path(input_name).stem}_step1_preprocess*"
-    candidates = glob.glob(os.path.join(temp_dir, pattern))
+    # R4（关键修复）：这个通配同时会命中 stage1 产出的 **sidecar**
+    # （如 `...step1_preprocess_pdXXXX.mkv.identity.json`），而 sidecar
+    # 是在 mkv 之后写的、mtime 更晚 —— 于是 `candidates[0]` 选中的是
+    # 那个 .json，ffprobe 解析失败 -> "Stage 1 output not valid video"
+    # (STAGE2_CORRUPT, 86)，真正的 582MB 视频反而被跳过。
+    candidates = [c for c in glob.glob(os.path.join(temp_dir, pattern))
+                  if not c.endswith((".json", ".log", ".vpy", ".txt"))]
     if not candidates:
         logger.error("STAGE2_NO_INPUT", "Stage 1 output not found")
         return 82
