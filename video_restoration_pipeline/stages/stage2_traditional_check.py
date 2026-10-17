@@ -20,6 +20,13 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
 
+try:  # NEW-V-06: 取消/中断守卫。stage2 是检查型 stage、不写最终产物，
+    # 但中断时同样必须留 rc=88 的诚实记录（video main.py 记 cancelled），
+    # 而不是让 `except Exception` 放它过去、状态悬空。
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
 
 def _load_params(args):
     if getattr(args, "params_file", None):
@@ -41,6 +48,10 @@ def main():
     params = _load_params(args)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+
+    # NEW-V-06: 注册取消守卫（无产物可登记；rc=88 由 main.py 记账）。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=2, logger=logger)
 
     temp_dir = params.get("temp_dir", "./temp")
     job_id = args.job_id

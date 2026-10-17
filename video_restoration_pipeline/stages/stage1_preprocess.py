@@ -33,6 +33,13 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 from checkpoint import compute_param_hash, build_intermediate_name  # noqa: E402
 
+try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
+    # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
+    # 半截渲染留在 inter_path 上，且 vspipe/ffmpeg 两个子进程变孤儿）
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
 
 def _get_video_color_metadata(video_path: str) -> dict:
     """Get color metadata from video stream using ffprobe."""
@@ -834,6 +841,10 @@ def main():
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
+    # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED）。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=1, logger=logger)
+
     temp_dir = params.get("temp_dir", "./temp")
     # FIX-P6-5: WSL2 defensive check per v7.32 §3.10.10
     # main.py handles primary WSL2 redirect; this is a defensive fallback
@@ -870,6 +881,11 @@ def main():
     if Path(inter_path).exists() and Path(inter_path).stat().st_size > 0:
         logger.info("STAGE1_SKIP", "Intermediate exists", path=inter_path)
         return 3
+
+    # NEW-V-06: 渲染开始前登记产物——取消时删掉半截 mkv，
+    # 否则上面的 exists()>0 缓存检查会把它当成功产物复用。
+    if _cancel_guard is not None:
+        _cancel_guard.watch_outputs(inter_path, logger=logger, stage=1)
 
     logger.info("STAGE1_START", "Traditional video preprocessing", input=input_path)
 
@@ -976,7 +992,18 @@ def main():
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, shell=False)
         vp.stdout.close()
-        _, stderr = ff.communicate(timeout=7200)
+        # NEW-V-06/RV-12: 两个子进程都必须登记——取消时只杀 Python  stage
+        # 的话，vspipe/ffmpeg 会继续把半截数据写回 inter_path（守卫刚删掉
+        # 的文件被孤儿进程重新创建，取消就白做了）。
+        if _cancel_guard is not None:
+            _cancel_guard.watch_process(vp)
+            _cancel_guard.watch_process(ff)
+        try:
+            _, stderr = ff.communicate(timeout=7200)
+        finally:
+            if _cancel_guard is not None:
+                _cancel_guard.unwatch_process(vp)
+                _cancel_guard.unwatch_process(ff)
         _vp_rc = vp.wait(timeout=60)
         try:
             if _vp_err is not subprocess.DEVNULL:
@@ -1137,6 +1164,10 @@ def main():
                     logger.warning("STAGE1_CLEANUP_FAIL", f"Failed to cleanup: {e}")
 
             logger.info("STAGE1_DONE", "Preprocessing complete", output=inter_path)
+            # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它
+            # （RV-12：发布是不可逆的成功事件）。
+            if _cancel_guard is not None:
+                _cancel_guard.release_outputs()
             return 0
         else:
             err_msg = stderr.decode()[:300] if stderr else "Unknown error"

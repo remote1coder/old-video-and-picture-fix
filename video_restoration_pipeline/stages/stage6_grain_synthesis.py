@@ -28,6 +28,13 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 from checkpoint import wsl_redirect_path, select_media_candidates  # FIX-P9-3 / R3-01
 
+try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
+    # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
+    # 半截 mkv 留在 temp 里被下游 stage 复用）
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
 
 def _build_vs_script(input_source: str, vs_format: str,
                      g1str: float, g2str: float, g3str: float,
@@ -103,10 +110,21 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
             ffmpeg_cmd, stdin=vspipe_proc.stdout,
             stderr=subprocess.PIPE, shell=False)
         vspipe_proc.stdout.close()
-        stdout, stderr = ffmpeg_proc.communicate(timeout=3600)
-        vspipe_stderr = (vspipe_proc.stderr.read()
-                         if vspipe_proc.stderr else b"")
-        vspipe_proc.wait()
+        # NEW-V-06/RV-12: 两个子进程都必须登记——取消时只杀 Python stage
+        # 的话，vspipe/ffmpeg 会继续把半截数据写回 output_path（守卫刚删掉
+        # 的文件被孤儿进程重新创建，取消就白做了）。
+        if _cancel_guard is not None:
+            _cancel_guard.watch_process(vspipe_proc)
+            _cancel_guard.watch_process(ffmpeg_proc)
+        try:
+            stdout, stderr = ffmpeg_proc.communicate(timeout=3600)
+            vspipe_stderr = (vspipe_proc.stderr.read()
+                             if vspipe_proc.stderr else b"")
+            vspipe_proc.wait()
+        finally:
+            if _cancel_guard is not None:
+                _cancel_guard.unwatch_process(vspipe_proc)
+                _cancel_guard.unwatch_process(ffmpeg_proc)
         if ffmpeg_proc.returncode == 0:
             if fallback_label:
                 logger.info("STAGE6_DONE",
@@ -171,6 +189,10 @@ def main() -> int:
     # Use get_logger with proper parameters from config
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
+
+    # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED）。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=6, logger=logger)
 
     # FIX-P9-3: WSL2 temp_dir redirect per v7.32 §3.10.10 / v6.32 §7.3
     temp_dir_raw = params.get("temp_dir", "./temp")
@@ -327,6 +349,11 @@ def main() -> int:
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return 3
 
+    # NEW-V-06: 写任何字节之前登记产物——取消时删掉半截 mkv，
+    # 否则上面的 exists()>0 缓存检查会把它当成功产物复用。
+    if _cancel_guard is not None:
+        _cancel_guard.watch_outputs(output_path, logger=logger, stage=6)
+
     # Load grain parameters from config
     config_path = args.config
     try:
@@ -425,6 +452,9 @@ def main() -> int:
         vs_script, vs_path, vspipe_cmd, ffmpeg_cmd,
         output_path, logger)
     if result[0] == 0:
+        # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
+        if _cancel_guard is not None:
+            _cancel_guard.release_outputs()
         return 0
 
     # If GrainFactory3 failed, try AddGrainC fallback (if enabled)
@@ -454,6 +484,9 @@ def main() -> int:
             addgrain_script, vs_path, vspipe_cmd, ffmpeg_cmd,
             output_path, logger, fallback_label="AddGrainC")
         if result2[0] == 0:
+            # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
+            if _cancel_guard is not None:
+                _cancel_guard.release_outputs()
             return 0
         err_str2 = result2[0] if isinstance(result2[0], str) else str(result2[0])
         logger.error("STAGE6_FAIL",

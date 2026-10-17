@@ -29,6 +29,13 @@ from logger import get_logger  # noqa: E402
 from checkpoint import (wsl_redirect_path, wsl_copy_back,
                         select_media_candidates)  # noqa: E402
 
+try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
+    # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
+    # 半截成品留在最终产物路径上，与成功产物在文件系统层面无法区分）
+    import cancel_guard as _cancel_guard
+except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
+    _cancel_guard = None
+
 
 def _get_audio_layout(audio_path: str) -> dict:
     """Get audio channel layout info using ffprobe."""
@@ -980,6 +987,11 @@ def main():
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
+    # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED，
+    # manifest 记 cancelled；stage7 是最终成品，尤其不能留半截）。
+    if _cancel_guard is not None:
+        _cancel_guard.install_cancel_guard(stage=7, logger=logger)
+
     temp_dir = params.get("temp_dir", "./temp")
     job_id = args.job_id
     # FIX-P7-10: Use .stem (without extension) to match stage0 naming
@@ -1049,6 +1061,12 @@ def main():
         logger.info("STAGE7_WSL_REDIRECT",
                    f"WSL redirect: {output_path} -> {redirected_path}")
         output_path = redirected_path
+
+    # NEW-V-06: 编码开始前登记最终产物（WSL 重定向后的真实写入目标）——
+    # 取消时删掉半截成品并写 FAILED 记录，否则"取消"在文件系统层面
+    # 与"成功"无法区分（半截文件往往还是非空的）。
+    if _cancel_guard is not None:
+        _cancel_guard.watch_outputs(output_path, logger=logger, stage=7)
 
     logger.info("STAGE7_START", "Final encoding",
                 input=input_source, output=output_path)
@@ -1446,8 +1464,15 @@ def main():
     ])
 
     try:
-        r = subprocess.run(video_cmd, capture_output=True, text=True,
-                          timeout=3600*2, shell=False)
+        # NEW-V-06/RV-12: 受管子进程——取消时 ffmpeg 一起收掉，
+        # 否则守卫删掉的半截成品会被孤儿 ffmpeg 重新写回来。
+        if _cancel_guard is not None:
+            r = _cancel_guard.run_managed(video_cmd, capture_output=True,
+                                          text=True, timeout=3600*2,
+                                          shell=False, logger=logger)
+        else:  # pragma: no cover - 守卫缺失时退回原行为
+            r = subprocess.run(video_cmd, capture_output=True, text=True,
+                               timeout=3600*2, shell=False)
         # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
         if r.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 0:
             # FIX-P7-4: Validate A/V sync on final muxed output (not separate files)
@@ -1468,6 +1493,10 @@ def main():
                     return 82
             
             logger.info("STAGE7_DONE", "Encoding complete", output=output_path)
+            # NEW-V-06: 产物已完整落盘（含 WSL 回拷），取消守卫不再有权
+            # 删它（RV-12：发布是不可逆的成功事件）。
+            if _cancel_guard is not None:
+                _cancel_guard.release_outputs()
             return 0
         else:
             logger.error("STAGE7_FAILED", f"Encoding failed: {r.stderr[:300]}")
