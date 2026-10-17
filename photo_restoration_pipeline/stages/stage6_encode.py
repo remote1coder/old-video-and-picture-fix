@@ -821,6 +821,13 @@ def main():
         output_path = os.path.join(output_dir,
             f"{Path(input_name).stem}_restored.avif")
 
+    # FIX-R5-08: 与视频链 stage7（FIX-R5-07）同型——显式 output_path
+    # 既不转绝对路径也不建父目录：相对路径按进程 cwd 解析，manifest 是
+    # 持久产物，换 cwd 执行就落错地方甚至直接崩（父目录不存在）。
+    # 统一 resolve + mkdir 父目录，cwd 从此无关。
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     # WSL2 redirect
     # RV-13: **工作路径与发布路径必须分别保存**。ORIGINAL 在回拷成功后把
     # output_path 改成发布路径，随后 TIFF 的源路径又从这个已换过的变量派生

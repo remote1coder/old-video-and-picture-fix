@@ -631,6 +631,14 @@ def _run_single_job(job: Dict[str, Any],
     params["file_mtime"] = job.get("file_mtime", 0)
     params["file_hash_prefix"] = job.get("file_hash_prefix", "")
 
+    # FIX-R5-08: manifest 的 per-job output_path 必须进 params。
+    # 原来 params["output_path"] 只来自 cli_params（--output，单文件模式
+    # 下是完整文件路径），manifest 里明明有 per-job 的 output_path 却
+    # 从未被消费 → **批量模式下所有 job 写同一个路径，互相覆盖**。
+    # 单文件模式构造的 job 没有 output_path 字段，自然回落到 CLI 值。
+    if job.get("output_path"):
+        params["output_path"] = job["output_path"]
+
     # Add log config to params for stages
     params["log_dir"] = log_dir
 
@@ -1004,7 +1012,18 @@ def main():
         sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
         try:
             from manifest_generate import generate_manifest
-            generate_manifest(scan_dirs, args.output_manifest, config)
+            # FIX-R5-08: 必须传 pipeline_type="photo"！
+            # 原来漏传，generate_manifest 默认 "video" → 按视频扩展名
+            # （.avi/.mkv/.mp4/...）扫描，照片一个都找不到；即便找到，
+            # 输出名也会是 .mkv 而不是 .avif，AI 封禁规则也会走视频分支
+            # （HDV_AVCHD/ANALOG_TAPE 而不是 SCAN_PRINT/DIGITAL_PHOTO）。
+            # 也就是说照片链的 manifest 批处理**从未真正工作过**——
+            # 历史 ai_photo* 验收全是单文件模式（--input <file>）绕开的。
+            # cli_output_dir 与视频链一致（FIX-R5-07）：扫描尊重 --output，
+            # manifest 记绝对路径。
+            generate_manifest(scan_dirs, args.output_manifest, config,
+                              "photo",
+                              cli_output_dir=getattr(args, 'output', None))
         except ImportError as e:
             print(f"manifest_generate module not available: {e}",
                   file=sys.stderr)
