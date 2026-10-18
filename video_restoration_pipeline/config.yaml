@@ -15,6 +15,12 @@ global:
   color_range: "limited"
   platform: "auto"
   gpu_priority: ["cuda", "rocm", "mps", "cpu"]
+  # 防抖默认 auto：抽样测全局位移后决定（见 stage1.detect_shakiness）
+  # 想要旧行为（总是开）：改成 "DepanStabilize"；想总是关：改成 ""
+  stabilize: "auto"
+  shake_probe_samples: 12
+  shake_probe_frames: 40
+  shake_probe_threshold_px: 1.0
   log_level: "INFO"
   log_dir: "./logs"
   manifest_format: "yaml"
