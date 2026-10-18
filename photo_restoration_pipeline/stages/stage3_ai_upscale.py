@@ -225,158 +225,29 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
         return False
 
 
-# BUG-052 fix: DAT model architecture config mapping.
-# FIX-P1-14: Corrected per official zhengchen1999/DAT source (train_DAT_*.yml).
-# Previous config used depth=[6,6,6,6] (4 groups) with no split_size — wrong,
-# caused state_dict mismatch on any real DAT weight. Official architecture:
-#   DAT / DAT-2: depth=[6,6,6,6,6,6] (6 groups), embed_dim=180, num_heads=[6,6,6,6,6,6],
-#                split_size=[8,32], img_size=64, img_range=1.0, resi_connection='1conv'.
-#   DAT vs DAT-2 differ ONLY in expansion_factor (4 vs 2).
-#   DAT-light: depth=[6,6,6,6,6,6], embed_dim=180, num_heads=[6,6,6,6,6,6],
-#              split_size=[8,16], expansion_factor=2 (see train_DAT_light_x2.yml).
-_DAT_MODEL_CONFIGS = {
-    # DAT-2 (default): expansion_factor=2
-    "DAT_2": {
-        "depth": [6, 6, 6, 6, 6, 6],
-        "embed_dim": 180,
-        "num_heads": [6, 6, 6, 6, 6, 6],
-        "split_size": [8, 32],
-        "expansion_factor": 2,
-        "resi_connection": "1conv",
-        "img_size": 64,
-        "img_range": 1.0,
-    },
-    # DAT (original): expansion_factor=4
-    "DAT": {
-        "depth": [6, 6, 6, 6, 6, 6],
-        "embed_dim": 180,
-        "num_heads": [6, 6, 6, 6, 6, 6],
-        "split_size": [8, 32],
-        "expansion_factor": 4,
-        "resi_connection": "1conv",
-        "img_size": 64,
-        "img_range": 1.0,
-    },
-    # DAT-light: split_size=[8,16], expansion_factor=2
-    "DAT_light": {
-        "depth": [6, 6, 6, 6, 6, 6],
-        "embed_dim": 180,
-        "num_heads": [6, 6, 6, 6, 6, 6],
-        "split_size": [8, 16],
-        "expansion_factor": 2,
-        "resi_connection": "1conv",
-        "img_size": 64,
-        "img_range": 1.0,
-    },
-}
-
-
-def _get_dat_config(model_name: str) -> dict:
-    """Get DAT architecture config by model name.
-
-    FIX-P1-14: Match by model filename. DAT_2 (default) vs DAT (original)
-    differ only in expansion_factor (2 vs 4); DAT_light uses split_size=[8,16].
-    Falls back to DAT_2 (the default per v7.32 §3.6).
-    """
-    name = model_name.lower()
-    # Order matters: check DAT_light before DAT_2/DAT (substring overlap).
-    if "dat_light" in name or "dat-light" in name:
-        return _DAT_MODEL_CONFIGS["DAT_light"]
-    if "dat_2" in name or "dat2" in name:
-        return _DAT_MODEL_CONFIGS["DAT_2"]
-    if "dat" in name:
-        return _DAT_MODEL_CONFIGS["DAT"]
-    return _DAT_MODEL_CONFIGS["DAT_2"]
+# FIX-R6-02: DAT 运行时已抽到 shared_modules/dat_runtime.py（照片/视频链
+# 共用唯一事实源）。原 _DAT_MODEL_CONFIGS / _get_dat_config /
+# _run_dat_pytorch 整体搬走；这里保留同名薄封装，既有调用点与单测不变。
+# 修复台账：DAT-light embed_dim=60（旧值 180 全错）、补 DAT_S 条目、
+# 构造必须传 split_size（默认 [2,4] 与官方权重全不符）、strict=False
+# 配套 missing/unexpected 主动核对（杜绝随机权重垃圾算成功）。
+from dat_runtime import (  # noqa: E402
+    DAT_MODEL_CONFIGS as _DAT_MODEL_CONFIGS,
+    get_dat_config as _get_dat_config,
+    run_dat_file as _run_dat_file,
+    is_dat_model as _is_dat_model,
+)
 
 
 def _run_dat_pytorch(input_path: str, output_path: str, model: str,
                      scale: int, model_dir: str, use_gpu: bool,
                      bit_depth: int = 8) -> bool:
-    """Run DAT model via PyTorch backend (v7.32 §3.1: DAT uses official PyTorch scripts).
+    """Run DAT model via PyTorch backend (delegates to shared_modules).
 
-    FIX-P12-3: Added bit_depth parameter per v6.32 §4.2.5.
-    When bit_depth=16, output is saved as 16-bit TIFF.
+    FIX-P12-3: bit_depth=16 → 16-bit TIFF output.
     """
-    model_path = os.path.join(model_dir, f"{model}.pth")
-    if not os.path.exists(model_path):
-        return False
-    try:
-        import torch
-        from PIL import Image
-        import numpy as np
-
-        device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
-        state_dict = torch.load(model_path, map_location=device, weights_only=False)
-
-        # BUG-052 fix: Load architecture config from mapping table instead of hardcoding
-        cfg = _get_dat_config(model)
-        dat_model = None
-        try:
-            from basicsr.archs.dat_arch import DAT
-            dat_model = DAT(
-                upscale=scale, in_chans=3,
-                img_size=cfg["img_size"], img_range=cfg["img_range"],
-                depth=cfg["depth"], embed_dim=cfg["embed_dim"],
-                num_heads=cfg["num_heads"],
-                expansion_factor=cfg["expansion_factor"],
-                resi_connection=cfg["resi_connection"],
-            )
-            sd = state_dict['params'] if 'params' in state_dict else state_dict
-            dat_model.load_state_dict(sd, strict=False)
-            dat_model.eval().to(device)
-        except Exception as e:
-            # Log architecture mismatch for debugging
-            import sys
-            print(f"DAT architecture load failed for {model}: {e}", file=sys.stderr)
-            # Fallback: try loading as a generic nn.Module if state dict keys suggest DAT
-            pass
-
-        if dat_model is None:
-            return False
-
-        img = Image.open(input_path).convert("RGB")
-        img_np = np.array(img).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
-        try:
-            with torch.no_grad():
-                output = dat_model(img_tensor)
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as oom:
-            # FIX-P1-1: CUDA OOM was swallowed by the outer `except Exception`
-            # (OutOfMemoryError is a RuntimeError subclass) → silent model
-            # fallback with no VRAM release. Now release VRAM explicitly per
-            # v7.32 §3.10.23 before returning False (caller downgrades
-            # 4×→2×→CPU). del model + empty_cache + 100ms wait.
-            import time as _time
-            try:
-                del dat_model
-            except Exception:
-                pass
-            del img_tensor
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                _time.sleep(0.1)
-            import sys
-            print(f"DAT CUDA OOM for {model}: {oom}", file=sys.stderr)
-            return False
-        output = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        # FIX-P12-3: 16-bit output per v6.32 §4.2.5
-        # FIX-P12-6: PIL I;16 only supports 2D arrays; for 3-channel 16-bit,
-        # use tifffile to save as TIFF (PIL cannot save RGB uint16 directly).
-        # Fallback: save as 8-bit PNG if tifffile unavailable.
-        if bit_depth == 16:
-            output_16 = np.clip(output * 65535.0, 0, 65535).astype(np.uint16)
-            try:
-                import tifffile
-                tifffile.imwrite(output_path, output_16, compression="zlib")
-            except ImportError:
-                output_8 = (output_16 // 256).astype(np.uint8)
-                Image.fromarray(output_8).save(output_path)
-        else:
-            output_8 = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-            Image.fromarray(output_8).save(output_path)
-        return True
-    except Exception:
-        return False
+    return _run_dat_file(input_path, output_path, model, scale,
+                         model_dir, use_gpu, bit_depth)
 
 
 def _run_gpen_pytorch(input_path: str, output_path: str, model: str,

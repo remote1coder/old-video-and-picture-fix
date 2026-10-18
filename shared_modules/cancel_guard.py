@@ -393,7 +393,7 @@ class CancelGuard:
 
 
 #: Process-wide guard instance.
-guard = CancelGuard()
+guard = CancelGuard()  # spawn-safe: 构造仅初始化属性，无信号注册/线程/IO
 
 
 def install_cancel_guard(stage: Optional[int] = None,

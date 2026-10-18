@@ -77,16 +77,22 @@ def main():
     # Find stage3 output - deterministic by mtime
     # FIX-P8-2: Match both step3_upscale and step3_forced_upscale per v7.32 §3.10.2 L3
     # ORIGINAL: Only matched step3_upscale*, missing _forced_upscale suffix
+    # R3-01（关键修复）：两个通配都会命中 sidecar
+    # （`...mkv.identity.json` 写在媒体之后、mtime 更晚），裸 sort 会把 .json
+    # 选成 stage3 输入，ffprobe 直接 STAGE4_INPUT_UNDECODABLE (82)。
+    # 统一走 checkpoint 媒体白名单 + mtime 新→旧。
+    from checkpoint import select_media_candidates
     pattern_upscale = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
     pattern_forced = f"{job_id}_{Path(input_name).stem}_step3_forced_upscale*"
-    candidates = list(Path(temp_dir).glob(pattern_upscale)) + \
-                 list(Path(temp_dir).glob(pattern_forced))
+    candidates = select_media_candidates(
+        list(Path(temp_dir).glob(pattern_upscale)) +
+        list(Path(temp_dir).glob(pattern_forced)))
     # P8-11 fallback A: if no stage3 output, look for stage2 output
     if not candidates:
         pattern2 = f"{job_id}_{Path(input_name).stem}_step2_traditional*"
-        candidates2 = list(Path(temp_dir).glob(pattern2))
+        candidates2 = select_media_candidates(
+            Path(temp_dir).glob(pattern2))
         if candidates2:
-            candidates2.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             stage3_output = str(candidates2[0])
             logger.info("STAGE4_FALLBACK",
                         "No stage3 output, using stage2 output",
@@ -96,7 +102,6 @@ def main():
                         "No AI upscale or traditional output")
             return 3
     else:
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         stage3_output = str(candidates[0])
 
     # FIX-P8-13: Validate stage3 output with ffprobe per v6.32 §7.1

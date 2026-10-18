@@ -64,14 +64,17 @@ def main():
     # 是在 mkv 之后写的、mtime 更晚 —— 于是 `candidates[0]` 选中的是
     # 那个 .json，ffprobe 解析失败 -> "Stage 1 output not valid video"
     # (STAGE2_CORRUPT, 86)，真正的 582MB 视频反而被跳过。
-    candidates = [c for c in glob.glob(os.path.join(temp_dir, pattern))
-                  if not c.endswith((".json", ".log", ".vpy", ".txt"))]
+    # R3-01：这里原本的黑名单元信息不全（挡不住未来的新侧车类型），统一
+    # 收编到 checkpoint 的媒体后缀白名单 + mtime 新→旧 排序
+    # （select_media_candidates），与 stage6/stage7 同一套规则。
+    from checkpoint import select_media_candidates
+    candidates = select_media_candidates(
+        glob.glob(os.path.join(temp_dir, pattern)))
     if not candidates:
         logger.error("STAGE2_NO_INPUT", "Stage 1 output not found")
         return 82
 
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    stage1_output = candidates[0]
+    stage1_output = str(candidates[0])
     logger.info("STAGE2_START", "Verifying deinterlace output", path=stage1_output)
 
     # Check file integrity

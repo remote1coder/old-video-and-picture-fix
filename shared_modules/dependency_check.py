@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-if str(SCRIPT_DIR) not in sys.path:
+if str(SCRIPT_DIR) not in sys.path:  # spawn-safe: 幂等 import 路径设置，spawn 子进程重执行无副作用
     sys.path.insert(0, str(SCRIPT_DIR))
 
 # R2-08: `arnndn=m=...` 的模型路径必须经 filter_option_path 转义（见
@@ -651,55 +651,120 @@ _FACE_DETECT_ORDER = [
 ]
 
 
-def check_face_detection_packages(config: Optional[Dict] = None) -> Tuple[List[str], Optional[str]]:
+def _probe_imports(python_exe: str, imports: str,
+                   timeout: int = 180) -> bool:
+    """用探针子进程在指定解释器里 import（FIX-R6-02）。
+
+    视频链编排器是 Portable R72，AI 栈在项目 .venv_r4 里——
+    进程内 importlib.util.find_spec 看到的是 R72 的 site-packages，
+    会把"AI 其实可用"误判成缺失（2026-10-18 实测：--ai-enabled
+    在 R72 下被这道检查直接 exit 80）。AI 相关检查必须问 AI 解释器
+    本人，只有它自己 import 成功才算数。
+    """
+    if not python_exe:
+        return False
+    try:
+        r = subprocess.run([python_exe, "-c", imports],
+                           capture_output=True, text=True,
+                           timeout=timeout, shell=False)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def check_face_detection_packages(config: Optional[Dict] = None,
+                                  ai_python: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
     """Check face detection packages and determine default model.
 
     Per v7.32 §3.6: checks in RetinaFace → YOLOv8-face → MTCNN order,
     first available becomes default.
+
+    FIX-R6-02: ai_python 指定时用子进程探针（R72 编排器场景）；
+    且 facexlib 本身算一个检测提供者——GFPGANer/CodeFormer 的运行时
+    检测就是走 facexlib（自带 RetinaFace 实现 + detection_Resnet50_Final.pth），
+    三个独立包只是备选 Provider，缺它们不构成"人脸修复不可用"。
 
     Returns (missing_list, default_model_name).
     """
     if config and not config.get("ai", {}).get("enabled", False):
         return [], None
 
+    def _spec_ok(mod_name: str) -> bool:
+        if ai_python:
+            return _probe_imports(ai_python, f"import {mod_name}")
+        return importlib.util.find_spec(mod_name) is not None
+
     missing = []
     default_model = None
     for mod_name, pip_name, display_name in _FACE_DETECT_ORDER:
-        spec = importlib.util.find_spec(mod_name)
-        if spec is None:
+        if not _spec_ok(mod_name):
             missing.append(f"  - {pip_name}: not installed (pip install {pip_name})")
         elif default_model is None:
             default_model = display_name
 
+    # facexlib = GFPGAN/CodeFormer 的运行时检测提供者（自带 RetinaFace）
+    if _spec_ok("facexlib") and default_model is None:
+        default_model = "facexlib (RetinaFace, bundled)"
+
     return missing, default_model
 
 
-def check_ai_cli_tools() -> List[str]:
-    """Check AI CLI tools are available (not just model files)."""
+def _resolve_models_dir(config: Optional[Dict] = None) -> str:
+    """解析模型目录（FIX-R6-02）。
+
+    优先级：config 顶层 model_dir > config.ai.model_dir > <项目根>/models。
+    相对路径一律按**项目根**（本文件位于 shared_modules/，父目录的父目录）
+    解析，不按 cwd——在隔离工作区里跑时 cwd 是临时目录，按它解析会
+    把明明存在的权重报成缺失（2026-10-18 实测踩坑）。
+    """
+    root = Path(__file__).resolve().parent.parent
+    candidates = []
+    if config:
+        candidates.append(config.get("model_dir"))
+        candidates.append(config.get("ai", {}).get("model_dir")
+                          if isinstance(config.get("ai"), dict) else None)
+    for c in candidates:
+        if c:
+            p = Path(str(c))
+            return str(p if p.is_absolute() else (root / p))
+    return str(root / "models")
+
+
+def check_ai_cli_tools(ai_python: Optional[str] = None) -> List[str]:
+    """Check AI CLI tools are available (not just model files).
+
+    FIX-R6-02: ai_python 指定时用子进程探针（视频链 R72 编排器场景——
+    进程内 find_spec 看到的是 R72 的 site-packages，AI 栈其实在
+    项目 .venv_r4 里）。
+    """
+    def _spec_ok(mod_name: str) -> bool:
+        if ai_python:
+            return _probe_imports(ai_python, f"import {mod_name}")
+        return importlib.util.find_spec(mod_name) is not None
+
+    def _import_ok(mod_name: str) -> bool:
+        if ai_python:
+            return _probe_imports(ai_python, f"import {mod_name}")
+        try:
+            importlib.import_module(mod_name)
+            return True
+        except ImportError:
+            return False
+
     missing = []
     # Check realesrgan-ncnn-vulkan
     if not shutil.which("realesrgan-ncnn-vulkan"):
-        spec = importlib.util.find_spec("realesrgan")
-        if spec is None:
+        if not _spec_ok("realesrgan"):
             missing.append("  - realesrgan: neither realesrgan-ncnn-vulkan binary nor Python package found")
-        else:
-            try:
-                import realesrgan  # noqa: F401
-            except ImportError:
-                missing.append("  - realesrgan Python package found but RealESRGANer not importable")
+        elif not _import_ok("realesrgan"):
+            missing.append("  - realesrgan Python package found but RealESRGANer not importable")
 
     # Check GFPGAN
     gfpgan_ok = False
     if shutil.which("inference_gfpgan.py"):
         gfpgan_ok = True
-    else:
-        spec = importlib.util.find_spec("gfpgan")
-        if spec is not None:
-            try:
-                import gfpgan  # noqa: F401
-                gfpgan_ok = True
-            except ImportError:
-                pass
+    elif _spec_ok("gfpgan") and _import_ok("gfpgan"):
+        gfpgan_ok = True
     if not gfpgan_ok:
         missing.append("  - gfpgan: neither inference_gfpgan.py nor GFPGANer API available")
 
@@ -707,13 +772,8 @@ def check_ai_cli_tools() -> List[str]:
     cf_ok = False
     if shutil.which("inference_codeformer.py"):
         cf_ok = True
-    else:
-        # Try importing codeformer through basicsr
-        try:
-            import basicsr.archs.codeformer_arch  # noqa: F401
-            cf_ok = True
-        except ImportError:
-            pass
+    elif _import_ok("basicsr.archs.codeformer_arch"):
+        cf_ok = True
     if not cf_ok:
         missing.append("  - codeformer: neither inference_codeformer.py nor basicsr.archs.codeformer importable")
 
@@ -1145,6 +1205,12 @@ def check_spawn_compliance(target_script: Optional[str] = None,
         "sys.path.insert",
         # * 纯语法结构，本身不执行任何东西（块内代码由后续行继续检查）
         "try:", "except", "else:", "finally:",
+        # R6: `if TYPE_CHECKING:` —— typing 标准惯用法。TYPE_CHECKING 在
+        # 运行期恒为 False，块体（只有 import 语句）永不执行，spawn 子进程
+        # 重新执行模块顶层时同样不执行——它是可证明的 spawn 安全代码。
+        # 2026-10-18 实测：photo_restoration_pipeline/stages/
+        # stage5_postprocess.py 因此被报成阻断项，照片链 dep check exit 80。
+        "if TYPE_CHECKING:",
     )
     # FIX-P2-3: Distinguish constant assignments from executable assignments
     # per v7.32 §3.10.18 constraint 2
@@ -1186,6 +1252,12 @@ def check_spawn_compliance(target_script: Optional[str] = None,
             if line[:1] in (" ", "\t"):
                 continue
             stripped = line.strip()
+            # R6: 显式抑制标记。可证明 spawn 安全的惯用法（无副作用构造、
+            # 幂等 import 路径设置等）由作者在行尾留 `# spawn-safe: 理由`
+            # 显式声明，检查器跳过该行。比白名单具体调用更稳——每一处
+            # 抑制都必须带人工理由、可审计；滥用会在 review 时暴露。
+            if "# spawn-safe:" in stripped:
+                continue
             # R4: 多行常量定义/调用的收尾行（`]` `}` `)`）缩进为 0，
             # 但本身不是可执行语句，一并跳过。
             if stripped[:1] in ("]", "}", ")"):
@@ -1260,13 +1332,19 @@ def check_spawn_compliance(target_script: Optional[str] = None,
             _check_file_full(mod_path, Path(mod_path).name)
     else:
         # Default: discover project Python files adjacent to the main script
-        if target_script:
+        # R6: 只有 argv[0] 是**真实文件**时才按它的目录做邻接扫描。
+        # stdin（python -）/-c 方式调用时 argv[0] 是 "-"/""，旧代码会把
+        # cwd 整棵树当扫描根，把 tests/_out 临时探针、tools_r4 里便携
+        # VapourSynth 自带的第三方脚本（vsrepo.py/get-pip.py/vsgenstubs.py
+        # 等）全扫进来报成阻断项——2026-10-18 实测 18 条噪音。
+        if target_script and Path(target_script).is_file():
             base_dir = Path(target_script).parent
             # FIX-P3-5: Exclude virtualenv / site-packages / test dirs so the
             # spawn scan does not flag third-party or test code as project
             # spawn targets per v7.32 §3.10.18.
             _EXCLUDE_DIRS = {"__pycache__", ".venv", "venv", "env",
-                             "site-packages", "test"}
+                             "site-packages", "test", "tests", "_out",
+                             "tools_r4", "node_modules", "dist", "build"}
             for py_file in base_dir.rglob("*.py"):
                 if any(part in _EXCLUDE_DIRS for part in py_file.parts):
                     continue
@@ -1309,6 +1387,18 @@ def run_all_checks(config: Optional[Dict] = None,
     """
     issues = []
     warnings = []
+
+    # FIX-R6-02: AI 栈（torch/realesrgan/gfpgan/facexlib/DAT arch）装在
+    # .venv_r4，而编排器是 Portable R72（进程内没有这些包）。AI 开启时，
+    # 后续第 7/8/12 节的相关检查必须改问 AI 解释器；解析不到则置 None，
+    # 由各检查函数按 fatal 处理（绝不许静默跳过）。
+    ai_python = None
+    if config and config.get("ai", {}).get("enabled", False):
+        try:
+            import ai_runtime as _air
+            ai_python = _air.resolve_ai_interpreter()
+        except Exception:
+            ai_python = None
 
     if pipeline_type is None:
         pipeline_type = _detect_pipeline_type(config)
@@ -1380,25 +1470,37 @@ def run_all_checks(config: Optional[Dict] = None,
     # 7. Face detection packages (if AI enabled)
     # FIX-P1-3: Handle new Tuple return (missing_list, default_model)
     # per v7.32 §3.6: first available model becomes default
+    # FIX-R6-02: AI 栈在独立解释器（.venv_r4）里——检查必须问那个解释器；
+    # 且"一个 Provider 可用"即不算缺失（facexlib 是 GFPGAN/CodeFormer
+    # 的运行时检测实现，三个独立包只是备选）。全不可用才致命。
     if config and config.get("ai", {}).get("enabled", False):
-        face_missing, face_default = check_face_detection_packages(config)
-        if face_missing:
+        face_missing, face_default = check_face_detection_packages(
+            config, ai_python=ai_python)
+        if face_default is None:
             issues.append("Missing face detection packages (AI enabled):")
-            issues.extend(face_missing)
-        if face_default:
+            issues.extend(face_missing or ["  - no face detector available"])
+        else:
+            if face_missing:
+                warnings.append("Face detection alternative providers "
+                                "unavailable (non-blocking):")
+                warnings.extend(face_missing)
             warnings.append(f"Face detection default model: {face_default}")
 
     # 8. AI CLI tools (if AI enabled)
+    # FIX-R6-02: 同样按 AI 解释器探测（R72 编排器进程内必然全缺）
     if config and config.get("ai", {}).get("enabled", False):
-        ai_cli = check_ai_cli_tools()
+        ai_cli = check_ai_cli_tools(ai_python=ai_python)
         if ai_cli:
             issues.append("Missing AI CLI tools:")
             issues.extend(ai_cli)
 
     # 9. AI models (if AI enabled)
+    # FIX-R6-02: model_dir 相对路径按**项目根**解析——原来默认 "./models"
+    # 按 cwd 解析，在隔离工作区里跑就永远找不到权重（实测把 models/ 里
+    # 明明有的 GFPGANv1.4.pth 报成缺失，exit 80）
     if config and config.get("ai", {}).get("enabled", False):
         model_errors, model_warnings = check_ai_models(
-            config.get("model_dir", "./models"), skip_md5_check=skip_md5_check
+            _resolve_models_dir(config), skip_md5_check=skip_md5_check
         )
         if model_errors:
             issues.append("Missing AI model weights:")
@@ -1433,12 +1535,16 @@ def run_all_checks(config: Optional[Dict] = None,
     has_gpu, gpu_msgs = check_gpu_backends()
     if not has_gpu:
         if ai_enabled:
-            # AI enabled: need at least CPU PyTorch to fall back to
-            try:
-                import torch  # noqa: F401
+            # AI enabled: need at least CPU PyTorch to fall back to.
+            # FIX-R6-02: 问 AI 解释器而不是编排器进程内 import torch——
+            # R72 进程内必然没有 torch，会把"AI 可跑（CPU）"误报成致命。
+            ai_has_torch = False
+            if ai_python:
+                ai_has_torch = _probe_imports(ai_python, "import torch")
+            if ai_has_torch:
                 warnings.append("GPU backend check (AI will run on CPU):")
                 warnings.extend(gpu_msgs)
-            except ImportError:
+            else:
                 issues.append("GPU backend check (AI enabled but PyTorch missing):")
                 issues.extend(gpu_msgs)
         else:
