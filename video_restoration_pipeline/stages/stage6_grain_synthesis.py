@@ -176,10 +176,21 @@ def main() -> int:
     parser.add_argument("--input", required=True)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--params", default="")
+    # FIX-R6-07: main.py 统一用 `--params-file`（避免超长命令行/转义问题），
+    # 但本 stage 原来只认 `--params` → argparse "unrecognized arguments"
+    # 直接退 2。**批处理下 stage6 从未被执行过**（实测 2026-10-18）。
+    parser.add_argument("--params-file", default="")
     args = parser.parse_args()
 
     params = {}
-    if args.params:
+    if getattr(args, "params_file", None):
+        import json
+        try:
+            with open(args.params_file, "r", encoding="utf-8") as f:
+                params = json.load(f)
+        except Exception:
+            params = {}
+    elif args.params:
         import json
         try:
             params = json.loads(args.params)

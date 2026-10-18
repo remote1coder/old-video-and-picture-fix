@@ -979,11 +979,21 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--params")
+    # FIX-R6-07: main.py 统一传 `--params-file`；stage7 原来只认 `--params`
+    # → argparse 退 2，批处理下 stage7 从未被执行过（实测 2026-10-18）。
+    parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
-    params = json.loads(args.params) if args.params else {}
+    if getattr(args, "params_file", None):
+        try:
+            with open(args.params_file, "r", encoding="utf-8") as f:
+                params = json.load(f)
+        except Exception:
+            params = {}
+    else:
+        params = json.loads(args.params) if args.params else {}
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
