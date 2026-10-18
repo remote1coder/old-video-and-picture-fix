@@ -205,6 +205,16 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     # 3. Override with path-specific params
     detected_class = job.get("detected_class", "")
     path_key = detected_class.lower()
+    # FIX-NEW-V-10 / R12: user_overrides 里的 `path` 应能切换分型参数组，
+    # 否则 `path: dv_digital` 只能写进 params["path"] 而 paths[path_key]
+    # 仍按 detected_class 取——实测三型矩阵三例参数完全相同。
+    # user_overrides 在第 6 步才应用，这里**预读**它（优先级最高，
+    # 只影响 paths/audio_override 的查表键，不改变其他层的应用顺序）。
+    _user_ov_pre = job.get("user_overrides", {}) or {}
+    _path_override = _user_ov_pre.get("path")
+    if isinstance(_path_override, str) and _path_override:
+        path_key = _path_override.lower()
+        _log_override("path", detected_class, path_key, "user_overrides")
     paths = config.get("paths", {})
     if path_key in paths:
         for k, v in paths[path_key].items():
@@ -213,17 +223,30 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     # 4. Override with audio_override (CORRECT POSITION: after paths, before recommended_params)
     #    ORIGINAL: audio_override was applied after user_overrides (line 147-154),
     #    causing it to override user_overrides. Now correctly between paths and recommended_params.
+    # FIX-NEW-V-10 / R12: 合并两类来源——
+    #   a) config["audio_override"][path_key]（分型默认）
+    #   b) user_overrides["audio_override"]（**扁平** dict，直接给
+    #      hum_freq/hum_dual 等；此前只认 (a)，实测传 (b) 整段被忽略，
+    #      三例 audio_override 全落回 config 默认值）
     audio_override = config.get("audio_override", {})
+    _merged_audio: Dict[str, Any] = {}
     if path_key in audio_override:
-        for k, v in audio_override[path_key].items():
-            # FIX-W1/W8: route cross-domain `denoise`/`denoise_params` into the
-            # audio_ namespace so audio_override (higher priority than paths)
-            # cannot clobber the video `denoise` set by paths[]. stage1 reads
-            # bare `denoise` for video; audio reads `audio_denoise`.
-            if k in ("denoise", "denoise_params"):
-                _set_param(f"audio_{k}", v, "audio_override")
-            else:
-                _set_param(k, v, "audio_override")
+        _merged_audio.update(audio_override[path_key] or {})
+    _user_audio = _user_ov_pre.get("audio_override")
+    if isinstance(_user_audio, dict):
+        for _k in _user_audio:
+            _log_override(_k, _merged_audio.get(_k), _user_audio[_k],
+                          "user_overrides")
+        _merged_audio.update(_user_audio)
+    for k, v in _merged_audio.items():
+        # FIX-W1/W8: route cross-domain `denoise`/`denoise_params` into the
+        # audio_ namespace so audio_override (higher priority than paths)
+        # cannot clobber the video `denoise` set by paths[]. stage1 reads
+        # bare `denoise` for video; audio reads `audio_denoise`.
+        if k in ("denoise", "denoise_params"):
+            _set_param(f"audio_{k}", v, "audio_override")
+        else:
+            _set_param(k, v, "audio_override")
 
     # 5. Override with job recommended_params
     rec_params = job.get("recommended_params", {})
