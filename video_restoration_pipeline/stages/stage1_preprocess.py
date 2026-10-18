@@ -202,6 +202,192 @@ def _get_matrix_in_from_meta(video_path: str, color_meta: dict,
     return "170m"  # NTSC BT.601 (480-line NTSC SD and all other resolutions)
 
 
+def detect_shakiness(video_path: str, logger=None, samples: int = 12,
+                     frames_per_sample: int = 40,
+                     threshold_px: float = 1.0) -> dict:
+    """抽样判定素材**是否真的需要防抖**（`stabilize: auto` 的决策依据）。
+
+    背景：`haf.Stab`（mvtools depan）在 1080p 上约 **3.1 秒/帧**，实测占
+    stage1 总耗时的 **89%**（QTGMC Slower 只要 0.25 秒/帧）。稳定素材
+    （三脚架/演播室录制）位移≈0，防抖收益为零还可能裁掉边缘。故默认
+    `auto`：先抽样测全局位移，再决定是否加 Stab。
+
+    实现要点（两次踩坑后的最终方案）：
+    * **不用** ffmpeg `vidstabdetect` 的 trf：它是**二进制** `TRF1` 格式，
+      不是文本（早期用 awk/split 解析会得到假的"位移 0.03px"）。
+    * **不用** `tblend=difference` 的帧间差：实测抖动素材的 YAVG 反而
+      比稳定素材低（合成平移大部分区域相同），区分度不可靠。
+    * **改为**：ffmpeg 抽低分辨率灰度帧 → `cv2.phaseCorrelate` 算相邻帧
+      的**真实全局位移**（自测已知平移 5px 可精确检出 5.0）。
+
+    抽样：在时长上均匀取 samples 段，每段 frames_per_sample 帧，缩到
+    320px 宽做相位相关——实测单段毫秒级，总开销可忽略。
+
+    返回：
+      needs_stabilization: bool
+      mean_abs_dx / mean_abs_dy / p95_abs：位移统计（像素，源分辨率）
+      samples_used / reason / error
+    探测失败时 **保守返回 needs_stabilization=True**（宁可多做，不误关）。
+    """
+    import tempfile
+
+    out = {"needs_stabilization": True, "mean_abs_dx": 0.0,
+           "mean_abs_dy": 0.0, "max_abs_dx": 0, "max_abs_dy": 0,
+           "p95_abs": 0.0, "samples_used": 0, "reason": "", "error": None}
+
+    # --- 总时长（用于均匀抽样） ---
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, errors="replace", timeout=30)
+        total = float((probe.stdout or "0").strip() or 0)
+        # 源宽度：相位相关在 320px 上算，位移要换算回源分辨率
+        wp = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, errors="replace", timeout=30)
+        probe_w = int((wp.stdout or "0").strip() or 0)
+    except Exception as exc:
+        out["error"] = f"duration probe failed: {exc}"
+        out["reason"] = "时长未知，保守启用防抖"
+        return out
+    if total <= 0:
+        out["error"] = "duration unavailable"
+        out["reason"] = "时长未知，保守启用防抖"
+        return out
+
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:
+        out["error"] = f"cv2/numpy unavailable: {exc}"
+        out["reason"] = "缺少 cv2，无法做位移抽样，保守启用防抖"
+        return out
+
+    # --- 均匀抽样 ---
+    step = max(total / max(samples, 1), 1.0)
+    offsets, t = [], 0.0
+    while t < total and len(offsets) < samples:
+        offsets.append(t)
+        t += step
+
+    ANALYZE_W = 320
+    dxs, dys = [], []
+    segments = []          # 每段独立统计，用于报告"哪些段抖"
+    for off in offsets:
+        # 抽成 PNG 序列到临时目录（-ss 放在 -i 前做快速 seek）
+        tmpdir = tempfile.mkdtemp(prefix="shake_")
+        try:
+            pattern = os.path.join(tmpdir, "f_%04d.png").replace(os.sep, "/")
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", f"{off:.3f}",
+                 "-i", video_path,
+                 "-vf", f"scale={ANALYZE_W}:-2,format=gray",
+                 "-frames:v", str(frames_per_sample),
+                 "-y", pattern],
+                capture_output=True, text=True, errors="replace", timeout=180)
+            frames = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+            if len(frames) < 2:
+                continue
+            prev = None
+            seg_dx, seg_dy = [], []
+            for fn in frames:
+                img = cv2.imread(os.path.join(tmpdir, fn),
+                                 cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                cur = img.astype(np.float32)
+                if prev is not None and prev.shape == cur.shape:
+                    (sx, sy), resp = cv2.phaseCorrelate(prev, cur)
+                    # 低响应视为不可信（画面几乎无特征），跳过
+                    if resp >= 0.05:
+                        # 换算回源分辨率
+                        scale_back = (float(probe_w) / ANALYZE_W
+                                      if probe_w else 1.0)
+                        dxs.append(abs(sx) * scale_back)
+                        dys.append(abs(sy) * scale_back)
+                        seg_dx.append(abs(sx) * scale_back)
+                        seg_dy.append(abs(sy) * scale_back)
+                prev = cur
+            if seg_dx:
+                _m = (sum(seg_dx) / len(seg_dx) + sum(seg_dy) / len(seg_dy)) / 2
+                segments.append({"start_s": round(off, 2),
+                                 "mean_px": round(_m, 3),
+                                 "shaky": _m >= threshold_px})
+            out["samples_used"] += 1
+        except Exception:
+            pass
+        finally:
+            try:
+                for f in os.listdir(tmpdir):
+                    os.unlink(os.path.join(tmpdir, f))
+                os.rmdir(tmpdir)
+            except Exception:
+                pass
+
+    if not dxs:
+        out["error"] = "phaseCorrelate produced no usable samples"
+        out["reason"] = "抽样无有效位移数据，保守启用防抖"
+        return out
+
+    all_abs = dxs + dys
+    all_abs_sorted = sorted(all_abs)
+    p95 = all_abs_sorted[min(len(all_abs_sorted) - 1,
+                             int(len(all_abs_sorted) * 0.95))]
+    out["mean_abs_dx"] = round(sum(dxs) / len(dxs), 3)
+    out["mean_abs_dy"] = round(sum(dys) / len(dys), 3)
+    out["max_abs_dx"] = int(max(dxs))
+    out["max_abs_dy"] = int(max(dys))
+    out["p95_abs"] = round(float(p95), 3)
+
+    mean_all = (out["mean_abs_dx"] + out["mean_abs_dy"]) / 2
+    if mean_all < threshold_px and p95 < threshold_px * 3:
+        out["needs_stabilization"] = False
+        out["reason"] = (f"stable: mean|d|={mean_all:.2f}px p95={p95:.2f}px "
+                         f"(< {threshold_px}px) -> skip Stab")
+    else:
+        out["needs_stabilization"] = True
+        out["reason"] = (f"shaky: mean|d|={mean_all:.2f}px p95={p95:.2f}px "
+                         f"(>= {threshold_px}px) -> enable Stab")
+
+    out["segments"] = segments
+    _shaky_segs = [g for g in segments if g.get("shaky")]
+    out["shaky_segment_count"] = len(_shaky_segs)
+    if _shaky_segs:
+        out["shaky_segments"] = _shaky_segs
+        out["reason"] += (f"; {len(_shaky_segs)}/{len(segments)} sampled "
+                          f"segments exceed {threshold_px}px "
+                          f"(e.g. at "
+                          + ", ".join(f"{g['start_s']}s" for g in _shaky_segs[:5])
+                          + ")")
+
+    if logger:
+        try:
+            if _shaky_segs:
+                # 局部抖动：整体判定可能为"稳定"，但某些段明显抖。
+                # 这里单独告警，便于用户决定是否对全片开启防抖。
+                logger.warning(
+                    "STAGE1_SHAKE_LOCALIZED",
+                    f"{len(_shaky_segs)}/{len(segments)} sampled segments are "
+                    f"shaky (>={threshold_px}px) while the overall average is "
+                    f"{(out['mean_abs_dx']+out['mean_abs_dy'])/2:.2f}px. "
+                    "Stab is applied to the WHOLE clip, so enabling it for "
+                    "these few segments would cost the full runtime; "
+                    "set stabilize=DepanStabilize to force it on.",
+                    shaky_segments=[g["start_s"] for g in _shaky_segs])
+            logger.info("STAGE1_SHAKE_PROBE", "Shakiness sampled: "
+                        + out["reason"],
+                        samples_used=out["samples_used"],
+                        mean_abs_dx=out["mean_abs_dx"],
+                        mean_abs_dy=out["mean_abs_dy"],
+                        p95_abs=out["p95_abs"],
+                        needs_stabilization=out["needs_stabilization"])
+        except Exception:
+            pass
+    return out
+
+
 def _fps_to_rational(fps):
     """Convert a framerate float to (numerator, denominator) for AssumeFPS.
 
@@ -608,7 +794,41 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("")
 
     # Stabilization
-    if stabilize == "DepanStabilize":
+    # FIX-效率：`stabilize` 支持四态，用户可任意手动覆盖：
+    #   "auto"（默认）  —— 抽样测位移后自动决定（见 detect_shakiness）
+    #   "DepanStabilize" / "Stab" —— 强制启用
+    #   "" / "none" / "off" / false —— 强制关闭
+    # 之所以引入 auto：`haf.Stab` 在 1080p 上约 3.1 秒/帧，占 stage1
+    # 总耗时 89%（QTGMC Slower 仅 0.25 秒/帧）；而稳定素材位移≈0，
+    # 防抖收益为零还可能裁掉边缘。实测同一素材：关 Stab 后 20 帧从
+    # 70 秒降到 8 秒（8.75×）。
+    _stab_requested = stabilize
+    _stab_auto_note = ""
+    if isinstance(_stab_requested, str) and _stab_requested.strip().lower() == "auto":
+        _probe = detect_shakiness(
+            input_path, logger,
+            samples=int(params.get("shake_probe_samples", 12) or 12),
+            frames_per_sample=int(params.get("shake_probe_frames", 40) or 40),
+            threshold_px=float(params.get("shake_probe_threshold_px", 1.0) or 1.0))
+        _stab_auto_note = _probe.get("reason", "")
+        if _probe.get("needs_stabilization"):
+            _stab_requested = "DepanStabilize"
+        else:
+            _stab_requested = ""
+        if logger:
+            logger.info("STAGE1_STABILIZE_DECISION",
+                        f"stabilize=auto -> {'ON' if _stab_requested else 'OFF'}"
+                        f" ({_stab_auto_note})",
+                        samples_used=_probe.get("samples_used"),
+                        mean_abs_dx=_probe.get("mean_abs_dx"),
+                        mean_abs_dy=_probe.get("mean_abs_dy"),
+                        p95_abs=_probe.get("p95_abs"))
+    if _stab_requested is False or (
+            isinstance(_stab_requested, str)
+            and _stab_requested.strip().lower() in ("", "none", "off", "false")):
+        _stab_requested = ""
+
+    if _stab_requested == "DepanStabilize":
         # R4: havsfunc r33 **没有** DepanStabilize。但 depan 防抖本身是可得的：
         #   * core.mv.DepanEstimate/DepanStabilise 都在 mvtools 里（英式拼写 -ise）
         #   * havsfunc 的 haf.Stab 内部用的就是 mvtools 的 depan
@@ -620,7 +840,7 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.append("# Temporal stabilization (depan via havsfunc Stab)")
         lines.append(f"clip = haf.Stab(clip, dxmax={dxmax}, dymax={dymax})")
         lines.append("")
-    elif stabilize == "Stab":
+    elif _stab_requested == "Stab":
         # FIX-W16: Provide Stab as a lightweight stabilization alternative per
         # v6.32 Part 4. DepanStabilize (mvtools) is the default and generally
         # superior, but Stab (havsfunc wrapper around core.std / internal) has
