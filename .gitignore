@@ -24,6 +24,8 @@ bugs.md
 shixian.md
 .ruff_cache/
 .claude/
+# 本机专用指南（用户指定）：只在本机生效，克隆到其他机器不应出现。
+# 配合下方 `*.md` 白名单，二者永远不入库；历史上也从未提交过。
 agents.md
 CLAUDE.md
 # 修复台账（本地工作记录，不入库）
