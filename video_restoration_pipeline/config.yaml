@@ -59,10 +59,20 @@ paths:
     qtgmc_tff_required: true
     qtgmc_clear_fieldbased: true
     psf_use_input_type1: false
-    stabilize: "DepanStabilize"
+    # 防抖：auto = 抽样测位移后自动决定（推荐）
+    #   "auto"（默认） 抽样 12 段×40 帧测位移；稳定素材跳过 Stab
+    #   "DepanStabilize" / "Stab"  强制启用
+    #   "" / "none" / "off"       强制关闭
+    # Stab 在 1080p 上约 3.1 秒/帧，是 stage1 最贵的滤镜（占 ~89%）；
+    # 稳定素材（位移 < 1px）启用它只有代价没有收益。
+    stabilize: "auto"
     stabilize_params:
       dxmax: 10
       dymax: 10
+    # auto 判定的抽样规模与阈值（仅 stabilize=auto 时生效）
+    shake_probe_samples: 12        # 抽几段
+    shake_probe_frames: 40         # 每段多少帧
+    shake_probe_threshold_px: 1.0  # 平均位移低于此值 → 判为稳定，跳过 Stab
 
   dv_digital:
     ivtc: "auto"
