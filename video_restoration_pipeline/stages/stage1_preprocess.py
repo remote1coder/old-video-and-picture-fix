@@ -557,9 +557,20 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
 
     # Deblocking
     if deblock == "Deblock_QED":
-        deblock_quant = params.get("deblock_quant", 25)
+        # FIX-NEW-V-15 / R17: havsfunc r33 的签名是
+        # Deblock_QED(clp, quant1=24, quant2=26, aOff1=1, bOff1=2,
+        #             aOff2=1, bOff2=2, uv=3)
+        # **没有 quant 参数**。原来写 `quant=` → TypeError → vpy 求值失败
+        # → vspipe rc=1 → stage1 STAGE1_FAILED rc=84。
+        # 后果：`paths.dv_digital.deblock = "Deblock_QED"` 这条配置
+        # **从未真正执行过**（此前 dv_digital 只在 v6/v7 之外的路径上跑过，
+        # 且失败被当成"素材不支持"）。
+        # 语义映射：单个 quant 值同时给 quant1/quant2（保持"整体强度"
+        # 这一原有意图），默认值对齐 havsfunc 的 24。
+        deblock_quant = int(params.get("deblock_quant", 24))
         lines.append("# Deblocking")
-        lines.append(f"clip = haf.Deblock_QED(clip, quant={deblock_quant})")
+        lines.append(f"clip = haf.Deblock_QED(clip, quant1={deblock_quant}, "
+                     f"quant2={deblock_quant})")
         lines.append("")
     elif deblock == "DeblockPP7":
         # FIX-P6-12: Support configurable DeblockPP7 parameters per v7.32 §3.10.1
