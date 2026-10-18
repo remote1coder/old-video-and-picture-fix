@@ -34,15 +34,28 @@ def now_iso() -> str:
 _CLASSIFY_CACHE: Dict[str, Any] = {}
 
 
-def classify_item(input_path: str, pipeline_type: str = "video") -> Dict[str, Any]:
+def classify_item(input_path: str, pipeline_type: str = "video",
+                  config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Classify a single file using importlib to avoid sys.path conflicts.
 
     Caches the loaded module so large directories don't pay importlib overhead
     per file.
+
+    FIX-B7：必须把 `config` 透传给分类器。`classify_video()` 内部有一处
+    `(config or {}).get("classify", {}).get("hdv_ivtc")`，但它的签名原本
+    **没有 config 参数** → 走到"NTSC + 隔行"分支就 `NameError`；而这里的
+    `except Exception` 会把异常**吞成 UNKNOWN/0.0**，于是素材被判
+    "低置信度 → SKIP → 不修"，且日志里只有一句 Low confidence，
+    看不出是崩溃。实测真实素材必现。
+    config 为 None 时仍按旧行为调用（向后兼容）。
     """
     cache_key = pipeline_type
     if cache_key in _CLASSIFY_CACHE:
-        return _CLASSIFY_CACHE[cache_key](input_path)
+        _fn = _CLASSIFY_CACHE[cache_key]
+        try:
+            return _fn(input_path, config) if config is not None else _fn(input_path)
+        except TypeError:
+            return _fn(input_path)
 
     if pipeline_type == "video":
         module_path = Path(__file__).parent.parent / "video_restoration_pipeline" / "classify.py"
@@ -59,7 +72,12 @@ def classify_item(input_path: str, pipeline_type: str = "video") -> Dict[str, An
         spec.loader.exec_module(module)
         classify_func = getattr(module, func_name)
         _CLASSIFY_CACHE[cache_key] = classify_func
-        return classify_func(input_path)
+        try:
+            return (classify_func(input_path, config)
+                    if config is not None else classify_func(input_path))
+        except TypeError:
+            # 该分类器不接受 config（如 classify_photo）→ 回退单参调用
+            return classify_func(input_path)
     except Exception as e:
         return {"detected_class": "UNKNOWN", "confidence": 0.0, "error": str(e)}
 
@@ -298,7 +316,10 @@ def generate_manifest(input_dirs: List[str], output_path: str,
                 input_str = str(f)
 
                 # Classify
-                classification = classify_item(input_str, pipeline_type)
+                # FIX-B7：透传 config —— classify_video 需要它读
+                # classify.hdv_ivtc 等开关；不透传会在 NTSC+隔行分支
+                # NameError，被吞成 UNKNOWN/0.0 → 素材被判不修。
+                classification = classify_item(input_str, pipeline_type, config)
 
                 detected_class = classification.get("detected_class", "UNKNOWN")
                 confidence = classification.get("confidence", 0.0)

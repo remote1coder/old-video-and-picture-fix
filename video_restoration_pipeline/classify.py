@@ -762,7 +762,8 @@ def _detect_blockiness_and_blur(input_path: str) -> Dict[str, float]:
     return scores
 
 
-def classify_video(input_path: str) -> Dict[str, Any]:
+def classify_video(input_path: str,
+                   config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Classify video and return full metadata.
 
     Returns dict with:
