@@ -25,6 +25,7 @@ import json
 import argparse
 import subprocess
 import glob
+import re
 import shutil
 from pathlib import Path
 
@@ -623,6 +624,28 @@ def _resolve_input_source(temp_dir: str, job_id: str,
             candidates.sort(
                 key=lambda p: os.path.getmtime(p), reverse=True)
             return candidates[0]
+
+    # FIX-NEW-V-13 / R15: stage3 的**真实**产物落在
+    # <temp>/<job_id>_upscaled/<stem>_x<N>.{tif,png}（推理引擎的原生输出
+    # 目录），而 `<temp>/<job>_*_step3_upscale_p<hash>.tif` 只是它随后
+    # shutil.copyfile 的目标。实测该 copy 目标并不总是留存，于是三个
+    # stepN_* glob 全部落空 → 返回 "" → 对空输入做检测 →
+    # STAGE4_NO_FACE → 人脸修复静默跳过（rc 仍 0）。
+    # 这里把 _upscaled 目录纳入候选，并按倍数从大到小（取最高倍结果）。
+    upscale_dir = os.path.join(temp_dir, f"{job_id}_upscaled")
+    if os.path.isdir(upscale_dir):
+        ups = glob.glob(os.path.join(upscale_dir, f"{stem}_x*"))
+        ups = [p for p in ups
+               if Path(p).suffix.lower() in (".tif", ".tiff", ".png")]
+
+        def _scale_of(p):
+            m = re.search(r"_x(\d+)", os.path.basename(p))
+            return int(m.group(1)) if m else 0
+
+        if ups:
+            ups.sort(key=lambda p: (_scale_of(p),
+                                    os.path.getmtime(p)), reverse=True)
+            return ups[0]
     return ""
 
 

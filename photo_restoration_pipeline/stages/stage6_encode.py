@@ -809,6 +809,20 @@ def main():
             input_source = candidates[0]
             break
 
+    # FIX-NEW-V-13 / R15: 与 stage4/stage5 同型——stage3 的真实产物在
+    # <temp>/<job_id>_upscaled/<stem>_x<N>.tif。若前序 stage 的 stepN_*
+    # 产物都不在（实测），没有这条回落就会 STAGE6_NO_INPUT 退 82。
+    if not input_source:
+        _up = os.path.join(temp_dir, f"{job_id}_upscaled")
+        if os.path.isdir(_up):
+            _c = glob.glob(os.path.join(
+                _up, f"{Path(input_name).stem}_x*"))
+            _c = [p for p in _c if Path(p).suffix.lower()
+                  in {".tif", ".tiff", ".png"}]
+            if _c:
+                _c.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                input_source = _c[0]
+
     if not input_source:
         # BUG-023 fix: require a processed intermediate
         logger.error("STAGE6_NO_INPUT", "No processed intermediate file found, refusing to encode raw input")
