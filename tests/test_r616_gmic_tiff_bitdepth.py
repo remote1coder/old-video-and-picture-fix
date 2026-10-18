@@ -122,3 +122,37 @@ def test_ai_paths_do_not_use_pil_directly():
             f"{os.path.basename(t)}: 推理读图不得直接用 PIL（R16 黑图）"
         assert "load_image_rgb_uint8" in src, \
             f"{os.path.basename(t)}: 必须走 media_io.load_image_rgb_uint8"
+
+
+def test_dat_output_format_follows_extension():
+    """R23 回归：DAT 输出格式必须跟随 output_path 扩展名。
+
+    R21 的修复把 `run_dat_file` 的 8bit 分支改成无条件 write_tiff
+    （为了避开 PIL 对 .tif 的 LZW 默认），但**视频链** stage3 的 DAT
+    批处理传的是 `frame_XXXXXXXX.png` —— 于是写出 TIFF 字节配 .png 名，
+    编码器报 `Invalid PNG signature 0x49492A00`（49 49 2A 00 = TIFF 的
+    `II*\\0`）→ stage3 rc=84。**这条修复反而 broke 了视频链。**
+    """
+    import ast
+    import io
+    import tokenize
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "shared_modules", "dat_runtime.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    code = []
+    prev = tokenize.INDENT
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.type == tokenize.STRING and prev in (
+                tokenize.INDENT, tokenize.NEWLINE, tokenize.NL,
+                tokenize.DEDENT):
+            continue
+        if tok.type not in (tokenize.NL, tokenize.NEWLINE,
+                            tokenize.INDENT, tokenize.DEDENT):
+            code.append(tok.string)
+        prev = tok.type
+    joined = " ".join(code)
+    assert "splitext" in joined, \
+        "必须按 output_path 扩展名决定输出格式（R23）"
