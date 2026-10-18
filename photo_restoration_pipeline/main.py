@@ -434,12 +434,21 @@ def _check_disk_space(input_path: str,
         return True
 
 
-def cleanup_old_intermediates(temp_dir: str, job_id: str) -> None:
-    """Clean old intermediate files."""
+def cleanup_old_intermediates(temp_dir: str, job_id: str,
+                              current_step=None) -> None:
+    """Clean old intermediate files.
+
+    FIX-NEW-V-12 / R10（与视频链 R6-10 同族）：必须传 current_step。
+    共享实现 `checkpoint.cleanup_old_intermediates` 在 current_step=None
+    时走"按 step 号降序取前 keep_steps 个"的分支——photo 链 keep_steps
+    默认 2，于是每个 stage 跑完就把它**刚产出**的中间产物删掉
+    （实测 stage3 的 step3_upscale 被删，stage4 找不到输入、
+    人脸检测必然零命中）。
+    """
     try:
         sys.path.insert(0, str(SCRIPT_DIR))
         from checkpoint import cleanup_old_intermediates as coi
-        coi(temp_dir, job_id)
+        coi(temp_dir, job_id, current_step=current_step)
     except Exception:
         pass
 
@@ -648,7 +657,22 @@ def _run_single_job(job: Dict[str, Any],
     temp_dir = params.get("temp_dir", "./temp")
 
     # Clean intermediates
-    cleanup_old_intermediates(temp_dir, job_id)
+    # FIX-NEW-V-12 / R10: 全新运行先清空本 job 的陈旧中间产物
+    # （与视频链 main.py 的 STALE_INTERMEDIATES_PURGED 同一处理），
+    # 否则陈旧的高 step 产物会霸占 keep_steps 保留位。
+    try:
+        if params.get("cleanup_intermediates", True) and \
+                not job.get("resume_from_stage"):
+            sys.path.insert(0, str(SCRIPT_DIR))
+            from checkpoint import cleanup_all_intermediates as _cai
+            _purged = _cai(temp_dir, job_id)
+            logger.info("STALE_INTERMEDIATES_PURGED",
+                        "Purged stale intermediates for fresh run",
+                        temp_dir=temp_dir, purged=_purged)
+        else:
+            cleanup_old_intermediates(temp_dir, job_id)
+    except Exception:
+        pass
 
     # Disk space check (WSL redirect handled inside check_wsl_space)
     # FIX-P10-8: Use merged params (not raw config) for upscale_scale
@@ -789,7 +813,12 @@ def _run_single_job(job: Dict[str, Any],
                             "PREVIEW_FORCED_UPSCALE_FAIL",
                             f"Comparison frame generation failed: {e}")
                 # BUG-053 fix: per-stage intermediate cleanup
-                cleanup_old_intermediates(temp_dir, job_id)
+                # FIX-NEW-V-12 / R10: 传 current_step（= 1-based stage 号），
+                # 否则共享实现走 current_step=None 分支会删掉本 stage
+                # 刚产出的中间产物（实测 stage3 的 step3_upscale 被删，
+                # stage4 找不到输入 → 人脸检测必然零命中）。
+                cleanup_old_intermediates(temp_dir, job_id,
+                                          current_step=stage_idx + 1)
                 break  # Success or skip
             elif _is_retryable_error(rc, stderr):
                 retry_count += 1
