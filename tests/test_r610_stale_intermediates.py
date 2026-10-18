@@ -116,3 +116,21 @@ def test_main_has_purge_branch():
     assert "STALE_INTERMEDIATES_PURGED" in src
     assert "current_step=stage_num" in src, \
         "循环内清理必须传 current_step，不能再依赖降序取前 N 个"
+
+
+def test_photo_main_cleanup_passes_current_step():
+    """R10 静态守卫：照片链 main.py 的清理必须传 current_step。
+
+    与视频链 R6-10 同族：photo 链 `cleanup_old_intermediates(temp_dir,
+    job_id)` 不传 current_step，共享实现走"按 step 号降序取前
+    keep_steps 个"分支，会删掉本 stage 刚产出的中间产物
+    （实测 stage3 的 step3_upscale 被删 → stage4 找不到输入 →
+    人脸检测必然零命中）。
+    """
+    import inspect
+    import photo_restoration_pipeline.main as pmain
+    src = inspect.getsource(pmain)
+    assert "current_step=stage_idx + 1" in src, \
+        "循环内清理必须传 current_step"
+    assert "STALE_INTERMEDIATES_PURGED" in src, \
+        "全新运行必须先 purge 陈旧中间产物"
