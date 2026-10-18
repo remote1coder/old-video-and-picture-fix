@@ -253,30 +253,33 @@ def build_intermediate_name(job_id: str,
     return f"{job_id}_{safe_name}_step{step}_{operation}_p{param_hash}.{ext}"
 
 
-def unlink_artifact_with_sidecars(path) -> None:
+def unlink_artifact_with_sidecars(path) -> int:
     """R3-01: 删除媒体产物时**连带删除它的侧车**。
 
     侧车（`<媒体>.identity.json` 等）不能比它描述的媒体活得更久：
     媒体被清理后残留的侧车会让"按侧车判断可复用"的逻辑失去依据，
     也会在目录里堆积孤儿 JSON。
+
+    FIX-NEW-V-07 / R6-10: 返回实际删除的文件数（含侧车），供调用方记日志。
     """
     from pathlib import Path as _P
     target = _P(path)
+    removed = 0
     try:
         target.unlink()
+        removed += 1
     except OSError:
-        return
+        return 0
     for suffix in (".identity.json", ".encode_contract.json", ".status.json",
                    ".cache.json", ".done.json"):
+        side = _P(str(target) + suffix)
         try:
-            _P(str(target) + suffix).unlink(missing_ok=True)
-        except (OSError, TypeError):
-            try:
-                side = _P(str(target) + suffix)
-                if side.exists():
-                    side.unlink()
-            except OSError:
-                pass
+            if side.exists():
+                side.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def cleanup_old_intermediates(temp_dir: str,
@@ -353,27 +356,33 @@ def cleanup_old_intermediates(temp_dir: str,
                 unlink_artifact_with_sidecars(f)
 
 
-def cleanup_all_intermediates(temp_dir: str, job_id: str) -> None:
+def cleanup_all_intermediates(temp_dir: str, job_id: str) -> int:
     """Remove ALL intermediate files for a job after the final output succeeds.
 
     FIX-CK-R2-13: Per v7.32 §3.10.17 / v6.32 §7.5, the pipeline removes every
     intermediate for a job once the final output is produced, unless
     --keep-intermediates is set (in which case the caller simply does not call
     this). Best-effort: ignores missing files / permission errors.
+
+    FIX-NEW-V-07 / R6-10: 同时用于「全新运行前清空陈旧中间产物」。返回删除
+    的文件数（含侧车），供调用方记日志。
     """
+    removed = 0
     temp = Path(temp_dir)
     if not temp.exists():
-        return
+        return 0
     for f in temp.iterdir():
         if f.is_file() and f.name.startswith(f"{job_id}_"):
             # R3-01：媒体产物连同侧车一起删；纯侧车（媒体已不在）也要清掉
             if is_media_artifact(f):
-                unlink_artifact_with_sidecars(f)
+                removed += unlink_artifact_with_sidecars(f)
             else:
                 try:
                     f.unlink()
+                    removed += 1
                 except OSError:
                     pass
+    return removed
 
 
 def _read_frame_info(filepath: str, position: float) -> Optional[Dict[str, Any]]:
