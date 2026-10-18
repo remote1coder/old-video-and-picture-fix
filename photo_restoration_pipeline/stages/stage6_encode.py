@@ -863,7 +863,15 @@ def main():
     # RV-12: 事务式发布 —— 先写临时文件，校验通过后再原子替换到发布路径。
     # 这样"编码失败/中断"不会在最终路径留下半截 AVIF，也不会删掉上一轮的
     # 有效成品（守卫只删本轮临时产物）。
-    tmp_avif = work_output_path + ".partial"
+    # FIX-A3：临时名必须带 job 维度。
+    # 原实现是 `work_output_path + ".partial"`，纯由**输出路径**派生。
+    # 当多个 job 并发发布到同一输出路径（或同一 job 重跑而上一轮的
+    # .partial 尚未清理）时，两个进程会**共用同一个临时名**：
+    # 一个进程写了一半被另一个覆盖，回滚时也可能把对方的备份删掉。
+    # 加 job_id 后各 job 的暂存/备份互不干扰；路径本身不参与发布，
+    # 因此不影响正常单 job 行为的产物布局。
+    _iso = f".{job_id}" if job_id else ""
+    tmp_avif = f"{work_output_path}{_iso}.partial"
     status_path = publish_output_path + ".status.json"
     contract_path = publish_output_path + ".encode_contract.json"
     if cancel_guard is not None:
@@ -912,7 +920,7 @@ def main():
     if params.get("photo_bit_depth", 16) == 16:
         publish_tiff_path = publish_output_path.rsplit(".", 1)[0] + ".tif"
         work_tiff_path = work_output_path.rsplit(".", 1)[0] + ".tif"
-        tmp_tiff = work_tiff_path + ".partial"
+        tmp_tiff = f"{work_tiff_path}{_iso}.partial"
         if cancel_guard is not None:
             cancel_guard.watch_outputs(
                 publish_output_path,
@@ -1070,7 +1078,8 @@ def main():
     # 契约是下一次 resume/验收的依据，与媒体不同代会让下游读到自相矛盾的记录。
     commit_targets.append(contract_path)
     commit_targets.append(status_path)
-    backup_dir = work_output_path + ".pubbak"
+    # FIX-A3：同 tmp_avif，备份目录也带 job 维度（见上方说明）。
+    backup_dir = f"{work_output_path}{_iso}.pubbak"
     snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
     # R3-03 / B14：进入发布临界区前把"成套回滚"挂到取消路径上。
     # 取消处理器最后是 os._exit，普通 try/finally 根本跑不到，
