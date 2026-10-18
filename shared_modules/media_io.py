@@ -1037,7 +1037,7 @@ def read_avif_header(path: str, capability: Any = None) -> Dict[str, Any]:
     try:
         r = subprocess.run(
             [_avifdec_binary(capability), "--info", path],
-            capture_output=True, text=True, timeout=30, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False)
     except Exception:
         return {}
     if r.returncode != 0:

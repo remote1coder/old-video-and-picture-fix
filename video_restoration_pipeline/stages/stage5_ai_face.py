@@ -103,7 +103,7 @@ class StreamingDecoder:
              "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
              "-show_entries", "format=duration",
              "-of", "json", self.video_path],
-            capture_output=True, text=True, shell=False
+            capture_output=True, text=True, errors="replace", shell=False
         )
         if r.returncode == 0:
             info = json.loads(r.stdout)
@@ -430,7 +430,7 @@ def run_gfpgan(input_dir: str, output_dir: str, model_path: str = "",
                 f"    cv2.imwrite(os.path.join({output_dir!r},\n"
                 "                            os.path.basename(f)), output)\n"
             )
-        r = subprocess.run([ai_py, script_path], capture_output=True, text=True,
+        r = subprocess.run([ai_py, script_path], capture_output=True, text=True, errors="replace",
                            timeout=1800, shell=False, cwd=project_root)
         if r.returncode == 0:
             try:
@@ -504,7 +504,7 @@ def _get_frame_pts(video_path: str) -> List[float]:
                  "-select_streams", "v:0",
                  "-show_entries", f"frame={field_name}",
                  "-of", "json", video_path],
-                capture_output=True, text=True, timeout=60, shell=False
+                capture_output=True, text=True, errors="replace", timeout=60, shell=False
             )
             if r.returncode == 0:
                 data = json.loads(r.stdout)
@@ -775,7 +775,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
              "-of", "json", video_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             info = json.loads(r.stdout)
@@ -832,7 +832,7 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
              "-show_entries", "stream=r_frame_rate",
              "-of", "default=noprint_wrappers=1:nokey=1",
              video_path],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r_fps.returncode == 0 and r_fps.stdout.strip():
             fps_raw = r_fps.stdout.strip()
@@ -1766,7 +1766,7 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=pix_fmt",
              "-of", "default=noprint_wrappers=1:nokey=1", input_source],
-            capture_output=True, text=True, timeout=10, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False)
         if _pf_r.returncode == 0:
             _pf = (_pf_r.stdout or "").strip().lower()
             if any(t in _pf for t in ("p16", "16le", "16be", "rgb48", "rgba64")):
@@ -1965,7 +1965,7 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
              "-show_entries", "stream=r_frame_rate",
              "-of", "default=noprint_wrappers=1:nokey=1",
             input_source],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             fps_str = r.stdout.strip()
@@ -1992,7 +1992,7 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
              "-show_entries", "stream=width,height,nb_frames",
              "-show_entries", "format=duration",
              "-of", "json", input_source],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             info = json.loads(r.stdout)

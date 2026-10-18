@@ -250,7 +250,7 @@ def _get_image_dimensions(input_path: str) -> tuple:
                 ["ffprobe", "-v", "error",
                  "-show_entries", "stream=width,height",
                  "-of", "csv=p=0", input_path],
-                capture_output=True, text=True, timeout=10, shell=False
+                capture_output=True, text=True, errors="replace", timeout=10, shell=False
             )
             if r.returncode == 0:
                 parts = r.stdout.strip().split(",")
@@ -373,7 +373,7 @@ def _run_stage(script_name: str,
 
     try:
         r = subprocess.run(cmd, timeout=timeout, env=env, shell=False,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, errors="replace")
         if r.returncode != 0 and r.stderr:
             print(f"[Stage {stage_idx}] stderr: {r.stderr[:500]}",
                   file=sys.stderr)

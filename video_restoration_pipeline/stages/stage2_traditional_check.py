@@ -89,7 +89,7 @@ def main():
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=codec_type",
              "-of", "default=noprint_wrappers=1", stage1_output],
-            capture_output=True, text=True, timeout=60, shell=False
+            capture_output=True, text=True, errors="replace", timeout=60, shell=False
         )
         if r.returncode != 0 or "video" not in r.stdout:
             logger.error("STAGE2_CORRUPT", "Stage 1 output not valid video")
@@ -109,7 +109,7 @@ def main():
             "-vf", "idet",
             "-f", "null", "-"
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=300, shell=False)
         if r.returncode == 0:
             stats = {}
@@ -135,7 +135,7 @@ def main():
                               "-select_streams", "v:0",
                               "-show_entries", "stream=r_frame_rate",
                               "-of", "default=noprint_wrappers=1:nokey=1", stage1_output]
-                    fr = subprocess.run(fr_cmd, capture_output=True, text=True,
+                    fr = subprocess.run(fr_cmd, capture_output=True, text=True, errors="replace",
                                         timeout=60, shell=False)
                     if fr.returncode == 0:
                         rate_str = fr.stdout.strip()

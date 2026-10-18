@@ -75,7 +75,7 @@ def detect_hum_frequency(audio_path: str, sample_rate: int = 48000,
                  "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1",
                  audio_path],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, errors="replace", timeout=10,
                 shell=False
             )
             if r_dur.returncode == 0 and r_dur.stdout.strip():
@@ -194,7 +194,7 @@ def get_audio_channel_layout(audio_path: str) -> str:
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=channel_layout",
              "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             layout = r.stdout.strip()
@@ -222,7 +222,7 @@ def get_audio_info(audio_path: str) -> Dict[str, Any]:
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=sample_rate,channels,codec_name",
              "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             lines = [line.strip() for line in r.stdout.strip().splitlines() if line.strip()]
@@ -293,7 +293,7 @@ def _build_afftdn_filter(num_channels: int, nr: int = 12) -> str:
 def _get_ffmpeg_version() -> Tuple[bool, str]:
     """Check if FFmpeg version >= 4.4. Returns (ok, version_str)."""
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, errors="replace",
                           timeout=10, shell=False)
         if r.returncode == 0:
             first = r.stdout.splitlines()[0]
@@ -904,7 +904,7 @@ def check_av_sync(video_path: str, audio_path: str,
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
                      "-show_entries", "stream=duration",
                      "-of", "default=noprint_wrappers=1:nokey=1", path],
-                    capture_output=True, text=True, timeout=30, shell=False
+                    capture_output=True, text=True, errors="replace", timeout=30, shell=False
                 )
                 if r.returncode == 0:
                     val = r.stdout.strip()
@@ -917,7 +917,7 @@ def check_av_sync(video_path: str, audio_path: str,
             r = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", path],
-                capture_output=True, text=True, timeout=30, shell=False
+                capture_output=True, text=True, errors="replace", timeout=30, shell=False
             )
             if r.returncode == 0:
                 return float(r.stdout.strip())

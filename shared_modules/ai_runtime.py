@@ -68,7 +68,7 @@ def interpreter_has_ai_stack(python_exe: str,
     try:
         r = subprocess.run(
             [python_exe, "-c", _PROBE_IMPORTS],
-            capture_output=True, text=True, timeout=timeout, shell=False,
+            capture_output=True, text=True, errors="replace", timeout=timeout, shell=False,
         )
         return r.returncode == 0
     except Exception:

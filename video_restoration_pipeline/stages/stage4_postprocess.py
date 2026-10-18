@@ -291,7 +291,7 @@ def main():
                                           text=True, timeout=3600,
                                           shell=False, logger=logger)
         else:  # pragma: no cover - 守卫缺失时退回原行为
-            r = subprocess.run(cmd, capture_output=True, text=True,
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                                timeout=3600, shell=False)
         if (r.returncode == 0 and Path(output_path).exists()
                 and Path(output_path).stat().st_size > 0):

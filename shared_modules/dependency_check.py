@@ -665,7 +665,7 @@ def _probe_imports(python_exe: str, imports: str,
         return False
     try:
         r = subprocess.run([python_exe, "-c", imports],
-                           capture_output=True, text=True,
+                           capture_output=True, text=True, errors="replace",
                            timeout=timeout, shell=False)
         return r.returncode == 0
     except Exception:

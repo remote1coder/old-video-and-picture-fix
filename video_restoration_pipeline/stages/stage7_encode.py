@@ -45,7 +45,7 @@ def _get_audio_layout(audio_path: str) -> dict:
              "-select_streams", "a:0",
              "-show_entries", "stream=channels,channel_layout",
              "-of", "json", audio_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             data = json.loads(r.stdout)
@@ -223,7 +223,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
     # V-P-051 fix: FFmpeg version check for bandreject compatibility
     ffmpeg_version_ok = True
     try:
-        vr = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10, shell=False)
+        vr = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, errors="replace", timeout=10, shell=False)
         if vr.returncode == 0:
             version_line = vr.stdout.splitlines()[0]
             # Extract version number like "4.4.2"
@@ -498,7 +498,7 @@ def _probe_packet_span(path: str, stream_type: str = "v") -> float:
             ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
              "-show_entries", "packet=pts_time,duration_time",
              "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=300, shell=False
+            capture_output=True, text=True, errors="replace", timeout=300, shell=False
         )
         if r.returncode != 0:
             return 0.0
@@ -545,7 +545,7 @@ def _get_stream_duration(path: str, stream_type: str = "v") -> float:
             ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
              "-show_entries", "stream=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             dur = r.stdout.strip()
@@ -570,7 +570,7 @@ def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height,pix_fmt,bits_per_raw_sample",
              "-of", "json", video_path],
-            capture_output=True, text=True, timeout=30, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False)
         ow = oh = 0
         bd = 8
         if pr.returncode == 0:
@@ -604,7 +604,7 @@ def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
             "-vf", f"cropdetect=limit={limit}:round=2:reset=0",
             "-frames:v", "100", "-f", "null", "-"
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                            timeout=120, shell=False)
         crop_match = None
         for line in r.stderr.split("\n"):
@@ -741,7 +741,7 @@ def _get_source_color_info(video_path: str) -> tuple:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=color_range,color_primaries",
              "-of", "json", video_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             data = json.loads(r.stdout)
@@ -793,7 +793,7 @@ def _probe_encoder_priming(path: str, stream_type: str = "a") -> float:
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=initial_padding,sample_rate",
              "-of", "json", path],
-            capture_output=True, text=True, timeout=30, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False)
         if r.returncode != 0:
             return 0.0
         streams = (json.loads(r.stdout or "{}").get("streams") or [])
@@ -825,7 +825,7 @@ def _source_has_audio_stream(path: str) -> bool:
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=codec_type",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=30, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False)
         return r.returncode == 0 and bool((r.stdout or "").strip())
     except Exception:
         return False
@@ -839,7 +839,7 @@ def _extract_audio_from_source(source: str, dest: str, logger=None) -> Optional[
         r = subprocess.run(
             ["ffmpeg", "-v", "error", "-y", "-i", source, "-vn",
              "-c:a", "pcm_s16le", dest],
-            capture_output=True, text=True, timeout=120, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=120, shell=False)
         if r.returncode != 0 or not _os.path.isfile(dest) or \
                 _os.path.getsize(dest) == 0:
             return None
@@ -869,7 +869,7 @@ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
             ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
              "-show_entries", "stream=start_time",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=30, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False)
         if r.returncode == 0:
             txt = r.stdout.strip()
             if txt and txt != "N/A":
@@ -881,7 +881,7 @@ def _probe_stream_start(path: str, stream_type: str = "v") -> Optional[float]:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
              "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=300, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=300, shell=False)
         if r.returncode == 0:
             vals = []
             for line in r.stdout.splitlines():
@@ -910,7 +910,7 @@ def _probe_audio_presence(path: str) -> str:
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=codec_type",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=30, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False)
     except Exception:
         return "unknown"
     if r.returncode != 0:
@@ -1161,7 +1161,7 @@ def main():
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
              "-of", "json", input_source],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             info = json.loads(r.stdout)
@@ -1534,7 +1534,7 @@ def main():
                                           text=True, timeout=3600*2,
                                           shell=False, logger=logger)
         else:  # pragma: no cover - 守卫缺失时退回原行为
-            r = subprocess.run(video_cmd, capture_output=True, text=True,
+            r = subprocess.run(video_cmd, capture_output=True, text=True, errors="replace",
                                timeout=3600*2, shell=False)
         # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
         if r.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 0:

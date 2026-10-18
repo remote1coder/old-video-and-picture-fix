@@ -34,7 +34,7 @@ def _get_video_fps(input_path: str) -> float:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=r_frame_rate",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             rate = r.stdout.strip()
@@ -58,7 +58,7 @@ def _is_vfr(input_path: str) -> bool:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=r_frame_rate,avg_frame_rate",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
@@ -92,7 +92,7 @@ def _check_pts_monotonic(input_path: str, max_frames: int = 200) -> bool:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "frame=pkt_pts_time",
              "-of", "csv=p=0", input_path],
-            capture_output=True, text=True, timeout=60, shell=False
+            capture_output=True, text=True, errors="replace", timeout=60, shell=False
         )
         if r.returncode != 0:
             return False
@@ -129,7 +129,7 @@ def _get_total_frames(input_path: str) -> int:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=nb_frames",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             val = r.stdout.strip()
@@ -143,7 +143,7 @@ def _get_total_frames(input_path: str) -> int:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "format=duration,stream=avg_frame_rate",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
@@ -174,7 +174,7 @@ def _get_video_bit_depth(input_path: str) -> Optional[int]:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=bits_per_raw_sample",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             val = r.stdout.strip()
@@ -248,7 +248,7 @@ def extract_preview_frames(input_path: str, output_dir: str,
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         duration = float(r.stdout.strip())
     except Exception:
@@ -464,7 +464,7 @@ def generate_comparison_frames(original_path: str, processed_path: str,
             r = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", original_path],
-                capture_output=True, text=True, timeout=30, shell=False
+                capture_output=True, text=True, errors="replace", timeout=30, shell=False
             )
             duration = float(r.stdout.strip())
             positions = [0.1, 0.5, 0.9][:num_pairs]
@@ -526,7 +526,7 @@ def detect_motion_segments(input_path: str, num_segments: int = 3,
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         duration = float(r.stdout.strip())
         if duration <= 0:

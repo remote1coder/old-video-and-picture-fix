@@ -115,7 +115,7 @@ def _query_nvidia_smi_free_bytes(logger=None):
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0 and r.stdout.strip():
             free_mib = float(r.stdout.strip().split("\n")[0].strip())
@@ -128,7 +128,7 @@ def _query_nvidia_smi_free_bytes(logger=None):
     try:
         r = subprocess.run(
             ["nvidia-smi"],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             mib_match = re.search(r"(\d+)\s*MiB", r.stdout)
@@ -336,7 +336,7 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
             "-g", str(gpu_id),
         ]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                             timeout=3600, shell=False)
             if r.returncode == 0:
                 return True
@@ -454,7 +454,7 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
             )
         # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
         cmd = [ai_py, script_path]
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=3600, shell=False, env=env)
         # FIX-R6-03: 失败必须留证据。原实现无条件删脚本 + 只返回 False，
         # 子进程真实 traceback（参数非法/架构不匹配/import 失败）全部丢失
@@ -541,7 +541,7 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
             )
         # FIX-R6-02: AI 解释器（不是 sys.executable）
         cmd = [ai_py, script_path]
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                             timeout=7200, shell=False, env=env)
         try:
             Path(script_path).unlink(missing_ok=True)
@@ -594,7 +594,7 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
             cmd = [vulkan_bin, "-i", frames_dir, "-o", out_dir,
                    "-n", model, "-s", str(scale), "-g", str(gpu_id)]
             try:
-                r = subprocess.run(cmd, capture_output=True, text=True,
+                r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                                 timeout=3600, shell=False)
                 if r.returncode != 0:
                     all_ok = False
@@ -718,7 +718,7 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
             )
         # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
         cmd = [ai_py, script_path]
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=7200, shell=False, env=env)  # Longer timeout
         # FIX-R6-03: 失败必须留证据（同 run_realesrgan；原实现静默 False）
         if r.returncode == 83:
@@ -762,7 +762,7 @@ def _query_all_pts(video_path: str, logger=None) -> dict:
             "-of", "json",
             video_path
         ]
-        pts_proc = subprocess.run(pts_cmd, capture_output=True, text=True,
+        pts_proc = subprocess.run(pts_cmd, capture_output=True, text=True, errors="replace",
                                  timeout=300, shell=False)
         if pts_proc.returncode == 0:
             data = json.loads(pts_proc.stdout)
@@ -857,7 +857,7 @@ def _count_video_frames(video_path: str) -> int:
              "-show_entries", "stream=nb_read_frames",
              "-of", "default=noprint_wrappers=1:nokey=1",
              video_path],
-            capture_output=True, text=True, timeout=60, shell=False
+            capture_output=True, text=True, errors="replace", timeout=60, shell=False
         )
         if r.returncode == 0:
             return int(r.stdout.strip())
@@ -870,7 +870,7 @@ def _count_video_frames(video_path: str) -> int:
              "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1",
              video_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         fps_r = subprocess.run(
             ["ffprobe", "-hide_banner", "-v", "error",
@@ -878,7 +878,7 @@ def _count_video_frames(video_path: str) -> int:
              "-show_entries", "stream=r_frame_rate",
              "-of", "default=noprint_wrappers=1:nokey=1",
              video_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if dur_r.returncode == 0 and fps_r.returncode == 0:
             duration = float(dur_r.stdout.strip())
@@ -1008,7 +1008,7 @@ def main():
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
              "-of", "json", stage2_output],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         info = json.loads(r.stdout)
         stream = info["streams"][0]
@@ -1244,7 +1244,7 @@ def main():
     ]
     actual_fps = 30.0
     try:
-        r = subprocess.run(fps_cmd, capture_output=True, text=True,
+        r = subprocess.run(fps_cmd, capture_output=True, text=True, errors="replace",
                           timeout=10, shell=False)
         if r.returncode == 0:
             fps_str_val = r.stdout.strip()
@@ -1437,7 +1437,7 @@ def main():
     ]
     fps_str = "25"
     try:
-        r = subprocess.run(fps_cmd, capture_output=True, text=True,
+        r = subprocess.run(fps_cmd, capture_output=True, text=True, errors="replace",
                           timeout=10, shell=False)
         if r.returncode == 0:
             fps_str = r.stdout.strip()
@@ -1522,7 +1522,7 @@ def main():
                                           text=True, timeout=3600,
                                           shell=False, logger=logger)
         else:  # pragma: no cover - 守卫缺失时退回原行为
-            r = subprocess.run(encode_cmd, capture_output=True, text=True,
+            r = subprocess.run(encode_cmd, capture_output=True, text=True, errors="replace",
                                timeout=3600, shell=False)
         if r.returncode != 0 or not Path(output_path).exists():
             logger.error("STAGE3_ENCODE_FAIL",
@@ -1546,7 +1546,7 @@ def main():
              "-show_entries", "stream=pix_fmt",
              "-of", "default=noprint_wrappers=1:nokey=1",
              output_path],
-            capture_output=True, text=True, shell=False
+            capture_output=True, text=True, errors="replace", shell=False
         )
         pix_fmt_out = r.stdout.strip()
         if "p16" not in pix_fmt_out and "16" not in pix_fmt_out:
