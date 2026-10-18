@@ -431,7 +431,7 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     # v7.32 §3.10.15; default fallback name aligned to revised spec.
     denoise = params.get("denoise", "TemporalDegrain")
     denoise_params = params.get("denoise_params", {})
-    stabilize = params.get("stabilize", "DepanStabilize")
+    stabilize = params.get("stabilize", "auto")
     stabilize_params = params.get("stabilize_params", {})
     chroma_shift = params.get("chroma_shift", False)
     deblock = params.get("deblock", "")
@@ -805,8 +805,12 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     _stab_requested = stabilize
     _stab_auto_note = ""
     if isinstance(_stab_requested, str) and _stab_requested.strip().lower() == "auto":
+        # NOTE: generate_vs_script() 按设计**没有 logger**（见函数内注释
+        # "doesn't have access to logger. Mark in params for downstream
+        # logging."）。因此这里不传 logger，把判定结果放进 params，
+        # 由 main() 统一记录 STAGE1_SHAKE_PROBE / STAGE1_STABILIZE_DECISION。
         _probe = detect_shakiness(
-            input_path, logger,
+            input_path, None,
             samples=int(params.get("shake_probe_samples", 12) or 12),
             frames_per_sample=int(params.get("shake_probe_frames", 40) or 40),
             threshold_px=float(params.get("shake_probe_threshold_px", 1.0) or 1.0))
@@ -815,14 +819,9 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
             _stab_requested = "DepanStabilize"
         else:
             _stab_requested = ""
-        if logger:
-            logger.info("STAGE1_STABILIZE_DECISION",
-                        f"stabilize=auto -> {'ON' if _stab_requested else 'OFF'}"
-                        f" ({_stab_auto_note})",
-                        samples_used=_probe.get("samples_used"),
-                        mean_abs_dx=_probe.get("mean_abs_dx"),
-                        mean_abs_dy=_probe.get("mean_abs_dy"),
-                        p95_abs=_probe.get("p95_abs"))
+        params["_shake_probe"] = _probe
+        params["_stabilize_effective"] = _stab_requested or "off"
+        params["_stabilize_auto_note"] = _stab_auto_note
     if _stab_requested is False or (
             isinstance(_stab_requested, str)
             and _stab_requested.strip().lower() in ("", "none", "off", "false")):
@@ -1129,6 +1128,30 @@ def main():
 
     # Generate VapourSynth script
     vs_script = generate_vs_script(input_path, params, args.job_id, crop_info)
+
+    # 防抖 auto 判定的日志（判定在 generate_vs_script 内完成，那里没有
+    # logger，故按函数内既有约定回传 params，在这里统一记录）
+    _probe = params.get("_shake_probe")
+    if _probe:
+        _eff = params.get("_stabilize_effective", "off")
+        logger.info("STAGE1_STABILIZE_DECISION",
+                    f"stabilize=auto -> {_eff.upper()} "
+                    f"({params.get('_stabilize_auto_note', '')})",
+                    samples_used=_probe.get("samples_used"),
+                    mean_abs_dx=_probe.get("mean_abs_dx"),
+                    mean_abs_dy=_probe.get("mean_abs_dy"),
+                    p95_abs=_probe.get("p95_abs"),
+                    shaky_segments=_probe.get("shaky_segment_count", 0))
+        _shaky = _probe.get("shaky_segments") or []
+        if _shaky:
+            logger.warning(
+                "STAGE1_SHAKE_LOCALIZED",
+                f"{len(_shaky)}/{_probe.get('samples_used', 0)} sampled "
+                "segments are shaky while the overall average may look "
+                "stable. Stab applies to the WHOLE clip; set "
+                "stabilize=DepanStabilize to force it on, or leave as-is "
+                "to accept the localized shake.",
+                shaky_segments=[g.get("start_s") for g in _shaky])
 
     # FIX-P6-3: Log WARNING when color_range cannot be detected per v6.32 §7.19
     if params.get("_color_range_unknown"):
