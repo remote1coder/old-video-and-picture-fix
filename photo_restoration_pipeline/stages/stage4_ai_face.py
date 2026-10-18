@@ -31,6 +31,27 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
+try:  # AI 解释器解析（与视频链 stage5 同一模块）
+    import ai_runtime as _ai_runtime
+except Exception:  # pragma: no cover - 缺模块时退化为"AI 不可用"
+    _ai_runtime = None
+
+_AI_PYTHON_CACHE = {}
+
+
+def _resolve_ai_python(logger=None):
+    """解析 AI 推理子进程解释器（带缓存；None = AI 不可用）。"""
+    if "py" in _AI_PYTHON_CACHE:
+        return _AI_PYTHON_CACHE["py"]
+    py = None
+    if _ai_runtime is not None:
+        try:
+            py = _ai_runtime.resolve_ai_interpreter(logger=logger)
+        except Exception:
+            py = None
+    _AI_PYTHON_CACHE["py"] = py
+    return py
+
 from logger import get_logger  # noqa: E402
 
 
@@ -124,6 +145,140 @@ def _detect_faces(input_path: str, params: dict, logger=None) -> bool:
     return len(_detect_face_boxes(input_path, params, logger)[0]) > 0
 
 
+def _detect_faces_via_facexlib(input_path, threshold, is_lowres,
+                               threshold_lowres, vw, vh, logger=None):
+    """FIX-NEW-V-11 / R13: facexlib 子进程人脸检测（照片链唯一可用后端）。
+
+    R13 实测：`_detect_face_boxes` 的回退链只有
+    RetinaFace / YOLOv8-face / MTCNN，而这三个包在照片链实际使用的
+    `.venv_r4` 里**一个都不存在** → 检测循环必然零命中 →
+    `STAGE4_NO_FACE` → **照片链人脸修复从未真正生效过**（rc 仍为 0，
+    只是一张原图拷贝）。项目依赖检查认的是 facexlib。
+
+    修法与视频链 stage5 同一模式：按 ai_runtime 解析出的 AI 解释器起
+    子进程（编排器无 torch），一次加载 retinaface_resnet50 做检测。
+
+    返回 None 表示不可用/失败（调用方保持"零命中"语义）。
+    """
+    ai_py = _resolve_ai_python(logger)
+    if ai_py is None:
+        if logger:
+            logger.warning("STAGE4_FACEXLIB_NO_INTERP",
+                           "无可用 AI 解释器，facexlib 检测跳过")
+        return None
+
+    models_dir = str(SCRIPT_DIR.parent.resolve() / "models")
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
+                                          delete=False,
+                                          encoding="utf-8") as f:
+            script_path = f.name
+            f.write(
+                "import json, os, shutil\n"
+                "import cv2, torch\n"
+                "from facexlib.detection import init_detection_model\n"
+                f"models_dir = {models_dir!r}\n"
+                # facexlib 权重解析路径是 <root>/facexlib/weights/，
+                # 本项目权重在 models/ 根部 —— 硬链接（失败则复制）补位，
+                # 避免联网下载 110MB。
+                "want_dir = os.path.join(models_dir, 'facexlib', 'weights')\n"
+                "want = os.path.join(want_dir, 'detection_Resnet50_Final.pth')\n"
+                "src = os.path.join(models_dir, 'detection_Resnet50_Final.pth')\n"
+                "if not os.path.exists(want) and os.path.exists(src):\n"
+                "    os.makedirs(want_dir, exist_ok=True)\n"
+                "    try:\n"
+                "        os.link(src, want)\n"
+                "    except OSError:\n"
+                "        shutil.copy2(src, want)\n"
+                f"path = {str(input_path)!r}\n"
+                "dev = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
+                "det = init_detection_model('retinaface_resnet50', half=False,\n"
+                "                           device=dev,\n"
+                "                           model_rootpath=models_dir)\n"
+                "img = cv2.imread(path)\n"
+                "rec = {'boxes': [], 'landmarks': []}\n"
+                "if img is not None:\n"
+                "    with torch.no_grad():\n"
+                "        dets = det.detect_faces(img, 0.5)\n"
+                # 该版本 facexlib 返回**单个 (N,15) ndarray**：
+                # [x1,y1,x2,y2,score, lm1x,lm1y, ..., lm5x,lm5y]
+                "    if dets is not None and len(dets) > 0:\n"
+                "        for row in dets:\n"
+                "            rec['boxes'].append([float(v) for v in row[:5]])\n"
+                "            rec['landmarks'].append(\n"
+                "                [[float(row[5 + 2 * k]), float(row[6 + 2 * k])]\n"
+                "                 for k in range(5)])\n"
+                "print('FACEDET_JSON:' + json.dumps(rec))\n"
+            )
+        r = subprocess.run([ai_py, script_path], capture_output=True,
+                           text=True, timeout=1800, shell=False)
+        if r.returncode == 0:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if r.returncode != 0:
+            if logger:
+                logger.warning("STAGE4_FACEXLIB_FAIL",
+                               f"facexlib 子进程失败 rc={r.returncode}; "
+                               f"script={script_path}",
+                               stderr_tail=(r.stderr or "")[-800:])
+            return None
+
+        payload = None
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("FACEDET_JSON:"):
+                payload = json.loads(line[len("FACEDET_JSON:"):])
+        if payload is None:
+            if logger:
+                logger.warning("STAGE4_FACEXLIB_NO_OUTPUT",
+                               "facexlib 子进程无 FACEDET_JSON 输出")
+            return None
+
+        lm_names = ("eye_l", "eye_r", "nose", "mouth_l", "mouth_r")
+        boxes_out = []
+        lms_out = []
+        for bi, b in enumerate(payload.get("boxes") or []):
+            x1, y1, x2, y2, conf = b[:5]
+            fw, fh = x2 - x1, y2 - y1
+            if fw <= 0 or fh <= 0:
+                continue
+            accept = conf >= threshold
+            if not accept and is_lowres and conf >= threshold_lowres \
+                    and vw * vh > 0 and (fw * fh) / (vw * vh) > 0.10:
+                accept = True
+                if logger:
+                    logger.warning(
+                        "STAGE4_LOWRES_FACE_ACCEPT",
+                        f"Low-res fallback: face conf={conf:.2f}, "
+                        f"area_ratio={((fw * fh) / (vw * vh)):.2f}")
+            if not accept:
+                continue
+            boxes_out.append((float(x1), float(y1), float(fw), float(fh)))
+            raw_lms = (payload.get("landmarks") or [])
+            pts = raw_lms[bi] if bi < len(raw_lms) else None
+            if pts and len(pts) >= 5:
+                # 与 RetinaFace/MTCNN 的键名对齐（stage5 色彩匹配依赖）
+                lms_out.append({
+                    "left_eye": tuple(pts[0]), "right_eye": tuple(pts[1]),
+                    "nose": tuple(pts[2]),
+                    "mouth_left": tuple(pts[3]), "mouth_right": tuple(pts[4]),
+                })
+            else:
+                lms_out.append(None)
+        if logger:
+            logger.info("STAGE4_FACE_DETECT",
+                        f"Faces found via facexlib: {len(boxes_out)} "
+                        f"(threshold={threshold if not is_lowres else threshold_lowres})")
+        return boxes_out, lms_out
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE4_FACEXLIB_EXC",
+                           f"facexlib detection raised: {type(e).__name__}: {e}")
+        return None
+
+
 def _detect_face_boxes(input_path: str, params: dict,
                        logger=None) -> tuple:
     """Detect faces and return (boxes, landmarks).
@@ -144,6 +299,7 @@ def _detect_face_boxes(input_path: str, params: dict,
     threshold_lowres = params.get("face_detect_threshold_lowres", 0.6)
     lowres_max = params.get("face_detect_lowres_max_dimension", 720)
 
+    is_lowres = False
     try:
         from PIL import Image
         with Image.open(input_path) as img:
@@ -155,6 +311,18 @@ def _detect_face_boxes(input_path: str, params: dict,
     except Exception:
         actual_threshold = threshold
         img_w = img_h = None
+
+    # FIX-NEW-V-11 / R13: facexlib 优先。
+    # config 的 face_detect_fallback 三个后端在 .venv_r4 里都不存在，
+    # 排在它们之后等于永远走不到；但 facexlib 是项目依赖检查实际认的，
+    # 且是本链唯一可用后端（与视频链 stage5 一致）。
+    fx = _detect_faces_via_facexlib(
+        input_path, threshold, is_lowres, threshold_lowres,
+        img_w or 0, img_h or 0, logger=logger)
+    if fx is not None:
+        fx_boxes, fx_lms = fx
+        if fx_boxes:
+            return fx_boxes, fx_lms
 
     for detector in face_detect_fallback:
         try:
