@@ -203,8 +203,17 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
                 f"half={'False' if not use_gpu else 'not torch.cuda.is_available()'})",
                 "from PIL import Image",
                 "import numpy as np",
-                f"img = Image.open({safe_input_path}).convert('RGB')",
-                "output, _ = model.enhance(np.array(img))",
+                # FIX-NEW-V-14 / R16: 不能用 Image.open(...).convert('RGB')。
+                # G'MIC 写出的 uint16 TIFF 里装的是 8-bit 量级数据，PIL 走
+                # uint8 TIFF 路径会读出**全 0**（实测 mean 0.0，原图 107.27）
+                # → AI 超分一张黑图 → 照片链交付纯黑 AVIF 而 rc 仍为 0。
+                # 改走 media_io.load_image_rgb_uint8（tifffile + 值域自适应）。
+                "import sys as _sys",
+                f"_sys.path.insert(0, {str(SCRIPT_DIR.parent.resolve() / 'shared_modules')!r})",
+                "from media_io import load_image_rgb_uint8 as _ldr",
+                f"_arr = _ldr({safe_input_path})",
+                "print('IN_ARR', _arr.shape, _arr.dtype, int(_arr.max()))",
+                "output, _ = model.enhance(_arr)",
                 resample_code,
                 save_code,
             ]),
@@ -271,8 +280,10 @@ def _run_gpen_pytorch(input_path: str, output_path: str, model: str,
 
         device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
 
-        img = Image.open(input_path).convert("RGB")
-        img_np = np.array(img).astype(np.float32) / 255.0
+        # FIX-NEW-V-14 / R16: 同 dat_runtime——PIL 读 G'MIC 的 uint16 TIFF
+        # 会得到全 0（黑图），改走 media_io 的值域自适应读取。
+        from media_io import load_image_rgb_uint8 as _ldr
+        img_np = _ldr(input_path).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
         # Try loading as GPEN architecture
