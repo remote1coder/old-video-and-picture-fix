@@ -641,18 +641,37 @@ def _write_tiff_internal(path: str, arr: Any,
 def embed_icc_in_tiff(path: str, icc_bytes: bytes) -> bool:
     """Attach an ICC profile to an existing TIFF (tag 34675) when possible.
 
-    Returns True when the profile was embedded by a known-good writer; False
-    means the caller must record that no profile is attached.
+    Returns True **only when the profile was written and read back
+    byte-for-byte**; False means the caller must record that no profile is
+    attached.
+
+    FIX-R3-07 / B06 补完：原实现 `tifffile.imwrite(...)` 之后直接
+    ``return True``，**没有任何回读验证**。这正好是 B06 反例
+    「写 ICC 失败仍算成功」中未被堵住的一半——异常路径会返回 False
+    （调用方标 `embed-failed`），但**静默写入失败**（tag 被丢弃、
+    字节被截断、写入成功但内容不对）仍会被当成成功。
+    与 R21「写得出、读不回来」同一条判据：写完必须自己读得回来。
     """
+    if not icc_bytes:
+        return False
     try:
         import tifffile  # type: ignore
-        import numpy as np
         arr = tifffile.imread(path)
         tifffile.imwrite(path, arr, compression="zlib",
                          extratags=[(34675, 1, len(icc_bytes), icc_bytes, True)])
-        return True
     except Exception:
         return False
+
+    # 回读验证：与源字节逐字节比对，不只看"tag 在不在"
+    try:
+        _arr, read_back = _tiff_read(path)
+    except Exception:
+        return False
+    if read_back is None:
+        return False
+    if len(read_back) != len(icc_bytes):
+        return False
+    return bytes(read_back) == bytes(icc_bytes)
 
 
 # --- avifenc capability / command ------------------------------------------
