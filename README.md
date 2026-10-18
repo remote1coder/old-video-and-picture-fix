@@ -51,37 +51,37 @@ quality while applying modern restoration techniques.
 `scan` / `edit` / `batch` / `quick` / `interactive` / `preview`）：
 
 ```bash
-# 模式 D（四步工作流）Step 1: 扫描输入目录生成分类清单
+# Step 1：扫描输入目录，生成分类清单
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     --scan -i /path/to/videos/ --output-manifest scan_manifest.yaml
 
-# 模式 D Step 2: 交互式审阅清单（调整参数覆盖）
+# Step 2：审阅清单（调整 status / 参数覆盖）
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     --edit-manifest --manifest scan_manifest.yaml
 
-# 模式 D Step 4 / 模式 F（批量执行，支持断点续传）
+# Step 3：批量执行（--resume 跳过已完成任务，断点续传）
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     --manifest scan_manifest.yaml --mode batch --resume
 
-# 模式 E（快速模式：扫描后立即执行，不保留清单）
+# 快速模式：扫描后立即执行（清单为临时文件，退出即删）
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     --mode quick -i /path/to/videos/
 
-# 模式 A（交互式单文件处理）
+# 交互式单文件
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     --mode interactive -i /path/to/single_video.avi
 
-# 模式 C / 模式 B（预览模式：提取代表性帧和运动片段）
+# 预览模式：提取代表性帧与运动片段（不执行修复）
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     --mode preview -i /path/to/videos/
 
-# 单 stage 调试运行
+# 单 stage 调试
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     --stage 3 -i /path/to/video.avi
