@@ -17,7 +17,7 @@ quality while applying modern restoration techniques.
 
 ### Prerequisites
 
-- Python 3.9+
+- Python 3.9+（实测运行环境为 3.12）
 - FFmpeg 4.4+（`bandreject` 需支持 `width_type=h`）
 - ExifTool
 - G'MIC（照片链）
@@ -115,7 +115,7 @@ python photo_restoration_pipeline/main.py \
 | 链 | 解释器 | 原因 |
 |---|---|---|
 | 视频链编排 | `tools_r4/vs_portable/r72/python.exe` | VapourSynth R72（API3 插件全通）；不含 torch |
-| 视频链 AI 推理 | 自动解析到 `.venv_r4` | stage3/stage5 以子进程调用（`shared_modules/ai_runtime.py`） |
+| 视频链 AI 推理 | 自动解析到 `.venv_r4` | stage3/stage5 以子进程调用；解析顺序 `WB_AI_PYTHON` → 当前解释器 → `.venv_r4`（`shared_modules/ai_runtime.py`） |
 | 照片链 | `.venv_r4/Scripts/python.exe` | torch / basicsr / realesrgan / gfpgan / facexlib 齐全 |
 
 - **PATH 必须包含子目录**：`tools_r4/gmic/gmic-*-cli-win64`、
@@ -163,11 +163,12 @@ See [PROJECT_MANUAL.md](PROJECT_MANUAL.md) for the complete operation manual.
 │   ├── config.yaml                  # Photo configuration
 │   └── stages/                      # Photo processing stages
 │       ├── stage1_preprocess.py
-│       ├── stage2_traditional_check.py
+│       ├── stage2_ai_pre.py          # 单通道校正
 │       ├── stage3_ai_upscale.py
-│       ├── stage4_postprocess.py
-│       ├── stage5_ai_face.py
-│       └── stage6_encode.py
+│       ├── stage4_ai_face.py
+│       ├── stage5_postprocess.py
+│       ├── stage6_encode.py
+│       └── stage2_traditional_check.py   # 历史遗留，不在默认链
 │
 ├── shared_modules/                  # Shared modules
 │   ├── checkpoint.py                # Checkpoint / resume support
@@ -178,6 +179,8 @@ See [PROJECT_MANUAL.md](PROJECT_MANUAL.md) for the complete operation manual.
 │   ├── manifest_editor.py           # Manifest editing
 │   ├── manifest_loader.py           # Manifest loading
 │   ├── preview.py                   # Preview utilities
+│   ├── media_io.py                  # Media probing / IO helpers
+│   ├── cancel_guard.py              # Cancellation / interrupt guard
 │   ├── ai_runtime.py                # AI interpreter resolution
 │   └── dat_runtime.py               # DAT model runtime
 │
@@ -186,9 +189,11 @@ See [PROJECT_MANUAL.md](PROJECT_MANUAL.md) for the complete operation manual.
 
 ## Version History
 
-- **v6.3** — Technical specification for video restoration
-- **v7.3** — Architecture specification with photo pipeline, TUI, manifest editor
-- **v7.4+** — Hybrid pipeline with both video and photo restoration
+实现遵循两本规范（规范原文为本地文档，不入库）：
+
+- **v6.32** — 视频修复技术规范（`v6.32.md`）
+- **v7.32** — 架构规范：照片链、TUI 清单编辑器、6 种运行模式
+- 当前仓库同时包含两条链（video + photo）与共享模块
 
 ## 问题台账与审计报告（仅本地，不入库）
 
