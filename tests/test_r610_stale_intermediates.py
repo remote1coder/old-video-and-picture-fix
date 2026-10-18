@@ -149,3 +149,34 @@ def test_photo_stages_fall_back_to_upscaled_dir():
     for mod in (s4,):
         src = inspect.getsource(mod._resolve_input_source)
         assert "_upscaled" in src, "stage4 必须回落到 _upscaled 目录"
+
+
+def test_no_lzw_tiff_writes():
+    """R21 静态守卫：不得再用 PIL 的 tiff_lzw 写中间产物。
+
+    写 LZW 就必须能读 LZW。tifffile 解 LZW 要 `imagecodecs`（本机未装），
+    于是 stage5 写出的文件 stage5 自己读不回来 →
+    MediaPrecisionError → STAGE5_ERROR rc=86。zlib（Python 内置）无此问题。
+    """
+    import inspect
+    import io
+    import tokenize
+    import photo_restoration_pipeline.stages.stage5_postprocess as s5
+    src = inspect.getsource(s5)
+    # 只看代码（注释/docstring 里可能出现该词作为说明）
+    code = []
+    prev = tokenize.INDENT
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.type == tokenize.STRING and prev in (
+                tokenize.INDENT, tokenize.NEWLINE, tokenize.NL,
+                tokenize.DEDENT):
+            continue
+        if tok.type not in (tokenize.NL, tokenize.NEWLINE,
+                            tokenize.INDENT, tokenize.DEDENT):
+            code.append(tok.string)
+        prev = tok.type
+    joined = " ".join(code)
+    assert "tiff_lzw" not in joined, \
+        "不得写 tiff_lzw（读回需要未安装的 imagecodecs，R21）"
