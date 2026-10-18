@@ -765,9 +765,20 @@ def resolve_depth_spec(requested_depth: int,
                          "reason": "avifenc lacks depth-extension support",
                          "requested_combo": list(combo)})
             return str(combo[0]), combo[0], info
+        # FIX-B6 实测修正：原文写 "avifdec --sato (or --depth 16)" 暗示两者
+        # 等价，**实测不等价**。对同一个 archival（12+8 depth-extension）
+        # 成品，与 16-bit 母版逐像素比对：
+        #   avifdec --sato            → MAE=0.0000  MAX=0   array_equal=True
+        #   avifdec --depth 16        → MAE=3.5024  MAX=15  array_equal=False
+        #   avifdec --depth 16 --sato → MAE=0.0000  MAX=0   array_equal=True
+        # 即**单独用 --depth 16 会丢低 4 位**（主图只有 12-bit，
+        # 扩展项需由 --sato 合并）。按旧描述解码会把无损档误判为有损。
         info.update({"mode": "depth-extension", "downgraded": False,
                      "primary_depth": combo[0], "extension_depth": combo[1],
-                     "decode_requires": "avifdec --sato (or --depth 16)"})
+                     "decode_requires": "avifdec --depth 16 --sato "
+                                        "(--sato is REQUIRED to merge the "
+                                        "depth-extension item; --depth 16 "
+                                        "alone loses the low 4 bits)"})
         return f"{combo[0]},{combo[1]}", 16, info
 
     raise UnsupportedAvifConfig(
