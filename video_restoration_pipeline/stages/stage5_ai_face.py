@@ -387,28 +387,65 @@ def run_gfpgan(input_dir: str, output_dir: str, model_path: str = "",
             pass
 
     # Fallback: Python API
-    # BUG-050 fix: Use json.dumps() for safe path quoting
-    # to prevent single-quote injection
+    # FIX-R6-08（2026-10-18 实测）：
+    #   ① GfpganRunner 内部建 FaceRestoreHelper 时不传 model_rootpath，
+    #      facexlib 把 `gfpgan/weights/` 当**相对 cwd** 解析 —— 子进程在
+    #      案例目录里跑会重新联网下载 195MB 权重，网络稍差即失败。
+    #      故 cwd 固定项目根，并预先把 models/ 权重硬链接进 gfpgan/weights/。
+    #   ② ORIGINAL 用 `python -c "a=1; b=2; for f in ...: ..."` —— Python
+    #      **不允许复合语句跟在分号后**（`SyntaxError: invalid syntax`），
+    #      所以这条回退路径从来没有执行成功过。改为写临时 .py 文件执行。
     try:
-        import json as _json
-        safe_input_dir = _json.dumps(input_dir)
-        safe_output_dir = _json.dumps(output_dir)
-        safe_model_path = _json.dumps(model_path)
-        cmd = [
-            ai_py, "-c",
-            f"from gfpgan import GFPGANer; "
-            f"import cv2; import os; import glob; "
-            f"os.makedirs({safe_output_dir}, exist_ok=True); "
-            f"restorer = GFPGANer(model_path={safe_model_path}, upscale={upscale}, arch='clean', bg_upsampler=None); "
-            f"for f in sorted(glob.glob(os.path.join({safe_input_dir}, '*.png'))): "
-            f"    img = cv2.imread(f, cv2.IMREAD_COLOR); "
-            f"    _, _, output = restorer.enhance(img, has_aligned=False, only_center_face=False); "
-            f"    out_path = os.path.join({safe_output_dir}, os.path.basename(f)); "
-            f"    cv2.imwrite(out_path, output)"
-        ]
-        r = subprocess.run(cmd, capture_output=True, timeout=1800, shell=False)
+        project_root = str(SCRIPT_DIR.parent.resolve())
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False,
+                                          encoding="utf-8") as fh:
+            script_path = fh.name
+            fh.write(
+                "import os, shutil, glob\n"
+                "import cv2\n"
+                f"root = {project_root!r}\n"
+                "wdir = os.path.join(root, 'gfpgan', 'weights')\n"
+                "os.makedirs(wdir, exist_ok=True)\n"
+                "for _n in ('detection_Resnet50_Final.pth', 'parsing_parsenet.pth'):\n"
+                "    _src = os.path.join(root, 'models', _n)\n"
+                "    _dst = os.path.join(wdir, _n)\n"
+                "    if os.path.exists(_src) and not os.path.exists(_dst):\n"
+                "        try:\n"
+                "            os.link(_src, _dst)\n"
+                "        except OSError:\n"
+                "            shutil.copy2(_src, _dst)\n"
+                "from gfpgan import GFPGANer\n"
+                f"restorer = GFPGANer(model_path={model_path!r}, upscale={upscale},\n"
+                "                     arch='clean', bg_upsampler=None)\n"
+                f"os.makedirs({output_dir!r}, exist_ok=True)\n"
+                f"for f in sorted(glob.glob(os.path.join({input_dir!r}, '*.png'))):\n"
+                "    img = cv2.imread(f, cv2.IMREAD_COLOR)\n"
+                "    if img is None:\n"
+                "        continue\n"
+                "    _, _, output = restorer.enhance(\n"
+                "        img, has_aligned=False, only_center_face=False)\n"
+                "    if output is None:\n"
+                "        continue\n"
+                f"    cv2.imwrite(os.path.join({output_dir!r},\n"
+                "                            os.path.basename(f)), output)\n"
+            )
+        r = subprocess.run([ai_py, script_path], capture_output=True, text=True,
+                           timeout=1800, shell=False, cwd=project_root)
+        if r.returncode == 0:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif logger:
+            logger.warning("STAGE5_GFPGAN_SUBPROC_FAIL",
+                           f"GFPGAN subprocess rc={r.returncode}; "
+                           f"script={script_path}",
+                           stderr_tail=(r.stderr or "")[-1200:])
         return r.returncode == 0
-    except Exception:
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE5_GFPGAN_ERROR", str(e))
         return False
 
 
@@ -2116,18 +2153,44 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                       f"Full frame extraction failed: {e}")
 
     # Step 2: Replace restored face frames with feathered blending
-    restored_frames = sorted(Path(face_output_dir).glob("*.png"))
+    # FIX-R6-09（2026-10-18 实测）：官方 inference_codeformer.py /
+    # inference_gfpgan.py 把结果写进 <output_dir>/restored_imgs/
+    # （还可能出现在 restored_faces/ 等子目录），而这里原来只在
+    # output_dir 根 glob → replaced_count 恒为 0，stage5 却仍返回 0。
+    # 这是典型假通过：日志写 "Feather-blended 0 frames"，画面其实没修。
+    # 修法：按优先级在多个候选目录里找结果，并把"0 替换"判为失败。
+    candidate_dirs = [
+        Path(face_output_dir),
+        Path(face_output_dir) / "restored_imgs",
+        Path(face_output_dir) / "restored_faces",
+        Path(face_output_dir) / "cropped_faces",
+    ]
+    restored_frames: List[Path] = []
+    used_dir = None
+    for cd in candidate_dirs:
+        if cd.is_dir():
+            pngs = sorted(cd.glob("*.png"))
+            if pngs:
+                restored_frames = pngs
+                used_dir = cd
+                break
+    if used_dir is not None:
+        logger.info("STAGE5_RESTORED_SOURCE",
+                    f"Restored frames source: {used_dir} "
+                    f"({len(restored_frames)} png)")
+
     replaced_count = 0
     for rf in restored_frames:
         target = Path(all_frames_dir) / rf.name
-        fallback_target = None
         if not target.exists():
-            m = re.match(r"face_(\d+)_\d+\.png", rf.name)
+            # face_{start}_{seq}.png → frame_%08d；ffmpeg 从 0001 起编号，
+            # 全局索引 i 对应 frame_{i+1}，故目标为 start + seq。
+            m = re.match(r"face_(\d+)_(\d+)\.png", rf.name)
             if m:
-                frame_idx = int(m.group(1))
-                fallback_target = (Path(all_frames_dir)
-                                   / f"frame_{frame_idx:08d}.png")
-                target = fallback_target
+                seg_start = int(m.group(1))
+                seq = int(m.group(2))          # 1-based
+                target = (Path(all_frames_dir)
+                          / f"frame_{seg_start + seq:08d}.png")
         if target.exists():
             try:
                 import cv2
@@ -2157,6 +2220,14 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
 
     logger.info("STAGE5_BLEND",
                f"Feather-blended {replaced_count} face-restored frames")
+
+    # FIX-R6-09: 有静态人脸段却一帧都没替换 = 修复实际没进画面。
+    # 这种情况下继续走只会产出"看起来成功"的未修复视频，必须显式失败。
+    if face_segments and replaced_count == 0:
+        logger.error("STAGE5_NO_BLEND",
+                    "Face segments exist but 0 restored frames were blended; "
+                    "refusing to report success (silent no-op)")
+        return 86
 
     # Auto color matching after face restoration
     # Per v7.3 §3.10.7: align face region color to neck region
