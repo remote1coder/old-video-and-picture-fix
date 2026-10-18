@@ -247,14 +247,23 @@ def run_dat_file(input_path: str, output_path: str, model: str, scale: int,
                 Image.fromarray(output_8).save(output_path)
         else:
             output_8 = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-            # FIX-NEW-V-18 / R21: 不用裸 PIL `.save(path)`——PIL 对 .tif
-            # 会默认选 **LZW** 压缩，而 tifffile 解 LZW 需要 `imagecodecs`
-            #（本机未装）→ 下游 stage5 读不回来 → MediaPrecisionError
-            # → rc=86。走 media_io.write_tiff（zlib，纯 Python 内置）。
-            try:
-                from media_io import write_tiff as _wt
-                _wt(output_path, output_8)
-            except Exception:
+            # FIX-NEW-V-20 / R23: 输出格式必须**跟随 output_path 的扩展名**。
+            # R21 的修复把这一支改成无条件 write_tiff（避开 PIL 的 LZW
+            # 默认），但视频链 stage3 的 DAT 批处理传的是
+            # `frame_XXXXXXXX.png` —— 于是写出的是 **TIFF 字节 + .png 名**，
+            # 编码器按 PNG 读即报 "Invalid PNG signature 0x49492A00"
+            # （49 49 2A 00 = TIFF 的 `II*\0`），stage3 rc=84。
+            # PNG 用 zlib 压缩的 imagecodecs/PIL 路径即可（不涉 LZW）；
+            # TIFF 才需要走 media_io.write_tiff（zlib）。
+            ext = os.path.splitext(str(output_path))[1].lower()
+            if ext in (".tif", ".tiff"):
+                try:
+                    from media_io import write_tiff as _wt
+                    _wt(output_path, output_8)
+                except Exception:
+                    Image.fromarray(output_8).save(output_path)
+            else:
+                # PNG / 其他：PIL 按内容选压缩（PNG 用 deflate，非 LZW）
                 Image.fromarray(output_8).save(output_path)
         return True
     except Exception:
