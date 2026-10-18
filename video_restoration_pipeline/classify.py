@@ -21,7 +21,8 @@ def run_ffprobe(input_path: str) -> Dict[str, Any]:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format:stream",
              "-of", "json", input_path],
-            capture_output=True, text=True, timeout=60, shell=False
+            capture_output=True, text=True,
+            errors="replace", timeout=60, shell=False
         )
         if r.returncode == 0:
             return json.loads(r.stdout)
@@ -40,7 +41,8 @@ def _check_psf_mediainfo(input_path: str) -> bool:
     try:
         r = subprocess.run(
             ["mediainfo", "--Inform=Video;%ScanType_StoreMethod%", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True,
+            errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             method = r.stdout.strip().lower()
@@ -131,9 +133,15 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list, floa
         r = subprocess.run(
             ["ffmpeg", "-hide_banner", "-v", "info", "-i", input_path,
              "-vf", "idet", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=120, shell=False
+            capture_output=True, text=True,
+            errors="replace", timeout=120, shell=False
         )
-        global_idet = r.stderr
+        # FIX-B7 实测：ffmpeg 的 stderr 含非 UTF-8 字节时，text=True 的
+        # subprocess 会把 stderr 置为 **None**（解码失败），于是下游
+        # `idet_output.split()` 抛 AttributeError → 分类整体崩溃 →
+        # 素材被当成"无法判断"→ 不修。真实中文素材（本例文件名含中文）
+        # 必现。上面已加 errors="replace"，这里再对 None 做防御。
+        global_idet = r.stderr or ""
     except Exception:
         global_idet = ""
 
@@ -202,7 +210,8 @@ def detect_field_order_segments(input_path: str) -> Tuple[str, float, list, floa
                  "-ss", str(start), "-t", str(window_duration),
                  "-i", input_path,
                  "-vf", "idet", "-f", "null", "-"],
-                capture_output=True, text=True, timeout=60, shell=False
+                capture_output=True, text=True,
+            errors="replace", timeout=60, shell=False
             )
             wtff, wbff, wprog, wund = _parse_idet_counts(r.stderr)
             wtotal = wtff + wbff + wprog + wund
