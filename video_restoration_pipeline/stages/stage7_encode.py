@@ -14,6 +14,7 @@ v6.3 Compliance:
 """
 
 import sys
+import os
 import json
 import argparse
 import subprocess
@@ -1242,6 +1243,36 @@ def main():
     # per v7.32 §3.10.3: conversion should be based on the video being encoded
     # ORIGINAL: _get_source_color_info(args.input) probed original input
     source_color_range, color_standard, range_known, primaries_known = _get_source_color_info(input_source)
+
+    # FIX-B7（画质关键）：中间产物可能**丢了色彩元数据**，此时必须回退到
+    # 原始输入再探一次，而不是直接默认 BT.601。
+    #
+    # 背景：FIX-P7-3 把探测对象从 `args.input`（原始）改成了 `input_source`
+    # （上游产物），理由是"转换应基于实际编码的视频"。这个理由在中间产物
+    # **保留**元数据时成立——但实测（2026-10-19，1080i 真实素材）：
+    #   * 源片 ffprobe: color_space=bt709 color_primaries=bt709 color_range=tv
+    #   * stage1-6 的 ffv1 mkv 中间产物：**读不到 color_primaries**
+    #   → 探测失败 → 默认 NTSC/BT.601 → 执行 `smpte170m → bt709` 转换
+    #   → **成品整体偏紫**（对比图肉眼可见）
+    #
+    # 正确的降级顺序：input_source（实际被编码的内容）→ 原始输入（元数据
+    # 权威来源）→ 最后才是"未知按 limited/601"的保守默认。
+    if not (range_known and primaries_known) and args.input \
+            and os.path.abspath(args.input) != os.path.abspath(input_source):
+        _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(args.input)
+        if _o_rk or _o_pk:
+            logger.info("STAGE7_COLOR_FALLBACK_ORIGINAL",
+                        "Intermediate lost color metadata; falling back to "
+                        "the original input for accurate color conversion "
+                        "instead of assuming BT.601 (which would tint the "
+                        "picture)",
+                        intermediate=input_source, original=args.input,
+                        orig_range=_o_range if _o_rk else None,
+                        orig_standard=_o_std if _o_pk else None)
+            if not range_known and _o_rk:
+                source_color_range, range_known = _o_range, True
+            if not primaries_known and _o_pk:
+                color_standard, primaries_known = _o_std, True
 
     # FIX-R7-S7-A1: log WARNING for unknown source range/primaries per v6.32 §7.19
     if not range_known:
