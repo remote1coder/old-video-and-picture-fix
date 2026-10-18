@@ -65,9 +65,27 @@ def _get_audio_layout(audio_path: str) -> dict:
 _MAX_PER_CHANNEL_ARNNDN = 8
 
 
+class AudioDegradeNotAllowed(Exception):
+    """FIX-R3-08 补完：明确要求的音频算法不可用，且未授权降级。
+
+    与 R3-08 / B12 同判据——"明确要求的算法不可用"必须让阶段失败，
+    不能只记一条 WARNING 然后照样 rc=0。
+    """
+
+
 def _arnndn_filters(model: str, audio_layout: dict, escape,
-                    logger=None) -> List[str]:
+                    logger=None, allow_degrade: bool = True) -> List[str]:
     """R2-10: build the arnndn filter chain **without merging channels**.
+
+    ``allow_degrade``: 是否授权"降级到 afftdn"。仅当声道数
+    ``> _MAX_PER_CHANNEL_ARNNDN`` 时才涉及降级决策。
+
+    * 用户**明确要求** arnndn（``choice == "arnndn"``）时，调用方应传入
+      ``params.get("allow_audio_degrade", False)``——未授权则抛
+      ``AudioDegradeNotAllowed``，由调用方转成阶段失败（与 R3-08 / B12
+      同判据：明确要求的算法不可用必须失败，不能静默降级）。
+    * ``choice == "auto"`` 的语义本就是"有 arnndn 就用、没有就降级"，
+      因此传 ``True``。
 
     旧实现（``aformat=channel_layouts=mono`` → arnndn → ``aformat=...stereo``）
     会把左右声道**下混成同一个单声道**再复制回去，左右差异永久丢失。
@@ -113,6 +131,23 @@ def _arnndn_filters(model: str, audio_layout: dict, escape,
                         channels=channels, layout=layout)
         return [chain]
 
+    # FIX-R3-08 补完 / >8ch：这里原本**无条件**退回 afftdn，只记一条
+    # WARNING。但 `allow_audio_degrade` 是"是否授权降级"的开关，
+    # 同一文件里"arnndn 模型缺失"的分支（见下方 `_resolve_audio_denoise`）
+    # 已经正确遵守它——唯独这条 >8ch 路径绕过了开关。
+    # 后果：用户明确要求 arnndn 且**未授权降级**时，>8 声道素材会被
+    # 静默换成 afftdn，日志只有一条 WARNING，rc 仍是 0（与 B12 同族：
+    # "明确要求的算法不可用"必须失败，而不是降级）。
+    if not allow_degrade:
+        if logger:
+            logger.error("STAGE7_ARNNDN_TOO_MANY_CHANNELS",
+                         f"per-channel arnndn for {channels}ch is not "
+                         "implemented and no degradation is authorized; "
+                         "failing the stage", channels=channels)
+        raise AudioDegradeNotAllowed(
+            f"arnndn requested for {channels}ch (> "
+            f"{_MAX_PER_CHANNEL_ARNNDN}) but per-channel arnndn is not "
+            "implemented; set allow_audio_degrade=true to accept afftdn")
     if logger:
         logger.warning("STAGE7_ARNNDN_MULTICHANNEL_DEGRADED",
                        f"per-channel arnndn for {channels}ch is not "
@@ -364,8 +399,23 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                             "afftdn applied as explicitly requested")
         elif choice == "arnndn":
             if model_exists:
-                audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
-                                                     _fpath, logger))
+                # FIX-R3-08 补完：用户**明确要求** arnndn。>8ch 时是否允许
+                # 降级由 allow_audio_degrade 决定（默认 False = 不许降级，
+                # 未授权则抛 AudioDegradeNotAllowed → 阶段失败）。
+                try:
+                    audio_filters.extend(_arnndn_filters(
+                        arnndn_model, audio_layout, _fpath, logger,
+                        allow_degrade=bool(params.get("allow_audio_degrade",
+                                                      False))))
+                except AudioDegradeNotAllowed as exc:
+                    if logger:
+                        logger.error("STAGE7_ARNNDN_CHANNELS_UNAVAILABLE",
+                                     "arnndn requested but per-channel "
+                                     "processing is unavailable for this "
+                                     "channel count and no degradation is "
+                                     "authorized; failing the stage",
+                                     detail=str(exc))
+                    return "__DENOISE_UNAVAILABLE__"
             elif params.get("allow_audio_degrade", False):
                 audio_filters.append("afftdn=nr=12:nf=-50")
                 if logger:
@@ -386,8 +436,11 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                 return "__DENOISE_UNAVAILABLE__"
         else:  # "auto"
             if model_exists:
+                # auto 的语义本就是"有 arnndn 就用、没有就降级"，
+                # 因此这里始终授权降级（与明确要求 arnndn 的分支不同）。
                 audio_filters.extend(_arnndn_filters(arnndn_model, audio_layout,
-                                                     _fpath, logger))
+                                                     _fpath, logger,
+                                                     allow_degrade=True))
             else:
                 audio_filters.append("afftdn=nr=12:nf=-50")
                 if logger:
