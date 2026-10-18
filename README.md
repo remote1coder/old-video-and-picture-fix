@@ -145,8 +145,50 @@ The two pipelines use **different interpreters**; mixing them fails:
 - For materials that need human review use `--scan` → `--edit-manifest` →
   `--mode batch`: set `status` to `PENDING` and adjust thresholds via
   `user_overrides` when needed (e.g. `deinterlace_progressive_threshold`).
+  The **photo** chain has a second gate: the job's own `confidence` must also
+  be raised, otherwise `_run_single_job` skips it silently (returns 3).
 - Failed jobs resume automatically from `last_completed_stage + 1`, so AI
   inference is not repeated.
+
+#### Verifying output content (do not skip this)
+
+An exit code of 0 does **not** mean the picture survived the pipeline. The
+photo chain once delivered **all-black AVIFs** (386 bytes, pixel mean 0.0)
+while every stage returned 0 and nothing was logged. Always inspect the
+result itself:
+
+| Check | How | Catches |
+|---|---|---|
+| Not a black frame | pixel `mean` / `std` of the decoded output | all-black output |
+| Model/scale applied | log the vpy / `PARAM_OVERRIDE` | override silently ignored |
+| Non-zero counters | blended frame count, faces detected | "0 frames" false pass |
+| Artifact exists | glob + extension | naming mismatch |
+| Intermediate TIFF readable | `tifffile` opens it directly | LZW (needs `imagecodecs`) |
+| Third-party calls | `inspect.signature().bind()` | invalid kwargs |
+
+**Never rely on rc + dimensions + bit depth alone** — that combination
+passes an all-black output.
+
+#### AI / face restore notes
+
+- Face detection uses **facexlib**; the `RetinaFace` / `YOLOv8-face` / `MTCNN`
+  packages named in the spec are not installed, so that fallback chain never
+  matched anything. facexlib is not a peer backend — it is the detector
+  bundled inside GFPGAN/CodeFormer.
+- CodeFormer inference uses `basicsr.archs.codeformer_arch` (the `codeformer`
+  package is absent, but the weights load with 0 missing / 0 unexpected keys).
+- **G'MIC's `-o X.tif,uint16` writes a file that claims 16-bit but holds
+  8-bit-range data.** Read such TIFFs with
+  `media_io.load_image_rgb_uint8()` (tifffile + per-channel adaptive range);
+  `PIL.Image.open(...).convert('RGB')` returns zeros.
+- **Intermediate TIFFs must not be LZW.** Both `PIL.Image.save()` and
+  `cv2.imwrite()` default to LZW for `.tif`, and reading LZW needs
+  `imagecodecs` (not installed) — write with `media_io.write_tiff()`
+  (zlib) or pass `[cv2.IMWRITE_TIFF_COMPRESSION, 8]`. Output **format must
+  follow the output extension**: the video chain feeds `.png` names.
+- Face restore works on real samples: on a frame extracted from
+  `seg_face_static.mp4`, GFPGAN yields 2560×1920 and CodeFormer 1280×960.
+  Note that facexlib detects **zero** faces across the 37 real photos.
 
 ### Architecture
 
@@ -361,7 +403,44 @@ python photo_restoration_pipeline/main.py \
 - 需要人工确认的素材走 `--scan` → `--edit-manifest` → `--mode batch`：
   把 `status` 置 `PENDING`，必要时用 `user_overrides` 调整门限
   （如 `deinterlace_progressive_threshold`）。
+  **照片链还有第二道门限**：job 自身的 `confidence` 也必须一并调高，
+  否则 `_run_single_job` 会静默跳过（返回 3）。
 - 中途失败的任务会按 `last_completed_stage + 1` 自动续跑，不重复 AI 推理。
+
+#### 必须核对产物内容（不要跳过）
+
+**退出码 0 不代表画面活着。** 照片链曾交付**全黑 AVIF**（386 字节、
+像素 mean 0.0），而全链 rc 一直是 0、没有任何日志报错。请务必检查成品本身：
+
+| 核对对象 | 手段 | 能抓到什么 |
+|---|---|---|
+| 是否黑图 | 解码后看像素 `mean` / `std` | 全黑成品 |
+| 模型/倍数是否真生效 | 查 vpy / `PARAM_OVERRIDE` | 覆盖被静默忽略 |
+| 关键计数是否非零 | blend 帧数、检出人脸数 | "0 帧"假通过 |
+| 产物是否存在 | glob 命中数 + 扩展名 | 命名约定不匹配 |
+| 中间 TIFF 能否读 | `tifffile` 能直接打开 | LZW（需 `imagecodecs`） |
+| 第三方调用 | `inspect.signature().bind()` | 非法 kwarg |
+
+**只核对 rc + 尺寸 + 位深，会让全黑图"通过"验收。**
+
+#### AI 与人脸修复要点
+
+- 人脸检测用 **facexlib**。规范里那套 `RetinaFace → YOLOv8-face → MTCNN`
+  回退链在本项目**三个包都没装**，恒为"全不可用"→ 检出零命中。
+  facexlib 不是并列的第四个后端，而是 **GFPGAN/CodeFormer 自带的检测实现**。
+- CodeFormer 推理走 `basicsr.archs.codeformer_arch`（`codeformer` 包不存在，
+  但权重可零 missing / 零 unexpected 载入）。
+- **G'MIC 的 `-o X.tif,uint16` 写出的文件声明 16-bit，实际却是 8-bit 量级。**
+  这类 TIFF 必须用 `media_io.load_image_rgb_uint8()` 读（tifffile +
+  逐通道值域自适应）；`PIL.Image.open(...).convert('RGB')` 只会读到全 0。
+- **中间 TIFF 一律不得是 LZW。** `PIL.Image.save()` 与 `cv2.imwrite()`
+  对 `.tif` 都默认选 LZW，而解 LZW 需要未安装的 `imagecodecs`——
+  请用 `media_io.write_tiff()`（zlib），或给 cv2 传
+  `[cv2.IMWRITE_TIFF_COMPRESSION, 8]`。**输出格式必须跟随输出扩展名**：
+  视频链喂的是 `.png` 文件名。
+- 人脸修复在真实样张上可用：从 `seg_face_static.mp4` 抽帧，
+  GFPGAN 出 2560×1920、CodeFormer 出 1280×960。
+  注意 facexlib 在**37 张真实照片上是零检出**。
 
 ### 架构
 

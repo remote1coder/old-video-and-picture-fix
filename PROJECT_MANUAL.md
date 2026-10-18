@@ -485,6 +485,23 @@ python photo_restoration_pipeline/main.py \
 - `GFPGAN`: 重建模糊人脸，恢复五官
 - `CodeFormer`: 保真度更高，保留皱纹和年龄特征
 
+**人脸修复的实测前提**（重要，直接影响你能否看到效果）：
+
+- 人脸检测由 **facexlib** 完成。规范里列出的 `RetinaFace` / `YOLOv8-face` /
+  `MTCNN` 三个独立包在本项目的环境里都没有安装——不要指望通过安装它们
+  来"启用"人脸修复，facexlib 才是 GFPGAN/CodeFormer 自带的检测实现。
+- **facexlib 在 37 张真实照片上检出 0 张脸**。如果你处理真实照片时日志出现
+  `STAGE4_NO_FACE` 且流程跳过面部修复，这是检出为零、不是功能坏了。
+  想验证人脸修复是否工作，请先用
+  `E:\codex\_repair_r4_20261013\matrix\photo_opt\face_sample\face_sample.png`
+  这类确含人脸的样张。
+- 面部修复会让输出尺寸变化：GFPGAN 在 2× 超分基础上再放大人脸区域，
+  样张上得到 2560×1920，而 CodeFormer 为 1280×960。这是预期行为，
+  不是 bug。
+- 若日志出现 `STAGE4_FAILED`（退出码 83），说明推理子进程失败；
+  此时应查看该 job 日志中的 `GFPGAN/CodeFormer subprocess failed` 行，
+  它会带出子进程的原始报错。
+
 ### 7.4 批量修复
 
 **方式一：使用 `--input-dir`（推荐）**
@@ -645,7 +662,45 @@ global:
 路径只能通过 config.yaml 或清单 job 的 `temp_dir`/`output_path` 指定；
 照片 `main.py` 支持 `--temp-dir` / `--output`。
 
-### 10.2 获取帮助
+### 10.2 怎么确认这次修复真的成功了
+
+退出码 0 **不等于画面活着**。本项目的照片链曾出现过"全链 rc=0、日志无报错、
+但交付的 AVIF 是全黑图"的情况（成品仅 386 字节，像素均值 0.0）。
+交付前请至少做一次像素级确认：
+
+```bash
+# 照片：解出成 PNG 看一眼，并看像素统计
+python -c "
+from PIL import Image; import numpy as np
+Image.MAX_IMAGE_PIXELS = None
+a = np.array(Image.open(r'你的输出.avif').convert('RGB'))
+print(a.shape, 'mean', round(float(a.mean()),2), 'std', round(float(a.std()),2))
+"
+# mean 接近 0 → 成品是黑图，别当成成功
+```
+
+```bash
+# 视频：抽第一帧看像素统计
+ffmpeg -v error -i 输出.mkv -frames:v 1 -y /tmp/chk.png
+python -c "
+from PIL import Image; import numpy as np
+a = np.array(Image.open('/tmp/chk.png').convert('RGB'))
+print('mean', round(float(a.mean()),2), 'std', round(float(a.std()),2))
+"
+```
+
+还要顺带确认：
+
+| 确认什么 | 看哪里 |
+|---|---|
+| 参数真的生效了 | 日志里的 `PARAM_OVERRIDE`、生成的 `.vpy` |
+| 人脸/帧数不是 0 | `STAGE4_FACE_DETECT`（faces found 数量）、`STAGE*_BLEND` 帧数 |
+| 没有被静默跳过 | `STAGE4_NO_FACE_SKIP`、`SKIP` 状态作业 |
+| 中间 TIFF 读得回来 | 用 `tifffile` 直接打开 |
+
+**只核对 rc + 尺寸 + 位深是不够的**——那三项对全黑图一样"通过"。
+
+### 10.3 获取帮助
 
 ```bash
 # 查看主脚本帮助
