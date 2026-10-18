@@ -1919,9 +1919,25 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     # FIX-P9-3: validate AI upscale completion order per v7.32 §3.10.5
     # When AI upscale is enabled, stage3 output MUST exist before stage5 runs
     if ai_enabled and input_source:
-        step3_pattern = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
+        # FIX-B7（关键）：stage3 在 **force 模式**下会把产物改名为
+        # `_step3_forced_upscale_p<hash>.mkv`（见 stage3_ai_upscale 的
+        # "V-P-031 fix: force_allow suffix"）。stage4 与 stage7 都已改成
+        # 同时匹配两种名字（stage4 的 FIX-P8-2、stage7 的 media 白名单），
+        # **唯独这里漏了**——于是只要用户用
+        # `force_allow_banned_upscale: true` 强制超分（1080p 素材必然
+        # 需要，因为默认判 banned），stage5 就报
+        #   STAGE5_ORDER_ERROR "AI upscale enabled but no stage3 output found"
+        # → rc=82 → STALE_INTERMEDIATES_PURGED → 整链从 stage0 重跑，
+        # 每跑一次崩一次，永远到不了 stage6/7。
+        # 实测（2026-10-19，2 秒 1080i）：stage4 DONE 后 1 秒即报此错。
+        _stem = Path(input_name).stem
+        step3_patterns = [
+            f"{job_id}_{_stem}_step3_upscale*",
+            f"{job_id}_{_stem}_step3_forced_upscale*",
+        ]
         step3_candidates = select_media_candidates(
-            glob.glob(os.path.join(temp_dir, step3_pattern)))
+            [p for _pat in step3_patterns
+             for p in glob.glob(os.path.join(temp_dir, _pat))])
         if not step3_candidates:
             logger.error("STAGE5_ORDER_ERROR",
                          "AI upscale enabled but no stage3 output found. "
