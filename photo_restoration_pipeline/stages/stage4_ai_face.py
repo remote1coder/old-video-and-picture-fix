@@ -123,8 +123,15 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
                 Image.fromarray(blended_16[:, :, 0], mode='I;16').save(
                     output_path)
         else:
-            result = Image.fromarray(blended)
-            result.save(output_path)
+            # FIX-NEW-V-18 / R21: 不用裸 PIL `.save(path)`——对 .tif 会
+            # 默认选 LZW，而 tifffile 解 LZW 需要未安装的 imagecodecs，
+            # 下游 stage5 就读不回来（MediaPrecisionError → rc=86）。
+            try:
+                from media_io import write_tiff as _wt
+                _wt(output_path, blended)
+            except Exception:
+                result = Image.fromarray(blended)
+                result.save(output_path)
         return True
     except Exception:
         # Fallback: direct copy if blending fails
