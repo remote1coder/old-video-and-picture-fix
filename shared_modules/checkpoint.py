@@ -410,7 +410,7 @@ def _read_frame_info(filepath: str, position: float) -> Optional[Dict[str, Any]]
             ["ffprobe", "-v", "error",
              "-show_entries", "format=duration",
              "-of", "csv=p=0", filepath],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         duration = float(r.stdout.strip()) if r.returncode == 0 else 0
         if duration <= 0:
@@ -458,7 +458,7 @@ def _get_video_dimensions(filepath: str) -> Tuple[int, int]:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
              "-of", "csv=p=0", filepath],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             parts = r.stdout.strip().split(",")
@@ -479,7 +479,7 @@ def _probe_bit_depth_from_pixfmt(filepath: str) -> int:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=pix_fmt",
              "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             pix_fmt = r.stdout.strip().lower()
@@ -561,7 +561,7 @@ def verify_frame_integrity(filepath: str,
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             duration = float(r.stdout.strip())
@@ -649,7 +649,7 @@ def _check_nvidia_smi_vram() -> Optional[int]:
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             line = r.stdout.strip().splitlines()[0]
@@ -661,7 +661,7 @@ def _check_nvidia_smi_vram() -> Optional[int]:
     try:
         r = subprocess.run(
             ["nvidia-smi"],
-            capture_output=True, text=True, timeout=10, shell=False
+            capture_output=True, text=True, errors="replace", timeout=10, shell=False
         )
         if r.returncode == 0:
             import re
@@ -887,7 +887,7 @@ def verify_ffprobe_decodeable(filepath: str) -> bool:
              "-select_streams", "v:0",
              "-show_entries", "stream=codec_name",
              "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         return r.returncode == 0 and r.stdout.strip() != ""
     except Exception:

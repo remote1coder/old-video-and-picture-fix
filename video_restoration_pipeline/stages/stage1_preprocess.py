@@ -49,7 +49,7 @@ def _get_video_color_metadata(video_path: str) -> dict:
              "-select_streams", "v:0",
              "-show_entries", "stream=color_primaries,color_trc,colorspace,color_range",
              "-of", "json", video_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             import json as _json
@@ -73,7 +73,7 @@ def detect_black_borders(video_path: str, logger=None) -> dict:
     crop_info = {"left": 0, "right": 0, "top": 0, "bottom": 0,
                  "cropped_w": 0, "cropped_h": 0}
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=120, shell=False)
         crop_match = None
         for line in r.stderr.split("\n"):
@@ -89,7 +89,7 @@ def detect_black_borders(video_path: str, logger=None) -> dict:
                 "-of", "csv=s=x:p=0",
                 video_path
             ]
-            wr = subprocess.run(w_cmd, capture_output=True, text=True,
+            wr = subprocess.run(w_cmd, capture_output=True, text=True, errors="replace",
                                timeout=30, shell=False)
             if wr.returncode == 0:
                 parts = wr.stdout.strip().split("x")
@@ -186,7 +186,7 @@ def _get_matrix_in_from_meta(video_path: str, color_meta: dict,
              "-select_streams", "v:0",
              "-show_entries", "stream=height",
              "-of", "json", video_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             data = json.loads(r.stdout)
@@ -380,7 +380,7 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
             lines.append(f"clip = haf.QTGMC(clip, Preset='{qtgmc_preset}', "
                         f"EZDenoise={qtgmc_ezdenoise}, Sharpness={qtgmc_sharpness}, "
                         f"ChromaMotion={cm_str}, SourceMatch={qtgmc_sourcematch}, "
-                        f"InputType=1, FpsDivisor=1)")
+                        f"InputType=1, FPSDivisor=1)")  # havsfunc r33: FPSDivisor
         lines.append("")
 
     # IVTC (must be before deinterlace)
@@ -468,7 +468,7 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
                         f"EZDenoise={qtgmc_ezdenoise}, Sharpness={qtgmc_sharpness}, "
                         f"ChromaMotion={cm_str}, SourceMatch={qtgmc_sourcematch}, "
                         f"InputType={qtgmc_input_type}, TFF={tff_bool}, "
-                        f"FpsDivisor={fps_divisor})")
+                        f"FPSDivisor={fps_divisor})")  # havsfunc r33: FPSDivisor（全大写 FPS）
             lines.append("")
         if segment_vars:
             splice_args = ", ".join(segment_vars)
@@ -503,7 +503,7 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
                     f"EZDenoise={qtgmc_ezdenoise}, Sharpness={qtgmc_sharpness}, "
                     f"ChromaMotion={cm_str}, SourceMatch={qtgmc_sourcematch}, "
                     f"InputType={qtgmc_input_type}, TFF={tff_bool}, "
-                    f"FpsDivisor={fps_divisor})")
+                    f"FPSDivisor={fps_divisor})")  # havsfunc r33: FPSDivisor（全大写 FPS）
         # v6.3: Reset _FieldBased to 0 after InputType=0 processing
         if qtgmc_input_type == 0:
             lines.append("clip = core.std.SetFieldBased(clip, 0)")
@@ -745,7 +745,7 @@ def check_deinterlace_quality(video_path: str, logger=None) -> Tuple[bool, float
             "-vf", "idet",
             "-f", "null", "-"
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=300, shell=False)
         if r.returncode != 0:
             return False, 0.0
@@ -790,7 +790,7 @@ def check_ivtc_quality(video_path: str, logger=None,
             "-vf", "idet",
             "-f", "null", "-"
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=300, shell=False)
         if r.returncode != 0:
             return False, {}
@@ -1091,7 +1091,7 @@ def main():
                                       "-select_streams", "v:0",
                                       "-show_entries", "stream=r_frame_rate",
                                       "-of", "default=noprint_wrappers=1:nokey=1", inter_path]
-                            fr_r = subprocess.run(fr_cmd, capture_output=True, text=True, timeout=30, shell=False)
+                            fr_r = subprocess.run(fr_cmd, capture_output=True, text=True, errors="replace", timeout=30, shell=False)
                             if fr_r.returncode == 0:
                                 rate_str = fr_r.stdout.strip()
                                 if "/" in rate_str:
@@ -1141,7 +1141,7 @@ def main():
                               "-select_streams", "v:0",
                               "-show_entries", "stream=r_frame_rate",
                               "-of", "default=noprint_wrappers=1:nokey=1", inter_path]
-                    fr_r = subprocess.run(fr_cmd, capture_output=True, text=True, timeout=30, shell=False)
+                    fr_r = subprocess.run(fr_cmd, capture_output=True, text=True, errors="replace", timeout=30, shell=False)
                     if fr_r.returncode == 0:
                         rate_str = fr_r.stdout.strip()
                         if "/" in rate_str:

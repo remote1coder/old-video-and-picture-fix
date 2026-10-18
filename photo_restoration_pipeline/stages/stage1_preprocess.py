@@ -339,7 +339,7 @@ def run_gmic(input_path: str, output_path: str, *gmic_args,
     # 3.x 默认沿用输入类型，所以这个问题只在升级后暴露。
     cmd.extend(_gmic_16bit_output_args(safe_out))
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=300, shell=False)
         if r.returncode != 0 and r.stderr:
             return False, r.stderr[:1000]
         return r.returncode == 0, ""

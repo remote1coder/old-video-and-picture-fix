@@ -154,7 +154,7 @@ def get_video_dimensions(input_source: str) -> tuple:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height,r_frame_rate",
              "-of", "csv=p=0", input_source],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             parts = r.stdout.strip().split(",")
@@ -330,7 +330,7 @@ def main() -> int:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
              "-of", "json", input_source],
-            capture_output=True, text=True, timeout=30, shell=False)
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False)
         if r.returncode != 0:
             logger.error("STAGE6_INPUT_CORRUPT",
                         f"Input file is not a valid video: {input_source}",

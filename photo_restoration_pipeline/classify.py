@@ -22,7 +22,7 @@ def run_exiftool(input_path: str) -> Dict[str, str]:
     try:
         r = subprocess.run(
             ["exiftool", "-json", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             data = json.loads(r.stdout)
@@ -45,7 +45,7 @@ def run_ffprobe(input_path: str) -> Dict[str, Any]:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height,display_aspect_ratio",
              "-of", "json", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             d = json.loads(r.stdout)

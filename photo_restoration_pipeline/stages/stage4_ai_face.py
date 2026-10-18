@@ -535,7 +535,7 @@ def run_gfpgan(input_path: str, output_dir: str,
             f"print('WROTE', out_path)",
         ]
         r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=900, shell=False)
+            cmd, capture_output=True, text=True, errors="replace", timeout=900, shell=False)
         if r.returncode != 0:
             # 不再静默：子进程 stderr 是唯一线索
             sys.stderr.write(
@@ -683,7 +683,7 @@ def run_codeformer(input_path: str, output_dir: str,
         ]
         cmd = [sys.executable, "-c", chr(10).join(_code_lines)]
         r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=900, shell=False)
+            cmd, capture_output=True, text=True, errors="replace", timeout=900, shell=False)
         if r.returncode != 0:
             sys.stderr.write(
                 f"CodeFormer subprocess failed (rc={r.returncode}): "

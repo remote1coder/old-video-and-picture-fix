@@ -166,7 +166,7 @@ def _get_duration(input_path: str, classification: Dict[str, Any]) -> float:
             ["ffprobe", "-hide_banner", "-v", "error",
              "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             return float(r.stdout.strip())

@@ -394,7 +394,7 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SCRIPT_DIR.parent)
 
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                           timeout=timeout, env=env, shell=False)
         stderr = r.stderr if r.stderr else ""
         return r.returncode, stderr
@@ -418,7 +418,7 @@ def _get_video_duration(video_path: str) -> float:
             ["ffprobe", "-hide_banner", "-v", "error",
              "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, timeout=30, shell=False
+            capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
             return float(r.stdout.strip())
