@@ -124,3 +124,51 @@ def test_stage6_material_group_values(group, expect):
     cfg = _cfg()["grain_factory3"]
     material = cfg[group]
     assert material["g1str"] == expect
+
+
+def _stage6_resolve(params_overrides):
+    """复刻 stage6 的取值链：params 扁平覆盖 > cfg 分型 > cfg 扁平 > 默认。
+
+    这是 v7 真机实测暴露的第二个 R12：原实现写成"扁平键只在分型子键
+    缺失时才补"，而 config 的分型子键永远存在 → 扁平覆盖 100% 失效，
+    dv 0.5 / hdv 0.8 全落回 1.0。
+    """
+    cfg = _cfg()["grain_factory3"]
+    params = dict(params_overrides)
+    grain_cfg = dict(cfg)
+    pg = params.get("grain_factory3")
+    if isinstance(pg, dict):
+        grain_cfg.update(pg)
+    material_key = params.get("detected_class", "analog_tape").lower()
+    material_grain = dict(grain_cfg.get(material_key, {}) or {})
+    flat_keys = ("g1str", "g2str", "g3str", "temp_avg")
+    flat_override = {k: pg[k] for k in flat_keys
+                     if isinstance(pg, dict) and k in pg}
+    for k in flat_keys:
+        if k not in flat_override and k in grain_cfg:
+            flat_override[k] = grain_cfg[k]
+    material_grain.update(flat_override)
+    return (material_grain.get("g1str", 1.0),
+            material_grain.get("temp_avg", grain_cfg.get("temp_avg", 0.0)))
+
+
+def test_stage6_flat_override_beats_config_material_group():
+    """核心断言：params 的扁平 g1str 必须盖过 config 的分型 g1str。"""
+    g1, _ = _stage6_resolve(
+        {"detected_class": "ANALOG_TAPE",
+         "grain_factory3": {"g1str": 0.3, "g2str": 0.05, "g3str": 0.05}})
+    assert g1 == 0.3, "扁平覆盖必须压过 config.analog_tape.g1str=1.0"
+
+
+def test_stage6_flat_override_temp_avg_wins():
+    g1, ta = _stage6_resolve(
+        {"detected_class": "ANALOG_TAPE",
+         "grain_factory3": {"g1str": 0.5, "temp_avg": 1}})
+    assert (g1, ta) == (0.5, 1)
+
+
+def test_stage6_no_override_uses_config_material_group():
+    """无覆盖时仍按 detected_class 取 config 分型值（原有行为不变）。"""
+    assert _stage6_resolve({"detected_class": "DV_DIGITAL"})[0] == 0.5
+    assert _stage6_resolve({"detected_class": "HDV_AVCHD"})[0] == 0.8
+    assert _stage6_resolve({"detected_class": "ANALOG_TAPE"})[0] == 1.0

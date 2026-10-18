@@ -420,19 +420,29 @@ def main() -> int:
                       f"defaulting to '{material_key}'")
 
     # FIX-NEW-V-09 / R12: **扁平**覆盖（直接给 g1str/g2str/g3str/temp_avg，
-    # 不带分型子键）必须作用到当前分型之上，否则 "params 里有值但 vpy
-    # 里还是默认值"。分型子键优先于扁平键。
+    # 不带分型子键）必须**盖过** config 的分型值，否则"params 里有值、
+    # vpy 里还是默认值"。
+    # 优先级：params 扁平覆盖 > cfg 分型子键 > cfg 扁平键 > 内置默认。
+    # （原实现写成 "扁平键只在分型子键缺失时才补"，而 config 的分型
+    # 子键永远存在，于是扁平覆盖 100% 失效——实测 dv 0.5/hdv 0.8 全落回 1.0。）
     _FLAT_GRAIN_KEYS = ("g1str", "g2str", "g3str", "temp_avg")
+    _flat_override = {
+        k: params["grain_factory3"][k]
+        for k in _FLAT_GRAIN_KEYS
+        if isinstance(params.get("grain_factory3"), dict)
+        and k in params["grain_factory3"]
+    }
     for _k in _FLAT_GRAIN_KEYS:
-        if _k in grain_cfg and _k not in material_grain:
-            material_grain[_k] = grain_cfg[_k]
+        if _k not in _flat_override and _k in grain_cfg:
+            _flat_override[_k] = grain_cfg[_k]
+    material_grain.update(_flat_override)
 
     g1str = material_grain.get("g1str", 1.0)
     g2str = material_grain.get("g2str", 0.2)
     g3str = material_grain.get("g3str", 0.2)
     # FIX-P1-13: pass temp_avg to GrainFactory3 (r33 legal param, controls
     # temporal correlation; default 0 = disabled, AddGrainC fallback used then).
-    temp_avg = grain_cfg.get("temp_avg", material_grain.get("temp_avg", 0.0))
+    temp_avg = material_grain.get("temp_avg", grain_cfg.get("temp_avg", 0.0))
 
     # Validate no illegal params
     if not grain_cfg:
