@@ -527,16 +527,21 @@ done
 ## 8. 日志查看
 
 ### 8.1 日志位置
-- 每任务一个日志文件：`logs/job_{job_id}.log`
-- 格式：JSON Lines，每行一条记录
+- 每任务一个日志文件：`logs/job_{job_id}.log`（例如 job_id=`job_001` →
+  `logs/job_job_001.log`）
+- 编排层汇总日志：`logs/general.log`
+- 格式：JSON Lines（每行一条独立 JSON，**不是**单个 JSON 文档）
 
 ### 8.2 查看日志
 ```bash
-# 查看最新日志
+# 跟踪最新日志
 tail -f logs/job_*.log
 
-# 格式化查看某任务日志
-python -m json.tool logs/job_photo_1234567890.log
+# 逐行格式化（JSONL：每行一个 JSON，用 jq 最方便）
+jq -c . logs/job_job_001.log | head -20
+
+# 没有 jq 时：逐行解析
+python -c "import sys,json;[print(json.loads(l)['event'], json.loads(l)['message']) for l in open('logs/job_job_001.log',encoding='utf-8') if l.strip()]"
 ```
 
 ### 8.3 日志字段示例
