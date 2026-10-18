@@ -381,7 +381,20 @@ def main() -> int:
         logger.error("STAGE6_CONFIG", f"Cannot load config: {e}")
         return 81
 
-    grain_cfg = cfg.get("grain_factory3", {})
+    # FIX-NEW-V-09 / R12: 合并 params 侧的 grain_factory3 覆盖。
+    # 原实现只读 cfg["grain_factory3"]（config.yaml），于是
+    # user_overrides / manifest 里的 grain_factory3 **完全无效**——
+    # 实测三型矩阵（dv g1str=0.5 / hdv 0.8 / temp_avg=1）全部落回
+    # analog_tape 默认 1.0，且日志不报警（rc 仍为 0）。
+    # 优先级：params（覆盖）> cfg（配置），与项目其余参数一致。
+    _cfg_grain = dict(cfg.get("grain_factory3", {}) or {})
+    _params_grain = params.get("grain_factory3")
+    if isinstance(_params_grain, dict):
+        _cfg_grain.update(_params_grain)
+        logger.info("STAGE6_GRAIN_OVERRIDE",
+                    "Applied grain_factory3 overrides from params",
+                    keys=sorted(_params_grain.keys()))
+    grain_cfg = _cfg_grain
     if not grain_cfg.get("enabled", True):
         logger.info("STAGE6_SKIP", "Grain synthesis disabled")
         return 0
@@ -400,11 +413,19 @@ def main() -> int:
     }
     material_type_raw = params.get("detected_class", "analog_tape").lower()
     material_key = _DETECTED_CLASS_TO_GRAIN_KEY.get(material_type_raw, "analog_tape")
-    material_grain = grain_cfg.get(material_key, {})
+    material_grain = dict(grain_cfg.get(material_key, {}) or {})
     if material_key != material_type_raw:
         logger.warning("STAGE6_GRAIN_MAPPING",
                       f"Unknown material type '{material_type_raw}', "
                       f"defaulting to '{material_key}'")
+
+    # FIX-NEW-V-09 / R12: **扁平**覆盖（直接给 g1str/g2str/g3str/temp_avg，
+    # 不带分型子键）必须作用到当前分型之上，否则 "params 里有值但 vpy
+    # 里还是默认值"。分型子键优先于扁平键。
+    _FLAT_GRAIN_KEYS = ("g1str", "g2str", "g3str", "temp_avg")
+    for _k in _FLAT_GRAIN_KEYS:
+        if _k in grain_cfg and _k not in material_grain:
+            material_grain[_k] = grain_cfg[_k]
 
     g1str = material_grain.get("g1str", 1.0)
     g2str = material_grain.get("g2str", 0.2)
@@ -419,7 +440,8 @@ def main() -> int:
         return 81
 
     logger.info("STAGE6_START", "Grain synthesis", input=input_source,
-                g1str=g1str, g2str=g2str, g3str=g3str)
+                g1str=g1str, g2str=g2str, g3str=g3str,
+                temp_avg=temp_avg, material_key=material_key)
 
     # Get video dimensions for vspipe
     width, height, fps = get_video_dimensions(input_source)
