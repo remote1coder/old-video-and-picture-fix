@@ -2180,43 +2180,59 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                     f"({len(restored_frames)} png)")
 
     replaced_count = 0
+    _unmatched = 0
     for rf in restored_frames:
         target = Path(all_frames_dir) / rf.name
         if not target.exists():
-            # face_{start}_{seq}.png → frame_%08d；ffmpeg 从 0001 起编号，
-            # 全局索引 i 对应 frame_{i+1}，故目标为 start + seq。
-            m = re.match(r"face_(\d+)_(\d+)\.png", rf.name)
+            # face_{start}_{seq}[_{crop}].png → frame_%08d；
+            # ffmpeg 从 0001 起编号，全局索引 i 对应 frame_{i+1}，
+            # 故目标为 start + seq。
+            # FIX-NEW-V-08 / R6-11: 实际产物名带**每帧人脸序号**后缀
+            # （face_000000_0001_00.png = start/seq/crop_0），原正则
+            # ^face_(\d+)_(\d+)\.png$ 因多一个 _NN 而零匹配 → 又是
+            # "有 145 张结果却 blend 0 帧"。后缀改为可选并兼容多脸。
+            m = re.match(r"face_(\d+)_(\d+)(?:_\d+)?\.png$", rf.name)
             if m:
                 seg_start = int(m.group(1))
                 seq = int(m.group(2))          # 1-based
                 target = (Path(all_frames_dir)
                           / f"frame_{seg_start + seq:08d}.png")
-        if target.exists():
-            try:
-                import cv2
-                orig = cv2.imread(str(target))
-                restored = cv2.imread(str(rf))
-                if orig is not None and restored is not None:
-                    if orig.shape != restored.shape:
-                        restored = cv2.resize(
-                            restored, (orig.shape[1], orig.shape[0]))
-                    h, w = orig.shape[:2]
-                    mask = np.zeros((h, w), dtype=np.float32)
-                    margin = max(8, min(h, w) // 20)
-                    mask[margin:h - margin,
-                         margin:w - margin] = 1.0
-                    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=margin)
-                    mask_3c = np.stack([mask] * 3, axis=2)
-                    blended = (restored * mask_3c +
-                               orig * (1 - mask_3c)).astype(np.uint8)
-                    cv2.imwrite(str(target), blended)
-                    replaced_count += 1
-                else:
-                    shutil.copy2(str(rf), str(target))
-                    replaced_count += 1
-            except Exception:
+            else:
+                _unmatched += 1
+        if not target.exists():
+            _unmatched += 1
+            continue
+        try:
+            import cv2
+            orig = cv2.imread(str(target))
+            restored = cv2.imread(str(rf))
+            if orig is not None and restored is not None:
+                if orig.shape != restored.shape:
+                    restored = cv2.resize(
+                        restored, (orig.shape[1], orig.shape[0]))
+                h, w = orig.shape[:2]
+                mask = np.zeros((h, w), dtype=np.float32)
+                margin = max(8, min(h, w) // 20)
+                mask[margin:h - margin,
+                     margin:w - margin] = 1.0
+                mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=margin)
+                mask_3c = np.stack([mask] * 3, axis=2)
+                blended = (restored * mask_3c +
+                           orig * (1 - mask_3c)).astype(np.uint8)
+                cv2.imwrite(str(target), blended)
+                replaced_count += 1
+            else:
                 shutil.copy2(str(rf), str(target))
                 replaced_count += 1
+        except Exception:
+            shutil.copy2(str(rf), str(target))
+            replaced_count += 1
+
+    if _unmatched:
+        # 有结果却映射不到目标帧 = 又一层静默 no-op，必须留痕。
+        logger.warning("STAGE5_BLEND_UNMATCHED",
+                       f"{_unmatched}/{len(restored_frames)} restored "
+                       f"frames could not be mapped to a target frame")
 
     logger.info("STAGE5_BLEND",
                f"Feather-blended {replaced_count} face-restored frames")
