@@ -180,6 +180,12 @@ def main() -> int:
     # 但本 stage 原来只认 `--params` → argparse "unrecognized arguments"
     # 直接退 2。**批处理下 stage6 从未被执行过**（实测 2026-10-18）。
     parser.add_argument("--params-file", default="")
+    # FIX-R6-07: main.py 统一给**每个** stage 传 `--cleanup-intermediates`
+    # （params.cleanup_intermediates 默认 True）。stage6 原来不认它 →
+    # argparse "unrecognized arguments" → sys.exit(2)，2 不在项目退出码表
+    # 内。**批处理下 stage6 从未被执行过**（实测 2026-10-18）。
+    # 本 stage 不自行删除上游产物（清理由 main.py 统一收口），故只接受不动作。
+    parser.add_argument("--cleanup-intermediates", action="store_true")
     args = parser.parse_args()
 
     params = {}
