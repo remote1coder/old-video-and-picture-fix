@@ -46,3 +46,6 @@ tools_r4/
 .venv*/
 # 扫描/跑批产物：manifest 是每次扫描重新生成的，不入库
 video_restoration_pipeline/batch_manifest*.yaml
+
+# 本地测试驱动（含本机绝对路径，不入库）
+/run_vid_ai_test*.sh
