@@ -1257,16 +1257,21 @@ def main():
     #
     # 正确的降级顺序：input_source（实际被编码的内容）→ 原始输入（元数据
     # 权威来源）→ 最后才是"未知按 limited/601"的保守默认。
-    if not (range_known and primaries_known) and args.input \
-            and os.path.abspath(args.input) != os.path.abspath(input_source):
-        _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(args.input)
+    #
+    # 注意：用 `args.input`（= main.py 传入的 `job["input_path"]`，即**原始
+    # 素材**）。不要被 `STAGE7_START` 日志误导——那里打的是 `input_source`
+    # （上游产物），不是 args.input。
+    _orig_input = args.input or ""
+    if not (range_known and primaries_known) and _orig_input \
+            and os.path.abspath(_orig_input) != os.path.abspath(input_source):
+        _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(_orig_input)
         if _o_rk or _o_pk:
             logger.info("STAGE7_COLOR_FALLBACK_ORIGINAL",
                         "Intermediate lost color metadata; falling back to "
                         "the original input for accurate color conversion "
                         "instead of assuming BT.601 (which would tint the "
                         "picture)",
-                        intermediate=input_source, original=args.input,
+                        intermediate=input_source, original=_orig_input,
                         orig_range=_o_range if _o_rk else None,
                         orig_standard=_o_std if _o_pk else None)
             if not range_known and _o_rk:
