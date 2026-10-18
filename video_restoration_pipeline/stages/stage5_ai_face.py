@@ -562,6 +562,152 @@ def _estimate_motion_optical_flow(frame_paths: List[str],
         return _estimate_motion(frame_paths)
 
 
+def _detect_faces_via_facexlib(sample_frames, threshold, is_lowres,
+                               threshold_lowres, vw, vh, logger=None):
+    """FIX-R6-06: facexlib 子进程人脸检测（视频链唯一真正可用的后端）。
+
+    R72 编排器里 RetinaFace / YOLOv8-face / MTCNN 三个包**一个都没有**
+    （配置的 face_detect_fallback 全是空想），原检测循环必然零命中 →
+    stage5 永远静默跳过，人脸修复在视频链从未生效。项目依赖检查认的是
+    facexlib（装在 .venv_r4），故按 stage3 同一 AI-解释器模式起子进程：
+    一次加载 retinaface_resnet50，检测全部采样帧，回填与 _detect_faces
+    同构的 (face_present, face_boxes, face_landmarks)。
+
+    返回 None 表示不可用/失败（调用方保持"零命中"语义）。
+    """
+    ai_py = _resolve_ai_python(logger)
+    if ai_py is None:
+        if logger:
+            logger.warning("STAGE5_FACEXLIB_NO_INTERP",
+                           "无可用 AI 解释器，facexlib 检测跳过")
+        return None
+
+    models_dir = str(SCRIPT_DIR.parent.resolve() / "models")
+    frame_paths = [str(p) for p in sample_frames]
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
+                                          delete=False,
+                                          encoding="utf-8") as f:
+            script_path = f.name
+            f.write(
+                "import json, os, shutil\n"
+                "import cv2, torch\n"
+                "from facexlib.detection import init_detection_model\n"
+                f"models_dir = {models_dir!r}\n"
+                # facexlib 的权重解析路径是 <root>/facexlib/weights/，
+                # 本项目权重在 models/ 根部 —— 硬链接（失败则复制）补位，
+                # 避免联网下载 110MB。
+                "want_dir = os.path.join(models_dir, 'facexlib', 'weights')\n"
+                "want = os.path.join(want_dir, 'detection_Resnet50_Final.pth')\n"
+                "src = os.path.join(models_dir, 'detection_Resnet50_Final.pth')\n"
+                "if not os.path.exists(want) and os.path.exists(src):\n"
+                "    os.makedirs(want_dir, exist_ok=True)\n"
+                "    try:\n"
+                "        os.link(src, want)\n"
+                "    except OSError:\n"
+                "        shutil.copy2(src, want)\n"
+                f"paths = {frame_paths!r}\n"
+                "dev = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
+                "det = init_detection_model('retinaface_resnet50', half=False,\n"
+                "                           device=dev,\n"
+                "                           model_rootpath=models_dir)\n"
+                "out = []\n"
+                "for p in paths:\n"
+                "    img = cv2.imread(p)\n"
+                "    if img is None:\n"
+                "        out.append(None)\n"
+                "        continue\n"
+                "    with torch.no_grad():\n"
+                "        dets = det.detect_faces(img, 0.5)\n"
+                # 该版本 facexlib 返回**单个 (N,15) ndarray**：
+                # [x1,y1,x2,y2,score, lm1x,lm1y, ..., lm5x,lm5y]
+                # （不是 (boxes, landmarks) 二元组——实测 rc=1 ValueError）
+                "    rec = {'boxes': [], 'landmarks': []}\n"
+                "    if dets is not None and len(dets) > 0:\n"
+                "        for row in dets:\n"
+                "            rec['boxes'].append([float(v) for v in row[:5]])\n"
+                "            rec['landmarks'].append(\n"
+                "                [[float(row[5 + 2 * k]), float(row[6 + 2 * k])]\n"
+                "                 for k in range(5)])\n"
+                "    out.append(rec)\n"
+                "print('FACEDET_JSON:' + json.dumps(out))\n"
+            )
+        r = subprocess.run([ai_py, script_path], capture_output=True,
+                           text=True, timeout=3600, shell=False)
+        # 失败保留脚本便于诊断；成功删除
+        if r.returncode == 0:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if r.returncode != 0:
+            if logger:
+                logger.warning("STAGE5_FACEXLIB_FAIL",
+                               f"facexlib 子进程失败 rc={r.returncode}; "
+                               f"script={script_path}",
+                               stderr_tail=(r.stderr or "")[-800:])
+            return None
+
+        payload = None
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("FACEDET_JSON:"):
+                payload = json.loads(line[len("FACEDET_JSON:"):])
+        if payload is None:
+            if logger:
+                logger.warning("STAGE5_FACEXLIB_NO_OUTPUT",
+                               "facexlib 子进程无 FACEDET_JSON 输出")
+            return None
+
+        lm_names = ("eye_l", "eye_r", "nose", "mouth_l", "mouth_r")
+        face_present = [False] * len(frame_paths)
+        face_boxes = [[] for _ in frame_paths]
+        face_landmarks = [[] for _ in frame_paths]
+        for i, rec in enumerate(payload):
+            if not rec or i >= len(frame_paths):
+                continue
+            boxes = rec.get("boxes") or []
+            lms = rec.get("landmarks") or []
+            for bi, b in enumerate(boxes):
+                x1, y1, x2, y2, conf = b[:5]
+                fw, fh = x2 - x1, y2 - y1
+                if fw <= 0 or fh <= 0:
+                    continue
+                accept = False
+                if conf >= threshold:
+                    accept = True
+                elif (is_lowres and conf >= threshold_lowres
+                      and vw * vh > 0
+                      and (fw * fh) / (vw * vh) > 0.10):
+                    accept = True
+                    if logger:
+                        logger.warning(
+                            "STAGE5_LOWRES_FACE_ACCEPT",
+                            f"Low-res fallback: face conf={conf:.2f}, "
+                            f"area_ratio={((fw*fh)/(vw*vh)):.2f}")
+                if not accept:
+                    continue
+                face_present[i] = True
+                face_boxes[i].append(
+                    (float(x1), float(y1), float(fw), float(fh), float(conf)))
+                lm = lms[bi] if bi < len(lms) else None
+                if lm and len(lm) >= 5:
+                    face_landmarks[i].append(
+                        {lm_names[k]: (float(lm[k][0]), float(lm[k][1]))
+                         for k in range(5)})
+                else:
+                    face_landmarks[i].append(None)
+        if logger:
+            logger.info("STAGE5_FACEXLIB_DONE",
+                        f"facexlib 检测完成："
+                        f"{sum(face_present)}/{len(frame_paths)} 采样帧命中人脸")
+        return face_present, face_boxes, face_landmarks
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE5_FACEXLIB_ERROR", str(e))
+        return None
+
+
 def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tuple[int, float]], dict, dict]:
     """Detect static face segments in video.
 
@@ -678,7 +824,10 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
 
     sample_frames = sorted(Path(sample_dir).glob("*.png"))
     if not sample_frames:
-        return ([], {})
+        # FIX-R6-05: 必须返回三元组（segments, boxes, landmarks）——
+        # 调用方按 3 元组解包，早退给 2 元组会 ValueError → 未捕获异常
+        # → stage5 rc=1（实测 2026-10-18，且 1 不在项目退出码表内）。
+        return ([], {}, {})
 
     # Map sample index -> approximate frame number
     sample_to_frame = {i: i * sample_interval for i in range(len(sample_frames))}
@@ -834,6 +983,16 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
                 logger.warning("STAGE5_FACE_FAIL", f"Detector {detector_name} failed: {e}")
             continue
 
+    # FIX-R6-06: 三个原生检测器（RetinaFace/YOLO/MTCNN）在 R72 里都不存在，
+    # 循环必然零命中。用 facexlib 子进程补位（.venv_r4 里有），
+    # 否则 stage5 永远"没检测到人脸"→ 静默跳过（假通过）。
+    if not any(face_present):
+        fx = _detect_faces_via_facexlib(
+            sample_frames, threshold, is_lowres, threshold_lowres,
+            vw, vh, logger=logger)
+        if fx is not None:
+            face_present, face_boxes, face_landmarks = fx
+
     # Build segments from contiguous face detections
     raw_segments = []
     in_segment = False
@@ -850,7 +1009,8 @@ def _detect_faces(video_path: str, params: dict, logger=None) -> Tuple[List[Tupl
 
     if not raw_segments:
         shutil.rmtree(sample_dir, ignore_errors=True)
-        return ([], {})
+        # FIX-R6-05: 同 681 行——早退也必须满足 3 元组契约。
+        return ([], {}, {})
 
     # V-P-042 fix: static frame detection via SSIM
     # Check for contiguous segments where SSIM > 0.99 across 25+ frames
