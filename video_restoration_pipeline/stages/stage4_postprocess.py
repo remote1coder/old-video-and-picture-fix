@@ -199,7 +199,14 @@ def main():
     # protected from gblur. Explicit hair segmentation (OpenCV/face parsing)
     # is deferred pending user decision on precision requirements (round_8 §5).
     filter_chain = (
-        "split[main][tmp];"
+        # FIX-R6-04: 多输入滤镜图必须走 filter_complex（-vf 只支持单入单出）。
+        # 原链 `split[main][tmp]` 之后 `[main]` 被引用 4 次，但 split 只产出
+        # 一份 main；[main] 还是 -vf 专属的输入别名，-filter_complex 下
+        # 会报 "Invalid stream specifier: main"。实测（2026-10-18）该选择性
+        # 处理图从未成功执行过：先卡 geq 选项逗号语法，修好后又报
+        # "had 4 input(s) and 1 output(s)"。标准写法：[0:v]split=5 出 5 份，
+        # 各分支独立标签，整图末尾统一 [vout] 供 -map 使用。
+        "[0:v]split=5[main1][main2][main3][main4][tmp];"
         # Edge-based region mask (detect flat vs textured)
         "[tmp]edgedetect=mode=colormix:low=0.05:high=0.15,"
         "format=gray,"
@@ -208,19 +215,22 @@ def main():
         "255*(lum(X,Y)-30)/60))'[maskraw];"
         # Skin-tone detection mask (YCbCr skin range)
         # Per v6.32 §3: protect human subjects from any processing
-        "[main]format=yuv420p,"
+        # FIX-R6-04: geq 的命名选项必须用 ':' 分隔（lum/cb/cr 是同一滤镜的
+        # 三个选项）。原来用 ',' 会被解析成新滤镜 cb='128' → ffmpeg 报
+        # "No option name near '128'"。
+        "[main1]format=yuv420p,"
         "geq=lum='if(between(cb(X,Y),77,127)*between(cr(X,Y),133,173)"
-        "*gt(lum(X,Y),80),255,0)',"
-        "cb='128',cr='128'[skinmask];"
+        "*gt(lum(X,Y),80),255,0)':"
+        "cb='128':cr='128'[skinmask];"
         # FIX-R8-W8 (方案A): explicit hair mask per v6.32 §3 ("人物主体、皮肤、
         # 头发区域完全排除"). Hair is typically dark (Y 16-80) but not pure black
         # (avoid protecting black borders). Blended with skin mask via screen
         # (union) so the person mask covers both skin and hair. ORIGINAL
         # (方案B) relied on edgedetect classifying hair as textured -> copy
         # branch, which protects it implicitly but fails on low-edge dark hair.
-        "[main]format=yuv420p,"
-        "geq=lum='if(gt(lum(X,Y),16)*lt(lum(X,Y),80),255,0)',"
-        "cb='128',cr='128'[hairmask];"
+        "[main2]format=yuv420p,"
+        "geq=lum='if(gt(lum(X,Y),16)*lt(lum(X,Y),80),255,0)':"
+        "cb='128':cr='128'[hairmask];"
         "[skinmask][hairmask]blend=all_mode=screen[personmask];"
         # Invert: person(=skin+hair)=0 (protect), non-person=255 (allow)
         "[personmask]negate[noskin];"
@@ -229,10 +239,10 @@ def main():
         # Feathered mask via gaussian blur (sigma=6 -> ~12px, >=8px per spec)
         "[combinedmask]gblur=sigma=6[mask];"
         # Flat branch: mild denoise for smooth regions
-        "[main]gblur=sigma=0.6[flat];"
+        "[main3]gblur=sigma=0.6[flat];"
         # Detail branch: preserve original (no unsharp per v6.32 §3)
         # FIX-P8-9: Removed unsharp; textured regions kept as-is
-        "[main]copy[detail];"
+        "[main4]copy[detail];"
         # Masked merge with feathered transition
         "[flat][detail][mask]maskedmerge,"
         # Final color grading: lift/gamma/gain via colorbalance
@@ -250,6 +260,8 @@ def main():
         filter_chain += (
             f",eq=saturation={saturation}:contrast={contrast}"
         )
+    # FIX-R6-04: 整图输出标签（filter_complex + -map [vout]）
+    filter_chain += "[vout]"
 
     # v6.3 §3.6: Intermediate format must be FFV1 YUV420P16
     vs_bit_depth = params.get("vs_bit_depth", 16)
@@ -262,7 +274,9 @@ def main():
     cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-i", stage3_output,
-        "-vf", filter_chain,
+        # FIX-R6-04: 多输入滤镜图用 -filter_complex + 显式 -map
+        "-filter_complex", filter_chain,
+        "-map", "[vout]",
         "-c:v", "ffv1",
         "-pix_fmt", pix_fmt,
         "-an",
