@@ -590,54 +590,86 @@ def run_codeformer(input_path: str, output_dir: str,
         safe_input = _json.dumps(input_path)
         safe_model = _json.dumps(model_path)
         safe_output_dir = _json.dumps(output_dir)
-        cmd = [
-            sys.executable, "-c",
-            f"import sys; sys.path.insert(0, 'CodeFormer'); "
-            f"from codeformer.facelib.utils.face_restoration_helper "
-            f"import FaceRestoreHelper; "
-            f"from codeformer.basicsr.utils.registry import ARCH_REGISTRY; "
-            f"import cv2; import torch; import numpy as np; import os; "
-            f"img = cv2.imread({safe_input}); "
-            f"if img is None: raise RuntimeError('Failed to load image'); "
-            f"try: "
-            f"    device = 'cuda' if torch.cuda.is_available() else 'cpu'; "
-            f"    helper = FaceRestoreHelper("
-            f"upscale_factor=1, face_size=512); "
-            f"    helper.read_image(img); "
-            f"    helper.get_face_landmarks_5("
-            f"only_center_face=False, resize=640, "
-            f"eye_dist_threshold=5); "
-            f"    helper.align_warp_face(); "
-            f"    codeformer_net = ARCH_REGISTRY.get('CodeFormer')"
-            f"(dim_embd=512, codebook_size=1024, "
-            f"n_head=8, n_layers=9, "
-            f"connect_list=['32','64','128','256']).to(device); "
-            f"    ckpt = torch.load({safe_model}, map_location=device); "
-            f"    codeformer_net.load_state_dict("
-            f"ckpt['params_ema'] if 'params_ema' in ckpt else ckpt); "
-            f"    codeformer_net.eval(); "
-            f"    for idx, cropped_face in enumerate(helper.cropped_faces): "
-            f"        face_t = torch.from_numpy("
-            f"cropped_face / 255.).permute(2,0,1).unsqueeze(0)"
-            f".float().to(device); "
-            f"        with torch.no_grad(): "
-            f"            output = codeformer_net("
-            f"face_t, w=0.9, adain=True)[0]; "
-            f"        restored = (output.squeeze(0).permute(1,2,0)"
-            f".cpu().numpy() * 255).clip(0,255).astype(np.uint8); "
-            f"        helper.add_restored_face(restored); "
-            f"    helper.get_inverse_affine(None); "
-            f"    result = helper.paste_faces_to_input_image("
-            f"upsample_img=img); "
+        # FIX-NEW-V-19 / R22: 原代码 `sys.path.insert(0, 'CodeFormer')` +
+        # `from codeformer.facelib...` 依赖一个**并不存在**的 `codeformer`
+        # 包（项目里没有 CodeFormer/ 目录，.venv_r4 里也没有该包，
+        # 依赖检查 dependency_check.py 已如实报告它缺失），
+        # 子进程必然 ModuleNotFoundError → rc=83。
+        # 实测 `basicsr.archs.codeformer_arch` **是可用的**（架构定义在
+        # basicsr 里），且 models/CodeFormer.pth 能零 missing / 零
+        # unexpected 载入 —— 缺的只是推理胶水层。
+        # 改用 facexlib（对齐/回贴）+ basicsr CodeFormer 架构，
+        # 与视频链 stage5 的 CodeFormer 分支同一套依赖。
+        shm = str(SCRIPT_DIR.parent.resolve() / "shared_modules")
+        models_dir = str(SCRIPT_DIR.parent.resolve() / "models")
+        # R4 的教训：python -c 的多行程序必须用**换行拼接**，不能用 `;`
+        # 把 if / try / for 这类复合语句串成一行（Python 语法不允许）。
+        # 这里显式列出每一条语句（与 stage3 同一写法）。
+        _code_lines = [
+            f"import sys; sys.path.insert(0, {shm!r})",
+            "import os",
+            f"models_dir = {models_dir!r}",
+            "want_dir = os.path.join(models_dir, 'facexlib', 'weights')",
+            "want = os.path.join(want_dir, 'detection_Resnet50_Final.pth')",
+            "src_w = os.path.join(models_dir, "
+            "'detection_Resnet50_Final.pth')",
+            "if not os.path.exists(want) and os.path.exists(src_w):",
+            "    os.makedirs(want_dir, exist_ok=True)",
+            "    try:",
+            "        os.link(src_w, want)",
+            "    except OSError:",
+            "        import shutil as _sh; _sh.copy2(src_w, want)",
+            "from facexlib.utils.face_restoration_helper import "
+            "FaceRestoreHelper",
+            "from basicsr.archs.codeformer_arch import CodeFormer",
+            "from media_io import load_image_rgb_uint8 as _ldr",
+            "import cv2; import torch; import numpy as np",
+            f"_rgb = _ldr({safe_input})",
+            "img = _rgb[:, :, ::-1].copy()",
+            "print('IN_SHAPE', img.shape)",
+            "try:",
+            "    device = 'cuda' if torch.cuda.is_available() else 'cpu'",
+            "    helper = FaceRestoreHelper(",
+            "        upscale_factor=1, face_size=512)",
+            "    helper.read_image(img)",
+            "    helper.get_face_landmarks_5(",
+            "        only_center_face=False, resize=640,",
+            "        eye_dist_threshold=5)",
+            "    helper.align_warp_face()",
+            "    codeformer_net = CodeFormer(",
+            "        dim_embd=512, codebook_size=1024,",
+            "        n_head=8, n_layers=9,",
+            "        connect_list=['32','64','128','256']).to(device)",
+            f"    ckpt = torch.load({safe_model}, map_location=device)",
+            "    codeformer_net.load_state_dict(",
+            "        ckpt['params_ema'] if 'params_ema' in ckpt else ckpt)",
+            "    codeformer_net.eval()",
+            "    for cropped_face in helper.cropped_faces:",
+            "        face_t = torch.from_numpy(",
+            "            cropped_face / 255.).permute(2, 0, 1)",
+            "        face_t = face_t.unsqueeze(0).float().to(device)",
+            "        with torch.no_grad():",
+            "            output = codeformer_net(face_t, w=0.9, adain=True)[0]",
+            "        restored = (output.squeeze(0).permute(1, 2, 0)",
+            "            .cpu().numpy() * 255).clip(0, 255).astype(np.uint8)",
+            "        helper.add_restored_face(restored)",
+            "    helper.get_inverse_affine(None)",
+            "    result = helper.paste_faces_to_input_image(upsample_img=img)",
             f"    out_path = os.path.join({safe_output_dir}, "
-            f"os.path.basename({safe_input})); "
-            f"    cv2.imwrite(out_path, result); "
-            f"except Exception as e: "
-            f"    print('CodeFormer fallback failed:', e, file=sys.stderr); "
-            f"    sys.exit(1); ",
+            f"os.path.basename({safe_input}))",
+            "    cv2.imwrite(out_path, result)",
+            "    print('WROTE', out_path)",
+            "except Exception:",
+            "    import traceback; traceback.print_exc()",
+            "    sys.exit(1)",
         ]
+        cmd = [sys.executable, "-c", chr(10).join(_code_lines)]
         r = subprocess.run(
-            cmd, capture_output=True, timeout=600, shell=False)
+            cmd, capture_output=True, text=True, timeout=900, shell=False)
+        if r.returncode != 0:
+            sys.stderr.write(
+                f"CodeFormer subprocess failed (rc={r.returncode}): "
+                f"{(r.stderr or '')[-800:]}\n")
         return r.returncode == 0
     except Exception:
         return False
