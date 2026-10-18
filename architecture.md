@@ -97,21 +97,29 @@ All shared modules are in `shared_modules/` directory.
 | Manifest Editor | `manifest_editor.py` | Edit manifest jobs |
 | Manifest Generator | `manifest_generate.py` | Generate manifests from directories |
 | Preview | `preview.py` | Preview frame extraction |
-| Media IO | `media_io.py` | Media probing / IO helpers |
+| Media IO | `media_io.py` | Media probing / IO helpers; `read_image_array` (format-aware), `load_image_rgb_uint8` (per-channel adaptive TIFF reading), `write_tiff` (zlib) |
 | Cancel Guard | `cancel_guard.py` | Cancellation / interrupt guard (rc=88), managed subprocess runner |
 | AI Runtime | `ai_runtime.py` | Resolve AI subprocess interpreter (`WB_AI_PYTHON` → current → `.venv_r4`) |
-| DAT Runtime | `dat_runtime.py` | DAT architecture configs + PyTorch inference (single source of truth) |
+| DAT Runtime | `dat_runtime.py` | DAT architecture configs + PyTorch inference (single source of truth); output format follows the output path extension |
 
 ### 4.1 Python Path Setup
-大多数 stage 脚本正确添加 shared_modules 到 sys.path：
+每个 stage 脚本把 `shared_modules` 加入 `sys.path`，但**两条链的层级不同**，
+表达方式也不同：
+
 ```python
+# video_restoration_pipeline/stages/*.py —— SCRIPT_DIR 是 stages/ 子目录
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "shared_modules"))
-from logger import get_logger
-from checkpoint import compute_param_hash
+
+# photo_restoration_pipeline/stages/*.py —— SCRIPT_DIR 是链目录本身，
+# 因此项目根只往上走一层；写成 .parent.parent 会高一层
+sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 ```
 
-`video_restoration_pipeline/stages/stage6_grain_synthesis.py` 的 sys.path 同样包含 `shared_modules/`。
+**这是跨链最易踩的坑**：两条链里同名表达式 `SCRIPT_DIR.parent.parent`
+含义不同。照片链若照抄视频链的写法，模型路径会解析到项目根之外，
+表现为"权重找不到"→ 推理失败。同理，`ai_spawn_isolation` 相关实现
+在两条链里也各自指向各自的链目录。
 
 ---
 
@@ -256,6 +264,18 @@ Returns exit code 80 if any required dependency is missing.
 - 视频链 AI 推理必须走外部解释器（`ai_runtime`），编排器 R72 无 torch
 - 依赖检查的 spawn 合规扫描是静态文本匹配（`# spawn-safe:` 可人工抑制）
 - WSL2 相关路径逻辑在本机（Windows 原生）不触发，属未实测分支
+- **中间 TIFF 的压缩方式必须是 tifffile 可直读的**
+  （`NONE` / `DEFLATE` / `ADOBE_DEFLATE`），不得用 LZW：
+  LZW 解码依赖 `imagecodecs`，本项目未安装。
+  注意 `PIL.Image.save()` 与 `cv2.imwrite()` 对 `.tif` **都默认 LZW**，
+  须显式指定压缩参数，或改走 `media_io.write_tiff()`。
+- **G'MIC 写出的 `uint16` TIFF 可能名实不符**（声明 16-bit、实际 8-bit
+  量级）。读这类文件必须用 `media_io.load_image_rgb_uint8()`
+  （tifffile + **逐通道**值域自适应）；按全局最大值判定会在
+  "部分通道被放大"的中间产物上整体走 `/257`，把画面压成全黑。
+- `facexlib` 是唯一可用的人脸检测后端（RetinaFace / YOLOv8-face / MTCNN
+  三个独立包均未安装）。它是 GFPGAN/CodeFormer 的内置检测实现，
+  不是并列备选。CodeFormer 架构取自 `basicsr.archs.codeformer_arch`。
 
 ## 12. 历史审查记录（本地）
 
