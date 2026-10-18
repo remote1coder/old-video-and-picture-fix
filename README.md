@@ -47,7 +47,8 @@ quality while applying modern restoration techniques.
 
 #### Video Restoration
 
-视频修复支持 **6 种运行模式**（v7.3 §3.3）：
+视频修复支持 **6 种运行模式**（`--mode` 的 6 个取值：
+`scan` / `edit` / `batch` / `quick` / `interactive` / `preview`）：
 
 ```bash
 # 模式 D（四步工作流）Step 1: 扫描输入目录生成分类清单
@@ -122,8 +123,10 @@ python photo_restoration_pipeline/main.py \
   `tools_r4/exiftool/exiftool-*`（只加 `tools_r4` 会 `[WinError 2]`）。
 - Windows/Git Bash 下 PATH 前置项要用 POSIX 形式（`/e/...`），
   写 `E:/...` 会被 MSYS 拆坏成 `E` + `/codex/...`。
-- 退出码语义：`80` 依赖缺失 / `81` 参数错误 / `82` stage 失败 /
-  `83` GPU / `84` IO / `86` 门禁 / `87` 超时 / `88` 取消。
+- 退出码语义（按代码实际使用统计）：`80` 依赖缺失 / `81` 参数错误 /
+  `82` 输入·IO·阶段失败 / `83` GPU / `84` 编码·IO / `85` 权限（保留未用）/
+  `86` 校验·门禁失败 / `87` 资源不足·超时 / `88` 取消（仅编排层）。
+  `3` 表示跳过（已存在、无需处理）。
 
 ### 跑批注意（重要）
 
@@ -136,9 +139,10 @@ python photo_restoration_pipeline/main.py \
 
 ## Architecture
 
-See [architecture.md](architecture.md) for detailed system architecture.
+- [architecture.md](architecture.md) — 系统架构说明
+- [PROJECT_MANUAL.md](PROJECT_MANUAL.md) — 操作手册
 
-See [PROJECT_MANUAL.md](PROJECT_MANUAL.md) for the complete operation manual.
+两份文档为**描述性材料**，如与代码不一致，以代码为准（见「版本与规范说明」）。
 
 ## Directory Structure
 
@@ -187,13 +191,17 @@ See [PROJECT_MANUAL.md](PROJECT_MANUAL.md) for the complete operation manual.
 └── models/                          # AI model weights directory
 ```
 
-## Version History
+## 版本与规范说明
 
-实现遵循两本规范（规范原文为本地文档，不入库）：
+**本仓库以代码为唯一事实来源**（`main.py` / `stages/` / `config.yaml` /
+`shared_modules/`）。历史规范文档仅作背景参考，且**可能已落后于实现**：
 
-- **v6.32** — 视频修复技术规范（`v6.32.md`）
-- **v7.32** — 架构规范：照片链、TUI 清单编辑器、6 种运行模式
-- 当前仓库同时包含两条链（video + photo）与共享模块
+- `v6.32.md` — 视频修复技术规范（历史版本）
+- `v7.32.md` — 架构规范（照片链、清单编辑器、运行模式）
+
+> 规范与代码不一致时，以代码行为为准。本 README 中的命令、参数、
+> 退出码、目录结构均按当前代码实测核对；规范文档如需继续作为依据，
+> 应先按代码修订。规范原文为本地文档，不入库。
 
 ## 问题台账与审计报告（仅本地，不入库）
 
