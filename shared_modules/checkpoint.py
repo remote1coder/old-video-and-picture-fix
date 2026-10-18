@@ -350,9 +350,25 @@ def cleanup_old_intermediates(temp_dir: str,
         for _, f in intermediates[keep_steps:]:
             unlink_artifact_with_sidecars(f)
     else:
-        steps_to_keep = {s for s, _ in intermediates[:keep_steps]}
+        # FIX-B7 / R6-10 补完：保留集合必须按 **step 号范围**算，
+        # 不能按"前 keep_steps 个文件"的 step 集合。
+        #
+        # 原实现 `steps_to_keep = {s for s, _ in intermediates[:keep_steps]}`
+        # 有个致命前提：**每个 step 只有一个产物**。一旦某一步产出多个
+        # 文件（stage4 在分窗口/多变体时会），名额被同一步占满：
+        #   intermediates = [(4,a),(4,b),(4,c),(3,d),(2,e),(1,f)]
+        #   keep_steps=2 → steps_to_keep={4}
+        #   → step3/2/1 全被删（`step < current_step` 且不在 {4}）
+        # 后果是下游 stage5 找不到 stage3 的产物：
+        #   STAGE5_ORDER_ERROR "AI upscale enabled but no stage3 output found"
+        #   → stage5 rc=82 → 整链 STALE_INTERMEDIATES_PURGED 从头重跑
+        # 实测（2026-10-19，2 秒 1080i）：stage4 DONE 后 1 秒即报此错。
+        #
+        # 正确语义：保留 `current_step - keep_steps + 1 .. current_step`
+        # 这一段里的**所有** step。
+        lowest_kept = max(0, current_step - max(1, keep_steps) + 1)
         for step, f in intermediates:
-            if step not in steps_to_keep and step < current_step:
+            if step < current_step and step < lowest_kept:
                 unlink_artifact_with_sidecars(f)
 
 
