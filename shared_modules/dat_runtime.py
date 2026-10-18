@@ -247,7 +247,15 @@ def run_dat_file(input_path: str, output_path: str, model: str, scale: int,
                 Image.fromarray(output_8).save(output_path)
         else:
             output_8 = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-            Image.fromarray(output_8).save(output_path)
+            # FIX-NEW-V-18 / R21: 不用裸 PIL `.save(path)`——PIL 对 .tif
+            # 会默认选 **LZW** 压缩，而 tifffile 解 LZW 需要 `imagecodecs`
+            #（本机未装）→ 下游 stage5 读不回来 → MediaPrecisionError
+            # → rc=86。走 media_io.write_tiff（zlib，纯 Python 内置）。
+            try:
+                from media_io import write_tiff as _wt
+                _wt(output_path, output_8)
+            except Exception:
+                Image.fromarray(output_8).save(output_path)
         return True
     except Exception:
         return False
