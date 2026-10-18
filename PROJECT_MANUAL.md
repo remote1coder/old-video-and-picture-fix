@@ -72,24 +72,34 @@ avifenc --version
 ```
 
 #### 6) VapourSynth (仅视频修复需要)
-```bash
-pip install vapoursynth
+**必须用 R72（最后完整支持 API3 的版本）**；`pip install vapoursynth`
+默认会装最新版（R80+，仅 API4），API3 社区插件全部失效。
 
-# 验证
-python3 -c "import vapoursynth as vs; print(vs.core)"
+```bash
+# 方案 A（本机已验证）：直接用 Portable R72
+tools_r4/vs_portable/r72/python.exe -c "import vapoursynth as vs; print(vs.core)"
+
+# 方案 B：自建环境时按 requirements.txt 钉版本
+pip install "vapoursynth>=57,<73"
 ```
 
 #### 7) havsfunc r33 (仅视频修复需要)
-```bash
-pip install "havsfunc==33"
+`havsfunc==33` 的依赖声明是 `VapourSynth (>=57)`（无上限），**直接 pip
+装会把 VS 连带升到最新版**。正确顺序是先钉住 VS 再装：
 
-# 验证
-python3 -c "import havsfunc; print('havsfunc OK')"
+```bash
+pip install "vapoursynth>=57,<73"
+pip install "havsfunc==33" --no-deps
+pip install vsutil
+
+# 验证（用 R72）
+tools_r4/vs_portable/r72/python.exe -c "import havsfunc; print('havsfunc OK')"
 ```
 
 ### 2.3 Python 依赖
 
-在项目根目录创建虚拟环境：
+**以 `requirements.txt` 为准**（其中已固定 `vapoursynth>=57,<73` 并说明了
+为什么不能升级、`havsfunc==33` 为什么不能直接装）。在项目根目录：
 
 ```bash
 # 创建虚拟环境
@@ -108,19 +118,18 @@ venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 应至少包含：
-```
-PyYAML>=6.0
-Pillow>=9.0
-numpy>=1.21
-scipy>=1.7
-opencv-python>=4.5
-pandas
-requests
-rich>=13.0
-vapoursynth>=60
-havsfunc==33
-```
+**本机实测环境（Windows，推荐直接复用）**：
+
+| 用途 | 解释器 |
+|---|---|
+| 视频链编排（VapourSynth R72，API3 插件全通） | `tools_r4/vs_portable/r72/python.exe` |
+| 视频链 AI 推理（torch/realesrgan/DAT/facexlib） | 自动解析到 `.venv_r4`（`shared_modules/ai_runtime.py`） |
+| 照片链（全栈，含 CUDA） | `.venv_r4/Scripts/python.exe` |
+
+两者均为 Python 3.12。**不要用 `.venv_r4` 跑视频链编排**：它的
+VapourSynth 已被 pip 升到 R81（API4），API3 社区插件会全部加载失败。
+PATH 需包含 `tools_r4/gmic/gmic-*-cli-win64` 与
+`tools_r4/exiftool/exiftool-*` 子目录（只加 `tools_r4` 会 `[WinError 2]`）。
 
 ### 2.4 AI 模型下载
 
@@ -177,25 +186,30 @@ project_root/
 │
 ├── photo_restoration_pipeline/      # 照片修复流水线
 │   ├── classify.py                  # 照片分类器
-│   ├── main.py                      # 照片主控脚本（单文件 + --input-dir 批量模式；manifest 工作流已支持 --manifest/--resume）
+│   ├── main.py                      # 照片主控脚本（单文件 + --input-dir 批量；manifest 工作流已支持 --manifest/--resume）
 │   ├── config.yaml                  # 照片配置
-│   └── stages/                      # 照片处理阶段
+│   └── stages/                      # 照片处理阶段（默认链 6 步）
 │       ├── stage1_preprocess.py     # 预处理（色彩空间、去划痕、去块、去色带）
-│       ├── stage2_traditional_check.py  # 质量验证
+│       ├── stage2_ai_pre.py         # AI 前处理：单通道校正
 │       ├── stage3_ai_upscale.py     # AI放大
-│       ├── stage4_postprocess.py    # 后处理（区域分离、颗粒合成）
-│       ├── stage5_ai_face.py        # 面部修复
-│       └── stage6_encode.py         # AVIF最终编码
+│       ├── stage4_ai_face.py        # 面部修复（GFPGAN/CodeFormer）
+│       ├── stage5_postprocess.py    # 后处理（局部遮罩 + 颗粒合成 + 人像色彩匹配）
+│       ├── stage6_encode.py         # AVIF最终编码
+│       └── stage2_traditional_check.py  # 历史遗留，不在默认链
 │
 ├── shared_modules/                  # 共享模块（两边共用）
-│   ├── checkpoint.py                # 断点续传支持
+│   ├── checkpoint.py                # 断点续传 / 身份与参数哈希
 │   ├── dependency_check.py          # 依赖检查
 │   ├── logger.py                    # 结构化日志记录
 │   ├── audio_utils.py               # 音频分析
 │   ├── manifest_generate.py         # 清单生成
-│   ├── manifest_editor.py           # 清单编辑
+│   ├── manifest_editor.py           # 清单编辑（含交互式 TUI）
 │   ├── manifest_loader.py           # 清单加载
-│   └── preview.py                   # 预览工具
+│   ├── preview.py                   # 预览工具
+│   ├── media_io.py                  # 媒体探测 / IO 辅助
+│   ├── cancel_guard.py              # 取消 / 中断守卫（rc=88）
+│   ├── ai_runtime.py                # AI 子进程解释器解析
+│   └── dat_runtime.py               # DAT 模型运行时
 │
 ├── models/                          # AI模型文件夹（需自行下载）
 ├── logs/                            # 日志输出（自动创建）
@@ -211,9 +225,8 @@ project_root/
 
 ### 4.1 视频修复依赖检查
 ```bash
-# 激活虚拟环境
-source venv/bin/activate
-
+# 激活虚拟环境（Linux/macOS: source venv/bin/activate；
+# Windows: venv\Scripts\activate 或直接 .venv_r4\Scripts\python.exe）
 # 运行依赖检查
 python shared_modules/dependency_check.py \
     -c video_restoration_pipeline/config.yaml \
@@ -321,12 +334,11 @@ ai:
 ### 6.1 单文件修复
 
 ```bash
-source venv/bin/activate
-
+# 运行环境见 §2；Windows 本机实测用 Portable R72 + .venv_r4（见 README 运行环境要点）
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     -i input_video.avi \
-    -o output.mkv \
+    -o ./output \
     --ai-enabled \
     --ai-upscale-factor 2 \
     --face-restore GFPGAN
@@ -335,7 +347,8 @@ python video_restoration_pipeline/main.py \
 参数说明：
 - `-c`: 配置文件路径
 - `-i`: 输入视频文件
-- `-o`: 输出文件路径
+- `-o`: **输出目录**（不是文件名）。成品为
+  `./output/<输入文件名去扩展名>_restored.mkv`
 - `--ai-enabled`: 启用AI放大
 - `--ai-upscale-factor`: AI放大倍数 (2或4)
 - `--face-restore`: 面部修复模型 (GFPGAN或CodeFormer)
@@ -395,7 +408,7 @@ python video_restoration_pipeline/main.py \
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     -i tape.avi \
-    -o tape_restored.mkv \
+    -o ./output \
     --ai-enabled \
     --ai-upscale-factor 2
 ```
@@ -405,7 +418,7 @@ python video_restoration_pipeline/main.py \
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     -i dv.mov \
-    -o dv_restored.mkv \
+    -o ./output \
     --ai-enabled \
     --ai-upscale-factor 2
 ```
@@ -415,12 +428,10 @@ python video_restoration_pipeline/main.py \
 python video_restoration_pipeline/main.py \
     -c video_restoration_pipeline/config.yaml \
     -i hdv.m2ts \
-    -o hdv_restored.mkv \
-    --crf 26 \
-    --preset 4
+    -o ./output
 ```
 
-**注意**: HDV/AVCHD 素材默认 **不建议** AI 放大（原生已 1080p），如需强制放大请设置 `force_allow_banned_upscale: true`。
+**注意 1**: HDV/AVCHD 素材默认 **不建议** AI 放大（原生已 1080p），如需强制放大请在清单该 job 的 `user_overrides` 里设置 `force_allow_banned_upscale: true`（视频 main.py **没有** `--crf` / `--preset` 命令行参数，编码质量请改 config.yaml 的 `global.crf` / `global.preset`，或在清单 `user_overrides` 里覆盖）。
 
 ---
 
@@ -429,7 +440,7 @@ python video_restoration_pipeline/main.py \
 ### 7.1 单文件修复（基础）
 
 ```bash
-source venv/bin/activate
+# 照片链用 .venv_r4（Windows 实测）：.venv_r4\Scripts\python.exe
 
 python photo_restoration_pipeline/main.py \
     -c photo_restoration_pipeline/config.yaml \
@@ -542,47 +553,17 @@ python -m json.tool logs/job_photo_1234567890.log
 
 ---
 
-## 9. 已知问题与限制
+## 9. 问题与限制（本地文档）
 
-### 9.1 关键运行时缺陷（生产环境使用前必读）
+缺陷登记、逐文件审计、修复台账与验收记录属于内部工作资料，**不随仓库分发**：
 
-| 问题 | 影响 | 临时规避措施 |
-|------|------|-------------|
-| ~~照片 main.py 未传入 `original_width/height`~~ | ~~AI 超分 1080p 限制完全失效~~ | ✅ **已修复** |
-| ~~照片 CLI `--ai-upscale-factor` 键名不匹配~~ | ~~CLI 指定的放大倍数被忽略~~ | ✅ **已修复** |
-| ~~照片 CLI `--ai-model` 键名不匹配~~ | ~~CLI 指定的模型被忽略~~ | ✅ **已修复** |
-| ~~checkpoint.py `wsl_copy_back` 使用 copy2~~ | ~~WSL2 下复制到 /mnt/ 可能 PermissionError~~ | ✅ **已修复**：改用 copyfile + 三重校验 |
-| ~~checkpoint.py `gpu_memory_check` 用 total_memory~~ | ~~显存预检测不准确，可能运行时 OOM~~ | ✅ **已修复**：改用可用显存查询 |
-| ~~照片 stage5 CodeFormer fallback 无操作~~ | ~~CodeFormer CLI 不可用时输出未修复原图~~ | ✅ **已修复**：已实现 CodeFormer Python API 推理（FaceRestoreHelper + torch 推理） |
-| ~~照片 stage5 RetinaFace/MTCNN 未过滤低置信度~~ | ~~可能误检非人脸区域~~ | ✅ **已修复**：已正确应用阈值 |
-| ~~视频 stage0/stage7 音频文件名不匹配~~ | ~~输出视频无音频~~ | ✅ **已修复**：stage0 统一输出 `.audio`，stage7 同时兼容旧命名 `.wav` fallback |
-| ~~视频 stage3 硬编码 25fps~~ | ~~非 25fps 素材帧率错误~~ | ✅ **已修复**：stage3 通过 ffprobe 读取原始 `r_frame_rate` 并用于编码 |
-| ~~视频 main.py `force_traditional_first` 未强制~~ | ~~stage2 失败仍进入 AI 阶段~~ | ✅ **已修复**：`process_job()` 中 stage2 非 0/3 时立即返回 86，阻止后续 AI 阶段执行 |
-| ~~视频 main.py 缺少 `--resume`~~ | ~~清单无法断点续传~~ | ✅ **已修复**：`--resume` 参数已添加，支持对 PENDING 任务检测有效中间文件并跳过，FAILED 任务校验后降级为 PENDING |
+- `bugs.md` — 缺陷登记册（BUG-xxx / ISSUE-xxx）
+- `shixian.md` — 实现差距登记
+- `修复清单.md` — 按轮次的修复台账与根因分析
+- `MEDIA_ACCEPTANCE_PLAN.md` — 验收门与实测记录
 
-### 9.2 规范偏离（不影响运行但影响质量）
-
-| 问题 | 影响 |
-|------|------|
-| 照片流水线无批量/清单模式 | 无法断点续传和审阅多文件任务 |
-| ~~照片 `--preview` 只打印计划不生成帧~~ | ~~无法预览效果~~ | ✅ **已修复**：预览模块已实现基础功能 |
-| I;16 图像在 Stage1/4 被降级到 8bit | 16bit 输入精度丢失 |
-| 半身人像色彩匹配未实现 | 面部修复后与身体可能有色彩断层 |
-| FLIF 色差层提取是空实现 | 未实现真正的 FLIF 存档 |
-| ~~照片重试间隔 2s/4s 而非规范 5s/15s~~ | ~~重试节奏过快~~ | ✅ **已修复**：已改为 5s/15s |
-
-### 9.3 已修复的关键缺陷
-
-以下问题在 2026-04-30 前的修复轮次中已解决：
-
-- ✅ video stage1 QTGMC 逻辑反转（tt/bb 分支无调用）
-- ✅ checkpoint.py 缺失 `is_retryable_error()` 和 `verify_ffprobe_decodeable()`
-- ✅ video stage5 编码参数硬编码
-- ✅ video stage6 `sys.path` 缺少 `shared_modules`
-- ✅ `wsl_redirect_path()` 未检查 `platform`
-- ✅ photo main.py 未定义退出码 88（已移除）
-- ✅ video stage3 目标分辨率 ≤1080p 检查缺失
-- ✅ video main.py `_worker_wrapper` 嵌套函数 spawn 下无法 pickle
+本手册只保留**当前代码的操作方式**；如遇具体报错，先查 §10「常见问题」，
+再到上述本地文档中检索对应事件的根因。
 
 ---
 
@@ -599,10 +580,16 @@ sudo apt install ffmpeg  # Ubuntu 22.04+ 自带 4.4+
 
 #### 问题2：VapourSynth插件缺失
 **症状**: stage1_preprocess.py 报错 "VS Plugin QTGMC not available"  
-**解决**: 安装插件
+**解决**: 不要用 `pip install havsfunc==33` —— 它会把 VapourSynth 连带升级到
+R73+，API3 社区插件（MVTools2/NNEDI3/MaskTools2/KNLMeansCL/focus2/ffms2）
+会全部加载失败（详见 README「运行环境要点」）。正确做法是使用本机已验证的
+Portable R72 环境：
+
 ```bash
-pip install "havsfunc==33"
+tools_r4/vs_portable/r72/python.exe video_restoration_pipeline/main.py --help
 ```
+
+如需自建同版本环境，见 `requirements.txt` 中 `vapoursynth>=57,<73` 的注释。
 
 #### 问题3：AI模型文件缺失
 **症状**: stage3_ai_upscale.py 报错 "Model file not found"  
@@ -643,37 +630,15 @@ gmic -h deband
 
 #### 问题8：WSL2 路径重定向不生效
 **症状**: WSL2 下处理大文件时 temp/output 仍在 `/mnt/c/`，I/O 极慢  
-~~**原因**: `wsl_redirect_path()` 仅检查 `output_path`，未检查 `temp_dir`。~~ ✅ **已修复**: `wsl_redirect_path()` 现在同时检查 `output_path` 和 `temp_dir`，两者任一在 `/mnt/` 下均自动重定向到 Linux 原生分区。
 **兜底解决**: 在 config.yaml 中显式将 `temp_dir` 和 `output_dir` 都设置为 Linux 原生分区路径：
 ```yaml
 global:
   temp_dir: "/home/user/temp"
   output_dir: "/home/user/output"
 ```
-或运行脚本时指定：
-```bash
-python video_restoration_pipeline/main.py ... --temp-dir /home/user/temp --output-dir /home/user/output
-```
-
-#### 问题9：WSL2 复制成品触发 PermissionError
-**症状**: 完成修复后 `wsl_copy_back()` 报错 PermissionError  
-~~**原因**: 使用 `shutil.copy2` 复制 WSL2 NTFS 挂载文件~~ ✅ **已修复**: 改用 `shutil.copyfile` 并添加三重校验。跨文件系统时自动回退到 copyfile。
-```bash
-cp /home/user/output/restored.avif /mnt/c/output/
-```
-
-#### 问题10：日志文件多进程时损坏
-**症状**: 并行处理多个文件后，日志文件中出现截断或交错的 JSON 行  
-~~**原因**: Windows 下使用非阻塞文件锁 `LK_NBLCK`~~ ✅ **已修复**: 日志锁已改为 `LK_LOCK` 阻塞模式。多进程运行正常。
-
-#### 问题11：依赖检查通过但运行时模型缺失
-**症状**: `dependency_check.py` 全部通过，但 stage5 报 "CodeFormer model not found"  
-~~**原因**: `check_ai_models()` 未检查 CodeFormer 权重~~ ✅ **已修复**: 依赖检查已包含 CodeFormer 权重验证。  
-~~**注意**: `check_ai_models()` 支持外部 `md5_manifest.json` 清单启用 MD5 校验；内置模型表 MD5 为 `None` 时输出 WARNING 提示用户创建外部 manifest，不阻断执行。~~ ✅ **已修复**: `check_ai_models()` 现在自动检测同目录下的 `md5_manifest.json` 外部 MD5 清单并执行校验。无 MD5 配置时会输出明确警告提示用户配置。
-
-#### 问题12：音频哼鸣未去除
-**症状**: 修复后视频仍有 50Hz/60Hz 哼鸣  
-~~**原因**: `arnndn` 模型未根据检测到的频率自动选择~~ ✅ **已修复**：已实现频率自动检测和 mono 转换。无需手动配置。
+注意：视频 `main.py` **没有** `--temp-dir` / `--output-dir` 命令行参数，
+路径只能通过 config.yaml 或清单 job 的 `temp_dir`/`output_path` 指定；
+照片 `main.py` 支持 `--temp-dir` / `--output`。
 
 ### 10.2 获取帮助
 
@@ -700,7 +665,7 @@ python shared_modules/dependency_check.py --help
 **限制**:
 - 照片流水线支持单文件断点续传（通过中间文件存在性判断）
 - 视频流水线支持清单级断点续传
-- ~~**⚠️ 重要**: `param_hash` 的 `CORE_QUALITY_PARAMS` 白名单缺少部分照片参数~~ ✅ **已修复**: 照片参数已加入白名单。
+- `param_hash` 的 `CORE_QUALITY_PARAMS` 白名单已覆盖照片与视频的质量参数
 
 ### 11.2 预览模式
 
@@ -777,128 +742,8 @@ python photo_restoration_pipeline/main.py ... --no-wsl-redirect
 
 ---
 
-## 视频流水线排障补充（2026-04-29 审查新增）
+## 历史排障记录（本地）
 
-### 问题13：视频修复后没有音频 / 音频未被处理
-~~**原因**: `stage0_audio_extract.py` 输出文件名为 `{job_id}_{input_name}_audio_raw.wav`，但 `stage7_encode.py` 查找的是 `{job_id}_{input_name}.audio`（无扩展名）。名称不匹配导致 stage7 找不到音频文件。~~ ✅ **已修复**：stage0 输出统一为 `{job_id}_{input_name}.audio`，stage7 同时兼容旧命名 `.wav` 作为 fallback。
-
-### 问题14：AI 超分后视频帧率变为 25fps
-~~**原因**: `stage3_ai_upscale.py` 编码输出时硬编码 `-framerate 25`，未读取原始帧率。~~ ✅ **已修复**：stage3 通过 ffprobe 读取原始 `r_frame_rate` 并用于编码。非 25fps 素材（29.97/50/60fps）现已正确保留帧率。
-
-### 问题15：WSL2 下视频修复 I/O 极慢
-~~**原因**: `main.py` 未在 stage0-6 中处理 WSL2 路径重定向，临时文件仍在 `/mnt/`（Windows NTFS 挂载）下。只有 stage7 做了重定向。~~ ✅ **已修复**。在 `process_job` 开始时对 `temp_dir` 和 `output_dir` 调用 `wsl_redirect_path()`，所有 stage 统一使用重定向后的路径。
-
-### 问题16：传统修复后仍进入 AI 阶段（即使失败）
-~~**原因**: `main.py` 未检查 `force_traditional_first` 参数，stage2 返回非零后仍继续执行 stage3/4/5。~~ ✅ **已修复**：`process_job()` 中 stage2 非 0/3 时立即返回 86，阻止后续 AI 阶段执行。
-
-### 问题17：视频修复清单无法断点续传
-~~**原因**: `main.py` 缺少 `--resume` 参数，也没有 FAILED 任务降级逻辑。~~ ✅ **已修复**：`--resume` 参数已添加，支持对 PENDING 任务检测有效中间文件并跳过，FAILED 任务校验后降级为 PENDING。
-
-### 问题18：人脸修复后画面有硬边界
-~~**原因**: `stage5_ai_face.py` 将修复后的人脸帧直接复制替换到原视频，未做羽化（feathering）。~~ ✅ **已修复**：使用高斯模糊 mask，margin = max(8px, 5% min_dim) 实现羽化边缘混合。
-
-### 问题19：GrainFactory3 颗粒效果不理想
-~~**原因**: `stage6_grain_synthesis.py` 未转换到 16bit 空间，且直接编码为有损 SVT-AV1。~~ ✅ **已修复**：VS 脚本中使用 `vs.YUV420P16`，输出改为 FFV1 无损格式。同时增加 AddGrainC fallback。
-
-### 问题20：多声道视频音频被混缩为立体声
-~~**原因**: `stage7_encode.py` 固定使用 AAC 320k，未根据原始声道布局选择 FLAC 或 AAC 640k。~~ ✅ **已修复**：读取原始声道布局，>2 声道时自动切换为 FLAC 以保留完整布局。arnndn 降噪时 mono 转换后也恢复原始布局。
-
-
----
-
-## shared_modules 排障补充（2026-04-29 审查新增）
-
-### 问题21：依赖检查通过但运行时 AI 模型缺失
-~~**原因**: `dependency_check.py` 的 `check_ai_models()` 未检查 CodeFormer 权重~~ ✅ **已修复**：依赖检查已包含 CodeFormer 权重验证。  
-**注意**: `check_ai_models()` 支持外部 `md5_manifest.json` 清单启用 MD5 校验；内置模型表 MD5 为 `None` 时输出 WARNING 提示用户创建外部 manifest，不阻断执行。
-
-### 问题22：WSL2 下成品文件复制失败 PermissionError
-~~**原因**: `checkpoint.py` 的 `wsl_copy_back()` 使用 `shutil.copy2`~~ ✅ **已修复**：改用 `shutil.copyfile()` + `os.utime()` 手动同步时间戳。跨文件系统时自动回退到 copyfile。
-
-### 问题23：Windows 下多进程日志文件损坏
-~~**原因**: `logger.py` 使用 `msvcrt.LK_NBLCK` 非阻塞锁~~ ✅ **已修复**：已改为 `msvcrt.LK_LOCK` 阻塞锁。多进程运行正常。
-
-### 问题24：音频处理后输出为 FLAC 而非 AAC
-~~**原因**: `audio_utils.py` 的 `process_audio()` 默认 codec 为 `"flac"`~~ ✅ **已修复**：默认 codec 已改为 `"aac"`。
-
-### 问题25：断点续传时修改照片参数未触发重新处理
-~~**原因**: `checkpoint.py` 的 `CORE_QUALITY_PARAMS` 缺少照片专属参数~~ ✅ **已修复**：照片参数已加入 `CORE_QUALITY_PARAMS` 白名单。  
-**注意**: 仍缺少少量参数（如 `enable_channel_correction`），修改这些参数不会触发 param_hash 更新。
-
-### 问题26：清单编辑器无法交互式审阅
-**原因**: `manifest_editor.py` 仅提供命令行子命令，无交互式 TUI。
-**解决**: 使用 `rich` 库实现交互式审阅，或手动编辑 YAML 清单文件。
-
-### 问题27：中间文件清理未生效（per-stage 清理）
-**原因**: `checkpoint.py` 的 `cleanup_old_intermediates()` 默认 `current_step=0`，清理条件 `step < 0` 永远为 False。若调用方未显式传入 `current_step`，函数不会删除任何旧中间文件。
-**解决**: 调用时显式传入当前 stage 编号，或将默认值改为 `sys.maxsize`。
-**状态**: ✅ **已修复** — 默认值改为 `Optional[int] = None`，当为 `None` 时保留 `keep_steps` 个最新文件并删除其余所有（BUG-058）
-
-### 问题28：多声道素材声道布局变体识别失败
-**原因**: `audio_utils.py` 的 `get_audio_channel_layout()` 使用精确字符串匹配 `("5.1", "6.1", "7.1")`。ffprobe 可能返回 `5.1(side)`、`7.1(wide)` 等变体，导致这些素材未被识别为多声道，继续编码为 AAC 而非 FLAC。
-**解决**: 改用 `channels >= 6` 判断多声道，或扩展正则匹配支持常见变体。
-**状态**: ✅ **已修复** — `process_audio()` 改用 `channels >= 6` 判断多声道，不再依赖 `channel_layout` 精确字符串匹配（BUG-059）
-
-### 问题29：FAILED 任务降级时 ImportError
-**原因**: `manifest_loader.py` 的 `_handle_failed_job()` 通过 `sys.path.insert` 假设 `shared_modules` 父目录为项目根。若项目结构变化，导入 `shared_modules.checkpoint` 会失败，FAILED 降级逻辑失效。
-**解决**: 使用 `importlib.util` 动态加载，或内联所需验证函数。
-**状态**: ✅ **已修复** — `sys.path.insert` 目标改为 `shared_modules/` 自身，使用 `from checkpoint import ...` 直接同目录导入（BUG-060）
-
-### 问题30：运动预览临时目录 PermissionError
-**原因**: `preview.py` 的 `detect_motion_segments()` 在输入文件所在目录创建 `_motion_temp`。若该目录只读（如光盘挂载点），触发 PermissionError。
-**解决**: 使用系统临时目录 `tempfile.mkdtemp(prefix="motion_")`。
-**状态**: ✅ **已修复** — 改用 `tempfile.mkdtemp(prefix="motion_")` 创建系统临时目录（BUG-061）
-
-### 问题31：GMIC 滤镜可用性误报
-**原因**: `dependency_check.py` 的 `check_gmic_filters()` 在 `gmic -h` 输出中做子串匹配（如 `-repair` 可能匹配 `unrepair`）。
-**解决**: 使用 `gmic -h repair` 精确查询单个滤镜。
-**状态**: ✅ **已修复** — 对每个滤镜单独调用 `gmic -h <filtername>`，通过返回码精确判断（BUG-062）
-
-
----
-
-## 视频流水线排障补充（2026-04-29 全面审查新增）
-
-### 问题27：AI 阶段永不执行（即使 config.yaml 中启用了 AI）
-~~**原因**: `main.py` 的 `merge_params()` 将 `config.ai.enabled` 注入为 flat key `"enabled"`，但 `process_job()` 和 stage3/stage5 查找的是 `"ai_enabled"`。由于 CLI 没有 `--ai-enabled` 参数，`params.get("ai_enabled", False)` 永远返回 `False`，导致 AI upscale 和人脸修复阶段永远不会被调度。~~ ✅ **已修复**：`merge_params()` 现在与 `audio_config` 处理方式一致，同步注入 `ai_{k}` 前缀版本（如 `ai_enabled`）。
-
-### 问题28：人脸修复片段提取时间戳偏移（非 25fps 素材）
-**原因**: `stage5_ai_face.py` 使用 `ffmpeg -ss {start_frame / 25.0}` 提取人脸片段，硬编码假设视频为 25fps。对于 29.97fps/50fps/60fps 素材，提取的时间戳会偏移，导致修复区域错位。
-**解决**: 使用 `ffprobe` 读取实际帧率进行转换，或直接使用 `_get_frame_pts()` 的原始 PTS 数据计算时间戳。
-**状态**: ✅ **已修复** — 已读取 `r_frame_rate` 并解析分数格式（如 30000/1001）（BUG-038）
-
-### 问题29：人脸修复输出文件名缺少 param_hash
-**原因**: `stage5_ai_face.py` 输出文件名为 `_step5_face_p{job_id}.mkv`，使用了 `job_id` 而非 `param_hash`。其他阶段（step1, step3 等）均使用 param_hash 实现 deterministic intermediate matching。缺少 param_hash 意味着仅调整 face_restore 相关参数时，文件名不变，可能被错误复用旧输出。
-**解决**: 从 params 读取 `param_hash` 并嵌入文件名，改为 `_step5_face_p{param_hash}.mkv`。
-**状态**: ✅ **已修复** — 输出文件名已改为 `_step5_face_p{param_hash}.mkv`（BUG-039）
-
-### 问题30：最终编码 SVT-AV1 参数字符串冗余构建
-**原因**: `stage7_encode.py` 中 `svtav1-params` 被构建两次：第一次在 `video_cmd` 初始化时仅含 tile 参数，第二次在颜色元数据确定后重新构建完整字符串并原地替换。功能正确但代码冗余。
-**解决**: 延迟构建 `svt_params`，在所有参数确定后一次性追加到 `video_cmd`。
-**状态**: ✅ **已修复** — 延迟构建 `svt_params`，所有参数确定后一次性 extend 到 `video_cmd`（BUG-041）
-
-### 问题31：spawn 模式下 worker 参数序列化风险
-**原因**: `main.py` 的 `_worker_wrapper` task dict 包含 `argparse.Namespace` 对象。虽然标准 Namespace 可被 pickle，但不够健壮，若被扩展可能引发序列化失败。
-**解决**: 将 `args` 转为纯 dict (`vars(args)`) 后再序列化。
-**状态**: ✅ **已修复** — task_contexts 中已传入纯 dict，但 `process_job()` 中仍使用 `args.config` / `args.stage`（AttributeError）。详见问题32。
-
-### 问题32：并行处理（`--workers 2`）时立即崩溃 AttributeError
-**原因**: `main.py` 的 `process_job()` 中直接使用 `args.config` 和 `args.stage`（Namespace 属性访问）。在 spawn 子进程中，`args` 已被转换为纯 dict，导致 `AttributeError: 'dict' object has no attribute 'config'`。
-**症状**: 运行 `python video_restoration_pipeline/main.py --workers 2 ...` 后立即崩溃，单 worker（默认）正常。
-**解决**: 
-1. `process_job()` 开头添加 `if not isinstance(args, dict): args = vars(args)`
-2. 将所有 `args.xxx` 访问改为 `args.get("xxx")`
-3. `run_stage()` 接收 `config_path` 参数而非从 `args` 读取
-**状态**: ✅ **已修复** — `process_job()` 已添加 `isinstance(args, dict)` 归一化，所有属性访问改为 `.get()`（BUG-042）
-
-### 问题33：断点续传（`--resume`）跳过未完成的任务
-**原因**: Resume 模式下，只要 PENDING 任务存在任意 stepN（如 step1）的有效中间文件，即被标记为 DONE。这导致仅完成了早期 stage 的任务被误认为全部完成。
-**症状**: 中断在 stage 3 的任务，重新运行 `--resume` 后状态变为 DONE，但输出视频不存在或只完成了预处理。
-**解决**: 逆向检查中间文件：从 step7 往下找第一个存在的中间文件。只有 step7 存在且有效时才标记 DONE；否则根据最高有效 stage 设置状态并从断点继续。
-**状态**: ✅ **已修复** — resume 逻辑仅当 step7 输出有效时标记 DONE；否则从最高有效 stage 恢复（BUG-043）
-
-### 问题34：视频分类后超时计算不准确
-**原因**: `classify_video()` 未返回 `duration` 字段，导致 `main.py` 的 `_calculate_timeout()` 和 `_check_disk_space()` 使用默认值 0。超时仅为基础值 600 秒（10 分钟），对大文件可能不足。
-**解决**: 在 `classify_video()` 中通过 ffprobe 读取 `format.duration` 并加入返回结果。
-**状态**: ✅ **已修复** — `classify_video()` 已从 ffprobe format 读取 `duration` 并加入返回结果（BUG-045）
-
+2026-04 及之后的逐文件审查、缺陷根因与修复过程已移出本手册，
+保留在本地 `bugs.md` / `shixian.md` / `修复清单.md`（不入库）。
+本手册只描述**当前代码**的操作方式与环境要点。
