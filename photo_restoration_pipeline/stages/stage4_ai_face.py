@@ -473,7 +473,14 @@ def run_gfpgan(input_path: str, output_dir: str,
         # Fallback: Python API
         model_dir = params.get("model_dir", "") if params else ""
         if not model_dir:
-            project_root = SCRIPT_DIR.parent.parent.resolve()
+            # FIX-NEW-V-16 / R19: 照片链 SCRIPT_DIR 本身就是
+            # <root>/photo_restoration_pipeline（视频链是 .../stages），
+            # 所以项目根是 `SCRIPT_DIR.parent`。原来写 `.parent.parent`
+            # → 解析到 E:\codex\code1 → model_dir 变成
+            # E:\codex\code1\models → model_path 不存在 → 子进程
+            # torch.load 失败 → rc=83。
+            # 与本文件 line 171（_detect_faces_via_facexlib）保持一致。
+            project_root = SCRIPT_DIR.parent.resolve()
             model_dir = str(project_root / "models")
         model_path = os.path.join(model_dir, f"GFPGANv{version}.pth")
 
@@ -483,28 +490,48 @@ def run_gfpgan(input_path: str, output_dir: str,
         safe_input = _json.dumps(input_path)
         safe_model = _json.dumps(model_path)
         safe_output_dir = _json.dumps(output_dir)
+        # FIX-NEW-V-16 / R18: 两个真实缺陷
+        # (1) `channel_only` **不存在**于本版本 GFPGANer，真实参数是
+        #     `channel_multiplier`（已用 inspect.signature 实测）。
+        #     旧参数使子进程 TypeError → returncode!=0 → run_gfpgan False
+        #     → STAGE4_FAILED rc=83。**人脸修复在照片链从未成功过**。
+        # (2) 子进程 stderr 被完全丢弃，只看 returncode，无法定位。
+        #     现在把 stderr 尾部保留下来（与 stage3 的 R4 同款处理）。
+        # 另外读图改走 media_io（R16：G'MIC 的 uint16 TIFF 用 cv2.imread
+        # 可能拿到错误/空数据），输出统一走 BGR 写回。
+        shm = str(SCRIPT_DIR.parent.resolve() / "shared_modules")
         cmd = [
             sys.executable, "-c",
+            f"import sys; sys.path.insert(0, {shm!r}); "
             f"from gfpgan import GFPGANer; "
             f"from basicsr.utils import img2tensor, tensor2img; "
-            f"from facexlib.utils.face_restoration_helper import FaceRestoreHelper; "
+            f"from media_io import load_image_rgb_uint8 as _ldr; "
             f"import cv2; "
             f"import torch; "
-            f"img = cv2.imread({safe_input}, cv2.IMREAD_COLOR); "
+            f"_rgb = _ldr({safe_input}); "
+            f"img = _rgb[:, :, ::-1].copy(); "  # RGB -> BGR（cv2 约定）
+            f"print('IN_SHAPE', img.shape); "
             f"restorer = GFPGANer(model_path={safe_model}, "
             f"upscale={upscale}, arch='clean', "
-            f"channel_only=False, bg_upsampler=None); "
+            f"channel_multiplier=2, bg_upsampler=None); "
             f"_, _, output = restorer.enhance(img, has_aligned=False, "
             f"only_center_face=False); "
             f"import os; "
             f"out_path = os.path.join({safe_output_dir}, "
             f"os.path.basename({safe_input})); "
-            f"cv2.imwrite(out_path, output)",
+            f"cv2.imwrite(out_path, output); "
+            f"print('WROTE', out_path)",
         ]
         r = subprocess.run(
-            cmd, capture_output=True, timeout=600, shell=False)
+            cmd, capture_output=True, text=True, timeout=900, shell=False)
+        if r.returncode != 0:
+            # 不再静默：子进程 stderr 是唯一线索
+            sys.stderr.write(
+                f"GFPGAN subprocess failed (rc={r.returncode}): "
+                f"{(r.stderr or '')[-800:]}\n")
         return r.returncode == 0
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"GFPGAN restore raised: {type(e).__name__}: {e}\n")
         return False
 
 
@@ -543,11 +570,20 @@ def run_codeformer(input_path: str, output_dir: str,
         # Fallback: attempt real CodeFormer Python API inference
         model_dir = params.get("model_dir", "") if params else ""
         if not model_dir:
-            project_root = SCRIPT_DIR.parent.parent.resolve()
+            # FIX-NEW-V-16 / R19: 同 GFPGAN——照片链的项目根是
+            # SCRIPT_DIR.parent，不是 .parent.parent。
+            project_root = SCRIPT_DIR.parent.resolve()
             model_dir = str(project_root / "models")
         model_path = os.path.join(model_dir, "codeformer.pth")
         if not os.path.exists(model_path):
-            return False  # No model available, cannot perform inference
+            # FIX-NEW-V-16: 权重实际叫 CodeFormer.pth（首字母大写）；
+            # Windows 不敏感所以本机无碍，但大小写敏感的平台会静默返回
+            # False。先按原名找，找不到再试实际文件名。
+            alt = os.path.join(model_dir, "CodeFormer.pth")
+            if os.path.exists(alt):
+                model_path = alt
+            else:
+                return False
 
         # BUG-051 fix: Use json.dumps() for safe path quoting
         import json as _json
