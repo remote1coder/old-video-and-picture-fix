@@ -171,6 +171,18 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
         # FIX-P12-6: PIL I;16 only supports 2D arrays; for 3-channel 16-bit,
         # use tifffile to save as TIFF (PIL cannot save RGB uint16 directly).
         # Fallback: save as 8-bit PNG (quality loss) if tifffile unavailable.
+        # FIX-NEW-V-18 / R21: 8-bit 分支也不能用裸 `Image.fromarray(output)
+        # .save(path)` —— 对 `.tif` PIL 会默认选 **LZW**，而 tifffile 解 LZW
+        # 需要未安装的 imagecodecs → 下游 stage5 读不回来 →
+        # MediaPrecisionError → rc=86（写得出、读不回来的自造依赖）。
+        # 改走 tifffile zlib（纯 Python 内置，无需额外依赖）。
+        save_code_8 = (
+            f"    try:\n"
+            f"        import tifffile as _tf2; "
+            f"_tf2.imwrite({safe_output_path}, output, compression='zlib')\n"
+            f"    except ImportError:\n"
+            f"        Image.fromarray(output).save({safe_output_path})\n"
+        )
         save_code = (
             f"if {bit_depth} == 16:\n"
             f"    out_16 = (output.astype(np.float32) / 255.0 * 65535.0)"
@@ -182,8 +194,8 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
             f"        Image.fromarray((out_16 // 256).astype(np.uint8))"
             f".save({safe_output_path})\n"
             f"else:\n"
-            f"    Image.fromarray(output).save({safe_output_path})"
-        ) if bit_depth == 16 else f"Image.fromarray(output).save({safe_output_path})"
+            + save_code_8
+        )
         cmd = [
             sys.executable, "-c",
             # R4：**必须用换行，不能用 `;` 串成一行**。
