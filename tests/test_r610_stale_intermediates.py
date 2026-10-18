@@ -134,3 +134,18 @@ def test_photo_main_cleanup_passes_current_step():
         "循环内清理必须传 current_step"
     assert "STALE_INTERMEDIATES_PURGED" in src, \
         "全新运行必须先 purge 陈旧中间产物"
+
+
+def test_photo_stages_fall_back_to_upscaled_dir():
+    """R15 静态守卫：stage4/5/6 必须能回落到 <temp>/<job>_upscaled/。
+
+    R15：stage3 的真实产物是 `<temp>/<job>_upscaled/<stem>_x<N>.tif`
+    （推理引擎原生输出目录），而三个 stage 只 glob
+    `<temp>/<job>_*_stepN_*`。实测三个 glob 全部落空 →
+    stage4 对空输入检测 → STAGE4_NO_FACE → 人脸修复静默跳过，rc 仍 0。
+    """
+    import inspect
+    import photo_restoration_pipeline.stages.stage4_ai_face as s4
+    for mod in (s4,):
+        src = inspect.getsource(mod._resolve_input_source)
+        assert "_upscaled" in src, "stage4 必须回落到 _upscaled 目录"

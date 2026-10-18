@@ -1318,6 +1318,20 @@ def main():
             input_source = candidates[0]
             break
 
+    # FIX-NEW-V-13 / R15: 与 stage4 同型——stage3 的真实产物在
+    # <temp>/<job_id>_upscaled/<stem>_x<N>.tif，三个 stepN_* glob 落空时
+    # 必须回落到它，否则 stage5 记 STAGE5_SKIP 静默跳过（rc=3）。
+    if not input_source:
+        _up = os.path.join(temp_dir, f"{job_id}_upscaled")
+        if os.path.isdir(_up):
+            _c = glob.glob(os.path.join(
+                _up, f"{Path(input_name).stem}_x*"))
+            _c = [p for p in _c if Path(p).suffix.lower()
+                  in {".tif", ".tiff", ".png"}]
+            if _c:
+                _c.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                input_source = _c[0]
+
     if not input_source:
         logger.info("STAGE5_SKIP", "No input from prior stages")
         return 3
