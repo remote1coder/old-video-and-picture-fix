@@ -1684,9 +1684,22 @@ def main():
         elif bit_depth == 16:
             # PIL Image path (non-I;16, e.g. RGB mode)
             if current_img is not None and current_img.mode == "I;16":
-                # Single-channel I;16 — PIL can save as TIFF directly
-                current_img.save(grain_temp, format="TIFF",
-                                compression="tiff_lzw")
+                # FIX-NEW-V-18 / R21: 不再用 PIL 的 tiff_lzw。
+                # LZW 解码在 tifffile 里要 `imagecodecs`（本机未安装），
+                # 于是 stage5 写出的 LZW 文件 stage5 自己都读不回来：
+                #   MediaPrecisionError: <COMPRESSION.LZW: 5> requires the
+                #   'imagecodecs' package ... refusing to return 8-bit data
+                # → STAGE5_ERROR → rc=86。
+                # **写 LZW 就必须能读 LZW**；这里改用 tifffile 的 zlib
+                # （Python 内置 zlib，无需额外依赖），与下面 RGB 分支一致。
+                try:
+                    import numpy as _np
+                    import tifffile as _tf
+                    _tf.imwrite(grain_temp,
+                                _np.array(current_img, dtype=_np.uint16),
+                                compression="zlib")
+                except ImportError:
+                    current_img.save(grain_temp, format="TIFF")
             elif current_img is not None:
                 # Convert 8-bit PIL image to 16-bit for grain in 16bit space
                 arr = np.array(current_img.convert("RGB"),

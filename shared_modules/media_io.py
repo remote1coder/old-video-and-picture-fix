@@ -216,6 +216,7 @@ def read_image_array(path: str,
             errors.append(f"imagecodecs: {type(e).__name__}: {e}")
 
     # 2) Pillow fallback — only acceptable when the file really is 8-bit
+    import numpy as np
     try:
         from PIL import Image  # noqa: WPS433 (optional dependency)
         with Image.open(path) as im:
@@ -224,11 +225,26 @@ def read_image_array(path: str,
             declared = meta.get("bit_depth")
             if declared is None and ext in (".tif", ".tiff"):
                 # RV-03: 没有能读 16-bit TIFF 的依赖时，不能"静默塌成 8-bit"
-                raise MediaPrecisionError(
-                    f"{path}: no high-bit-depth TIFF reader available "
-                    f"({'; '.join(errors) or 'tifffile/imagecodecs missing'}); "
-                    "refusing to return 8-bit data for a possibly 16-bit file")
-            import numpy as np
+                # FIX-NEW-V-18 / R21: 但也不能一律拒绝——**Pillow 自己就能
+                # 解 LZW / packbits 压缩的 TIFF**（只有 16-bit RGB 会被它
+                # 截成 8-bit）。所以先真的读一次，读出来再按实际 dtype 判定，
+                # 而不是看到"tifffile 报了错"就直接抛。
+                probe = np.array(im)
+                got_depth = 16 if probe.dtype == np.uint16 else 8
+                if got_depth == 8:
+                    # 单通道 8-bit TIFF 是可信的（没有 16-bit 信息可丢）；
+                    # 多通道 8-bit 则无法排除"16-bit 被截断"，仍需拒绝。
+                    if probe.ndim == 2:
+                        return probe, dict(
+                            meta, reader="pillow", icc_profile=icc,
+                            icc_source="pillow-info" if icc else None,
+                            bit_depth=8)
+                    raise MediaPrecisionError(
+                        f"{path}: no high-bit-depth TIFF reader available "
+                        f"({'; '.join(errors) or 'tifffile/imagecodecs missing'}); "
+                        "refusing to return 8-bit data for a possibly "
+                        "16-bit file")
+                meta["bit_depth"] = declared = got_depth
             arr = np.array(im)
             got_depth = 16 if str(getattr(arr, "dtype", "")) == "uint16" else 8
             if declared and declared > 8 and got_depth == 8:
