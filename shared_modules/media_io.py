@@ -270,6 +270,75 @@ def _ensure_uint(arr: Any) -> Any:
     return np.clip(arr, 0, 65535).astype(np.uint16)
 
 
+def load_image_rgb_uint8(path: str, logger=None) -> Any:
+    """R16: 把图像读成 uint8 RGB，正确处理 G'MIC 的"名实不符" 16-bit TIFF。
+
+    **实测缺陷（R16）**：G'MIC 4.x 用 `-o X.tif,uint16` 写出的 TIFF，
+    头部声明 ``BitsPerSample=16`` / ``dtype=uint16``，但**像素值其实仍是
+    8-bit 量级**（0–244）。于是：
+
+    * ``PIL.Image.open(p).convert('RGB')`` → 走 uint8 TIFF 路径 → **全 0**
+      （实测 mean 0.0，而原图 107.27）；
+    * 按 uint16 正确解释再 ``/257`` → mean 0.42，同样接近全黑。
+
+    后果极严重：stage1 之后每个用 PIL 读图的 stage 都拿到黑图，
+    **照片链交付的 AVIF 全是纯黑**（成品仅 386 字节，像素 mean 0.0），
+    而全链 rc 一直是 0，没有任何日志报错。
+
+    本函数用 tifffile 读真实像素，并按**实际值域**自适应：
+    最大值 ≤ 255 说明数据本就是 8-bit 量级，直接采用；
+    否则按 uint16 → uint8 缩放（/257）。
+
+    返回 HxWx3 的 uint8 ndarray（供 RealESRGAN 等按 uint8 推理的后端）。
+    """
+    import numpy as np
+    ext = Path(path).suffix.lower()
+    arr = None
+    if ext in (".tif", ".tiff"):
+        try:
+            arr, _icc = _tiff_read(path)
+        except Exception as e:  # pragma: no cover - 回退到 PIL
+            if logger is not None:
+                logger.warning("MEDIA_IO_TIFF_FALLBACK",
+                               f"tifffile read failed ({e}); falling back "
+                               f"to Pillow", path=str(path))
+            arr = None
+    if arr is None:
+        from PIL import Image as _PILImage  # type: ignore
+        with _PILImage.open(path) as im:
+            arr = np.array(im.convert("RGB"))
+
+    arr = _ensure_uint(np.asarray(arr))
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise ValueError(f"unsupported image shape {arr.shape} for {path}")
+
+    if arr.dtype == np.uint16:
+        # R16 自适应：G'MIC 声明 uint16、实际存 8-bit 量级数据。
+        # **必须逐通道判定**：实测 deblock 之后 ch0/ch2 仍是 0–244，
+        # 而 ch1 被放大到 65532（16-bit 量级）。用全局 max 判定会让
+        # 整幅图走 /257 分支 → mean 从 107 掉到 0.001（纯黑）。
+        # 逐通道：值域 ≤255 的通道按 8-bit 直接采用，其余按 /257 缩放。
+        out = arr.astype(np.float32)
+        for c in range(out.shape[2]):
+            ch = out[:, :, c]
+            hi_c = int(ch.max()) if ch.size else 0
+            if hi_c > 255:
+                out[:, :, c] = ch / 257.0
+        out = out.clip(0, 255).astype(np.uint8)
+        if logger is not None:
+            logger.info("MEDIA_IO_8BIT_IN_16BIT",
+                        "TIFF declares 16-bit but holds per-channel 8-bit "
+                        "range data (G'MIC); per-channel adaptive read",
+                        path=str(path), global_max=int(arr.max()))
+    else:
+        out = arr.astype(np.uint8)
+    return np.ascontiguousarray(out)
+
+
 def read_png(path: str) -> Any:
     """Minimal PNG reader used to verify what we wrote (no external deps).
 

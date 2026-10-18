@@ -208,8 +208,10 @@ def run_dat_file(input_path: str, output_path: str, model: str, scale: int,
     if dat_model is None:
         return False
     try:
-        img = Image.open(input_path).convert("RGB")
-        img_np = np.array(img).astype(np.float32) / 255.0
+        # FIX-NEW-V-14 / R16: 不用 Image.open(...).convert('RGB')——G'MIC 的
+        # uint16 TIFF 里装的是 8-bit 量级数据，PIL 会读出全 0（黑图）。
+        from media_io import load_image_rgb_uint8 as _ldr
+        img_np = _ldr(input_path).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
         try:
             with torch.no_grad():
