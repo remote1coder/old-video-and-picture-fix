@@ -32,7 +32,8 @@ from manifest_loader import (  # noqa: E402
     load_manifest, filter_jobs, save_manifest, update_job_status,
     save_manifest_job_result, acquire_run_ownership, update_manifest_with_writer,
 )
-from checkpoint import cleanup_old_intermediates, check_wsl_space  # noqa: E402
+from checkpoint import (cleanup_old_intermediates, cleanup_all_intermediates,  # noqa: E402
+                         check_wsl_space)
 
 
 def parse_args():
@@ -809,6 +810,23 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             job_logger.info("RESUME_STAGE", f"Resuming job from stage {resume_from}")
             # Clear one-shot resume marker so re-runs don't keep skipping
             job.pop("resume_from_stage", None)
+        elif params.get("cleanup_intermediates", True):
+            # FIX-NEW-V-07 / R6-10: 全新（非 resume）运行必须先清空本 job 的
+            # 全部陈旧中间产物。keep_steps 是"保留最近 N 个阶段"，而
+            # cleanup_old_intermediates 在 current_step=None 时按 step 号降序
+            # 取前 keep_steps 个保留——上一次运行残留的高 step 产物（step3/
+            # step4）会永久霸占保留位，把本轮刚生成的 step1 当"最旧"删掉，
+            # 导致下游 stage 报 NO_INPUT（实测 GFPGAN 案例 rc=86）。
+            try:
+                _purged = cleanup_all_intermediates(
+                    params.get("temp_dir", "./temp"), job_id)
+                job_logger.info("STALE_INTERMEDIATES_PURGED",
+                                "Purged stale intermediates for fresh run",
+                                temp_dir=params.get("temp_dir", "./temp"),
+                                purged=_purged)
+            except Exception as e:  # 清理失败不应阻断运行
+                job_logger.warning("STALE_INTERMEDIATES_PURGE_FAIL",
+                                   f"Could not purge stale intermediates: {e}")
 
     # Run stages
     traditional_stage_completed = False
@@ -981,7 +999,11 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             # FIX-NEW-1: Removed spurious input_name arg — function signature is
             # cleanup_old_intermediates(temp_dir, job_id, keep_steps, current_step)
             # and matches files by job_id prefix; input_name is not a parameter.
-            cleanup_old_intermediates(temp_dir, job_id, keep_steps)
+            # FIX-NEW-V-07 / R6-10: 传 current_step，让判定走
+            # "step < current_step 且不在保留集" 的显式语义，而不是
+            # current_step=None 时"按 step 号降序取前 keep_steps 个"。
+            cleanup_old_intermediates(temp_dir, job_id, keep_steps,
+                                      current_step=stage_num)
 
     logger.info("JOB_DONE", f"Job {job_id} complete")
     # RV-09: 成功后写下"这个产物是用哪个输入/哪套参数做出来的"，
