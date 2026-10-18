@@ -92,3 +92,20 @@ def test_gfpgan_subprocess_keeps_stderr():
     src = _source()
     assert "GFPGAN subprocess failed" in src
     assert "capture_output=True, text=True" in src
+
+
+def test_restored_output_globs_all_image_exts():
+    """R20：修复图按输入文件名写出（16bit TIFF → .tif），
+    消费方不得只 glob '*.png'（否则永远匹配不到 → rc=83）。"""
+    src = _source()
+    code = _code_only()
+    assert 'rglob("*.png")' not in code and "rglob('*.png')" not in code, \
+        "不得只 glob png（R20：输出扩展名跟随输入）"
+    # 扩展名集合必须覆盖 16bit 链路的实际输出（.tif/.tiff）
+    assert "png, tif, tiff, jpg, jpeg" in src or \
+        "'png', 'tif', 'tiff', 'jpg', 'jpeg'" in src or \
+        '"png", "tif", "tiff", "jpg", "jpeg"' in src, \
+        "必须收集 png/tif/tiff/jpg/jpeg 五种扩展名"
+    assert "rglob(f\"*.{ext}\")" in src, "应按扩展名逐个收集"
+    assert "STAGE4_NO_RESTORED_OUTPUT" in src, \
+        "收集不到修复图时必须显式报错，不能静默"

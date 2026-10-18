@@ -795,11 +795,22 @@ def main():
         f"{job_id}_{Path(input_name).stem}_step4_face_blended.{out_ext}")
 
     success = False
+    # FIX-NEW-V-17 / R20: 修复图是按**输入文件名**写出的（GFPGAN 走
+    # `os.path.basename(input)`），而输入是 16bit TIFF → 输出也叫 .tif。
+    # 原来只 glob "*.png"，于是永远匹配不到 → success 保持 False →
+    # STAGE4_FAILED rc=83。与 R6-09/R6-11 同族（扩展名/命名约定与
+    # 消费方不一致），但发生在照片链。
+    _RESTORED_EXTS = ("png", "tif", "tiff", "jpg", "jpeg")
+
+    def _collect_restored():
+        cands = []
+        for ext in _RESTORED_EXTS:
+            cands.extend(Path(face_dir).rglob(f"*.{ext}"))
+        return sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True)
+
     if face_restore == "GFPGAN":
         if run_gfpgan(input_source, face_dir, params):
-            face_files = sorted(
-                Path(face_dir).rglob("*.png"),
-                key=lambda p: p.stat().st_mtime, reverse=True)
+            face_files = _collect_restored()
             if face_files:
                 if feather_blend(input_source, str(face_files[0]),
                                  blended_path, feather_width=8,
@@ -809,12 +820,16 @@ def main():
                     logger.error("STAGE4_BLEND_FAIL",
                                  "Feather blend failed")
                     return 83
+            else:
+                logger.error("STAGE4_NO_RESTORED_OUTPUT",
+                             "GFPGAN produced no restorable image",
+                             face_dir=face_dir,
+                             found=[p.name for p in
+                                    Path(face_dir).rglob("*")][:5])
 
     elif face_restore == "CodeFormer":
         if run_codeformer(input_source, face_dir, params):
-            face_files = sorted(
-                Path(face_dir).rglob("*.png"),
-                key=lambda p: p.stat().st_mtime, reverse=True)
+            face_files = _collect_restored()
             if face_files:
                 if feather_blend(input_source, str(face_files[0]),
                                  blended_path, feather_width=8,
@@ -824,6 +839,12 @@ def main():
                     logger.error("STAGE4_BLEND_FAIL",
                                  "Feather blend failed")
                     return 83
+            else:
+                logger.error("STAGE4_NO_RESTORED_OUTPUT",
+                             "CodeFormer produced no restorable image",
+                             face_dir=face_dir,
+                             found=[p.name for p in
+                                    Path(face_dir).rglob("*")][:5])
 
     if not success:
         logger.error("STAGE4_FAILED", "Face restore failed")
