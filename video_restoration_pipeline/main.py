@@ -426,12 +426,13 @@ def _verify_stage2_output(job_id: str, input_path: str,
     # 通配 `_step2*` 同样命中 sidecar（`...step2_traditional.mkv.identity.json`），
     # 而 sidecar 写在 mkv 之后、mtime 更晚，于是 candidates[0] 选中的是
     # 那个 .json，ffprobe 自然解不出 -> "Stage 2 output not decodeable"。
-    candidates = [c for c in glob.glob(pattern)
-                  if not c.endswith((".json", ".log", ".vpy", ".txt"))]
+    # R3-01：黑名单元信息不全（挡不住未来的新侧车类型），统一收编到
+    # checkpoint.select_media_candidates 的媒体白名单 + mtime 新→旧 排序。
+    from checkpoint import select_media_candidates
+    candidates = select_media_candidates(glob.glob(pattern))
     if not candidates:
         return False, "Stage 2 output file missing"
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    step2_output = candidates[0]
+    step2_output = str(candidates[0])
     if os.path.getsize(step2_output) == 0:
         return False, "Stage 2 output file is empty"
     try:
@@ -651,14 +652,17 @@ def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
     job_id = str(job.get("job_id", "") or "")
     # RV-09: 同名不同 job 的候选：{stem}_{job_id}_restored.* 由
     # _ensure_unique_final_outputs 在检测到冲突时产生。
+    # R3-01（关键修复）：`_restored.*` 通配同时命中 completion marker
+    # `<...>_restored.mkv.done.json`（写在 mkv 之后、mtime 更晚），裸 sort
+    # 会把 .json 选成"最终产物"，resume/验收拿到的是 JSON 不是视频。
+    # 统一走 checkpoint 媒体白名单过滤。
+    from checkpoint import select_media_candidates
     job_scoped: List[str] = []
     if job_id:
-        job_scoped = sorted(
-            glob.glob(str(Path(output_dir) / f"{stem}_{job_id}_restored.*")),
-            key=lambda p: os.path.getmtime(p), reverse=True)
-    plain = sorted(
-        glob.glob(str(Path(output_dir) / f"{stem}_restored.*")),
-        key=lambda p: os.path.getmtime(p), reverse=True)
+        job_scoped = [str(p) for p in select_media_candidates(
+            glob.glob(str(Path(output_dir) / f"{stem}_{job_id}_restored.*")))]
+    plain = [str(p) for p in select_media_candidates(
+        glob.glob(str(Path(output_dir) / f"{stem}_restored.*")))]
     candidates.extend(job_scoped + plain)
     return candidates
 
@@ -836,11 +840,12 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                     _input_name = Path(input_path).name
                     import glob as _glob
                     _step3_pattern = f"{_temp_dir}/{job_id}_{_input_name}_step3*"
-                    _step3_cands = _glob.glob(_step3_pattern)
+                    # R3-01：`_step3*` 通配同样命中 sidecar（mtime 晚于媒体），
+                    # 裸 sort 会把 .json 当成 stage3 产物送给 preview 抽帧。
+                    from checkpoint import select_media_candidates as _smc
+                    _step3_cands = _smc(_glob.glob(_step3_pattern))
                     if _step3_cands:
-                        _step3_cands.sort(
-                            key=lambda p: os.path.getmtime(p), reverse=True)
-                        _step3_output = _step3_cands[0]
+                        _step3_output = str(_step3_cands[0])
                         _comp_frames = auto_generate_comparison_if_needed(
                             original_path=input_path,
                             processed_path=_step3_output,

@@ -352,7 +352,7 @@ class StructuredLogger:
 
 # Fix: job_id-based map to avoid creating multiple loggers for same job
 _loggers: Dict[str, StructuredLogger] = {}
-_loggers_lock = threading.Lock()
+_loggers_lock = threading.Lock()  # spawn-safe: 无副作用初始化器，spawn 子进程重导入安全
 
 
 def get_logger(log_dir: str = "./logs",

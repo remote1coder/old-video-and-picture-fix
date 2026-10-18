@@ -36,6 +36,32 @@ try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException�
 except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
     _cancel_guard = None
 
+# FIX-R6-02: AI 推理子进程解释器解析（与 stage3 同一规则）。
+# 视频链编排器是 Portable R72（无 torch/gfpgan），stage5 历来用
+# sys.executable 起 GFPGAN/CodeFormer 推理——R72 下必然 ImportError，
+# 人脸修复这条路从未跑通。解析：sys.executable 有 AI 栈就用（照片链），
+# 否则回退项目内 .venv_r4（探针验证），再不行返回 None → 显式失败。
+try:
+    import ai_runtime as _ai_runtime
+except Exception:  # pragma: no cover
+    _ai_runtime = None
+
+_AI_PYTHON_CACHE = {}
+
+
+def _resolve_ai_python(logger=None):
+    """解析 AI 推理子进程解释器（带缓存；None = AI 不可用）。"""
+    if "py" in _AI_PYTHON_CACHE:
+        return _AI_PYTHON_CACHE["py"]
+    py = None
+    if _ai_runtime is not None:
+        try:
+            py = _ai_runtime.resolve_ai_interpreter(logger=logger)
+        except Exception:
+            py = None
+    _AI_PYTHON_CACHE["py"] = py
+    return py
+
 
 # ---------------------------------------------------------------------------
 # P9-ARCH: Streaming infrastructure classes
@@ -327,12 +353,20 @@ def run_gfpgan(input_dir: str, output_dir: str, model_path: str = "",
             if recommended_upscale < upscale:
                 upscale = recommended_upscale
 
+    # FIX-R6-02: AI 解释器（R72 编排器没有 gfpgan/torch）
+    ai_py = _resolve_ai_python(logger)
+    if ai_py is None:
+        if logger:
+            logger.error("STAGE5_AI_INTERPRETER_MISSING",
+                         "找不到具备 torch/gfpgan 的 AI 解释器")
+        return False
+
     # Try inference_gfpgan.py script
     gfpgan_script = shutil.which("inference_gfpgan.py")
     if not gfpgan_script:
         for candidate in [
             Path.home() / ".local" / "bin" / "inference_gfpgan.py",
-            Path(sys.executable).parent / "inference_gfpgan.py",
+            Path(ai_py).parent / "inference_gfpgan.py",
         ]:
             if candidate.exists():
                 gfpgan_script = str(candidate)
@@ -340,7 +374,7 @@ def run_gfpgan(input_dir: str, output_dir: str, model_path: str = "",
 
     if gfpgan_script:
         cmd = [
-            sys.executable, gfpgan_script,
+            ai_py, gfpgan_script,
             "-i", input_dir,
             "-o", output_dir,
             "-v", "1.4",
@@ -361,7 +395,7 @@ def run_gfpgan(input_dir: str, output_dir: str, model_path: str = "",
         safe_output_dir = _json.dumps(output_dir)
         safe_model_path = _json.dumps(model_path)
         cmd = [
-            sys.executable, "-c",
+            ai_py, "-c",
             f"from gfpgan import GFPGANer; "
             f"import cv2; import os; import glob; "
             f"os.makedirs({safe_output_dir}, exist_ok=True); "
@@ -384,12 +418,17 @@ def run_codeformer(input_dir: str, output_dir: str, model_path: str = "",
 
     Uses inference_codeformer.py script or Python API fallback.
     """
+    # FIX-R6-02: AI 解释器（R72 编排器没有 basicsr/codeformer）
+    ai_py = _resolve_ai_python()
+    if ai_py is None:
+        return False
+
     # Try inference_codeformer.py script
     cf_script = shutil.which("inference_codeformer.py")
     if not cf_script:
         for candidate in [
             Path.home() / ".local" / "bin" / "inference_codeformer.py",
-            Path(sys.executable).parent / "inference_codeformer.py",
+            Path(ai_py).parent / "inference_codeformer.py",
         ]:
             if candidate.exists():
                 cf_script = str(candidate)
@@ -397,7 +436,7 @@ def run_codeformer(input_dir: str, output_dir: str, model_path: str = "",
 
     if cf_script:
         cmd = [
-            sys.executable, cf_script,
+            ai_py, cf_script,
             "-i", input_dir,
             "-o", output_dir,
             "--face_upsample",
@@ -1666,11 +1705,17 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     # FIX-P9-1: stage5必须在stage4之后执行，严禁直接接收stage3或stage1输出
     # Per v6.3 §3.10.5: 执行顺序为 传统修复 → AI超分(stage3) → AI人脸修复(stage5)
     # stage5 must only accept stage4_postprocess as input
+    # R3-01（关键修复）：`_step4_postprocess*` 与 `_step3_upscale*` 通配都会
+    # 命中 sidecar（`.identity.json` mtime 晚于媒体），裸 sort 会把 .json 选成
+    # 推理输入（ffmpeg 直接炸）；且 step3 存在性门禁也会被 sidecar 忽悠
+    # （step3 明明失败、只剩 sidecar 残留却判"已完成"）。统一走 checkpoint
+    # 媒体白名单：既防错选，也让门禁只认真实媒体。
+    from checkpoint import select_media_candidates
     pattern = f"{job_id}_{Path(input_name).stem}_step4_postprocess*"
-    candidates = glob.glob(os.path.join(temp_dir, pattern))
+    candidates = select_media_candidates(
+        glob.glob(os.path.join(temp_dir, pattern)))
     if candidates:
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        input_source = candidates[0]
+        input_source = str(candidates[0])
     else:
         input_source = None
 
@@ -1678,7 +1723,8 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     # When AI upscale is enabled, stage3 output MUST exist before stage5 runs
     if ai_enabled and input_source:
         step3_pattern = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
-        step3_candidates = glob.glob(os.path.join(temp_dir, step3_pattern))
+        step3_candidates = select_media_candidates(
+            glob.glob(os.path.join(temp_dir, step3_pattern)))
         if not step3_candidates:
             logger.error("STAGE5_ORDER_ERROR",
                          "AI upscale enabled but no stage3 output found. "

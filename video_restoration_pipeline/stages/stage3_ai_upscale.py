@@ -54,6 +54,33 @@ try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException�
 except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该保护
     _cancel_guard = None
 
+# FIX-R6-02: AI 推理子进程解释器解析。视频链编排器是 Portable R72
+# （无 torch/realesrgan/basicsr/gfpgan），AI stage 历来用 sys.executable
+# 生成推理脚本——R72 下必然 ImportError，`--ai-enabled` 整条路从未跑通
+# （2026-10-18 实测：依赖自检 exit 80，job 从未执行）。解析规则：
+# sys.executable 有 torch 就用它（照片链场景），否则回退项目内
+# .venv_r4（探针子进程验证），再不行返回 None → AI 显式失败。
+try:
+    import ai_runtime as _ai_runtime
+except Exception:  # pragma: no cover
+    _ai_runtime = None
+
+_AI_PYTHON_CACHE = {}
+
+
+def _resolve_ai_python(logger=None) -> Optional[str]:
+    """解析 AI 推理子进程解释器（带缓存；None = AI 不可用）。"""
+    if "py" in _AI_PYTHON_CACHE:
+        return _AI_PYTHON_CACHE["py"]
+    py = None
+    if _ai_runtime is not None:
+        try:
+            py = _ai_runtime.resolve_ai_interpreter(logger=logger)
+        except Exception:
+            py = None
+    _AI_PYTHON_CACHE["py"] = py
+    return py
+
 
 def estimate_gpu_memory(width: int, height: int, scale: int,
                         model_name: str) -> int:
@@ -283,8 +310,19 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
 
     FIX-P8-6: ncnn-vulkan tried first (doesn't need .pth), then Python API.
     FIX-P8-1: OOM detection via child process exit code 83 per v6.32 §7.14.
+    FIX-R6-02: DAT 家族分流到 _run_dat_batch（RealESRGANer 加载不了 DAT
+    架构；ncnn-vulkan 的 DAT 需要 .bin/.param，本项目只有 .pth）。
     """
     model_dir = SCRIPT_DIR.parent.resolve() / "models"
+
+    # FIX-R6-02: DAT 家族（单窗口 = 单窗口批处理）
+    try:
+        from dat_runtime import is_dat_model as _is_dat_model
+    except Exception:  # pragma: no cover
+        _is_dat_model = lambda m: m.lower().startswith("dat")
+    if _is_dat_model(model):
+        return _run_dat_batch([(input_path, output_dir)], model, scale,
+                              gpu_id=gpu_id)
 
     # FIX-P8-6: 1. Try realesrgan-ncnn-vulkan CLI first (doesn't need .pth)
     vulkan_bin = shutil.which("realesrgan-ncnn-vulkan")
@@ -310,10 +348,43 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
     if not Path(model_path).exists():
         return False
 
+    # FIX-R6-02: 推理子进程解释器。R72 编排器无 torch——必须换 .venv_r4，
+    # 否则这里 sys.executable 起的脚本第一行 import torch 就炸（实测：
+    # --ai-enabled 在 R72 下从未跑通，依赖自检直接 exit 80）。
+    ai_py = _resolve_ai_python()
+    if ai_py is None:
+        return False
+
     try:
         env = os.environ.copy()
         if gpu_id < 0:
             env["CUDA_VISIBLE_DEVICES"] = ""
+        # FIX-R6-03: 架构选择。本项目安装的 realesrgan 版本 **没有 model_name
+        # 参数**：RealESRGANer(scale, model_path, dni_weight, model, tile,
+        # tile_pad, pre_pad, half, device, gpu_id) 要求调用方传入已实例化的
+        # nn.Module（内部 load_state_dict(..., strict=True)）。
+        # 原脚本传 `prepad=10`（正确名是 pre_pad）且不给 model：
+        # 子进程 1.6s 内 TypeError 退出 → 被当成 non-OOM 失败 → stage3 rc=83。
+        # 2026-10-18 实测：realesr-general-x4v3 2× 矩阵首案即此崩法。
+        if "general-x4v3" in model:
+            # realesr-general-x4v3 / realesr-general-wdn-x4v3：SRVGGNetCompact 4×
+            native_scale = 4
+            arch_code = (
+                "from realesrgan.archs.srvgg_arch import SRVGGNetCompact\n"
+                "arch = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, "
+                "num_feat=64, num_conv=32, upscale=4, act_type='prelu')\n")
+        elif "x2plus" in model:
+            native_scale = 2
+            arch_code = (
+                "from basicsr.archs.rrdbnet_arch import RRDBNet\n"
+                "arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, "
+                "num_block=23, num_grow_ch=32, scale=2)\n")
+        else:  # RealESRGAN_x4plus 及其它 RRDB 4× 系
+            native_scale = 4
+            arch_code = (
+                "from basicsr.archs.rrdbnet_arch import RRDBNet\n"
+                "arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, "
+                "num_block=23, num_grow_ch=32, scale=4)\n")
         import tempfile
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
                                           delete=False) as f:
@@ -335,13 +406,17 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 f"use_half = not torch.cuda.is_available() "
                 f"if {gpu_id} >= 0 else False\n"
                 "os.makedirs(output_dir, exist_ok=True)\n"
+                f"{arch_code}"
                 "try:\n"
-                "    upsampler = RealESRGANer(scale=scale, "
-                "model_path=model_path, prepad=10, half=use_half)\n"
+                # outscale=scale：x4v3 是 4× 网络，出 2× 时由 RealESRGANer
+                # 内部 LANCZOS4 缩放（与官方 inference 脚本一致）
+                f"    upsampler = RealESRGANer(scale={native_scale}, "
+                "model_path=model_path, model=arch, pre_pad=10, half=use_half)\n"
                 "    for fp in sorted(glob.glob("
                 "os.path.join(input_path, '*.png'))):\n"
                 "        img = Image.open(fp).convert('RGB')\n"
-                "        output, _ = upsampler.enhance(np.array(img))\n"
+                "        output, _ = upsampler.enhance("
+                "np.array(img), outscale=scale)\n"
                 "        Image.fromarray(output).save("
                 "os.path.join(output_dir, os.path.basename(fp)))\n"
                 "    del upsampler\n"
@@ -377,16 +452,104 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 "        sys.exit(83)  # FIX-P8-1: GPU OOM per v6.32 §7.14\n"
                 "    raise\n"
             )
-        cmd = [sys.executable, script_path]
+        # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
+        cmd = [ai_py, script_path]
         r = subprocess.run(cmd, capture_output=True, text=True,
                           timeout=3600, shell=False, env=env)
+        # FIX-R6-03: 失败必须留证据。原实现无条件删脚本 + 只返回 False，
+        # 子进程真实 traceback（参数非法/架构不匹配/import 失败）全部丢失
+        # —— 2026-10-18 实测因此多绕两圈才定位到 prepad kwarg。
+        if r.returncode == 83:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return "OOM"
+        if r.returncode != 0:
+            if logger:
+                logger.error("STAGE3_AI_SUBPROC_FAIL",
+                             f"AI subprocess exited {r.returncode}; "
+                             f"script kept at {script_path}",
+                             stderr_tail=(r.stderr or "")[-1500:])
+            return False
         try:
             # FIX-P8-10: Use Path.unlink instead of os.unlink
             Path(script_path).unlink(missing_ok=True)
         except Exception:
             pass
-        # FIX-P8-1: Check OOM exit code
-        if r.returncode == 83:
+        return True
+    except Exception as e:
+        if logger:
+            logger.error("STAGE3_AI_LAUNCH_FAIL", str(e))
+        return False
+
+
+# FIX-R6-02: DAT 系批处理（2026-10-18 全选项矩阵验收新增）。
+# DAT 家族（DAT/DAT-2/DAT-S/DAT-light）的架构与官方配置表在
+# shared_modules/dat_runtime.py（唯一事实源，照片链同一份）。
+# 子进程用 AI 解释器（.venv_r4，有 torch+basicsr+timm+einops）；
+# 编排器 R72 只负责拼参数、起进程、收三态结果。
+def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
+                   scale: int, gpu_id: int = 0,
+                   logger=None) -> Union[bool, str]:
+    """Run DAT upscaling on all windows. Returns True/False/"OOM".
+
+    帧级循环放在子进程里（与 RealESRGAN 分支同样的 spawned-script 模式），
+    模型每个窗口重复加载——DAT 参数量小（DAT-light 573K / DAT-2 11.2M），
+    且窗口数通常个位数，加载开销可接受；换来的是 OOM 隔离与降级链统一。
+    """
+    ai_py = _resolve_ai_python(logger)
+    if ai_py is None:
+        if logger:
+            logger.error("STAGE3_AI_INTERPRETER_MISSING",
+                         "找不到具备 torch/realesrgan/basicsr 的 AI 解释器"
+                         "（视频编排器 R72 不含这些包）")
+        return False
+
+    model_dir = str(SCRIPT_DIR.parent.resolve() / "models")
+    shared_dir = str(SCRIPT_DIR.parent.resolve() / "shared_modules")
+    window_repr = repr([(d, o) for d, o in window_dirs])
+
+    try:
+        env = os.environ.copy()
+        if gpu_id < 0:
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
+                                          delete=False) as f:
+            script_path = f.name
+            f.write(
+                "import sys, os, glob\n"
+                f"sys.path.insert(0, {repr(shared_dir)})\n"
+                "from dat_runtime import run_dat_file\n"
+                f"model = {repr(model)}\n"
+                f"scale = {scale}\n"
+                f"model_dir = {repr(model_dir)}\n"
+                f"use_gpu = {gpu_id >= 0}\n"
+                f"windows = {window_repr}\n"
+                "rc = 0\n"
+                "for frames_dir, output_dir in windows:\n"
+                "    os.makedirs(output_dir, exist_ok=True)\n"
+                "    for fp in sorted(glob.glob("
+                "os.path.join(frames_dir, '*.png'))):\n"
+                "        out = os.path.join(output_dir, os.path.basename(fp))\n"
+                "        if not run_dat_file(fp, out, model, scale, "
+                "model_dir, use_gpu, 8):\n"
+                "            print('DAT_FRAME_FAIL ' + fp, flush=True)\n"
+                "            rc = 1\n"
+                "sys.exit(rc)\n"
+            )
+        # FIX-R6-02: AI 解释器（不是 sys.executable）
+        cmd = [ai_py, script_path]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                            timeout=7200, shell=False, env=env)
+        try:
+            Path(script_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        # run_dat_file 的 CUDA OOM 会在 stderr 打 "DAT CUDA OOM"
+        # ——映射成三态契约的 "OOM"，让调用方的 4x→2x→CPU 降级链生效
+        if r.returncode != 0 and "DAT CUDA OOM" in (r.stderr or ""):
             return "OOM"
         return r.returncode == 0
     except Exception:
@@ -403,8 +566,23 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
     FIX-P8-9: Loads model once for Python API path, processing all windows.
     ncnn-vulkan still per-window (loads fast natively).
     Returns True/False/"OOM".
+
+    FIX-R6-02: DAT 系模型（--ai-model DAT_x2/DAT_2_x2/...）走独立分支
+    _run_dat_batch——DAT 不是 RealESRGANer 能加载的架构（RRDBNet），
+    且 ncnn-vulkan 的 DAT 支持需要 .bin/.param（本项目 models/ 只有
+    .pth）。DAT 分支与 RealESRGAN 分支返回同一套三态契约
+    （True/False/"OOM"），调用方的 OOM 降级链原样适用。
     """
     model_dir = SCRIPT_DIR.parent.resolve() / "models"
+
+    # FIX-R6-02: DAT 家族分流（DAT / DAT-2 / DAT-S / DAT-light）
+    try:
+        from dat_runtime import is_dat_model as _is_dat_model
+    except Exception:  # pragma: no cover
+        _is_dat_model = lambda m: m.lower().startswith("dat")
+    if _is_dat_model(model):
+        return _run_dat_batch(window_dirs, model, scale,
+                              gpu_id=gpu_id, logger=logger)
 
     # ncnn-vulkan: per-window (ncnn loads fast)
     vulkan_bin = shutil.which("realesrgan-ncnn-vulkan")
@@ -439,10 +617,43 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
     if not Path(model_path).exists():
         return False
 
+    # FIX-R6-03: 这里必须自己解析 AI 解释器。原实现直接在 cmd 里用 `ai_py`，
+    # 但该名字只在 run_realesrgan / _run_dat_batch 内定义 —— 本函数内
+    # NameError，又被外层裸 `except Exception: return False` 吞掉，
+    # **批量 AI 超分路径从未真正跑通过**（2026-10-18 加失败日志后秒现形）。
+    ai_py = _resolve_ai_python(logger)
+    if ai_py is None:
+        if logger:
+            logger.error("STAGE3_AI_INTERPRETER_MISSING",
+                         "找不到具备 torch/realesrgan/basicsr 的 AI 解释器"
+                         "（视频编排器 R72 不含这些包）")
+        return False
+
     try:
         env = os.environ.copy()
         if gpu_id < 0:
             env["CUDA_VISIBLE_DEVICES"] = ""
+        # FIX-R6-03: 架构选择（与 run_realesrgan 同一规则）。该 realesrgan
+        # 版本无 model_name 参数，RealESRGANer 必须收到已实例化的 nn.Module；
+        # 原脚本的 `prepad=10` 是非法 kwarg（应为 pre_pad），子进程秒崩。
+        if "general-x4v3" in model:
+            native_scale = 4
+            arch_code = (
+                "from realesrgan.archs.srvgg_arch import SRVGGNetCompact\n"
+                "arch = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, "
+                "num_feat=64, num_conv=32, upscale=4, act_type='prelu')\n")
+        elif "x2plus" in model:
+            native_scale = 2
+            arch_code = (
+                "from basicsr.archs.rrdbnet_arch import RRDBNet\n"
+                "arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, "
+                "num_block=23, num_grow_ch=32, scale=2)\n")
+        else:  # RealESRGAN_x4plus 及其它 RRDB 4× 系
+            native_scale = 4
+            arch_code = (
+                "from basicsr.archs.rrdbnet_arch import RRDBNet\n"
+                "arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, "
+                "num_block=23, num_grow_ch=32, scale=4)\n")
         import tempfile
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
                                           delete=False) as f:
@@ -462,16 +673,18 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 f"use_half = not torch.cuda.is_available() "
                 f"if {gpu_id} >= 0 else False\n"
                 f"windows = {window_repr}\n"
+                f"{arch_code}"
                 "# FIX-P8-9: Load model ONCE for all windows\n"
                 "try:\n"
-                "    upsampler = RealESRGANer(scale=scale, "
-                "model_path=model_path, prepad=10, half=use_half)\n"
+                f"    upsampler = RealESRGANer(scale={native_scale}, "
+                "model_path=model_path, model=arch, pre_pad=10, half=use_half)\n"
                 "    for frames_dir, output_dir in windows:\n"
                 "        os.makedirs(output_dir, exist_ok=True)\n"
                 "        for fp in sorted(glob.glob("
                 "os.path.join(frames_dir, '*.png'))):\n"
                 "            img = Image.open(fp).convert('RGB')\n"
-                "            output, _ = upsampler.enhance(np.array(img))\n"
+                "            output, _ = upsampler.enhance("
+                "np.array(img), outscale=scale)\n"
                 "            Image.fromarray(output).save("
                 "os.path.join(output_dir, os.path.basename(fp)))\n"
                 "    del upsampler\n"
@@ -503,19 +716,33 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "        sys.exit(83)  # FIX-P8-1: GPU OOM exit code\n"
                 "    raise\n"
             )
-        cmd = [sys.executable, script_path]
+        # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
+        cmd = [ai_py, script_path]
         r = subprocess.run(cmd, capture_output=True, text=True,
                           timeout=7200, shell=False, env=env)  # Longer timeout
+        # FIX-R6-03: 失败必须留证据（同 run_realesrgan；原实现静默 False）
+        if r.returncode == 83:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return "OOM"
+        if r.returncode != 0:
+            if logger:
+                logger.error("STAGE3_AI_SUBPROC_FAIL",
+                             f"AI subprocess exited {r.returncode}; "
+                             f"script kept at {script_path}",
+                             stderr_tail=(r.stderr or "")[-1500:])
+            return False
         try:
             # FIX-P8-10: Use Path.unlink instead of os.unlink
             Path(script_path).unlink(missing_ok=True)
         except Exception:
             pass
-        # FIX-P8-1: Check OOM exit code
-        if r.returncode == 83:
-            return "OOM"
-        return r.returncode == 0
-    except Exception:
+        return True
+    except Exception as e:
+        if logger:
+            logger.error("STAGE3_AI_LAUNCH_FAIL", str(e))
         return False
 
 
@@ -744,13 +971,18 @@ def main():
     job_id = args.job_id
     input_name = Path(args.input).name
     pattern = f"{job_id}_{Path(input_name).stem}_step2_traditional*"
-    candidates = list(Path(temp_dir).glob(pattern))
+    # R3-01（关键修复）：`_step2_traditional*` 通配同时命中 sidecar
+    # `<...>.mkv.identity.json`（身份登记写在 mkv 之后、mtime 更晚），裸 sort
+    # 选中 .json → ffprobe 解析失败 → STAGE3_STAGE2_UNDECODABLE (82)，
+    # 而真正的 mkv 就在旁边（2026-10-18 矩阵首跑实测复现）。
+    # 按 checkpoint 的媒体后缀白名单过滤后再按 mtime 选最新。
+    from checkpoint import select_media_candidates
+    candidates = select_media_candidates(Path(temp_dir).glob(pattern))
     if not candidates:
         logger.error("STAGE3_NO_INPUT",
                      "Stage 2 traditional output not found")
         return 82
 
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     stage2_output = str(candidates[0])
 
     # Validate stage2 output (v6.32 §7.1 mandatory)
