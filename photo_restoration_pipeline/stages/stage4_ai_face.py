@@ -526,7 +526,12 @@ def run_gfpgan(input_path: str, output_dir: str,
             f"import os; "
             f"out_path = os.path.join({safe_output_dir}, "
             f"os.path.basename({safe_input})); "
-            f"cv2.imwrite(out_path, output); "
+            # FIX-NEW-V-18 / R21: `cv2.imwrite` 对 .tif **默认选 LZW**
+            # （实测 COMPRESSION=5），下游 stage5 用 tifffile 读不回来
+            # （需要未安装的 imagecodecs）→ MediaPrecisionError → rc=86。
+            # 显式指定 ADOBE_DEFLATE(=8)，tifffile 原生可读。
+            f"cv2.imwrite(out_path, output, "
+            f"[cv2.IMWRITE_TIFF_COMPRESSION, 8]); "
             f"print('WROTE', out_path)",
         ]
         r = subprocess.run(
@@ -664,7 +669,13 @@ def run_codeformer(input_path: str, output_dir: str,
             "    result = helper.paste_faces_to_input_image(upsample_img=img)",
             f"    out_path = os.path.join({safe_output_dir}, "
             f"os.path.basename({safe_input}))",
-            "    cv2.imwrite(out_path, result)",
+            # FIX-NEW-V-18 / R21: `cv2.imwrite` 对 .tif **也默认选 LZW**
+            # （实测 COMPRESSION=5），与裸 PIL `.save()` 同一个毛病 →
+            # 下游 stage5 读不回来（MediaPrecisionError → rc=86）。
+            # 显式指定 ADOBE_DEFLATE(=8)：tifffile 原生可读，无需
+            # imagecodecs。实测 5(LZW) → 8(ADOBE_DEFLATE)。
+            "    cv2.imwrite(out_path, result, "
+            "[cv2.IMWRITE_TIFF_COMPRESSION, 8])",
             "    print('WROTE', out_path)",
             "except Exception:",
             "    import traceback; traceback.print_exc()",
