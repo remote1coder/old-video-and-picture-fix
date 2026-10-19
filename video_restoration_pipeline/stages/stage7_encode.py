@@ -31,6 +31,8 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 from logger import get_logger  # noqa: E402
 from checkpoint import (wsl_redirect_path, wsl_copy_back,
                         select_media_candidates)  # noqa: E402
+# PUB-04（第七轮）：发布目标互斥锁（逐路径加锁，非集合摘要）
+from publish_lock import acquire_target_locks, TargetLockTimeout  # noqa: E402
 
 try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
     # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
@@ -1647,18 +1649,33 @@ def main():
                     return sync_result
 
             # PUB-01 发布：暂存 → 最终（同盘原子；跨盘回退 copy+unlink）
+            #
+            # PUB-04（第七轮）：发布瞬间必须持有目标锁。编码阶段各自写
+            # attempt 独占的暂存文件，互不冲突，**不需要**长时间持锁；
+            # 只有 replace 到同一个最终路径这一步需要互斥 ——
+            # 否则两个 attempt（同 job 重试，或不同 job 撞同一 -o）
+            # 会互相覆盖，且失败方回滚时可能删掉对方刚发布的结果。
             try:
-                if os.path.exists(output_path) and not _same_volume(
-                        _publish_tmp, output_path):
-                    # 跨盘：先完整复制到目标端，再删暂存
-                    shutil.copy2(_publish_tmp, output_path)
-                    os.unlink(_publish_tmp)
-                else:
-                    os.replace(_publish_tmp, output_path)
-                logger.info("STAGE7_PUBLISHED",
-                            "Attempt staged file promoted to the final "
-                            "path after validation",
-                            output=output_path, attempt_id=_attempt_id)
+                with acquire_target_locks([output_path], timeout=30,
+                                          logger=logger):
+                    if os.path.exists(output_path) and not _same_volume(
+                            _publish_tmp, output_path):
+                        # 跨盘：先完整复制到目标端，再删暂存
+                        shutil.copy2(_publish_tmp, output_path)
+                        os.unlink(_publish_tmp)
+                    else:
+                        os.replace(_publish_tmp, output_path)
+                    logger.info("STAGE7_PUBLISHED",
+                                "Attempt staged file promoted to the final "
+                                "path after validation",
+                                output=output_path, attempt_id=_attempt_id)
+            except TargetLockTimeout as _lt:
+                logger.error("STAGE7_PUBLISH_LOCK_TIMEOUT",
+                             "Another attempt holds the target lock; this "
+                             "attempt keeps its staging file and does not "
+                             "overwrite the published result",
+                             output=output_path, targets=_lt.targets)
+                return 82
             except Exception as _pub_exc:
                 logger.error("STAGE7_PUBLISH_FAIL",
                              f"Cannot promote staged output: {_pub_exc}")
