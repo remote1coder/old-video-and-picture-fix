@@ -982,9 +982,22 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         _pinned_upstream = None
         for _prev in range(stage_num - 1, -1, -1):
             _cands = _last_produced.get(_prev) or []
-            if _cands:
-                _pinned_upstream = _cands[0]
+            _alive = [_c for _c in _cands if os.path.exists(_c)]
+            if _alive:
+                _pinned_upstream = _alive[0]
                 break
+            if _cands:
+                # 本次确实产出过，但**已经被 cleanup 删除**（keep_steps 只保留
+                # 最近 N 个 stage）。实测：stage5/6 被跳过时，stage4 的产物
+                # 在 stage6 结束时被清理，于是 stage7 拿到一个不存在的 pin →
+                # STAGE7_PINNED_INPUT_MISSING → rc=82。
+                # 这里跳过已消失的候选，继续往更早的 stage 找。
+                job_logger.warning(
+                    "STAGE_PIN_CANDIDATE_GONE",
+                    f"Stage {_prev} artifact produced by this run is no longer "
+                    "on disk (removed by intermediate cleanup); trying an "
+                    "earlier stage instead",
+                    stage=stage_num, gone=_cands[:3])
         if _pinned_upstream:
             params["upstream_artifact"] = _pinned_upstream
             job_logger.info("STAGE_UPSTREAM_PINNED",
@@ -1190,7 +1203,21 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         # 因此以下 gate 逻辑已在前面的 if/else 中完整覆盖，此处无需重复检查。
 
         # Cleanup old intermediates after successful stage
-        if params.get("cleanup_intermediates", True):
+        #
+        # ID-04 关联修复（第七轮）：**本 stage 没有产出时不要清理**。
+        #
+        # 实测（2 秒 1080i，AI 全开）：stage5（无人脸）与 stage6（颗粒关闭）
+        # 都被 STAGE_SKIP 跳过、不产生任何文件。但清理照旧执行
+        # `keep_steps=2, current_step=6` → 保留集 = {step5, step6} = 空集
+        # → **把 step4 删掉**。而 step7 真正需要的上游正是 step4，
+        # 于是 stage7 报 PINNED_INPUT_MISSING / NO_INPUT → rc=82 →
+        # 整链从 stage0 重来。
+        #
+        # 语义上：跳过 = 这一代没有新产物 = 没有"更老的一代"需要腾空间，
+        # 清理的必要性不存在，风险却实实在在。
+        _produced_this_stage = bool(_last_produced.get(stage_num))
+        if params.get("cleanup_intermediates", True) and (
+                _produced_this_stage or stage_num == 7):
             temp_dir = params.get("temp_dir", "./temp")
             keep_steps = params.get("keep_steps", 2)
             # FIX-NEW-1: Removed spurious input_name arg — function signature is

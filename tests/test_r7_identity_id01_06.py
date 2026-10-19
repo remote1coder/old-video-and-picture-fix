@@ -242,3 +242,87 @@ def test_id06_identity_mismatch_does_not_delete(tmp_path):
         "缺少「保留但标 unproven」的分支"
     assert "verify_ffprobe_decodeable(fpath)" in src, \
         "没有用「能否解码」来区分损坏与身份不符"
+
+
+# ---------------------------------------------------------------------------
+# 回归守卫：新增代码用到的模块必须已导入（静态字符串检查抓不到这类问题）
+# ---------------------------------------------------------------------------
+
+import ast
+
+
+@pytest.mark.parametrize("stage_file", [
+    "stage4_postprocess.py",
+    "stage5_ai_face.py",
+    "stage6_grain_synthesis.py",
+    "stage7_encode.py",
+])
+def test_stage_imports_os_when_using_os(stage_file):
+    """ID-04 的 pinned 分支用了 `os.path.exists`。
+
+    实测踩坑：stage4 原本**没有** `import os`，加完 pinned 逻辑后
+    真实运行时 `NameError: name 'os' is not defined` → stage4 rc=1，
+    而我的静态测试（只查字符串）全部通过。这条用 AST 兜住。
+    """
+    path = os.path.join(ROOT, "video_restoration_pipeline", "stages",
+                        stage_file)
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                imported.add(a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imported.add(node.module.split(".")[0])
+    # 真的用到 os. 属性吗
+    uses_os = any(isinstance(n, ast.Attribute)
+                  and isinstance(n.value, ast.Name)
+                  and n.value.id == "os"
+                  for n in ast.walk(tree))
+    if uses_os:
+        assert "os" in imported, \
+            f"{stage_file} 用了 os.* 但没有 import os（运行会 NameError）"
+
+
+@pytest.mark.parametrize("stage_file", [
+    "stage4_postprocess.py",
+    "stage5_ai_face.py",
+    "stage6_grain_synthesis.py",
+    "stage7_encode.py",
+])
+def test_stage_compiles_and_has_no_obvious_name_errors(stage_file):
+    """AST 级别的引号/缩进守卫（真实运行前的最低成本拦截）。"""
+    path = os.path.join(ROOT, "video_restoration_pipeline", "stages",
+                        stage_file)
+    src = open(path, encoding="utf-8").read()
+    compile(src, path, "exec")      # 语法/缩进问题直接抛
+
+
+def test_pin_skips_artifacts_removed_by_cleanup():
+    """pin 前必须检查路径仍在磁盘上。
+
+    实测踩坑：stage5/stage6 被跳过时没有新产物，而 stage4 的产物在
+    stage6 结束时被 `cleanup_old_intermediates(keep_steps=2)` 删掉。
+    旧逻辑直接把 `_last_produced[4]` 当作 pin 下发 → stage7 拿到不存在
+    的路径 → `STAGE7_PINNED_INPUT_MISSING` → rc=82 → 整链重试。
+    """
+    src = open(os.path.join(ROOT, "video_restoration_pipeline", "main.py"),
+               encoding="utf-8").read()
+    assert "STAGE_PIN_CANDIDATE_GONE" in src, "缺少 pin 失效告警"
+    assert "_alive = [_c for _c in _cands if os.path.exists(_c)]" in src, \
+        "pin 没有过滤已被清理的候选"
+
+
+def test_cleanup_skipped_when_stage_produced_nothing():
+    """跳过的 stage 不能执行中间产物清理。
+
+    实测：stage5/stage6 被 SKIP 时没有产物，但 cleanup 仍按
+    `keep_steps=2, current_step=6` 保留 {step5, step6}（空集）→ 删掉
+    step4，而 step7 正需要它 → rc=82 → 整链重试。
+    """
+    src = open(os.path.join(ROOT, "video_restoration_pipeline", "main.py"),
+               encoding="utf-8").read()
+    assert "_produced_this_stage = bool(_last_produced.get(stage_num))" in src
+    assert "_produced_this_stage or stage_num == 7" in src
