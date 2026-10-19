@@ -1550,11 +1550,51 @@ def main():
                               / f"frame_{len(all_pts)-1:08d}.png")
                 f.write(f"file '{last_frame}'\n")
 
+        # COL-04（第七轮）：**显式携带颜色表示**，不要让下游去猜。
+        #
+        # rgb48 -> yuv420p16le 是一次真正的矩阵转换。旧代码没有传
+        # `-colorspace`，于是 ffmpeg 按分辨率启发式选矩阵（SD 走 601、
+        # HD 走 709），而产物**不带任何颜色标签**（实测中间产物
+        # matrix=None/range=None）。下游 stage7 再把原片标签"补"上去 ——
+        # 一旦 ffmpeg 选的矩阵与原片不同，这个标签就是**错的**。
+        #
+        # 现在：先探测源的颜色描述，转换时显式指定同一套，并写进容器标签。
+        _src_color = {}
+        try:
+            from media_io import probe_color as _probe_color
+            _src_color = _probe_color(input_path) or {}
+        except Exception as _ce:
+            logger.warning("STAGE3_COLOR_PROBE_FAIL", str(_ce))
+        _color_opts: List[str] = []
+        if _src_color.get("probed"):
+            if _src_color.get("matrix"):
+                _color_opts += ["-colorspace", str(_src_color["matrix"])]
+            if _src_color.get("range"):
+                _color_opts += ["-color_range",
+                                "tv" if _src_color["range"] == "limited" else "pc"]
+            if _src_color.get("primaries"):
+                _color_opts += ["-color_primaries", str(_src_color["primaries"])]
+            if _src_color.get("transfer"):
+                _color_opts += ["-color_trc", str(_src_color["transfer"])]
+            logger.info("STAGE3_COLOR_CARRIED",
+                        "Encoding with the source's colour description "
+                        "explicitly (so downstream need not inherit blindly)",
+                        matrix=_src_color.get("matrix"),
+                        range=_src_color.get("range"),
+                        primaries=_src_color.get("primaries"),
+                        transfer=_src_color.get("transfer"))
+        else:
+            logger.warning("STAGE3_COLOR_UNKNOWN",
+                           "Source colour description unavailable; the "
+                           "intermediate will have no colour tags "
+                           "(downstream must not assume BT.601/709)")
+
         encode_cmd = [
             "ffmpeg", "-hide_banner", "-v", "error", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_path,
             "-c:v", "ffv1",
             "-pix_fmt", "yuv420p16le",
+            *_color_opts,
             "-an",
             output_path,
         ]
@@ -1566,6 +1606,7 @@ def main():
             "-i", str(Path(output_dir) / "frame_%08d.png"),
             "-c:v", "ffv1",
             "-pix_fmt", "yuv420p16le",
+            *_color_opts,
             "-an",
             output_path,
         ]

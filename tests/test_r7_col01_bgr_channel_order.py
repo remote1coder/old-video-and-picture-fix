@@ -51,18 +51,26 @@ def _stage3_src():
                 encoding="utf-8").read()
 
 
-def test_both_callsites_convert_rgb_to_bgr_before_enhance():
-    """两个调用点（单窗/批量）都必须显式 RGB→BGR。"""
-    src = _stage3_src()
-    assert src.count("_rgb[:, :, ::-1].copy()") == 2, \
-        "不是两个调用点都做了 RGB→BGR 适配"
+def test_both_callsites_feed_bgr_to_enhance():
+    """两个调用点（单窗/批量）都必须把 **BGR** 喂给 enhance。
 
+    演进说明（COL-03 之后）：旧方案是 "PIL 读 RGB → 手动转 BGR →
+    enhance → 手动转回 RGB → PIL 存"。改用 `cv2.imread(IMREAD_UNCHANGED)`
+    之后，读出的是 uint16 **BGR**、写入的也是 BGR —— 通道本来就对，
+    **不需要任何手动交换**，同时还能保住 16bit（PIL 会降 8bit）。
 
-def test_both_callsites_convert_output_back_to_rgb():
-    """官方返回 BGR，保存前必须转回 RGB。"""
+    所以这里断言的不再是 "有没有 ::-1"，而是"通道由 cv2 保证"：
+    两次调用都用 cv2 读写，且 **没有** 残留的 PIL-RGB 直传。
+    """
     src = _stage3_src()
-    assert src.count("output[:, :, ::-1].copy()") == 2, \
-        "输出没有转回 RGB"
+    assert src.count("cv2.imread(fp, cv2.IMREAD_UNCHANGED)") == 2, \
+        "不是两个调用点都走 cv2 读帧（通道与位深会失控）"
+    assert src.count("cv2.imwrite(os.path.join(output_dir") == 2, \
+        "不是两个调用点都用 cv2 写回"
+    # 不允许再出现 "PIL 读出的 RGB 直接进 enhance"
+    assert "np.array(img), outscale=scale" not in src
+    assert "_rgb[:, :, ::-1].copy()" not in src, \
+        "cv2 已是 BGR，再手动反转会把通道改错"
 
 
 def test_no_bare_rgb_enhance_left():
