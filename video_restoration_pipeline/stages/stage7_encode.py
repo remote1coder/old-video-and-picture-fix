@@ -1913,6 +1913,43 @@ def main():
                                 f"Failed to copy {output_path} back to {original_output_path}")
                     return 82
             
+            # 产物核对（第七轮）：stage7 只做编码，**不改帧数**。
+            # 对比 stage7 的输入（stage6 产物）与最终成品：
+            # 帧数必须精确相等，时长 ±3%，首末帧画面应高度接近
+            # （同分辨率同内容，只差一次编码）。
+            #
+            # 之所以核对的是"输入 vs 成品"而不是"源片 vs 成品"：
+            # stage7 的责任边界就是编码这一步。全链丢帧由
+            # `artifact_verify.verify_output(源, 成品)` 这个独立入口查。
+            try:
+                from artifact_verify import verify_output, render_verdict
+                _ver = verify_output(input_source, output_path, {})
+                _side = str(output_path) + ".verify.json"
+                try:
+                    import json as _json
+                    with open(_side, "w", encoding="utf-8") as _f:
+                        _json.dump(_ver, _f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                if _ver.get("ok"):
+                    logger.info("STAGE7_VERIFY_OK",
+                                "Output passed the mechanical check "
+                                "(frame count / duration / first-last frame)",
+                                sidecar=_side)
+                else:
+                    logger.error("STAGE7_VERIFY_FAIL",
+                                 "Output failed the mechanical check",
+                                 sidecar=_side,
+                                 verdict=render_verdict(_ver))
+                    # 核对失败不清成品（它可能仍有价值），但必须让 main
+                    # 知道这次运行不算成功 —— 退出码 86 = 验证失败。
+                    if _cancel_guard is not None:
+                        _cancel_guard.release_outputs()
+                    return 86
+            except Exception as _ve:
+                # 核对器自身出问题不应把一次成功的编码判死，但要留痕
+                logger.warning("STAGE7_VERIFY_ERROR", str(_ve))
+
             logger.info("STAGE7_DONE", "Encoding complete", output=output_path)
             # NEW-V-06: 产物已完整落盘（含 WSL 回拷），取消守卫不再有权
             # 删它（RV-12：发布是不可逆的成功事件）。
