@@ -357,6 +357,25 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
 
     try:
         env = os.environ.copy()
+        # 【第七轮·关键修复】**必须清掉编排器的 Python 环境变量**。
+        #
+        # 父进程是 Portable R72（VapourSynth 环境），它的 PYTHONPATH 指向
+        # `tools_r4/vs_portable/r72/Lib/site-packages`。`os.environ.copy()`
+        # 会把这一套原封不动传给 **另一个解释器** `.venv_r4` —— 于是
+        # .venv_r4 的 Python 去 R72 的目录里找包，`import torch` 直接死锁：
+        # 进程 CPU 0.16 秒、内存 11MB、`<no Python frame>`，几十分钟不动。
+        #
+        # 实测对照（同一个 .venv_r4）：
+        #   干净环境            -> torch 2.11.0+cu128 cuda True，1.8 秒
+        #   带 R72 的 PYTHONPATH-> 卡死（60 秒超时，无 Python 栈帧）
+        #
+        # 这就是"AI 子进程卡死、一次两小时"的真正原因 —— 不是模型慢、
+        # 不是 CUDA 驱动，是环境变量串了。之前所有"并发抢 GPU"的推断
+        # 都是表象。
+        for _bad_env in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+                         "PYTHONEXECUTABLE", "PYTHONUSERBASE",
+                         "PYTHONNOUSERSITE"):
+            env.pop(_bad_env, None)
         if gpu_id < 0:
             env["CUDA_VISIBLE_DEVICES"] = ""
         # FIX-R6-03: 架构选择。本项目安装的 realesrgan 版本 **没有 model_name
@@ -477,8 +496,61 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
             )
         # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
         cmd = [ai_py, script_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                          timeout=3600, shell=False, env=env)
+
+        # B9-后续（第七轮）：**子进程必须受取消守卫管理**，且超时不能是
+        # 固定的 1 小时。
+        #
+        # 实测踩到的三个问题：
+        #   1. 旧代码用裸 `subprocess.run(timeout=3600)` —— 子进程一旦
+        #      卡住（CUDA 初始化死锁、驱动 hang、模型加载阻塞），父进程
+        #      要干等**整整 1 小时**才超时；超时后 main 若重试，又是 1 小时
+        #      （实测观察到"卡了约 2 小时"正是两轮超时）。
+        #   2. `subprocess.run` 不受取消守卫管辖：Ctrl+C/取消只杀父进程，
+        #      AI 子进程继续占着 GPU 写文件，守卫删掉的半成品会被它重建
+        #      （与 RV-12 同族）。其他 stage 都用了 run_managed，只有这里
+        #      漏了。
+        #   3. 超时抛出 `TimeoutExpired` 时没有留下任何说明 —— 日志里只
+        #      看到"卡住"，不知道是超时还是崩了。
+        #
+        # 现在：走 run_managed（可取消、超时会 kill+reap 子进程），
+        # 超时按**窗口总帧数**动态给（每帧 30 秒的保守上限，最少 300 秒），
+        # 并在超时时写明确日志与 stderr 尾部。
+        _total_frames = 0
+        for _fd, _od in window_dirs:
+            try:
+                _total_frames += len([n for n in os.listdir(_fd)
+                                      if n.endswith(".png")])
+            except OSError:
+                pass
+        _ai_timeout = max(300, min(7200, _total_frames * 30))
+        if logger:
+            logger.info("STAGE3_AI_SUBPROC_START",
+                        "Launching AI subprocess under cancel-guard",
+                        frames=_total_frames, timeout_s=_ai_timeout,
+                        interpreter=ai_py)
+        try:
+            if _cancel_guard is not None:
+                r = _cancel_guard.run_managed(
+                    cmd, capture_output=True, text=True, timeout=_ai_timeout,
+                    shell=False, env=env, logger=logger)
+            else:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   errors="replace", timeout=_ai_timeout,
+                                   shell=False, env=env)
+        except subprocess.TimeoutExpired as _te:
+            if logger:
+                logger.error(
+                    "STAGE3_AI_SUBPROC_TIMEOUT",
+                    f"AI subprocess exceeded {_ai_timeout}s "
+                    f"({_total_frames} frames). This is NOT a silent hang: "
+                    "the child was killed and reaped. Common causes: CUDA "
+                    "init deadlock (several processes sharing one GPU), "
+                    "driver hang, or a model that is far slower than "
+                    "expected.",
+                    frames=_total_frames, timeout_s=_ai_timeout,
+                    stdout_tail=str(getattr(_te, "stdout", "") or "")[-800:],
+                    stderr_tail=str(getattr(_te, "stderr", "") or "")[-800:])
+            return False
         # FIX-R6-03: 失败必须留证据。原实现无条件删脚本 + 只返回 False，
         # 子进程真实 traceback（参数非法/架构不匹配/import 失败）全部丢失
         # —— 2026-10-18 实测因此多绕两圈才定位到 prepad kwarg。
@@ -535,6 +607,25 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 
     try:
         env = os.environ.copy()
+        # 【第七轮·关键修复】**必须清掉编排器的 Python 环境变量**。
+        #
+        # 父进程是 Portable R72（VapourSynth 环境），它的 PYTHONPATH 指向
+        # `tools_r4/vs_portable/r72/Lib/site-packages`。`os.environ.copy()`
+        # 会把这一套原封不动传给 **另一个解释器** `.venv_r4` —— 于是
+        # .venv_r4 的 Python 去 R72 的目录里找包，`import torch` 直接死锁：
+        # 进程 CPU 0.16 秒、内存 11MB、`<no Python frame>`，几十分钟不动。
+        #
+        # 实测对照（同一个 .venv_r4）：
+        #   干净环境            -> torch 2.11.0+cu128 cuda True，1.8 秒
+        #   带 R72 的 PYTHONPATH-> 卡死（60 秒超时，无 Python 栈帧）
+        #
+        # 这就是"AI 子进程卡死、一次两小时"的真正原因 —— 不是模型慢、
+        # 不是 CUDA 驱动，是环境变量串了。之前所有"并发抢 GPU"的推断
+        # 都是表象。
+        for _bad_env in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+                         "PYTHONEXECUTABLE", "PYTHONUSERBASE",
+                         "PYTHONNOUSERSITE"):
+            env.pop(_bad_env, None)
         if gpu_id < 0:
             env["CUDA_VISIBLE_DEVICES"] = ""
         import tempfile
@@ -654,6 +745,25 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
 
     try:
         env = os.environ.copy()
+        # 【第七轮·关键修复】**必须清掉编排器的 Python 环境变量**。
+        #
+        # 父进程是 Portable R72（VapourSynth 环境），它的 PYTHONPATH 指向
+        # `tools_r4/vs_portable/r72/Lib/site-packages`。`os.environ.copy()`
+        # 会把这一套原封不动传给 **另一个解释器** `.venv_r4` —— 于是
+        # .venv_r4 的 Python 去 R72 的目录里找包，`import torch` 直接死锁：
+        # 进程 CPU 0.16 秒、内存 11MB、`<no Python frame>`，几十分钟不动。
+        #
+        # 实测对照（同一个 .venv_r4）：
+        #   干净环境            -> torch 2.11.0+cu128 cuda True，1.8 秒
+        #   带 R72 的 PYTHONPATH-> 卡死（60 秒超时，无 Python 栈帧）
+        #
+        # 这就是"AI 子进程卡死、一次两小时"的真正原因 —— 不是模型慢、
+        # 不是 CUDA 驱动，是环境变量串了。之前所有"并发抢 GPU"的推断
+        # 都是表象。
+        for _bad_env in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+                         "PYTHONEXECUTABLE", "PYTHONUSERBASE",
+                         "PYTHONNOUSERSITE"):
+            env.pop(_bad_env, None)
         if gpu_id < 0:
             env["CUDA_VISIBLE_DEVICES"] = ""
         # FIX-R6-03: 架构选择（与 run_realesrgan 同一规则）。该 realesrgan
@@ -747,8 +857,44 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
             )
         # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
         cmd = [ai_py, script_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                          timeout=7200, shell=False, env=env)  # Longer timeout
+
+        # B9-后续（第七轮）：**批量路径原来固定 timeout=7200（两小时）**。
+        # 这就是"卡了约 2 小时"的字面来源：子进程一旦不返回，父进程要
+        # 等满 2 小时才动。改成按窗口总帧数动态给（每帧 30 秒上限，
+        # 最少 300 秒），并走取消守卫（可 Ctrl+C、超时会 kill+reap）。
+        _batch_frames = 0
+        for _fd, _od in window_dirs:
+            try:
+                _batch_frames += len([n for n in os.listdir(_fd)
+                                      if n.endswith(".png")])
+            except OSError:
+                pass
+        _batch_timeout = max(300, min(7200, _batch_frames * 30))
+        if logger:
+            logger.info("STAGE3_AI_SUBPROC_START",
+                        "Launching AI subprocess under cancel-guard",
+                        frames=_batch_frames, timeout_s=_batch_timeout,
+                        interpreter=ai_py)
+        try:
+            if _cancel_guard is not None:
+                r = _cancel_guard.run_managed(
+                    cmd, capture_output=True, text=True, timeout=_batch_timeout,
+                    shell=False, env=env, logger=logger)
+            else:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   errors="replace",
+                                   timeout=_batch_timeout, shell=False, env=env)
+        except subprocess.TimeoutExpired as _te:
+            if logger:
+                logger.error(
+                    "STAGE3_AI_SUBPROC_TIMEOUT",
+                    f"AI subprocess exceeded {_batch_timeout}s "
+                    f"({_batch_frames} frames); child killed and reaped. "
+                    "Check that PYTHONHOME/PYTHONPATH were not inherited from "
+                    "the orchestrator (that makes .venv_r4 hang with zero CPU).",
+                    frames=_batch_frames, timeout_s=_batch_timeout,
+                    stderr_tail=str(getattr(_te, "stderr", "") or "")[-800:])
+            return False
         # FIX-R6-03: 失败必须留证据（同 run_realesrgan；原实现静默 False）
         if r.returncode == 83:
             try:
