@@ -50,12 +50,25 @@ __all__ = [
     "verify_output",
     "render_verdict",
     "hash_distance",
+    "verify_frame_alignment",
+    "normalized_correlation",
+    "render_alignment",
 ]
 
 #: 时长相对误差上限。放 3% 是因为容器时长与源可能差 1-2 帧。
 DURATION_TOLERANCE = 0.03
 #: 感知哈希汉明距离上限（64 bit 里最多差这么多位）。
 PHASH_MAX_DISTANCE = 12
+#: 对齐校验里"错位"的判定线：抽样点中偏向邻居的比例超过它就算错位。
+#:
+#: 实测：正常素材 40%、整体偏移一位 100%。取 70% 落在中间，
+#: 两边都有余量。**这不是逐帧保证**，只是"整体错位"的证据。
+ALIGNMENT_FLIP_RATIO = 0.7
+#: 源相邻帧的"差异"低于它，这个采样点就没有判别力（两帧太像）。
+#: 用 1-NCC 度量；0.01 大致对应"肉眼几乎看不出区别"。
+MIN_SRC_FRAME_DIFF = 0.01
+#: 有判别力的采样点少于这个数，就不下结论（记未校验）。
+MIN_ALIGNMENT_SAMPLES = 3
 #: 画面"不是黑图"的下限（0-255）。
 MIN_MEAN = 8.0
 MIN_STD = 3.0
@@ -498,3 +511,251 @@ if __name__ == "__main__":
     else:
         print(render_verdict(result))
     sys.exit(0 if result["ok"] else 86)
+
+
+# ===========================================================================
+# 逐帧对齐校验：抓"帧数对、内容错位"
+# ===========================================================================
+#
+# **为什么光看 pHash 不够**
+#
+# 2026-10-19 实测：`testsrc2` 素材上，源与成品的正常差异距离是 14，
+# 而"偏移一位"的距离是 17 —— 区间重叠，分不开。根因是相邻帧本身太像。
+#
+# **换个问法就分得开了**
+#
+# 不要问"src[k] 和 out[k] 像不像"（绝对相似度，受素材影响大），
+# 而要问"src[k] 更像 out[k]，还是更像 out[k+1]"（相对比较）。
+#
+#   src[k] vs out[k]   应该**最像**
+#   src[k] vs out[k±1] 应该**明显更不像**
+#
+# 即使相邻帧很像，只要"自己那帧"始终比"邻居"更像，顺序就是对的。
+# 这个判据对"整体相似度高低"不敏感，只对**排序**敏感 —— 正是我们要的。
+#
+# 度量用归一化互相关（NCC），对亮度/对比度变化比 SSIM 更宽容，
+# 且 cv2 一行就能算，不必额外依赖 scikit-image。
+#
+# **适用边界（实测，2026-10-19）——这条很重要**
+#
+# | 场景 | 结果 |
+# |---|---|
+# | 纯重编码（帧序不变） | 5/5 点 `对应=1.0000`、邻居 0.65-0.96 → **可靠** |
+# | 全链含 QTGMC 去隔行 | 8/8 点 flipped → **不可用** |
+#
+# 后者不是阈值问题，是**物理上不对应**：QTGMC 用时间邻域重建每一帧，
+# 输出的第 k 帧不等于输入的第 k 帧时刻。拿"源第 k 帧"去比"成品第 k 帧"
+# 本来就不该相等。IVTC（4/5 抽帧）、补帧同理。
+#
+# 所以这个函数**只该用在帧序不变、时间基准不变的两端**：
+# 典型是 stage7 的「输入（step6 产物）vs 输出（成品）」——
+# 那里是纯编码，实测对应帧相关系数 1.0000，判别力极强。
+# 不要拿它去比"原始源 vs 全链成品"。
+
+
+def _extract_frame(path: str, index: int, out_png: str,
+                   width: int = 320, timeout: int = 120) -> bool:
+    """抽第 index 帧，缩到 width 宽（统一尺寸后可比）。"""
+    cmd = ["ffmpeg", "-v", "error", "-i", path,
+           "-vf", f"select=eq(n\\,{index}),scale={width}:-2",
+           "-frames:v", "1", "-y", out_png]
+    return _run(cmd, timeout=timeout) is not None and os.path.exists(out_png)
+
+
+def _gray_float(img_path: str):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    a = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+    if a is None:
+        return None
+    if a.dtype != np.uint8:
+        scale = 65535.0 if a.dtype == np.uint16 else float(a.max() or 1)
+        a = (a.astype(np.float32) / scale * 255.0).clip(0, 255).astype(np.uint8)
+    if a.ndim == 3:
+        a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+    return a.astype(np.float32)
+
+
+def normalized_correlation(a, b) -> Optional[float]:
+    """两张灰度图的归一化互相关（-1..1，1 表示完全一致）。"""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if a is None or b is None:
+        return None
+    if a.shape != b.shape:
+        try:
+            import cv2
+            b = cv2.resize(b, (a.shape[1], a.shape[0]),
+                           interpolation=cv2.INTER_AREA)
+        except Exception:
+            return None
+    af, bf = a.ravel(), b.ravel()
+    af = af - af.mean()
+    bf = bf - bf.mean()
+    denom = (float((af ** 2).sum()) ** 0.5) * (float((bf ** 2).sum()) ** 0.5)
+    if denom <= 1e-9:
+        return None
+    return float((af * bf).sum() / denom)
+
+
+def verify_frame_alignment(source_path: str, output_path: str,
+                           samples: int = 6,
+                           margin: float = 0.02) -> Dict[str, Any]:
+    """抽查若干位置，确认 src[k] 比 src[k±1] 更像 out[k]。
+
+    Args:
+        samples: 抽多少个位置（均匀分布）。
+        margin: "自己那帧"要比"邻居"至少好这么多，避免噪声抖动误判。
+
+    Returns:
+        `{"ok": bool|None, "points": [...], "flipped": int,
+          "note": str, "error": str|None}`
+
+    `ok=None` 表示无法判定（抽帧失败/依赖缺失），调用方必须标"未校验"。
+    """
+    import tempfile
+
+    out: Dict[str, Any] = {"ok": None, "points": [], "flipped": 0,
+                           "skipped": 0, "note": "", "error": None}
+    src_frames = probe_media_facts(source_path).get("frames")
+    out_frames = probe_media_facts(output_path).get("frames")
+    if not src_frames or not out_frames:
+        out["error"] = "帧数未知，无法做对齐校验"
+        return out
+    n = min(src_frames, out_frames)
+    if n < 4:
+        out["error"] = f"帧数太少（{n}），对齐校验无意义"
+        return out
+
+    # 均匀取样，避开首末（首末可能有容器差异）
+    idxs = sorted({max(1, min(n - 2, int(round(n * (i + 0.5) / samples))))
+                   for i in range(samples)})
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            for k in idxs:
+                s_png = os.path.join(td, f"s{k}.png")
+                c_png = os.path.join(td, f"c{k}.png")
+                p_png = os.path.join(td, f"p{k}.png")
+                m_png = os.path.join(td, f"m{k}.png")
+                if not _extract_frame(source_path, k, s_png):
+                    out["error"] = f"源第 {k} 帧抽取失败"
+                    return out
+                if not _extract_frame(output_path, k, c_png):
+                    out["error"] = f"成品第 {k} 帧抽取失败"
+                    return out
+                self_sim = normalized_correlation(_gray_float(s_png),
+                                                  _gray_float(c_png))
+                # 邻居：往后一帧（错位最常表现为整体前移/后移一位）
+                nbr = []
+                if k + 1 < n and _extract_frame(output_path, k + 1, p_png):
+                    nbr.append(("k+1", normalized_correlation(
+                        _gray_float(s_png), _gray_float(p_png))))
+                if k - 1 >= 0 and _extract_frame(output_path, k - 1, m_png):
+                    nbr.append(("k-1", normalized_correlation(
+                        _gray_float(s_png), _gray_float(m_png))))
+                nbr = [(t, v) for t, v in nbr if v is not None]
+                if self_sim is None or not nbr:
+                    out["error"] = f"第 {k} 帧相似度计算失败"
+                    return out
+                best_nbr = max(v for _, v in nbr)
+                # 两种判"对齐"：
+                #   a) 几乎像素级一致（>= 0.999）—— 不可能错位，直接通过。
+                #      实测：纯重编码时对应帧是 1.0000，而邻居 0.9972，
+                #      只差 0.0028 < margin 0.02，会被误判成 flipped。
+                #   b) 比最好的邻居至少好 margin（正常情况）。
+                aligned = (self_sim >= 0.999
+                           or self_sim >= best_nbr + margin)
+
+                # **跳过"相邻帧本身几乎一样"的采样点**。
+                #
+                # 实测：合成素材上第 18 帧 对应=0.9765、邻居=0.9775，
+                # 差 0.001 —— 这两帧肉眼几乎相同，任何相似度度量都分不出
+                # 顺序。在这样的点上判"错位"是噪声，不是证据。
+                #
+                # 判据：源的第 k 帧与第 k+1 帧本身是否足够不同。
+                # 太像就跳过（记 skipped），并让最终结论把"可判定点数"
+                # 一起报出来 —— 不假装查过判不了的点。
+                _s_next = os.path.join(td, f"sn{k}.png")
+                src_self_diff = None
+                if _extract_frame(source_path, k + 1, _s_next):
+                    _a = _gray_float(s_png)
+                    _b = _gray_float(_s_next)
+                    _nc = normalized_correlation(_a, _b)
+                    if _nc is not None:
+                        src_self_diff = 1.0 - _nc      # 0 = 完全相同
+                discriminative = (src_self_diff is None
+                                  or src_self_diff >= MIN_SRC_FRAME_DIFF)
+                point = {
+                    "frame": k,
+                    "self": round(self_sim, 4),
+                    "neighbors": {t: round(v, 4) for t, v in nbr},
+                    "best_neighbor": round(best_nbr, 4),
+                    "src_frame_diff": (round(src_self_diff, 4)
+                                       if src_self_diff is not None else None),
+                    "aligned": aligned,
+                    "discriminative": discriminative,
+                }
+                if not discriminative:
+                    point["note"] = ("源相邻帧差异过小，此点无判别力，"
+                                     "不计入统计")
+                    out["skipped"] = out.get("skipped", 0) + 1
+                else:
+                    out["points"].append(point)
+                    if not aligned:
+                        out["flipped"] += 1
+    except Exception as exc:            # 抽帧工具异常不该弄坏调用方
+        out["error"] = str(exc)
+        return out
+
+    # 判据用**比例**，不用"每个点都必须过"。
+    #
+    # 实测（2026-10-19，60 帧 1080p→4K）：
+    #   正常成品：2/5 个点被判 flipped（第 18 帧 对应 0.9765 vs 邻居
+    #             0.9775，只差 0.001 —— 这两帧本身几乎一样）
+    #   整体前移一位：5/5 全部 flipped
+    #
+    # 绝对区分很明显（40% vs 100%），但"全部通过"会让正常素材也报警。
+    # 所以用 70% 作为错位判定线：正常素材即使有若干相似帧干扰，
+    # 也很难有 70% 的点都偏向邻居；而真正错位时几乎必然接近 100%。
+    total = len(out["points"])
+    if total < MIN_ALIGNMENT_SAMPLES:
+        out["ok"] = None
+        out["flip_ratio"] = None
+        out["error"] = (f"只有 {total} 个采样点有判别力"
+                        f"（另 {out.get('skipped', 0)} 个因相邻帧过像被跳过），"
+                        f"不足以判断帧序 —— 记为**未校验**")
+        return out
+    ratio = out["flipped"] / total
+    out["flip_ratio"] = round(ratio, 3)
+    out["ok"] = ratio < ALIGNMENT_FLIP_RATIO
+    if out["ok"]:
+        out["note"] = (f"{out['flipped']}/{total} 个抽样点偏向邻居"
+                       f"（{ratio:.0%} < {ALIGNMENT_FLIP_RATIO:.0%}）"
+                       "—— 帧序判定为正确")
+    else:
+        out["note"] = (f"{out['flipped']}/{total} 个抽样点偏向邻居"
+                       f"（{ratio:.0%} ≥ {ALIGNMENT_FLIP_RATIO:.0%}）"
+                       "—— **帧序可能整体错位**")
+    if out["flipped"] and out["ok"]:
+        out["note"] += ("；少量翻转点通常是相邻帧本身极像所致，"
+                        "如需逐帧保证请人工复核这些位置")
+    return out
+
+
+def render_alignment(result: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    if result.get("ok") is None:
+        return f"对齐校验: 未完成（{result.get('error')}）"
+    for p in result.get("points") or []:
+        mark = "OK  " if p["aligned"] else "FAIL"
+        nbr = ", ".join(f"{k}={v}" for k, v in p["neighbors"].items())
+        lines.append(f"  [{mark}] 第 {p['frame']:5d} 帧: 对应={p['self']:.4f}"
+                     f"  邻居={nbr}")
+    lines.append("  " + (result.get("note") or ""))
+    return "\n".join(lines)

@@ -368,10 +368,12 @@ _PHOTO_STAGE_KEYS: Dict[int, Set[str]] = {
         "icc_profile", "output_format"},
 }
 
+#: 前缀 -> stage。**更长的前缀优先**（见 `_photo_claimants`）。
 _PHOTO_STAGE_PREFIXES: Dict[int, Tuple[str, ...]] = {
     1: ("deband", "scratch", "denoise", "descreen", "photo_"),
     2: ("deblock", "traditional_", "psf_", "ai_pre", "pre_denoise"),
-    3: ("upscale", "ai_model", "ai_max", "ai_gpu"),
+    # `ai_` 兜底归到这里（AI 超分）；`ai_face*` 有更长的前缀，会归 stage4
+    3: ("upscale", "ai_model", "ai_max", "ai_gpu", "ai_"),
     4: ("ai_face", "face_", "gfpgan", "codeformer"),
     5: ("unsharp", "gblur", "eq_", "sharpen", "grain_"),
     6: ("crf", "encoder", "pix_fmt", "avif", "archival", "jpeg_",
@@ -380,20 +382,42 @@ _PHOTO_STAGE_PREFIXES: Dict[int, Tuple[str, ...]] = {
 
 
 def _photo_claimants(key: str) -> Set[int]:
+    """哪些 stage 认领这个键。
+
+    **精确键优先于前缀，长前缀优先于短前缀**。
+
+    实测踩到的坑：加了 `ai_` 前缀后，`ai_face_threshold` 会同时命中
+    stage4 的 `ai_face` 和 stage3 的 `ai_`，结果它同时影响两个 stage ——
+    于是改人脸阈值也会让 AI 超分 stage 失效。按最长前缀优先即可：
+    `ai_face`（7 字符）胜过 `ai_`（3 字符）。
+    """
     k = _norm_key(key)
-    out: Set[int] = set()
+    exact: Set[int] = set()
     for s, keys in _PHOTO_STAGE_KEYS.items():
         if k in {_norm_key(x) for x in keys}:
-            out.add(s)
+            exact.add(s)
+    if exact:
+        return exact
+
+    best_len = 0
+    best: Set[int] = set()
     for s, prefs in _PHOTO_STAGE_PREFIXES.items():
-        if any(k.startswith(p) for p in prefs):
-            out.add(s)
-    return out
+        for pref in prefs:
+            if k.startswith(pref):
+                if len(pref) > best_len:
+                    best_len, best = len(pref), {s}
+                elif len(pref) == best_len:
+                    best.add(s)
+    return best
 
 
 def photo_param_affects_stage(key: str, stage: int) -> bool:
     """照片链版：这个参数是否影响该 stage。语义与视频链一致。"""
     k = _norm_key(key)
+    # CLI 内部参数（`_stage` / `_mode` / `_quick` ...）不是质量参数。
+    # 实测：`_stage` 混进了 stage1 的 scope，让每次换 --stage 都改变身份。
+    if k.startswith("_"):
+        return False
     if k in NON_SEMANTIC_PARAMS:
         return False
     if k in GLOBAL_PARAMS:
