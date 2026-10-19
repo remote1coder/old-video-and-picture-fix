@@ -173,3 +173,63 @@ def test_stage7_runs_the_check_and_fails_with_86():
     assert "return 86" in src, "核对失败必须让运行不算成功"
     # 核对器自身异常不能把成功编码判死
     assert "STAGE7_VERIFY_ERROR" in src
+
+
+# ---------------------------------------------------------------------------
+# 逐帧对齐校验：只在"帧序不变"的两端可靠
+# ---------------------------------------------------------------------------
+
+def test_alignment_uses_relative_comparison_not_absolute_similarity():
+    """判据必须是"自己那帧比邻居更像"，不是"绝对相似度够高"。
+
+    实测依据：合成素材上 `src[k] vs out[k]` 的绝对距离和
+    `src[k] vs out[k+1]` 只差 0.001，绝对判据分不开；相对比较不受影响。
+    """
+    src = open(os.path.join(ROOT, "shared_modules", "artifact_verify.py"),
+               encoding="utf-8").read()
+    assert "best_nbr" in src
+    assert "self_sim >= best_nbr" in src
+    # 比例判据（不是"每个点都必须过"）
+    assert "ALIGNMENT_FLIP_RATIO" in src
+    # 判别力过滤（相邻帧太像就跳过）
+    assert "MIN_SRC_FRAME_DIFF" in src
+    assert "discriminative" in src
+    # 可判定点太少时不下结论
+    assert "MIN_ALIGNMENT_SAMPLES" in src
+
+
+def test_alignment_documents_its_scope():
+    """必须写明"不能拿它比源 vs 全链成品"—— 去隔行会改变时间对应。"""
+    src = open(os.path.join(ROOT, "shared_modules", "artifact_verify.py"),
+               encoding="utf-8").read()
+    assert "QTGMC" in src
+    assert "不要拿它去比" in src or "不该用在" in src
+    assert "stage7" in src
+
+
+def test_alignment_rejects_too_short_clips():
+    r = av.verify_frame_alignment("E:/does/not/exist.mkv",
+                                  "E:/does/not/exist2.mkv")
+    assert r["ok"] is None
+    assert r["error"]
+
+
+@pytest.mark.skipif(not (os.path.exists(GOOD)
+                         and os.path.exists(r"E:/codex/_round7_20261019/align/reenc.mkv")),
+                    reason="需要重编码样本")
+def test_alignment_passes_on_reencode():
+    """纯重编码（帧序不变）必须判为对齐 —— 这是它唯一可靠的用法。"""
+    r = av.verify_frame_alignment(
+        GOOD, r"E:/codex/_round7_20261019/align/reenc.mkv", samples=4)
+    assert r["ok"] is True, av.render_alignment(r)
+    assert r["flipped"] == 0
+
+
+@pytest.mark.skipif(not (os.path.exists(GOOD)
+                         and os.path.exists(r"E:/codex/_round7_20261019/align/shifted.mkv")),
+                    reason="需要错位样本")
+def test_alignment_catches_shifted_output():
+    """整体前移一位必须被抓出来。"""
+    r = av.verify_frame_alignment(
+        GOOD, r"E:/codex/_round7_20261019/align/shifted.mkv", samples=4)
+    assert r["ok"] is not True, av.render_alignment(r)
