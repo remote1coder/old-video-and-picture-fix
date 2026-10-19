@@ -37,6 +37,7 @@ CLAUDE.md
 *.pth
 # 文档：默认忽略所有 md；README.md 与下面两本长期文档保留入库（用户指定）
 *.md
+*.md.bak*
 !README.md
 !readme.md
 !PROJECT_MANUAL.md
