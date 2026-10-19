@@ -305,12 +305,33 @@ def generate_manifest(input_dirs: List[str], output_path: str,
     temp_dir_abs = str(Path(temp_dir).resolve())
 
     job_id = 0
+    missing_inputs: List[str] = []
     for inp_dir in input_dirs:
         inp_path = Path(inp_dir).resolve()
         if not inp_path.exists():
+            # 原来这里是**静默** continue：输入路径写错时扫描结果为空而毫无
+            # 提示，main 侧会输出 "executing 0 jobs" 并以 RC=0 退出（假成功）。
+            missing_inputs.append(inp_dir)
             continue
 
-        for f in sorted(inp_path.rglob("*")):
+        # FIX-2026-10-20: --input 允许直接传**媒体文件**，不只是目录。
+        # 原实现对所有输入都做 rglob("*")，而 Path(<file>).rglob("*") 不产出
+        # 任何条目 -> manifest 的 jobs 为空 -> main 输出 "executing 0 jobs"
+        # 且 RC=0；更糟的是默认分支会用它**覆盖**上一次扫描的持久 manifest
+        # （video_restoration_pipeline/main.py:1976-1982），把已有 job 全清掉。
+        # 实测仓库内的 video_restoration_pipeline/batch_manifest.yaml 就是
+        # 这么被写成一个 .mov 文件路径 + jobs: [] 的。
+        if inp_path.is_file():
+            if inp_path.suffix.lower() not in exts:
+                print(f"[WARN] input file extension not supported for "
+                      f"{pipeline_type} pipeline ({inp_path.suffix}): {inp_path}",
+                      file=sys.stderr)
+                continue
+            candidates = [inp_path]
+        else:
+            candidates = sorted(inp_path.rglob("*"))
+
+        for f in candidates:
             if f.is_file() and f.suffix.lower() in exts:
                 job_id += 1
                 input_str = str(f)
@@ -421,7 +442,40 @@ def generate_manifest(input_dirs: List[str], output_path: str,
 
                 manifest["jobs"].append(job)
 
+    if missing_inputs:
+        print(f"[WARN] input path(s) not found, skipped: "
+              f"{', '.join(missing_inputs)}", file=sys.stderr)
+
     manifest["meta"]["total_files"] = job_id
+
+    if job_id == 0:
+        # 0 jobs 几乎从不是用户想要的：轻则扫到了空目录，重则是上面那两类
+        # 输入错误（传了文件 / 路径写错）。不告警的话会被 RC=0 的假成功掩盖。
+        # 注意这里是 WARN 不是 raise：refuse 会破坏"扫描空目录也应产出清单"
+        # 的既有行为，而调用方（main.py）会写空清单覆盖旧清单，这个副作用
+        # 必须由用户显式看到。
+        print(f"[WARN] scan produced 0 jobs from input(s): "
+              f"{', '.join(str(d) for d in input_dirs)} "
+              f"(pipeline_type={pipeline_type}, "
+              f"extensions={sorted(exts)})", file=sys.stderr)
+
+        # 0 jobs 且目标清单已存在：写出空清单会**抹掉**上次扫描的 job
+        # （连带用户审阅过的 user_overrides）。这是本函数唯一不可逆的副作用，
+        # 不能只给 WARN。
+        try:
+            prev = Path(output_path)
+            if prev.exists():
+                with open(prev, "r", encoding="utf-8") as fh:
+                    old = yaml.safe_load(fh) or {}
+                n_old = len(old.get("jobs") or [])
+                if n_old:
+                    print(f"[ERROR] overwriting {output_path}, which currently "
+                          f"holds {n_old} job(s), with an empty manifest — "
+                          f"previous scan results will be lost. Re-run with "
+                          f"--incremental to preserve user edits.",
+                          file=sys.stderr)
+        except Exception:
+            pass
 
     # Write manifest
     out_path = Path(output_path)
