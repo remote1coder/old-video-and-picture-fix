@@ -1794,15 +1794,32 @@ def main():
                 frame_file = Path(output_dir) / f"frame_{i:08d}.png"
                 f.write(f"file '{frame_file}'\n")
                 f.write(f"duration {duration:.6f}\n")
-            # FFmpeg concat demuxer needs last frame without duration
-            if all_pts:
-                last_frame = (Path(output_dir)
-                              / f"frame_{len(all_pts)-1:08d}.png")
-                f.write(f"file '{last_frame}'\n")
+            # 最后一帧**不要再重复写一次**（旧代码和旧注释都错了）。
+            #
+            # 实测对照（60 个 PNG，`-count_frames` 真解码计数）：
+            #
+            # | concat 文件写法              | 编码参数            | 帧数 |
+            # |------------------------------|---------------------|------|
+            # | 每帧 file+duration，末尾重复 | 默认 vsync          |  52  |
+            # | 每帧 file+duration，末尾重复 | fps_mode passthrough|  61  |
+            # | 每帧 file+duration，不重复   | 默认 vsync          |  51  |
+            # | **每帧 file+duration，不重复** | **passthrough**   | **60** |
+            #
+            # 结论：**每一帧（含末帧）都要写 duration，且不要重复末帧**，
+            # 编码时必须 `-fps_mode passthrough`。三者缺一都会丢帧或
+            # 多帧。旧代码是"末帧不写 duration"，60 帧素材出来 59 帧。
+            #
+            # 循环里已经给每一帧（含最后一帧）写过 duration，所以这里
+            # 什么都不用补。
 
         encode_cmd = [
             "ffmpeg", "-hide_banner", "-v", "error", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_path,
+            # **必须 passthrough**：默认 `-vsync auto` 会在时间戳不连续时
+            # 丢帧/复制帧。实测 60 帧素材经 concat 后只剩 59 帧 —— 就是
+            # 默认 vsync 在末帧上做的"对齐"。VFR 路径的全部意义就是保留
+            # 原始时间戳，绝不能让它再做帧率重整。
+            "-fps_mode", "passthrough",
             "-c:v", "ffv1",
             "-pix_fmt", "yuv420p16le",
             *_color_opts,
@@ -1878,14 +1895,24 @@ def main():
             pass
         Path(preview_dir).mkdir(parents=True, exist_ok=True)
         try:
-            from preview import generate_before_after_comparison
-            generate_before_after_comparison(
+            # 之前这里 import 的是 `generate_before_after_comparison` ——
+            # shared_modules/preview.py **没有这个名字**，只有
+            # `generate_comparison_frames(original, processed, output_dir,
+            # num_pairs)`。于是每次都被 `except Exception` 吞成
+            # STAGE3_PREVIEW_FAIL，"生成强制超分对比图"从来没成功过。
+            #
+            # 签名也不同：这里原来传的是一个 .png 文件路径，而函数要的是
+            # **目录**（它在目录下自己建 preview/ 并写多张图）。
+            from preview import generate_comparison_frames
+            _pairs = generate_comparison_frames(
                 stage2_output, output_path,
-                str(Path(preview_dir)
-                    / f"{job_id}_forced_upscale_comparison.png")
+                str(Path(preview_dir) / f"{job_id}_forced_upscale"),
+                num_pairs=1,
             )
             logger.info("STAGE3_PREVIEW",
-                        "Generated forced upscale comparison frames")
+                        "Generated forced upscale comparison frames",
+                        count=len(_pairs or []),
+                        first=(_pairs or [None])[0])
         except Exception as e:
             logger.warning("STAGE3_PREVIEW_FAIL",
                            f"Failed to generate preview: {e}")
