@@ -1405,20 +1405,59 @@ def main():
     _orig_input = args.input or ""
     if not (range_known and primaries_known) and _orig_input \
             and os.path.abspath(_orig_input) != os.path.abspath(input_source):
-        _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(_orig_input, logger)
-        if _o_rk or _o_pk:
-            logger.info("STAGE7_COLOR_FALLBACK_ORIGINAL",
-                        "Intermediate lost color metadata; falling back to "
-                        "the original input for accurate color conversion "
-                        "instead of assuming BT.601 (which would tint the "
-                        "picture)",
-                        intermediate=input_source, original=_orig_input,
-                        orig_range=_o_range if _o_rk else None,
-                        orig_standard=_o_std if _o_pk else None)
-            if not range_known and _o_rk:
-                source_color_range, range_known = _o_range, True
-            if not primaries_known and _o_pk:
-                color_standard, primaries_known = _o_std, True
+        # COL-04（第七轮）：继承**必须有证据**，不能盲目。
+        #
+        # 任务书 §4.3：「原片标签只能在有保持表示的证据时补未知中间标签，
+        # 不能盲目继承」。判定依据是**中间产物实际的颜色描述**：
+        #
+        #   * 中间产物自己有标签 → 直接用它的（上一行已读，走不到这里）；
+        #   * 中间产物无标签，且它与原片的**像素格式族**一致
+        #     （都是 yuv*）→ 说明这一代没有发生 rgb↔yuv 矩阵转换，
+        #     继承原片标签是安全的；
+        #   * 中间产物无标签，但原片是 rgb* 而中间是 yuv*（或反之）
+        #     → 发生了矩阵转换，转换用的矩阵无从得知 →
+        #     **不继承**，明确报未知（让下游走保守路径并留痕）。
+        _inherit_ok = True
+        _evidence = "no-matrix-change"
+        try:
+            from media_io import probe_color as _pc
+            _mid = _pc(input_source) or {}
+            _srcp = _pc(_orig_input) or {}
+            if _mid.get("probed") and _srcp.get("probed"):
+                _mid_family = str(_mid.get("pix_fmt") or "").split("p")[0]
+                _src_family = str(_srcp.get("pix_fmt") or "").split("p")[0]
+                if _mid_family != _src_family:
+                    _inherit_ok = False
+                    _evidence = (f"pixel-family changed "
+                                 f"({_src_family} -> {_mid_family})")
+        except Exception as _pe:
+            logger.warning("STAGE7_COLOR_EVIDENCE_FAIL", str(_pe))
+
+        if not _inherit_ok:
+            logger.warning("STAGE7_COLOR_INHERIT_REFUSED",
+                           "Intermediate has no colour tags AND its pixel "
+                           "family differs from the source, so a matrix "
+                           "conversion happened somewhere. Refusing to "
+                           "inherit the source's tags (that would label the "
+                           "pixels wrongly); treating colour as unknown.",
+                           intermediate=input_source, original=_orig_input,
+                           evidence=_evidence)
+        else:
+            _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(
+                _orig_input, logger)
+            if _o_rk or _o_pk:
+                logger.info("STAGE7_COLOR_FALLBACK_ORIGINAL",
+                            "Intermediate lost color metadata; inheriting the "
+                            "original input's description (evidence: the "
+                            "pixel family did not change)",
+                            intermediate=input_source, original=_orig_input,
+                            orig_range=_o_range if _o_rk else None,
+                            orig_standard=_o_std if _o_pk else None,
+                            evidence=_evidence)
+                if not range_known and _o_rk:
+                    source_color_range, range_known = _o_range, True
+                if not primaries_known and _o_pk:
+                    color_standard, primaries_known = _o_std, True
 
     # FIX-R7-S7-A1: log WARNING for unknown source range/primaries per v6.32 §7.19
     if not range_known:

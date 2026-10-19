@@ -1080,3 +1080,120 @@ def cicp_matrix(cicp: Optional[str]) -> Optional[int]:
         return int(parts[2])
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# COL-04（第七轮）：实际颜色表示探测
+# ---------------------------------------------------------------------------
+
+#: 与 media_io 其余部分一致的 ffprobe 枚举映射。**只映射确实认识的**，
+#: 数字 9 是 BT2020（不是 BT709 —— 这个别名曾让 stage7 把宽色域当 709）。
+_COLOR_ENUM = {
+    "primaries": {"1": "bt709", "4": "bt470m", "5": "bt470bg",
+                  "6": "smpte170m", "7": "smpte240m", "8": "film",
+                  "9": "bt2020"},
+    "matrix": {"1": "bt709", "4": "fcc", "5": "bt470bg", "6": "smpte170m",
+               "7": "smpte240m", "9": "bt2020nc", "10": "bt2020c",
+               "0": "rgb"},
+    "transfer": {"1": "bt709", "4": "gamma22", "5": "gamma28",
+                 "6": "smpte170m", "8": "linear", "9": "log100",
+                 "16": "pq", "18": "hlg"},
+    "range": {"0": "tv", "1": "pc"},
+}
+
+
+def probe_color(path: str, stream: str = "v:0",
+                timeout: int = 30) -> Dict[str, Any]:
+    """探测**实际**颜色表示（不是继承来的标签）。
+
+    COL-04：任务书要求「每个 stage 记录并保留/更新实际颜色表示。
+    原片标签只能在有保持表示的证据时补未知中间标签，不能盲目继承」。
+
+    返回字段全部**原样保留**，不做"猜一个 standard"的塌缩：
+
+    ```
+    {
+      "pix_fmt": "yuv420p10le",
+      "range_raw": "tv" | None,      "range": "limited"|"full"|None,
+      "matrix": "bt709" | None,
+      "primaries": "bt709" | None,
+      "transfer": "bt709" | None,
+      "width": 3840, "height": 2160,
+      "probed": True,                # False = ffprobe 失败，字段不可信
+      "error": "..."                 # probed=False 时给出原因
+    }
+    ```
+
+    **unknown 不等于 known**：字段缺失就是 None，绝不填默认值。
+    """
+    import json as _json
+    import subprocess as _sp
+
+    out: Dict[str, Any] = {
+        "pix_fmt": None, "range_raw": None, "range": None,
+        "matrix": None, "primaries": None, "transfer": None,
+        "width": None, "height": None,
+        "probed": False,
+    }
+    try:
+        r = _sp.run(
+            ["ffprobe", "-v", "error", "-select_streams", stream,
+             "-show_entries",
+             "stream=pix_fmt,color_range,color_space,color_primaries,"
+             "color_transfer,width,height",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, errors="replace",
+            timeout=timeout, shell=False)
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    if r.returncode != 0:
+        out["error"] = f"ffprobe exited {r.returncode}: {(r.stderr or '')[:200]}"
+        return out
+    try:
+        streams = (_json.loads(r.stdout or "{}").get("streams") or [])
+    except ValueError as exc:
+        out["error"] = f"unparsable ffprobe output: {exc}"
+        return out
+    if not streams:
+        out["error"] = "no matching stream"
+        return out
+
+    st = streams[0]
+    out["probed"] = True
+    out["pix_fmt"] = st.get("pix_fmt") or None
+    out["width"] = st.get("width")
+    out["height"] = st.get("height")
+
+    def _norm(field: str, key: str) -> Optional[str]:
+        raw = str(st.get(key) or "").strip().lower()
+        if not raw or raw in ("unknown", "unspecified", "reserved"):
+            return None
+        return _COLOR_ENUM.get(field, {}).get(raw, raw)
+
+    out["range_raw"] = str(st.get("color_range") or "").strip().lower() or None
+    out["range"] = _norm("range", "color_range")
+    if out["range"] in ("tv",):
+        out["range"] = "limited"
+    elif out["range"] in ("pc",):
+        out["range"] = "full"
+    out["matrix"] = _norm("matrix", "color_space")
+    out["primaries"] = _norm("primaries", "color_primaries")
+    out["transfer"] = _norm("transfer", "color_transfer")
+    return out
+
+
+def color_descriptions_equal(a: Dict[str, Any],
+                             b: Dict[str, Any],
+                             fields=("pix_fmt", "range", "matrix",
+                                     "primaries", "transfer")) -> bool:
+    """两组颜色描述是否**完全**相同（缺字段按不同处理）。
+
+    COL-04 用于判断"能否把原片标签继承给中间产物"：只有当中间产物与
+    原片的颜色描述逐项一致（或中间产物明确缺失、而该 stage 未做转换）
+    时才可以继承；否则补标签就是**标错**。
+    """
+    for f in fields:
+        if (a or {}).get(f) != (b or {}).get(f):
+            return False
+    return True

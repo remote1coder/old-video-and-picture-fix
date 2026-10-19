@@ -1340,6 +1340,16 @@ def intermediate_identity_path(artifact: str) -> str:
     return str(artifact) + ".identity.json"
 
 
+def _read_color_description(artifact: str) -> Dict[str, Any]:
+    """COL-04：探测并返回该产物的实际颜色描述（失败时 probed=False）。"""
+    try:
+        from media_io import probe_color
+        return probe_color(artifact)
+    except Exception as exc:
+        return {"probed": False,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _read_exec_fingerprint(artifact: str) -> Optional[Dict[str, Any]]:
     """读 stage 自己写的 `.exec.json`；没有就返回 None（不猜）。"""
     try:
@@ -1384,6 +1394,11 @@ def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
         # ID-07（第七轮）：并入"实际执行"记录（后端/实际模型/权重指纹/工具版本）。
         # 配置里写的是请求；这里记的是真的跑了什么。
         "exec": _read_exec_fingerprint(artifact),
+        # COL-04（第七轮）：记录这一代**实际**的颜色表示。字段分开保留
+        # （pix_fmt/range/matrix/primaries/transfer），不塌缩成一个
+        # "standard"；探测失败时 probed=False，字段一律 None，
+        # 绝不用默认值冒充"已知"。
+        "color": _read_color_description(artifact),
         "recorded_at": datetime.now().astimezone().isoformat(),
     }
     try:
