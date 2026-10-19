@@ -40,6 +40,8 @@ sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
 from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
+# PUB-04（第七轮）：发布目标互斥锁（逐路径加锁，非集合摘要）
+from publish_lock import acquire_target_locks, TargetLockTimeout  # noqa: E402
 
 try:  # FIX-V01/V05: encode-boundary contracts
     sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
@@ -1179,89 +1181,112 @@ def main():
               "incomplete backup; commit not started", paths=[])
         return 82
 
+    # PUB-04（第七轮）：提交段必须持有**全部目标路径的互斥锁**。
+    # 逐路径加锁（不是集合摘要），任何重叠目标集合都会互斥；
+    # 锁从"改任何目标之前"开始，覆盖备份、替换、侧车写入与回滚。
     try:
-        os.replace(tmp_avif, work_output_path)
-        contract["published"] = True
-        if tiff_info.get("written") and tmp_tiff:
-            os.replace(tmp_tiff, work_tiff_path)
-            tiff_info["master_path"] = work_tiff_path
-        if original_output_path:
-            # RV-13: 源路径一律用工作路径（work_*）
-            if not wsl_copy_back(work_output_path, publish_output_path):
-                raise PublishAbort("wsl_copyback",
-                                   f"copy back failed: {work_output_path}")
-            logger.info("STAGE6_WSL_COPYBACK",
-                        f"Copied result back to {publish_output_path}")
-            if tiff_info.get("written") and work_tiff_path:
-                if not wsl_copy_back(work_tiff_path, publish_tiff_path):
-                    raise PublishAbort(
-                        "wsl_copyback_tiff",
-                        f"copy back failed: {work_tiff_path}")
-                logger.info("STAGE6_WSL_COPYBACK_TIFF",
-                            f"Copied master back to {publish_tiff_path}")
-        # 契约与状态必须**写成功**才算提交完成（A12：侧车写失败仍 rc=0 是错的）
-        if not _write_json_sidecar(contract_path, contract):
-            raise PublishAbort("contract",
-                               "could not write the encode contract sidecar")
-        if not _write_json_sidecar(status_path, {
-            "status": "SUCCESS",
-            "stage": 6,
-            "skipped_operations": _color_skipped(color),
-            "output_path": publish_output_path,
-            "published": True,
-        }):
-            raise PublishAbort("status",
-                               "could not write the SUCCESS status sidecar")
-    except PublishAbort as abort:
-        logger.error("STAGE6_PUBLISH_ABORT",
-                     f"Publish aborted at {abort.operation}: {abort.reason}; "
-                     "rolling the whole generation back",
-                     operation=abort.operation)
-        # PUB-02/03（第七轮）：按**可核验的回滚结果**分流，不再无条件
-        # 宣布"Previous generation restored"；也不再把当前有效代的
-        # status 覆写成 FAILED（旧代若完好，它仍然是有效成品）。
-        _rb = _rollback_publish(snapshot, logger)
-        if _rb["fully_restored"]:
-            logger.warning("STAGE6_PUBLISH_ROLLBACK",
-                           "Previous generation restored and verified; no "
-                           "mixed-generation output is left behind",
-                           restored=_rb["restored"], removed=_rb["removed"])
-            # 旧代仍有效 → 固定 status 保持原样（可能是 SUCCESS），
-            # 本次失败只记到 attempt 级 sidecar。
-            _fail(logger, status_path, abort.operation, abort.reason,
-                  paths=[], preserve_valid_status=True)
-        else:
-            logger.error("STAGE6_RECOVERY_REQUIRED",
-                         "Rollback did NOT fully restore the previous "
-                         "generation; manual recovery is required before the "
-                         "next run may treat these paths as valid",
-                         failed=_rb["failed"], impossible=_rb["impossible"],
-                         restored=_rb["restored"])
-            _fail(logger, status_path, abort.operation, abort.reason,
-                  paths=[], recovery_required=True,
-                  rollback_detail=_rb)
-        return 82
-    except OSError as e:
-        logger.error("STAGE6_PUBLISH_FAIL", f"Could not publish the output: {e}")
-        _rb = _rollback_publish(snapshot, logger)
-        if _rb["fully_restored"]:
-            _fail(logger, status_path, "publish", str(e), paths=[],
-                  preserve_valid_status=True)
-        else:
-            logger.error("STAGE6_RECOVERY_REQUIRED",
-                         "Rollback after publish failure did NOT fully "
-                         "restore the previous generation",
-                         failed=_rb["failed"], impossible=_rb["impossible"])
-            _fail(logger, status_path, "publish", str(e), paths=[],
-                  recovery_required=True, rollback_detail=_rb)
+        _lock_cm = acquire_target_locks(
+            commit_targets,
+            timeout=float(params.get("publish_lock_timeout", 60)),
+            logger=logger)
+        _lock_cm.__enter__()
+    except TargetLockTimeout as _lt:
+        logger.error("STAGE6_PUBLISH_LOCK_TIMEOUT",
+                     "Could not acquire publish locks; nothing was modified",
+                     targets=_lt.targets, timeout=_lt.timeout)
+        _fail(logger, status_path, "publish_lock", str(_lt), paths=[],
+              preserve_valid_status=True)
         return 82
 
-    # 已发布：守卫不再删除任何产物
-    if cancel_guard is not None:
-        cancel_guard.release_outputs()
+    try:
+        try:
+            os.replace(tmp_avif, work_output_path)
+            contract["published"] = True
+            if tiff_info.get("written") and tmp_tiff:
+                os.replace(tmp_tiff, work_tiff_path)
+                tiff_info["master_path"] = work_tiff_path
+            if original_output_path:
+                # RV-13: 源路径一律用工作路径（work_*）
+                if not wsl_copy_back(work_output_path, publish_output_path):
+                    raise PublishAbort("wsl_copyback",
+                                       f"copy back failed: {work_output_path}")
+                logger.info("STAGE6_WSL_COPYBACK",
+                            f"Copied result back to {publish_output_path}")
+                if tiff_info.get("written") and work_tiff_path:
+                    if not wsl_copy_back(work_tiff_path, publish_tiff_path):
+                        raise PublishAbort(
+                            "wsl_copyback_tiff",
+                            f"copy back failed: {work_tiff_path}")
+                    logger.info("STAGE6_WSL_COPYBACK_TIFF",
+                                f"Copied master back to {publish_tiff_path}")
+            # 契约与状态必须**写成功**才算提交完成（A12：侧车写失败仍 rc=0 是错的）
+            if not _write_json_sidecar(contract_path, contract):
+                raise PublishAbort("contract",
+                                   "could not write the encode contract sidecar")
+            if not _write_json_sidecar(status_path, {
+                "status": "SUCCESS",
+                "stage": 6,
+                "skipped_operations": _color_skipped(color),
+                "output_path": publish_output_path,
+                "published": True,
+            }):
+                raise PublishAbort("status",
+                                   "could not write the SUCCESS status sidecar")
+        except PublishAbort as abort:
+            logger.error("STAGE6_PUBLISH_ABORT",
+                         f"Publish aborted at {abort.operation}: {abort.reason}; "
+                         "rolling the whole generation back",
+                         operation=abort.operation)
+            # PUB-02/03（第七轮）：按**可核验的回滚结果**分流，不再无条件
+            # 宣布"Previous generation restored"；也不再把当前有效代的
+            # status 覆写成 FAILED（旧代若完好，它仍然是有效成品）。
+            _rb = _rollback_publish(snapshot, logger)
+            if _rb["fully_restored"]:
+                logger.warning("STAGE6_PUBLISH_ROLLBACK",
+                               "Previous generation restored and verified; no "
+                               "mixed-generation output is left behind",
+                               restored=_rb["restored"], removed=_rb["removed"])
+                # 旧代仍有效 → 固定 status 保持原样（可能是 SUCCESS），
+                # 本次失败只记到 attempt 级 sidecar。
+                _fail(logger, status_path, abort.operation, abort.reason,
+                      paths=[], preserve_valid_status=True)
+            else:
+                logger.error("STAGE6_RECOVERY_REQUIRED",
+                             "Rollback did NOT fully restore the previous "
+                             "generation; manual recovery is required before the "
+                             "next run may treat these paths as valid",
+                             failed=_rb["failed"], impossible=_rb["impossible"],
+                             restored=_rb["restored"])
+                _fail(logger, status_path, abort.operation, abort.reason,
+                      paths=[], recovery_required=True,
+                      rollback_detail=_rb)
+            return 82
+        except OSError as e:
+            logger.error("STAGE6_PUBLISH_FAIL", f"Could not publish the output: {e}")
+            _rb = _rollback_publish(snapshot, logger)
+            if _rb["fully_restored"]:
+                _fail(logger, status_path, "publish", str(e), paths=[],
+                      preserve_valid_status=True)
+            else:
+                logger.error("STAGE6_RECOVERY_REQUIRED",
+                             "Rollback after publish failure did NOT fully "
+                             "restore the previous generation",
+                             failed=_rb["failed"], impossible=_rb["impossible"])
+                _fail(logger, status_path, "publish", str(e), paths=[],
+                      recovery_required=True, rollback_detail=_rb)
+            return 82
 
-    logger.info("STAGE6_DONE", "Photo encoding complete", output=publish_output_path)
-    return 0
+        # 已发布：守卫不再删除任何产物
+        if cancel_guard is not None:
+            cancel_guard.release_outputs()
+
+        logger.info("STAGE6_DONE", "Photo encoding complete", output=publish_output_path)
+        return 0
+    finally:
+        try:
+            _lock_cm.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
