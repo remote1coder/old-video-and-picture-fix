@@ -112,6 +112,25 @@ def _analyze_pixel_features(input_path: str) -> Dict[str, Any]:
         return {"blockiness": 0.0, "blur_laplacian_var": 0.0, "noise_std": 0.0}
 
 
+#: 扫描仪常见的"整数"输出分辨率（DPI）。
+SCANNER_DPI_DISCRETE = {300, 600, 1200, 2400, 3200, 4800, 6400}
+
+
+def _is_scanner_dpi(dpi: Any, tolerance: int = 5) -> bool:
+    """DPI 是否落在扫描仪常见档位上。
+
+    仅凭 DPI 不能断定是扫描件（相机照片也可能被设成 300 DPI 用于打印），
+    所以调用方还要结合"有没有相机型号"一起判断。
+    """
+    if not dpi:
+        return False
+    try:
+        d = float(dpi)
+    except (TypeError, ValueError):
+        return False
+    return any(abs(d - sd) <= tolerance for sd in SCANNER_DPI_DISCRETE)
+
+
 def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
     """Classify photo and return metadata.
 
@@ -258,15 +277,30 @@ def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
     if scanner_lower or "scan" in software_lower or "scan" in make_lower:
         result["detected_class"] = "SCAN_PRINT"
         result["confidence"] = 0.95
-    # FIX-P11-8: DPI discrete value detection per v7.32 §3.9
-    # "分辨率离散值" - scanner DPI values are typically at standard resolutions
-    elif result.get("dpi"):
-        SCANNER_DPI_DISCRETE = {300, 600, 1200, 2400, 3200, 4800, 6400}
-        dpi = result["dpi"]
-        dpi_discrete_match = any(abs(dpi - sd) <= 5 for sd in SCANNER_DPI_DISCRETE)
-        if dpi_discrete_match:
-            result["detected_class"] = "SCAN_PRINT"
-            result["confidence"] = 0.80
+    # FIX-R7-A1: DPI 分支**不能短路** `elif model or make`。
+    #
+    # 原实现是 `elif result.get("dpi"):` —— 只要 DPI 非空就进这个分支，
+    # 然后在里面判断"是不是标准扫描 DPI"（300/600/...）；不匹配时**什么
+    # 都不做**就结束了，后面的 `elif model or make:` 永远走不到。
+    #
+    # 实测后果（2026-10-20，一张带 Make=Canon / Model=EOS 5D 的图）：
+    #   DPI=72  → 进入本分支、不匹配、什么都不做 → 最终 UNKNOWN / 0.0
+    #             → main 判 LOW_CONFIDENCE_SKIP，整张图被跳过
+    #   DPI=300 → 匹配 → 被判成 SCAN_PRINT / 0.80
+    #             （相机照片被当成扫描件，走错参数组）
+    #
+    # 也就是说：**任何带常见 DPI 的数码相机照片都过不了分类**。
+    #
+    # 现在把"是否是标准扫描 DPI"收进条件本身，并且要求**没有相机型号**
+    # 才按扫描件处理（扫描件通常不写 Make/Model）。
+    # 已知局限：某些扫描仪会写 Make=EPSON/Brother，这类仍会被后面的
+    # `model or make` 分支判成 DIGITAL_PHOTO —— 比"整张图被跳过"好，
+    # 但没有品牌白名单就无法彻底区分，这里不引入白名单以免新的误判。
+    elif (result.get("dpi")
+          and _is_scanner_dpi(result["dpi"])
+          and not (model or make)):
+        result["detected_class"] = "SCAN_PRINT"
+        result["confidence"] = 0.80
     elif model or make:
         result["detected_class"] = "DIGITAL_PHOTO"
         result["confidence"] = 0.90
