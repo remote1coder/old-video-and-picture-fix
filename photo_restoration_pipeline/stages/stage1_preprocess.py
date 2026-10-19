@@ -317,6 +317,55 @@ def _gmic_16bit_output_args(output_path: str) -> list:
     return ["-type", "ushort", "-o", output_path]
 
 
+#: 缓存"哪个 gmic 可执行文件能跑 denoise_patchpca"。
+#:
+#: `None` = 还没探测过；`""` = 探测过但都不行（用默认 PATH）。
+_PATCHPCA_GMIC_CACHE = {"exe": None}
+
+
+def _gmic_candidates() -> list:
+    """按"优先默认、然后从新到旧"列出可执行文件。
+
+    默认（PATH 上的 `gmic`）排第一 —— 如果哪天升级到修好这个 bug 的版本，
+    直接用新的，不浪费一次失败。
+    """
+    import re as _re
+    cands = ["gmic"]
+    try:
+        gdir = SCRIPT_DIR.parent / "tools_r4" / "gmic"
+        found = []
+        for d in gdir.glob("gmic-*-cli-win64"):
+            exe = d / "gmic.exe"
+            if not exe.exists():
+                continue
+            m = _re.search(r"gmic-(\d+)\.(\d+)\.(\d+)", d.name)
+            ver = tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+            found.append((ver, str(exe)))
+        for _, exe in sorted(found, reverse=True):
+            cands.append(exe)
+    except Exception:
+        pass
+    return cands
+
+
+def _run_gmic_once(exe: str, safe_in: str, safe_out: str,
+                   gmic_args: tuple) -> tuple:
+    cmd = [exe, safe_in]
+    cmd.extend(list(gmic_args))
+    cmd.extend(_gmic_16bit_output_args(safe_out))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace", timeout=300, shell=False)
+        if r.returncode != 0:
+            return False, (r.stderr or "")[:1000]
+        # 返回码 0 但没产出也算失败（实测过这种情况）
+        if not Path(safe_out).exists():
+            return False, (r.stderr or "")[:1000] or "no output produced"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def run_gmic(input_path: str, output_path: str, *gmic_args,
              params: dict = None) -> tuple:
     """Run G'MIC with shell=False safety.
@@ -331,20 +380,41 @@ def run_gmic(input_path: str, output_path: str, *gmic_args,
         safe_out = _validate_gmic_path(output_path, wl_re)
     except ValueError as e:
         return False, str(e)
-    cmd = ["gmic", safe_in]
-    cmd.extend(list(gmic_args))
     # R4：输出也必须显式指定 16-bit。G'MIC 4.x 的 `-o` 若不指定像素类型会写出
     # **float32 TIFF**，而 Pillow 读不了 float TIFF —— 实测表现为
     # `UnidentifiedImageError` → OUTPUT_CORRUPT → 阻塞后续 AI 阶段。
     # 3.x 默认沿用输入类型，所以这个问题只在升级后暴露。
-    cmd.extend(_gmic_16bit_output_args(safe_out))
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=300, shell=False)
-        if r.returncode != 0 and r.stderr:
-            return False, r.stderr[:1000]
-        return r.returncode == 0, ""
-    except Exception as e:
-        return False, str(e)
+
+    # 只对 `denoise_patchpca` 做版本回落。
+    #
+    # 实测（2026-10-20）：G'MIC **4.0.6**（2026/10/14 发布）的
+    # `denoise_patchpca` 在**所有**输入上都崩：
+    #   `Operator 'vector[ind]': Invalid vector read`
+    # 而项目里同时存在的 **4.0.5** 对同一输入正常产出。
+    # 4.0.6 太新（发布 5 天），上游还没有相关 issue。
+    #
+    # 策略：先用默认（PATH 上的 4.0.6），失败后回落到旧版本重试一次。
+    # 这样如果将来升级到修好的版本，会自动用新的，不浪费任何一次调用。
+    wants_patchpca = any("denoise_patchpca" in str(a) for a in gmic_args)
+
+    if not wants_patchpca:
+        return _run_gmic_once("gmic", safe_in, safe_out, gmic_args)
+
+    cached = _PATCHPCA_GMIC_CACHE["exe"]
+    if cached is not None:
+        # 已经探测过：直接用记下来的那个（"" 表示都不行，回到默认再试一次）
+        return _run_gmic_once(cached or "gmic", safe_in, safe_out, gmic_args)
+
+    last_err = ""
+    for exe in _gmic_candidates():
+        ok, err = _run_gmic_once(exe, safe_in, safe_out, gmic_args)
+        if ok:
+            _PATCHPCA_GMIC_CACHE["exe"] = exe
+            return True, ""
+        last_err = err
+        # 默认版本成功就直接返回（上面已处理）；失败则继续试旧版本
+    _PATCHPCA_GMIC_CACHE["exe"] = ""     # 都不行，别每次都重试一轮
+    return False, last_err
 
 
 def detect_channel_degradation(img_path: str, params: dict) -> dict:
