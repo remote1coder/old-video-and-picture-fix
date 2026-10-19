@@ -725,7 +725,7 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
     return filters
 
 
-def _get_source_color_info(video_path: str) -> tuple:
+def _get_source_color_info(video_path: str, logger=None) -> tuple:
     """Probe source color_range and color_primaries via ffprobe.
 
     Returns (source_color_range, color_standard, range_known, primaries_known)
@@ -741,35 +741,90 @@ def _get_source_color_info(video_path: str) -> tuple:
     属性,默认假设老影像为 limited range,但记录 WARNING").
     ORIGINAL: only recognized PAL/NTSC, defaulted unknown to NTSC silently.
     """
+    # COL-02（第七轮）：**必须分开读 matrix / primaries / transfer / range**。
+    #
+    # 旧实现只读 color_range + color_primaries，并且：
+    #   * 把枚举 "9" 当 BT709 —— **9 是 BT2020**（FFmpeg
+    #     AVColorPrimaries: 1=bt709, 4=bt470m, 5=bt470bg, 6=smpte170m,
+    #     9=bt2020）。BT2020 素材因此被误判为"已经是 709"→ 跳过转换 →
+    #     宽色域像素被打上 bt709 标签，颜色严重错误。
+    #   * 用 primaries 推断"要不要做矩阵转换"。真正决定色彩矩阵的是
+    #     **color_space（matrix）**，primaries 只是色域原色。
+    #   * `range_known = bool(cr)` —— 只要字符串非空就算"已知"，
+    #     垃圾值也会被当成有效范围。
+    #
+    # 新实现：四项分开取、数字枚举显式映射、BT2020 明确标为不支持。
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=color_range,color_primaries",
+             "-show_entries",
+             "stream=color_range,color_primaries,color_space,color_transfer",
              "-of", "json", video_path],
-            capture_output=True, text=True, errors="replace", timeout=30, shell=False
-        )
+            capture_output=True, text=True, errors="replace", timeout=30,
+            shell=False)
         if r.returncode == 0:
             data = json.loads(r.stdout)
             streams = data.get("streams", [])
             if streams:
-                cr = streams[0].get("color_range", "")
-                cp = streams[0].get("color_primaries", "")
-                range_known = bool(cr)
+                st = streams[0]
+                cr = str(st.get("color_range", "") or "").strip()
+                cp = str(st.get("color_primaries", "") or "").strip().lower()
+                mx = str(st.get("color_space", "") or "").strip().lower()
+                tr = str(st.get("color_transfer", "") or "").strip().lower()
+
+                # 数字枚举 → 名字（只映射我们**确实认识**的）
+                _PRIM = {"1": "bt709", "4": "bt470m", "5": "bt470bg",
+                         "6": "smpte170m", "9": "bt2020"}
+                _MATRIX = {"1": "bt709", "5": "bt470bg", "6": "smpte170m",
+                           "9": "bt2020nc", "10": "bt2020c"}
+                cp = _PRIM.get(cp, cp)
+                mx = _MATRIX.get(mx, mx)
+
+                # range：只有 pc/tv 才算"已知"，别的值当未知
+                range_known = cr in ("pc", "tv")
                 source_range = "full" if cr == "pc" else "limited"
+
+                _BT2020_MATRIX = {"bt2020nc", "bt2020c"}
+                _BT2020_PRIM = {"bt2020"}
+
                 primaries_known = False
-                # FIX-P7-2/P7-7: Add BT.709 recognition per v7.32 §3.10.3
-                if cp in ("bt709", "1", "9"):
+                if mx in _BT2020_MATRIX or cp in _BT2020_PRIM:
+                    # 明确不支持：绝不塞进 601/709 的某个分支里
+                    color_std = "BT2020"
+                    primaries_known = True
+                elif mx == "bt709":
+                    # **matrix** 是 bt709 才算"已经是 709"
                     color_std = "BT709"
                     primaries_known = True
-                elif cp in ("bt470bg", "5"):
+                elif mx in ("bt470bg",):
                     color_std = "PAL"
                     primaries_known = True
-                elif cp in ("smpte170m", "bt470m", "6", "4"):
+                elif mx in ("smpte170m", "bt470m"):
                     color_std = "NTSC"
                     primaries_known = True
+                elif not mx and cp:
+                    # 只有 primaries、没有 matrix：不能推出完整色彩状态，
+                    # 按任务书"仅 primaries=709 不够跳过所有转换"处理 ——
+                    # 标记为"已知原色但矩阵未知"，由调用方保守处理。
+                    color_std = "BT709" if cp == "bt709" else "NTSC"
+                    primaries_known = True
                 else:
-                    # Unknown primaries — default NTSC for old footage
-                    color_std = "NTSC"
+                    color_std = "NTSC"     # 完全未知 → 保持历史默认
+
+                if logger:
+                    try:
+                        logger.info("STAGE7_COLOR_PROBE",
+                                    "Probed colour description (fields are "
+                                    "kept separate, not collapsed)",
+                                    range_raw=cr or None,
+                                    matrix=mx or None,
+                                    primaries=cp or None,
+                                    transfer=tr or None,
+                                    standard=color_std,
+                                    range_known=range_known,
+                                    primaries_known=primaries_known)
+                    except Exception:
+                        pass
                 return source_range, color_std, range_known, primaries_known
     except Exception:
         pass
@@ -1328,7 +1383,7 @@ def main():
     # FIX-P7-3: Probe stage output (input_source), not original input (args.input)
     # per v7.32 §3.10.3: conversion should be based on the video being encoded
     # ORIGINAL: _get_source_color_info(args.input) probed original input
-    source_color_range, color_standard, range_known, primaries_known = _get_source_color_info(input_source)
+    source_color_range, color_standard, range_known, primaries_known = _get_source_color_info(input_source, logger)
 
     # FIX-B7（画质关键）：中间产物可能**丢了色彩元数据**，此时必须回退到
     # 原始输入再探一次，而不是直接默认 BT.601。
@@ -1350,7 +1405,7 @@ def main():
     _orig_input = args.input or ""
     if not (range_known and primaries_known) and _orig_input \
             and os.path.abspath(_orig_input) != os.path.abspath(input_source):
-        _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(_orig_input)
+        _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(_orig_input, logger)
         if _o_rk or _o_pk:
             logger.info("STAGE7_COLOR_FALLBACK_ORIGINAL",
                         "Intermediate lost color metadata; falling back to "
@@ -1407,7 +1462,29 @@ def main():
     # FIX-R7-S7-16: crop black bars BEFORE color conversion
     if _crop_filter:
         vf_parts.append(_crop_filter)
-    if color_standard == "BT709":
+    if color_standard == "BT2020":
+        # COL-02（第七轮）：BT2020 素材**明确不支持**。
+        #
+        # 旧代码把 primaries 枚举 9（=BT2020）误当 BT709，于是走到下面的
+        # "已经是 709，跳过转换"分支 —— 宽色域像素被打上 bt709 标签，
+        # 播放器按 709 解释，颜色严重错误。
+        #
+        # 任务书 §4.3：「HDR/BT2020 不支持时明确拒绝或标未支持，
+        # 不能默认塞进 601/709」。这里选择**阻断**而不是猜一个转换：
+        # 本项目的老影像修复流程没有 BT2020→709 的正确实现。
+        logger.error("STAGE7_COLORSPACE_UNSUPPORTED",
+                     "Source is BT.2020 (wide gamut). This pipeline has no "
+                     "correct BT.2020 conversion; refusing to encode it as "
+                     "BT.709 (that would silently destroy the colours). "
+                     "Set color_standard_override to acknowledge and force, "
+                     "or pre-convert the source correctly.",
+                     deteced="BT2020")
+        if not params.get("color_standard_override"):
+            return 82
+        logger.warning("STAGE7_COLORSPACE_FORCED",
+                       "color_standard_override is set; encoding BT.2020 "
+                       "source as BT.709 anyway (colours will NOT be correct)")
+    elif color_standard == "BT709":
         logger.info("STAGE7_COLORSPACE_SKIP",
                     "Source already BT.709, skipping colorspace conversion")
     elif not params.get("colorspace_converted", False):

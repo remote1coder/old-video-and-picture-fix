@@ -1348,9 +1348,18 @@ def main():
         # 配置里写的是"请求"，这里记的是"真的跑了什么"。
         try:
             from exec_fingerprint import build_exec_fingerprint
+            # 必须在**真正的 AI 解释器**里探版本：编排器（Portable R72）
+            # 没有 torch，问它只会得到 probe_error。实测未传时
+            # torch/cuda/gpu 全是 None。
+            _ai_py_for_fp = _resolve_ai_python(logger)
             _exec_fp = build_exec_fingerprint(
                 model=model, scale=scale,
-                model_path=str(Path(model_dir) / f"{model}.pth"),
+                ai_python=_ai_py_for_fp,
+                # 注意：`model_dir` 是 run_realesrgan_batch() 的**局部变量**，
+                # main() 里看不到（实测 NameError: model_dir）。这里按同一
+                # 约定重算一次。
+                model_path=str(SCRIPT_DIR.parent.resolve()
+                               / "models" / f"{model}.pth"),
                 backend=("cpu" if backend == "cpu" else "gpu"),
                 fallback_reason=(params.get("_oom_fallback_reason") or None),
                 logger=logger)
