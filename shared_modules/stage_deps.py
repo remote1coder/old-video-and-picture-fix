@@ -62,14 +62,15 @@ _STAGE_KEYS: Dict[int, Set[str]] = {
         "frame_rate_mode", "progressive_threshold"},
     2: {"deblock", "deblock_alt", "psf_handling", "psf_handling_alt",
         "traditional_strength", "degrain_enabled"},
-    3: {"upscale_model", "upscale_scale", "model_dir", "max_scale",
+    3: {"ai_enabled", "ai_force_allow_banned_upscale",
+        "upscale_model", "upscale_scale", "model_dir", "max_scale",
         "lanczos_target", "ban_intermediate_pixels",
         "ban_original_input_pixels", "force_allow_banned_upscale",
         "gpu_memory_fallback", "gpu_priority", "force_traditional_first"},
     4: {"unsharp_enabled", "unsharp_strength", "gblur_enabled",
         "gblur_sigma", "eq_enabled", "eq_contrast", "eq_saturation",
         "eq_brightness", "sharpen_enabled"},
-    5: {"face_restore", "face_detect_threshold",
+    5: {"ai_enabled", "face_restore", "face_detect_threshold",
         "face_detect_threshold_lowres", "face_detect_fallback",
         "face_detect_lowres_max_dimension", "static_segment_duration",
         "gfpgan_model", "codeformer_fidelity"},
@@ -117,32 +118,46 @@ def _norm_key(key: str) -> str:
     return str(key).strip().lower()
 
 
+def _claimants(key: str) -> Set[int]:
+    """哪些 stage 明确"认领"了这个参数。"""
+    k = _norm_key(key)
+    out: Set[int] = set()
+    for s, keys in _STAGE_KEYS.items():
+        if k in {_norm_key(x) for x in keys}:
+            out.add(s)
+    for s, prefs in _STAGE_PREFIXES.items():
+        if any(k.startswith(p) for p in prefs):
+            out.add(s)
+    return out
+
+
 def param_affects_stage(key: str, stage: int) -> bool:
     """这个参数的变化是否会让该 stage 的产物失效？
 
     * 非语义参数（日志、目录）→ False（任何 stage 都不受影响）
     * 全局参数（位深、像素格式）→ True（所有 stage）
-    * 在 stage 的精确键/前缀表里 → True
-    * **认不出的参数 → True**（保守：宁可多跑，不可误复用）
+    * **被某些 stage 认领** → 只对认领者 True，其他全 False
+    * **无人认领（认不出的键）→ True**（保守：宁可多跑，不可误复用）
+
+    **为什么必须先"收集认领者"再判断**（这是第七轮真跑抓到的缺陷）：
+
+    旧实现是"如果被**别的** stage 认领 → 返回 False"。它隐含假设
+    "一个参数只属于一个 stage"。但 `ai_enabled` 同时影响 stage3 和
+    stage5 —— 它没有出现在任何 stage 的表里，于是落到"无人认领 →
+    保守 True"分支，**连 stage1 都被判失效**。
+
+    实测后果：改 CRF 重跑时，日志显示
+    `stage 1 (preprocess): params-changed keys=ai_enabled,...`
+    —— 本该只重跑 stage7，却从 stage1 全链重来。
     """
     k = _norm_key(key)
     if k in NON_SEMANTIC_PARAMS:
         return False
     if k in GLOBAL_PARAMS:
         return True
-    if stage in _STAGE_KEYS:
-        if k in {_norm_key(x) for x in _STAGE_KEYS[stage]}:
-            return True
-    for pref in _STAGE_PREFIXES.get(stage, ()):
-        if k.startswith(pref):
-            return True
-    # 是否被**别的** stage 认领
-    for other, keys in _STAGE_KEYS.items():
-        if other != stage and k in {_norm_key(x) for x in keys}:
-            return False
-    for other, prefs in _STAGE_PREFIXES.items():
-        if other != stage and any(k.startswith(p) for p in prefs):
-            return False
+    who = _claimants(k)
+    if who:
+        return stage in who
     return True
 
 
