@@ -42,6 +42,10 @@ from logger import get_logger  # noqa: E402
 from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
 # PUB-04（第七轮）：发布目标互斥锁（逐路径加锁，非集合摘要）
 from publish_lock import acquire_target_locks, TargetLockTimeout  # noqa: E402
+# 持久 journal（第七轮）：让硬终止后"上次做到哪一步"可判断
+from publish_journal import (  # noqa: E402
+    JOURNAL_SCHEMA, PHASE_PREPARED, PHASE_COMMITTED,
+    PHASE_RECOVERY_REQUIRED, file_digest, journal_path_for, write_journal)
 
 try:  # FIX-V01/V05: encode-boundary contracts
     sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
@@ -1181,6 +1185,52 @@ def main():
               "incomplete backup; commit not started", paths=[])
         return 82
 
+    # 持久 journal（第七轮）：备份已完整、即将改动目标 —— 此刻把"这次事务
+    # 要动哪些文件、旧内容是什么、备份在哪"落盘。
+    #
+    # 为什么必须落盘：进程被硬终止后，内存 snapshot 与取消钩子都没了，
+    # 只剩一堆 `.pubbak`。没有 journal 时，谁也说不清这些备份属于哪次
+    # 事务、事务走到哪一步、还完不完整 —— 只能靠"发现备份 + 摘要不符"
+    # 去**猜**，而那可能是一次早已成功的旧尝试。
+    _journal_targets = list(commit_targets)
+    _journal_records: Dict[str, Any] = {}
+    for _t in _journal_targets:
+        _entry = snapshot.get(_t) or {}
+        _existed = os.path.exists(_t)
+        _bk = _entry.get("backup")
+        _journal_records[_t] = {
+            "existed": _existed,
+            "old_digest": file_digest(_t) if _existed else None,
+            "backup": _bk,
+            "backup_digest": file_digest(_bk) if _bk else None,
+            "state": _entry.get("state"),
+        }
+    _journal_path = journal_path_for(work_output_path)
+    _journal_base = {
+        "schema": JOURNAL_SCHEMA,
+        "job_id": params.get("job_id") or "",
+        "attempt_id": f"{os.getpid()}-{int(time.time() * 1000)}",
+        "stage": 6,
+        "targets": _journal_targets,
+        "records": _journal_records,
+        "roots": [os.path.dirname(os.path.abspath(_t)) for _t in _journal_targets],
+    }
+    if not write_journal(_journal_path,
+                         dict(_journal_base, phase=PHASE_PREPARED)):
+        # journal 写不下去 → **不改任何目标**（否则硬终止后无法判断状态）
+        logger.error("STAGE6_JOURNAL_WRITE_FAIL",
+                     "Cannot persist the publish journal; refusing to modify "
+                     "any target (a crash would leave an unidentifiable state)",
+                     journal=_journal_path)
+        _fail(logger, status_path, "publish_journal",
+              "journal not persisted; commit not started", paths=[],
+              preserve_valid_status=True)
+        return 82
+    logger.info("STAGE6_JOURNAL_PREPARED",
+                "Publish journal persisted before touching any target",
+                journal=_journal_path,
+                attempt_id=_journal_base["attempt_id"])
+
     # PUB-04（第七轮）：提交段必须持有**全部目标路径的互斥锁**。
     # 逐路径加锁（不是集合摘要），任何重叠目标集合都会互斥；
     # 锁从"改任何目标之前"开始，覆盖备份、替换、侧车写入与回滚。
@@ -1274,11 +1324,25 @@ def main():
                              failed=_rb["failed"], impossible=_rb["impossible"])
                 _fail(logger, status_path, "publish", str(e), paths=[],
                       recovery_required=True, rollback_detail=_rb)
+            write_journal(_journal_path,
+                          dict(_journal_base,
+                               phase=PHASE_RECOVERY_REQUIRED,
+                               rollback=_rb))
             return 82
 
         # 已发布：守卫不再删除任何产物
         if cancel_guard is not None:
             cancel_guard.release_outputs()
+
+        # journal 推进到 COMMITTED（含新代摘要，供下次判断"是否已提交"）
+        _done_records = {}
+        for _t in _journal_targets:
+            _r = dict(_journal_records.get(_t) or {})
+            _r["new_digest"] = file_digest(_t)
+            _done_records[_t] = _r
+        write_journal(_journal_path,
+                      dict(_journal_base, phase=PHASE_COMMITTED,
+                           records=_done_records))
 
         logger.info("STAGE6_DONE", "Photo encoding complete", output=publish_output_path)
         return 0
