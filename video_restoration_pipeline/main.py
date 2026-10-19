@@ -480,6 +480,26 @@ def _safe_input_stem(input_path: str) -> str:
     return Path(input_path).stem.replace(" ", "_").replace("/", "_").replace("\\", "_")
 
 
+def _snapshot_stage_files(temp_dir: str, job_id: str, input_path: str,
+                          stage_num: int) -> Dict[str, Tuple[int, int]]:
+    """拍下某个 step 的现有产物指纹（mtime_ns, size），用于区分"本次新增"。
+
+    ID-05（第七轮）配套：登记身份时必须知道"哪些是这个 stage 刚写的"，
+    不能把整个 glob 结果当成自己的产物。
+    """
+    out: Dict[str, Tuple[int, int]] = {}
+    try:
+        for p in find_stage_artifacts(temp_dir, job_id, input_path, stage_num):
+            try:
+                st = os.stat(p)
+                out[p] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return out
+
+
 def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
                          stage_num: int) -> List[str]:
     """Return existing **media** artifacts of (job_id, stage_num), newest first.
@@ -561,19 +581,77 @@ def build_input_identity(input_path: str) -> Dict[str, Any]:
     return ident
 
 
+# ID-02（第七轮）：纯位置字段 —— 它们不影响媒体内容，不能进身份摘要。
+# 把 temp_dir / 日志目录之类算进身份，会导致"只改了输出目录就触发全量重算"，
+# 以及"同一份结果换个目录就认不出来"。
+_IDENTITY_POSITIONAL_KEYS = frozenset({
+    "temp_dir", "log_dir", "output_dir", "output_path",
+    "input_path", "log_path", "manifest_path", "params_file",
+    "_effective_params", "job_id", "run_id", "attempt_id",
+})
+
+
+def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
+    """从有效参数里挑出**影响媒体语义**的部分，用于身份摘要。
+
+    任务书 §2.3：『按语义规范化的有效参数；不要把日志路径、输出目录等
+    纯位置字段当作媒体语义，导致无谓重算』。
+    """
+    out: Dict[str, Any] = {}
+    for k, v in (params or {}).items():
+        if k in _IDENTITY_POSITIONAL_KEYS:
+            continue
+        if k.startswith("_"):          # 内部临时键（_shake_probe 等）
+            continue
+        out[k] = v
+    return out
+
+
 def build_params_identity(config: Dict[str, Any], job: Dict[str, Any],
-                          logger=None) -> str:
+                          logger=None,
+                          params: Optional[Dict[str, Any]] = None) -> str:
     """RV-09: digest of the *effective* parameters of this job.
 
-    Uses the real 6-layer merge (merge_params) so a changed config or a changed
-    user override invalidates previously produced artifacts.
+    **ID-02（第七轮）关键修复**：旧实现固定用
+    `merge_params(job, config, {}, logger)` —— **空 CLI 覆盖**。
+    而真正执行 stage 的 params 是带 CLI 覆盖的（`--ai-model`、
+    `--ai-upscale-factor`、`--face-restore` …）。于是：
+
+    ```
+    实际执行：merge_params(job, config, {"ai_upscale_model": "x4plus"})
+    身份摘要：merge_params(job, config, {})          # 忽略了 CLI
+    ```
+
+    用户用 CLI 换了模型，摘要却没变 → 旧产物被当作"同一身份"复用 →
+    **记录与实际执行不符**。身份必须来自"实际执行的那一份参数"。
+
+    参数来源优先级：
+    1. 显式传入的 `params`（调用方手上就是执行用的那份）；
+    2. `job["_effective_params"]`（merge 之后挂上去的同一对象引用）；
+    3. 兜底：重新按无 CLI 覆盖合并（**仅为兼容旧调用**，会给
+       `STAGE_IDENTITY_FALLBACK` 告警，便于发现遗漏的调用点）。
     """
-    try:
-        params = merge_params(job, config, {}, logger)
-    except Exception:
-        params = dict(job or {})
-    payload = json.dumps(params, sort_keys=True, ensure_ascii=False,
-                         default=str)
+    effective = params
+    if effective is None:
+        effective = job.get("_effective_params")
+    if effective is None:
+        try:
+            effective = merge_params(job, config, {}, logger)
+        except Exception:
+            effective = dict(job or {})
+        if logger:
+            try:
+                logger.warning(
+                    "STAGE_IDENTITY_FALLBACK",
+                    "build_params_identity() had no effective params at hand "
+                    "and fell back to merging WITHOUT CLI overrides; the "
+                    "resulting identity may not match what actually ran",
+                    job_id=job.get("job_id", ""))
+            except Exception:
+                pass
+
+    payload = json.dumps(_identity_semantics(effective), sort_keys=True,
+                         ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -598,6 +676,9 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
         "output_path": str(final_path),
         "output_size": (os.path.getsize(final_path)
                         if os.path.exists(final_path) else None),
+        # ID-03（第七轮）：成品**内容摘要**。旧实现只有 size —— 等长替换、
+        # 重新编码、拷错文件都骗得过它；而"能解码"更不能当身份。
+        "output_sha256": _chunked_sha256(final_path),
         "completed_at": datetime.now().astimezone().isoformat(),
     }
     try:
@@ -641,9 +722,36 @@ def resume_artifact_matches(final_path: str, job: Dict[str, Any],
     if status == "unproven":
         return False, ("input identity cannot be verified (missing/unreadable "
                        "on one side); refusing to reuse the artifact")
-    if str(data.get("params_identity", "")) and \
-            data["params_identity"] != build_params_identity(config, job, logger):
+    recorded_params_id = str(data.get("params_identity", "") or "")
+    if not recorded_params_id.strip():
+        # ID-01（第七轮）：旧实现是
+        #     if data.get("params_identity") and data["params_identity"] != ...
+        # —— 空串直接短路，等于**没有身份也放行**。缺身份必须拒绝复用
+        # （但不删文件：它可能是用户还想要的结果，只是无法证明归属）。
+        return False, ("completion marker has no params identity; cannot "
+                       "prove this artifact matches the current parameters "
+                       "(file kept, not deleted)")
+    current_params_id = build_params_identity(config, job, logger)
+    if recorded_params_id != current_params_id:
         return False, "effective parameters changed since it was produced"
+
+    # ID-03（第七轮）：核对**成品内容摘要**。
+    # 旧实现连 output_size 都没比 —— 等长替换、截断重写、拷错文件都能
+    # 冒充"这个 job 的成品"。"能解码"更不能当身份。
+    recorded_sha = data.get("output_sha256")
+    if recorded_sha:
+        current_sha = _chunked_sha256(final_path)
+        if current_sha is None:
+            return False, "artifact unreadable while verifying its digest"
+        if current_sha != recorded_sha:
+            return False, ("artifact content differs from what was recorded "
+                           "at completion (file was replaced or modified)")
+    else:
+        # 旧标记没有摘要（第七轮之前产出）→ 视为 legacy/unproven，
+        # 不自动当作 verified 复用。
+        return False, ("completion marker predates content digests; "
+                       "artifact is legacy/unproven and is not auto-reused")
+
     return True, "identity-match"
 
 
@@ -774,6 +882,10 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # Merge params
     params = merge_params(job, config, cli_overrides, logger)
     params["output_path"] = job.get("output_path", "")
+    # ID-02（第七轮）：把**实际执行用的这一份**参数挂到 job 上，
+    # 让 build_params_identity() 拿到同一份（含 CLI 覆盖），
+    # 而不是退回"空 CLI 覆盖"的另一次合并。
+    job["_effective_params"] = params
 
     # FIX-W19: if the startup dependency check found sRestore unavailable, force
     # ivtc_auto_fallback=False so the VFM _Combed failure path does not request
@@ -853,8 +965,45 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
 
     # Run stages
     traditional_stage_completed = False
+    # ID-04：本 job 内"每个 stage 本次真正产出的路径"，供下游精确消费
+    _last_produced: Dict[int, List[str]] = {}
+
     for stage_num, script_name in stages:
+        # ID-04（第七轮）：把**上一个 stage 本次真正产出**的精确路径传下去，
+        # 让下游不再 glob 重选。
+        #
+        # 为什么必须显式传：旧流程里 main 这边校验过候选，但 stage 内部
+        # 又自己 glob 一次（按 mtime 取最新），两次选择完全可能不是同一个
+        # 文件 —— "验证 A、消费 B"。现在改为：编排器选定并传递，
+        # stage 只消费被点名的那一份。
+        #
+        # 找不到本次产出（如 resume 从中间 stage 开始、或上游被跳过）时
+        # 不下发 key，stage 回落到自己的 glob 逻辑（兼容独立 CLI 运行）。
+        _pinned_upstream = None
+        for _prev in range(stage_num - 1, -1, -1):
+            _cands = _last_produced.get(_prev) or []
+            if _cands:
+                _pinned_upstream = _cands[0]
+                break
+        if _pinned_upstream:
+            params["upstream_artifact"] = _pinned_upstream
+            job_logger.info("STAGE_UPSTREAM_PINNED",
+                            f"Stage {stage_num} will consume the artifact "
+                            f"produced by this run: {_pinned_upstream}",
+                            stage=stage_num, upstream=_pinned_upstream)
+        else:
+            params.pop("upstream_artifact", None)
+
         job_logger.info("STAGE_START", f"Stage {stage_num}: {script_name}")
+        # ID-05（第七轮）：stage 执行**前**拍一次产物指纹，执行后只登记
+        # 真正变了的那些。旧实现直接遍历 find_stage_artifacts() 的整个
+        # glob 结果并逐条写入当前身份 —— temp 里任何**陈旧**的同 step
+        # 文件（上次运行留下、或别的参数生成的）都会被"洗白"成当前
+        # 身份，下次 resume 就把它当成合法产物复用。
+        _pre_stage_files: Dict[str, Tuple[int, int]] = (
+            _snapshot_stage_files(params.get("temp_dir", "./temp"),
+                                  job_id, input_path, stage_num)
+            if stage_num != 7 else {})
         exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
@@ -863,11 +1012,34 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             if stage_num != 7:
                 try:
                     _td = params.get("temp_dir", "./temp")
-                    for _art in find_stage_artifacts(_td, job_id, input_path,
-                                                     stage_num):
+                    _post_stage_files = _snapshot_stage_files(
+                        _td, job_id, input_path, stage_num)
+                    _produced = [
+                        _p for _p, _sig in _post_stage_files.items()
+                        if _pre_stage_files.get(_p) != _sig]
+                    _stale = [p for p in _post_stage_files
+                              if p not in _produced]
+                    if _stale:
+                        # 不删、不洗白，只如实说明"这些不是本次产出"
+                        job_logger.warning(
+                            "STAGE_STALE_ARTIFACTS_PRESENT",
+                            f"{len(_stale)} artifact(s) for stage {stage_num} "
+                            "were not produced by this run and are left "
+                            "WITHOUT the current identity (kept on disk)",
+                            stale=_stale[:10])
+                    for _art in _produced:
                         record_stage_artifact_identity(
                             _art, job, config, stage_num, input_path,
                             job_logger)
+                    # ID-04：记下本次产出，供下一个 stage 作为精确上游
+                    if _produced:
+                        _last_produced[stage_num] = _produced
+                        # 优先用"带当前 param_hash"的那一份（同一 stage 可能
+                        # 有多个变体，最新写入的排后面，这里按 mtime 取最后）
+                        _last_produced[stage_num] = sorted(
+                            _produced,
+                            key=lambda _p: os.stat(_p).st_mtime_ns
+                            if os.path.exists(_p) else 0)[::-1]
                 except Exception as e:
                     job_logger.warning(
                         "STAGE_IDENTITY_SKIP",
@@ -1208,8 +1380,15 @@ def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
     if status == "unproven":
         return False, "source identity cannot be verified for this intermediate"
     recorded_params = data.get("params_identity")
-    if recorded_params and recorded_params != build_params_identity(
-            config, job, logger):
+    if not str(recorded_params or "").strip():
+        # ID-01（第七轮）第二处：旧写法
+        #     if recorded_params and recorded_params != ...
+        # 空值短路放行，等于"没有身份也当有效中间产物复用"。
+        # 最终产物与中间产物**两条路径都要拒绝**（此前只修了一条会漏）。
+        # 注意：拒绝复用 ≠ 删除文件；旧文件保留，只是不进严格恢复。
+        return False, ("intermediate has no params identity; cannot prove it "
+                       "matches the current parameters (file kept)")
+    if recorded_params != build_params_identity(config, job, logger):
         return False, "effective parameters changed since it was produced"
     # R3-06 / B08：内容摘要必须一致（等长替换也要能发现）；
     # 任一侧拿不到摘要 → unproven，拒绝复用。
@@ -1691,17 +1870,52 @@ def main():
                      "input_identity": current_ident},
                     expect_statuses=["FAILED"], logger=logger)
             else:
-                # FIX-P5-2: 删除所有损坏的中间文件，并重新标记为 PENDING
-                for stage_num in range(8):
-                    for fpath in find_stage_artifacts(temp_dir, job_id,
-                                                      input_path, stage_num):
+                # ID-06（第七轮）：**身份不符 ≠ 文件损坏**。
+                #
+                # 旧实现（FIX-P5-2）在这里把该 job 的所有中间产物一律
+                # `os.remove()` 并记成 "corrupt intermediate"。但走到这个
+                # 分支的原因通常是：
+                #   * 参数变了（改了 CRF/模型/滤镜）→ 产物本身完好；
+                #   * 输入内容变了 → 产物完好，只是不属于这次输入；
+                #   * 侧车缺身份（旧格式）→ 产物完好，只是无法证明归属。
+                # 把它们当"损坏"删掉，等于**用户改了参数就静默销毁上一版
+                # 结果**，且日志谎称是损坏。
+                #
+                # 新行为：
+                #   * 只有 ffprobe 真的解不开的，才按损坏删除（记录在案）；
+                #   * 身份不符/身份缺失的全部**保留**，标记 legacy/unproven，
+                #     让用户看得见、可导出，但不进严格恢复。
+                _truly_corrupt: List[str] = []
+                _kept_unproven: List[str] = []
+                for _stage_num in range(8):
+                    for fpath in find_stage_artifacts(
+                            temp_dir, job_id, input_path, _stage_num):
+                        if verify_ffprobe_decodeable(fpath):
+                            _kept_unproven.append(fpath)
+                            continue
+                        _truly_corrupt.append(fpath)
                         try:
                             os.remove(fpath)
-                            logger.info("FAILED_CLEANUP", f"Removed corrupt intermediate: {fpath}")
+                            logger.info("FAILED_CLEANUP",
+                                        "Removed genuinely undecodable "
+                                        "intermediate", path=fpath)
                         except Exception as e:
-                            logger.warning("FAILED_CLEANUP_FAIL", f"Could not remove {fpath}: {e}")
+                            logger.warning("FAILED_CLEANUP_FAIL",
+                                           f"Could not remove {fpath}: {e}",
+                                           path=fpath)
+                if _kept_unproven:
+                    logger.warning(
+                        "RESUME_ARTIFACTS_KEPT_UNPROVEN",
+                        f"Job {job_id}: kept {len(_kept_unproven)} intermediate "
+                        "file(s) that could not be bound to this run but are "
+                        "still decodable. They are NOT deleted and NOT treated "
+                        "as verified; they will be recomputed as needed.",
+                        kept=_kept_unproven[:10])
                 logger.info("FAILED_DOWNGRADE",
-                           f"Job {job_id} no valid intermediates, cleaned up and downgraded to PENDING")
+                           f"Job {job_id} has no reusable intermediates "
+                           f"({len(_truly_corrupt)} removed as corrupt, "
+                           f"{len(_kept_unproven)} kept as unproven); "
+                           "downgraded to PENDING")
                 _apply_startup_job_decision(
                     manifest_path, job_id,
                     {"status": "PENDING",

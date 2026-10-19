@@ -248,11 +248,25 @@ def main() -> int:
         # case). Per v7.32 §3.10.24, fall back to stage4 output instead of
         # aborting the whole pipeline with return 82.
         expected_stage = "step5_face"
-        pattern5 = f"{job_id}_{input_name}_step5_face*"
-        # R3-01：只接受媒体产物，排除同前缀侧车
-        cands = select_media_candidates(glob.glob(os.path.join(temp_dir, pattern5)))
-        if cands:
-            input_source = str(cands[0])
+        # ID-04（第七轮）：精确产物优先（同一约定，贯穿 3→4→5→6→7）
+        _pinned = str(params.get("upstream_artifact") or "")
+        if _pinned:
+            if not os.path.exists(_pinned):
+                logger.error("STAGE6_PINNED_INPUT_MISSING",
+                             "Orchestrator pinned an upstream artifact that "
+                             "does not exist; refusing to silently glob",
+                             pinned=_pinned)
+                return 82
+            input_source = _pinned
+            logger.info("STAGE6_INPUT_PINNED",
+                        "Using the exact upstream artifact", input=_pinned)
+            cands = None
+        else:
+            pattern5 = f"{job_id}_{input_name}_step5_face*"
+            # R3-01：只接受媒体产物，排除同前缀侧车
+            cands = select_media_candidates(glob.glob(os.path.join(temp_dir, pattern5)))
+            if cands:
+                input_source = str(cands[0])
         if not input_source:
             # Fallback to stage4 output
             pattern4 = f"{job_id}_{input_name}_step4_postprocess*"
