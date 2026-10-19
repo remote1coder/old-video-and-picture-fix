@@ -1931,11 +1931,49 @@ def main():
                         _json.dump(_ver, _f, ensure_ascii=False, indent=2)
                 except Exception:
                     pass
+                # 逐帧对齐（第七轮）：**只在帧序不变的两端可靠**。
+                #
+                # stage7 是纯编码，输入（step6 产物）与输出（成品）的
+                # 帧序严格一一对应。实测：对应帧相关系数 1.0000，
+                # 邻居帧 0.65-0.96，判别力极强。
+                #
+                # **不要**把这个结果拿去推"源片 vs 全链成品"—— 中间有
+                # QTGMC 去隔行，输出第 k 帧不等于源第 k 帧时刻，
+                # 那种比法会给出 8/8 全 flipped 的假警报。
+                try:
+                    from artifact_verify import (verify_frame_alignment,
+                                                 render_alignment)
+                    _align = verify_frame_alignment(
+                        input_source, output_path, samples=4)
+                    if _align.get("ok") is True:
+                        logger.info("STAGE7_ALIGN_OK",
+                                    "Frame order verified on sampled points",
+                                    flipped=_align.get("flipped"),
+                                    checked=len(_align.get("points") or []))
+                    elif _align.get("ok") is False:
+                        logger.error("STAGE7_ALIGN_FAIL",
+                                     "Frame order looks shifted between "
+                                     "stage7 input and output",
+                                     verdict=render_alignment(_align))
+                        _ver["ok"] = False
+                        _ver.setdefault("issues", []).append({
+                            "level": "error",
+                            "code": "FRAME_ORDER_SHIFTED",
+                            "message": _align.get("note") or "帧序错位",
+                        })
+                    else:
+                        # 采样点判别力不足 —— 如实记"未校验"，不假装通过
+                        logger.warning("STAGE7_ALIGN_SKIPPED",
+                                       _align.get("error") or "无法判定",
+                                       skipped=_align.get("skipped"))
+                except Exception as _ae:
+                    logger.warning("STAGE7_ALIGN_ERROR", str(_ae))
+
                 if _ver.get("ok"):
                     logger.info("STAGE7_VERIFY_OK",
                                 "Output passed the mechanical check "
-                                "(frame count / duration / first-last frame)",
-                                sidecar=_side)
+                                "(frame count / duration / first-last frame "
+                                "/ frame order)", sidecar=_side)
                 else:
                     logger.error("STAGE7_VERIFY_FAIL",
                                  "Output failed the mechanical check",

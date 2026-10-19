@@ -1201,9 +1201,39 @@ def main():
                           params=params)
         if success and Path(deblock_out).exists():
             working_path = deblock_out
-        elif not success:
-            logger.error("STAGE1_DEBLOCK_FAIL", f"G'MIC -denoise_patchpca failed: {stderr}")
-            return PHOTO_ERR_GMIC_FAIL
+        else:
+            # **降级跳过，不阻断整张照片**。
+            #
+            # 原来的行为是 `return PHOTO_ERR_GMIC_FAIL` —— 一个**可选增强**
+            # 失败，导致整张照片处理失败。实测发现 G'MIC 4.0.6 的
+            # `denoise_patchpca` 在我们测过的**所有**输入上都会崩：
+            #
+            #   | 输入 | 结果 |
+            #   |---|---|
+            #   | 1600x1200 16bit 3ch | Invalid vector read |
+            #   | 1600x1200 8bit  3ch | 同上 |
+            #   |  400x300  16bit 3ch | 同上 |
+            #   | 1600x1200 8bit  1ch | 同上 |
+            #   | 官方示例语法 `,`     | 同上 |
+            #
+            # 报错是 `Error in ./denoise_patchpca/*foreach/ *** Command 'f':
+            # [instance(...)] gmic<float32>: Operator 'vector[ind]':
+            # Invalid vector read` —— G'MIC 内部越界，与我们的参数无关。
+            #
+            # 所以这里记 warning 后继续：deblock 只是"锦上添花"，
+            # 没有它照片仍然可以完成整套修复（后面的 scratch/deblock 强度
+            # 由配置控制，用户也可以直接把 deblock_strength 设 0）。
+            logger.warning(
+                "STAGE1_DEBLOCK_SKIP",
+                "G'MIC denoise_patchpca failed; continuing WITHOUT deblock. "
+                "Known issue: this command crashes inside G'MIC 4.0.6 "
+                "('Invalid vector read') on every input shape we tested "
+                "(8/16-bit, 1/3 channels, 400x300..1600x1200) and even with "
+                "the upstream example syntax. Set deblock_strength=0 to "
+                "avoid the wasted attempt.",
+                strength=deblock_strength,
+                threshold=round(pca_thresh, 3),
+                stderr_tail=(stderr or "")[-400:])
 
     # Deband
     # FIX-R11-9: Unify default — guard and value read from the SAME variable

@@ -92,7 +92,8 @@ def test_camera_photo_with_common_dpi_is_not_unknown(tmp_path):
     assert r["detected_class"] == "DIGITAL_PHOTO", (
         f"相机照片被判成 {r['detected_class']} —— "
         "DPI 分支又短路了 model/make 判断")
-    assert r["confidence"] >= 0.90
+    # 无拍摄参数时判 0.85（证据只到"有型号"这一层）；有拍摄参数才 0.90。
+    assert r["confidence"] >= 0.85
 
 
 def test_camera_photo_with_print_dpi_is_not_scan(tmp_path):
@@ -102,7 +103,7 @@ def test_camera_photo_with_print_dpi_is_not_scan(tmp_path):
     r = classify.classify_photo(str(p))
     assert r["detected_class"] == "DIGITAL_PHOTO", (
         f"300 DPI 的相机照片被判成 {r['detected_class']}")
-    assert r["confidence"] >= 0.90
+    assert r["confidence"] >= 0.85
 
 
 def test_no_camera_model_with_scanner_dpi_is_scan(tmp_path):
@@ -151,7 +152,10 @@ def test_dpi_branch_does_not_short_circuit_model_check():
     src = open(classify.__file__, encoding="utf-8").read()
     assert "_is_scanner_dpi(result[\"dpi\"])" in src, (
         "DPI 分支又退回成 `elif result.get('dpi'):` —— 会重新短路 model/make")
-    assert "and not (model or make)" in src
+    # 现在用"拍摄参数 + 型号关键词"两层，比原来的 `not (model or make)`
+    # 更精确（后者会把 EPSON 扫描仪误判成相机）
+    assert "_looks_like_camera_capture" in src
+    assert "_model_looks_like_scanner" in src
     # 不能再出现"进分支后什么都不做"的写法。
     # 注意只查**代码行**：docstring/注释里引用旧写法是允许的。
     code_lines = [ln.strip() for ln in src.splitlines()
@@ -159,3 +163,92 @@ def test_dpi_branch_does_not_short_circuit_model_check():
     assert not any(ln.startswith('elif result.get("dpi"):')
                    for ln in code_lines), (
         "DPI 分支又退回成裸 elif —— 会重新短路 model/make")
+
+
+# ---------------------------------------------------------------------------
+# 拍摄参数 + 型号关键词：区分"相机拍的"与"扫描仪扫的"
+# ---------------------------------------------------------------------------
+#
+# 背景：单纯看 `Make/Model` 分不开这两类 —— `Canon` 既做相机也做扫描仪，
+# `EPSON Perfection V600` 和 `Canon EOS 5D` 在元数据形状上可以完全一样
+# （都有 Make/Model、都没有曝光参数、都被设成 300 DPI）。
+#
+# 加两层：
+#   1. **拍摄参数**（ExposureTime/FNumber/ISO/FocalLength）—— 扫描仪不产生
+#   2. **型号关键词**（scanner/perfection/v600/...）—— 补前者的盲区
+
+
+def test_camera_with_capture_tags_is_digital_photo(tmp_path):
+    p = tmp_path / "shot.jpg"
+    _make_jpg(p, 300, make="Canon", model="EOS 5D")
+    if not (HAS_EXIFTOOL and HAS_FFMPEG):
+        pytest.skip("需要 ffmpeg + exiftool")
+    subprocess.run(["exiftool", "-ExposureTime=1/125", "-FNumber=2.8",
+                    "-ISO=200", "-FocalLength=50", "-overwrite_original",
+                    str(p)], capture_output=True)
+    r = classify.classify_photo(str(p))
+    assert r["detected_class"] == "DIGITAL_PHOTO"
+    assert r["confidence"] >= 0.90
+    assert r.get("classify_basis") == "camera_make_model_with_capture_tags"
+
+
+def test_scanner_make_without_capture_tags_is_scan(tmp_path):
+    """`Make=EPSON` 但没有拍摄参数 → 应判扫描件（修复前会判 DIGITAL_PHOTO）。"""
+    p = tmp_path / "epson.jpg"
+    _make_jpg(p, 300, make="EPSON", model="Perfection V600")
+    r = classify.classify_photo(str(p))
+    assert r["detected_class"] == "SCAN_PRINT", (
+        f"扫描仪被判成 {r['detected_class']}")
+    assert abs(r["confidence"] - 0.80) < 1e-6
+    assert r.get("classify_basis") == "scanner_model_keyword"
+
+
+def test_camera_without_capture_tags_is_not_misjudged_as_scan(tmp_path):
+    """相机 + 无拍摄参数 + 300 DPI：**不能**因为 DPI 就判扫描件。
+
+    这是加了型号关键词层之后必须保住的底线 —— 相机照片被误判成扫描件，
+    会走错参数组。
+    """
+    p = tmp_path / "cam300notags.jpg"
+    _make_jpg(p, 300, make="Canon", model="EOS 5D")
+    r = classify.classify_photo(str(p))
+    assert r["detected_class"] == "DIGITAL_PHOTO", (
+        f"相机照片被判成 {r['detected_class']} —— 型号关键词层没生效或误伤")
+    assert r["confidence"] >= 0.85
+
+
+@pytest.mark.parametrize("exif,expected", [
+    ({"ExposureTime": "1/125"}, True),
+    ({"FNumber": "2.8"}, True),
+    ({"ISO": "200"}, True),
+    ({"FocalLength": "50"}, True),
+    ({"ExposureTime": "0"}, False),      # 0 视为没有
+    ({"ExposureTime": ""}, False),
+    ({"Make": "Canon"}, False),          # 只有品牌不算拍摄参数
+    ({}, False),
+    (None, False),
+])
+def test_looks_like_camera_capture(exif, expected):
+    assert classify._looks_like_camera_capture(exif) is expected
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("Perfection V600", True),
+    ("Perfection V850", True),
+    ("CanoScan 9000F", True),
+    ("ScanJet 5590", True),
+    ("ES-500W", True),
+    ("EOS 5D", False),
+    ("D850", False),
+    ("", False),
+])
+def test_model_looks_like_scanner(model, expected):
+    assert classify._model_looks_like_scanner(model) is expected
+
+
+def test_scanner_keyword_layer_is_documented_as_incomplete():
+    """这个关键词表**故意不完备**，注释里必须写明取舍。"""
+    src = open(classify.__file__, encoding="utf-8").read()
+    assert "SCANNER_MODEL_KEYWORDS" in src
+    assert "不可能完备" in src, "必须写明关键词表不完备"
+    assert "宁可漏判" in src, "必须写明取舍方向"

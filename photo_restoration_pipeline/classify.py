@@ -116,6 +116,65 @@ def _analyze_pixel_features(input_path: str) -> Dict[str, Any]:
 SCANNER_DPI_DISCRETE = {300, 600, 1200, 2400, 3200, 4800, 6400}
 
 
+#: 只有"拍摄"才会产生的 EXIF 标签。
+#:
+#: 扫描仪也会写 Make/Model（EPSON、Brother、Canon 的扫描仪部门都写），
+#: 但它**不会**写曝光时间/光圈/ISO/焦距 —— 那些是镜头和快门才有的量。
+#: 所以这几个标签是区分"相机拍的"和"扫描仪扫的"最可靠的信号。
+CAMERA_CAPTURE_TAGS = (
+    "ExposureTime", "ShutterSpeedValue",
+    "FNumber", "ApertureValue",
+    "ISO", "ISOSpeedRatings", "PhotographicSensitivity",
+    "FocalLength", "DigitalZoomRatio",
+)
+
+
+#: 扫描仪型号里常见的字样。
+#:
+#: 为什么需要这一层：`Make/Model + 无拍摄参数 + 300 DPI` 这个组合
+#: **相机和扫描仪都可能出现**（相机直出也可能不带曝光参数、也被设 300 DPI）。
+#: 实测：
+#:   `EPSON / Perfection V600`  → 想判扫描件
+#:   `Canon / EOS 5D`（无拍摄参数）→ 想判数码照片
+#: 两者元数据形状一样，只能靠型号名里的关键词再分一层。
+#:
+#: **这个表不可能完备** —— 没列到的扫描仪会被判成 DIGITAL_PHOTO。
+#: 这是有意的取舍：宁可漏判扫描件（只是参数组选得不够贴），
+#: 也不要把相机照片误判成扫描件。
+SCANNER_MODEL_KEYWORDS = (
+    "scanner", "scanjet", "canoscan", "lidescan", "opticslim",
+    "imagescan", "perfection", "v600", "v800", "v850", "es-", "ds-",
+    "fl-", "snapscan", "plustek", "opticbook",
+)
+
+
+def _model_looks_like_scanner(model: str) -> bool:
+    """型号名里是否带扫描仪特征字样。"""
+    if not model:
+        return False
+    m = str(model).lower()
+    return any(kw in m for kw in SCANNER_MODEL_KEYWORDS)
+
+
+def _looks_like_camera_capture(exif: Dict[str, Any]) -> bool:
+    """EXIF 里是否有"拍照"才有的参数。
+
+    有任意一个即认为是相机拍摄。扫描仪不产生这些标签，
+    所以 Make/Model 写着 EPSON 也不会被冤枉成相机。
+
+    注意：截图、导出图、AI 生成图可能**一个都没有** —— 那不代表是扫描件，
+    只是"没有拍摄信息"，调用方要按"证据不足"处理，不能直接判扫描。
+    """
+    if not exif:
+        return False
+    for tag in CAMERA_CAPTURE_TAGS:
+        v = exif.get(tag)
+        if v in (None, "", 0, "0"):
+            continue
+        return True
+    return False
+
+
 def _is_scanner_dpi(dpi: Any, tolerance: int = 5) -> bool:
     """DPI 是否落在扫描仪常见档位上。
 
@@ -296,14 +355,35 @@ def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
     # 已知局限：某些扫描仪会写 Make=EPSON/Brother，这类仍会被后面的
     # `model or make` 分支判成 DIGITAL_PHOTO —— 比"整张图被跳过"好，
     # 但没有品牌白名单就无法彻底区分，这里不引入白名单以免新的误判。
-    elif (result.get("dpi")
-          and _is_scanner_dpi(result["dpi"])
-          and not (model or make)):
+    elif model or make:
+        # 有 Make/Model 时，用**有没有拍摄参数**来区分相机和扫描仪。
+        #
+        # 上一版只判断"有没有 Make/Model"，于是扫描仪写的 `Make=EPSON`
+        # 会被判成 DIGITAL_PHOTO。加上拍摄参数这一层就能分开：
+        #   Canon + ExposureTime/FNumber/ISO → 相机拍的
+        #   EPSON + 只有 Make/Model         → 扫描仪扫的
+        if _looks_like_camera_capture(exif):
+            # 有曝光/光圈/ISO/焦距 → 一定是镜头拍的
+            result["detected_class"] = "DIGITAL_PHOTO"
+            result["confidence"] = 0.90
+            result["classify_basis"] = "camera_make_model_with_capture_tags"
+        elif _model_looks_like_scanner(str(model) if model else ""):
+            # 型号名带 scanner/perfection/v600 等 → 扫描仪
+            result["detected_class"] = "SCAN_PRINT"
+            result["confidence"] = 0.80
+            result["classify_basis"] = "scanner_model_keyword"
+        else:
+            # 有型号但没拍摄参数、型号也不像扫描仪。
+            # 这类元数据"形状"和扫描仪一样，无法再细分 —— 保守判数码照片，
+            # 理由见 SCANNER_MODEL_KEYWORDS 的注释（宁可漏判扫描件）。
+            result["detected_class"] = "DIGITAL_PHOTO"
+            result["confidence"] = 0.85
+            result["classify_basis"] = ("make_model_without_capture_tags"
+                                        "_not_scanner_like")
+    elif (result.get("dpi") and _is_scanner_dpi(result["dpi"])):
         result["detected_class"] = "SCAN_PRINT"
         result["confidence"] = 0.80
-    elif model or make:
-        result["detected_class"] = "DIGITAL_PHOTO"
-        result["confidence"] = 0.90
+        result["classify_basis"] = "scanner_dpi_no_make_model"
     else:
         # Default based on resolution + pixel features
         w = result["original_width"]
@@ -312,12 +392,15 @@ def classify_photo(input_path: str, config: dict = None) -> Dict[str, Any]:
             if w > 3000 or h > 2000:
                 result["detected_class"] = "SCAN_PRINT"
                 result["confidence"] = 0.70
+                result["classify_basis"] = "resolution_fallback_large"
             else:
                 result["detected_class"] = "DIGITAL_PHOTO"
                 result["confidence"] = 0.60
+                result["classify_basis"] = "resolution_fallback_small"
         else:
             result["detected_class"] = "UNKNOWN"
             result["confidence"] = 0.0
+            result["classify_basis"] = "no_metadata_no_dimensions"
     
     # Adjust confidence based on pixel features
     # High blockiness suggests scanned/printed material (JPEG recompression)
