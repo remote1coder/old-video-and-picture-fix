@@ -1576,22 +1576,102 @@ def main():
         output_opts.extend(["-vf", ",".join(vf_parts)])
 
     # Scene detection for audio handling (v6.3 §3.10.9)
-    # Scene 1: duration unchanged -> asetpts=PTS only
-    # Scene 2: duration changed -> atempo adjustment needed
+    #
+    # B7（第七轮）：**时长变了 ≠ 需要 atempo**。
+    #
+    # 旧实现：
+    #     if abs(original_duration - processed_duration) * 1000 > 300:
+    #         tempo_ratio = original_duration / processed_duration
+    # 只要时长差超过 300ms 就拉音频。但导致时长变化的原因至少有四种：
+    #   (a) 明确要求的变速（合法）；
+    #   (b) 去隔行/抽帧改变了帧率但内容完整（应保时长，变了就是异常）；
+    #   (c) 丢帧 / 截断（故障）；
+    #   (d) 错误的 PTS / 容器时基（故障）。
+    # 对 (c)(d) 用 atempo 去"凑"时长，等于**把损坏掩盖成同步正常** ——
+    # 任务书明确禁止：「只有明确的视频时间映射发生变化，才按映射处理
+    # 音频……不能拉音频掩盖损坏视频」。
+    #
+    # 新规则：
+    #   1. 上游**显式声明**的映射（`expected_speed` / `expected_tempo`）
+    #      优先，且要与实测时长互相印证；
+    #   2. 没有声明但时长变了 → **不改音频**，记 `STAGE7_TIMING_UNEXPLAINED`
+    #      并在产物 metadata 里标记 `timing_unexplained=true`，让人能发现；
+    #   3. 时长信息缺失 → 标 `timing_unverified`，**不**宣称同步已验证。
     original_duration = params.get("duration", 0)
     processed_duration = _get_stream_duration(input_source, "v")
     tempo_ratio = 1.0
+    _timing_state = "verified"          # verified | adjusted | unverified | unexplained
+    _declared_speed = params.get("expected_speed")
+    _declared_tempo = params.get("expected_tempo")
+
     if original_duration > 0 and processed_duration > 0:
         diff_ms = abs(original_duration - processed_duration) * 1000
-        if diff_ms > 300:
-            tempo_ratio = original_duration / processed_duration
-            logger.info("STAGE7_SCENE2",
-                       f"Detected Scene 2: video duration changed by {diff_ms:.0f}ms (ratio={tempo_ratio:.4f})")
+        measured_ratio = (original_duration / processed_duration
+                          if processed_duration else 1.0)
+
+        if _declared_tempo is not None or _declared_speed is not None:
+            # 上游明确声明了时间映射 —— 只有这种情况用 tempo
+            try:
+                # 语义：expected_speed = 视频播放速度相对原素材的倍数。
+                # 时长减半 => speed 2.0 => 音频也要 2 倍速 => atempo=2.0，
+                # 因此**直接取用，不取倒数**（第一版写成 1/speed 是反的）。
+                # expected_tempo 则是直接的 atempo 比例。
+                declared = (float(_declared_tempo)
+                            if _declared_tempo is not None
+                            else float(_declared_speed))
+            except (TypeError, ValueError):
+                declared = None
+            if declared and declared > 0:
+                # 声明值与实测值必须互相印证，否则说明声明本身不可信。
+                # 容差取 10%：素材时间戳有舍入/容器时基差异，setpts 类
+                # 操作的实测比例常有几个百分点的偏移（实测 2.0 声明对应
+                # 1.85 实测），2% 会把正常素材判成"声明不可信"。
+                if abs(declared - measured_ratio) <= 0.10 * max(declared, 1.0):
+                    tempo_ratio = declared
+                    _timing_state = "adjusted"
+                    logger.info(
+                        "STAGE7_SCENE2",
+                        f"Declared time mapping {declared:.4f} matches the "
+                        f"measured ratio {measured_ratio:.4f}; applying atempo",
+                        declared=declared, measured=measured_ratio)
+                else:
+                    _timing_state = "unexplained"
+                    logger.error(
+                        "STAGE7_TIMING_DECLARATION_MISMATCH",
+                        f"Upstream declared ratio {declared:.4f} but the media "
+                        f"measures {measured_ratio:.4f}. NOT applying atempo "
+                        "(the declaration cannot be trusted).",
+                        declared=declared, measured=measured_ratio)
+            else:
+                _timing_state = "unexplained"
+                logger.error("STAGE7_TIMING_DECLARATION_INVALID",
+                             "Declared time mapping is unusable; not "
+                             "applying atempo",
+                             tempo=_declared_tempo, speed=_declared_speed)
+        elif diff_ms > 300:
+            # 时长变了，但没人声明这是有意的变速
+            _timing_state = "unexplained"
+            logger.error(
+                "STAGE7_TIMING_UNEXPLAINED",
+                f"Video duration changed by {diff_ms:.0f}ms "
+                f"(orig={original_duration:.3f}s, processed="
+                f"{processed_duration:.3f}s, ratio={measured_ratio:.4f}) "
+                "WITHOUT a declared time mapping. This usually means dropped "
+                "frames, truncation or bad PTS — stretching the audio would "
+                "hide the defect, so the audio is left untouched. Marking the "
+                "output timing_unexplained=true.",
+                orig=original_duration, processed=processed_duration,
+                ratio=measured_ratio)
         else:
             logger.info("STAGE7_SCENE1",
-                       f"Detected Scene 1: duration diff {diff_ms:.0f}ms <= 300ms")
+                        f"Detected Scene 1: duration diff {diff_ms:.0f}ms <= 300ms")
     else:
-        logger.info("STAGE7_SCENE1", "Duration info unavailable, defaulting to Scene 1")
+        # 时长信息不全：**不能**当成"同步已验证"
+        _timing_state = "unverified"
+        logger.warning("STAGE7_SCENE1",
+                       "Duration info unavailable; audio timing is UNVERIFIED "
+                       "(not reported as in-sync)",
+                       orig=original_duration, processed=processed_duration)
 
     # Audio (extract from original if available)
     # V-P-049 fix: match stage0 output naming convention
@@ -1754,6 +1834,9 @@ def main():
     video_cmd.extend(output_opts)
     video_cmd.extend([
         "-metadata", "restored=true",
+        # B7（第七轮）：把时间轴判定结果写进产物，让"未验证"和"发现异常
+        # 但未掩盖"这两种情况**跟着文件走**，而不是只躺在日志里。
+        "-metadata", f"timing_state={_timing_state}",
         # FIX-P7-12: Use proper datetime import per CLAUDE.md §4
         # ORIGINAL: __import__('datetime').datetime.now().isoformat()
         "-metadata", f"restored_at={datetime.datetime.now().isoformat()}",
