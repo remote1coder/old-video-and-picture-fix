@@ -1908,13 +1908,42 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     # （step3 明明失败、只剩 sidecar 残留却判"已完成"）。统一走 checkpoint
     # 媒体白名单：既防错选，也让门禁只认真实媒体。
     from checkpoint import select_media_candidates
-    pattern = f"{job_id}_{Path(input_name).stem}_step4_postprocess*"
-    candidates = select_media_candidates(
-        glob.glob(os.path.join(temp_dir, pattern)))
-    if candidates:
-        input_source = str(candidates[0])
+
+    # ID-04（第七轮）：**精确产物优先**。
+    #
+    # 旧行为：无条件 glob + 按 mtime 取最新。于是"编排器验证了 A、
+    # stage 实际消费了 B"——main 那边校验过的候选，到了这里又被重新
+    # 挑一次，完全可能挑到另一个文件（并发残留、旧 hash 变体、
+    # 别人刚写的同模式产物）。
+    #
+    # 约定：main 通过 `params["upstream_artifact"]` 传**已验证过的精确
+    # 路径**；stage 有就用它，没有（独立 CLI 运行）才回落到 glob。
+    _pinned = str(params.get("upstream_artifact") or "")
+    if _pinned:
+        if os.path.exists(_pinned):
+            input_source = _pinned
+            logger.info("STAGE5_INPUT_PINNED",
+                        "Using the exact upstream artifact handed down by the "
+                        "orchestrator (no glob re-selection)",
+                        input=_pinned)
+        else:
+            # 编排器点名了却不存在 —— 这是真的异常，不能悄悄换一个文件
+            logger.error("STAGE5_PINNED_INPUT_MISSING",
+                         "Orchestrator pinned an upstream artifact that does "
+                         "not exist; refusing to silently glob for another "
+                         "file", pinned=_pinned)
+            return 82
     else:
-        input_source = None
+        pattern = f"{job_id}_{Path(input_name).stem}_step4_postprocess*"
+        candidates = select_media_candidates(
+            glob.glob(os.path.join(temp_dir, pattern)))
+        if candidates:
+            input_source = str(candidates[0])
+            logger.info("STAGE5_INPUT_GLOB",
+                        "No pinned input (standalone run); selected the "
+                        "newest step4 artifact by glob", input=input_source)
+        else:
+            input_source = None
 
     # FIX-P9-3: validate AI upscale completion order per v7.32 §3.10.5
     # When AI upscale is enabled, stage3 output MUST exist before stage5 runs

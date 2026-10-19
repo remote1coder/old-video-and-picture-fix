@@ -82,11 +82,28 @@ def main():
     # 选成 stage3 输入，ffprobe 直接 STAGE4_INPUT_UNDECODABLE (82)。
     # 统一走 checkpoint 媒体白名单 + mtime 新→旧。
     from checkpoint import select_media_candidates
-    pattern_upscale = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
-    pattern_forced = f"{job_id}_{Path(input_name).stem}_step3_forced_upscale*"
-    candidates = select_media_candidates(
-        list(Path(temp_dir).glob(pattern_upscale)) +
-        list(Path(temp_dir).glob(pattern_forced)))
+
+    # ID-04（第七轮）：**精确产物优先**（与 stage5 同一约定）。
+    # main 已验证过的那份路径通过 params["upstream_artifact"] 传下来；
+    # 有它就绝不再 glob 重选，避免"验证 A、消费 B"。
+    _pinned = str(params.get("upstream_artifact") or "")
+    if _pinned:
+        if not os.path.exists(_pinned):
+            logger.error("STAGE4_PINNED_INPUT_MISSING",
+                         "Orchestrator pinned an upstream artifact that does "
+                         "not exist; refusing to silently glob for another "
+                         "file", pinned=_pinned)
+            return 82
+        candidates = [_pinned]
+        logger.info("STAGE4_INPUT_PINNED",
+                    "Using the exact upstream artifact handed down by the "
+                    "orchestrator", input=_pinned)
+    else:
+        pattern_upscale = f"{job_id}_{Path(input_name).stem}_step3_upscale*"
+        pattern_forced = f"{job_id}_{Path(input_name).stem}_step3_forced_upscale*"
+        candidates = select_media_candidates(
+            list(Path(temp_dir).glob(pattern_upscale)) +
+            list(Path(temp_dir).glob(pattern_forced)))
     # P8-11 fallback A: if no stage3 output, look for stage2 output
     if not candidates:
         pattern2 = f"{job_id}_{Path(input_name).stem}_step2_traditional*"

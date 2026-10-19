@@ -1103,17 +1103,38 @@ def main():
 
     # FIX-P7-9: Use pathlib.Path instead of os.path per CLAUDE.md §4
     # Find input - deterministic by mtime
+    #
+    # ID-04（第七轮）：**精确产物优先**。编排器已验证过的上游路径通过
+    # `params["upstream_artifact"]` 传下来；有它就绝不再按 mtime 重选。
+    # 否则会出现"编排器校验了 A、这里实际编码了 B"——两条独立的选择
+    # 逻辑，不可能保证一致。
     input_source = None
-    for pat in ["step6_grain*", "step5_face*", "step4_postprocess*",
-                "step3_upscale*", "step3_forced_upscale*",
-                "step2_traditional*", "step1_preprocess*"]:
-        pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
-        # ORIGINAL: glob.glob(os.path.join(temp_dir, pattern))
-        # R3-01：只接受媒体产物，排除同前缀的身份/契约/状态侧车（B10）
-        candidates = select_media_candidates(Path(temp_dir).glob(pattern))
-        if candidates:
-            input_source = str(candidates[0])
-            break
+    _pinned = str(params.get("upstream_artifact") or "")
+    if _pinned:
+        if not os.path.exists(_pinned):
+            logger.error("STAGE7_PINNED_INPUT_MISSING",
+                         "Orchestrator pinned an upstream artifact that does "
+                         "not exist; refusing to silently glob for another "
+                         "file", pinned=_pinned)
+            return 82
+        input_source = _pinned
+        logger.info("STAGE7_INPUT_PINNED",
+                    "Using the exact upstream artifact handed down by the "
+                    "orchestrator (no mtime re-selection)", input=_pinned)
+    else:
+        for pat in ["step6_grain*", "step5_face*", "step4_postprocess*",
+                    "step3_upscale*", "step3_forced_upscale*",
+                    "step2_traditional*", "step1_preprocess*"]:
+            pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
+            # ORIGINAL: glob.glob(os.path.join(temp_dir, pattern))
+            # R3-01：只接受媒体产物，排除同前缀的身份/契约/状态侧车（B10）
+            candidates = select_media_candidates(Path(temp_dir).glob(pattern))
+            if candidates:
+                input_source = str(candidates[0])
+                logger.info("STAGE7_INPUT_GLOB",
+                            "No pinned input (standalone run); selected by "
+                            "mtime fallback chain", input=input_source)
+                break
 
     if not input_source:
         logger.error("STAGE7_NO_INPUT", "No input found")
