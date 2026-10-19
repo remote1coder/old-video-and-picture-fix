@@ -1612,7 +1612,23 @@ def main():
             match = re.search(r'\d+', src.name)
             if not match:
                 continue
-            global_idx = win_start + int(match.group()) - 1
+            # **不要 -1**。
+            #
+            # 抽帧用 ffmpeg 的 `frame_%08d.png`，默认 `-start_number 0`，
+            # 所以编号是 0..N-1。AI 子进程用 `os.path.basename(fp)` 原样
+            # 保留文件名。这里再减 1 会让整批编号前移一位：
+            #
+            #   frame_00000000.png  (源第 1 帧) -> frame_-0000001.png
+            #   frame_00000001.png  (源第 2 帧) -> frame_00000000.png
+            #   ...
+            #   frame_00000059.png  (源第 60 帧) -> frame_00000058.png
+            #
+            # 实测输出目录正好是 -1..58 共 60 个文件。而下游 ffmpeg 用
+            # `-i frame_%08d.png` 从 0 开始读，读到 58 就停 —— 于是
+            # **源视频的第一帧被整帧丢弃**，成品只有 59 帧。
+            #
+            # 这个 -1 大概是早期抽帧从 1 开始时的补偿，但抽帧早已改成 0 起点。
+            global_idx = win_start + int(match.group())
             dst = Path(output_dir) / f"frame_{global_idx:08d}.png"
             # FIX-R8-M2: detect disk-full (errno 28 / ENOSPC) on frame copy and
             # return 87 (non-retryable resource exhausted) per v7.32 §3.10.18.
@@ -1779,6 +1795,23 @@ def main():
             max_deviation = max(abs(iv - avg_interval) for iv in intervals)
             # If max deviation > 10% of average, treat as VFR
             is_vfr = max_deviation > avg_interval * 0.1
+
+    # 诊断：60 帧进、59 帧出的问题就出在这条分岔上。先把它记清楚，
+    # 不要再靠猜。
+    try:
+        _png_total = 0
+        for _od in (w[1] for w in window_dirs):
+            _png_total += len(list(Path(_od).glob("frame_*.png")))
+    except Exception:
+        _png_total = -1
+    logger.info("STAGE3_ENCODE_MODE",
+                "Encoding path selected",
+                is_vfr=is_vfr,
+                pts_count=len(all_pts),
+                windows=len(window_dirs),
+                upscaled_pngs=_png_total,
+                actual_fps=actual_fps,
+                path=("vfr-concat" if (is_vfr and all_pts) else "cfr-sequence"))
 
     concat_path: Optional[str] = None
     if is_vfr and all_pts:
