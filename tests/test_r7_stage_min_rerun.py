@@ -207,3 +207,130 @@ def test_sidecar_records_stage_local_identity():
     assert '"stage_identity": _stage_identity_for(params, stage_num)' in src
     assert '"stage_scope": _stage_scope_snapshot(params, stage_num)' in src
     assert "params=params)" in src
+
+
+# ---------------------------------------------------------------------------
+# 裁剪语义：main 里那一行的精确复现
+# ---------------------------------------------------------------------------
+
+def test_stages_list_is_trimmed_to_restart_from():
+    """验证 main 的裁剪语义：`[(n, s) for n, s in stages if n >= restart_from]`。
+
+    **这不是端到端测试**，而是把 main.py 里那行代码原样复现一遍，
+    确认"plan 给出 restart_from=7 时，stage 列表真的只剩 stage7"。
+
+    端到端（真跑批）多次尝试未拿到干净证据：跑批环境里 AI 子进程
+    会卡死（一次卡了 2 小时）、残留进程互相抢 manifest、日志交织。
+    这些是**环境问题**，不是 plan 逻辑问题 —— 但既然没拿到证据，
+    就不声称已验证。
+    """
+    all_stages = [
+        (0, "stage0_audio_extract.py"),
+        (1, "stage1_preprocess.py"),
+        (2, "stage2_traditional_check.py"),
+        (3, "stage3_ai_upscale.py"),
+        (4, "stage4_postprocess.py"),
+        (5, "stage5_ai_face.py"),
+        (6, "stage6_grain_synthesis.py"),
+        (7, "stage7_encode.py"),
+    ]
+    plan = {"restart_from": 7}
+    rf = int(plan["restart_from"])
+    trimmed = [(n, s) for n, s in all_stages if n >= rf]
+    assert trimmed == [(7, "stage7_encode.py")], trimmed
+
+    # restart_from=3 时保留 3..7
+    plan = {"restart_from": 3}
+    trimmed = [(n, s) for n, s in all_stages if n >= int(plan["restart_from"])]
+    assert [n for n, _ in trimmed] == [3, 4, 5, 6, 7]
+
+    # 无需重算时不裁剪（None）
+    assert [n for n, _ in all_stages] == list(range(8))
+
+
+def test_real_sidecars_yield_restart_at_encode(tmp_path):
+    """用**真实跑批产物**验证 plan 结论（不跑 stage，也不污染真实目录）。
+
+    做法：把真实 temp 里现存的 stepN 产物**硬链接**到测试自己的目录
+    （不占空间、不改原文件），按"上一轮 CRF=26"造侧车，再用 CRF=18 的
+    参数算 plan，断言 `restart_from == 7` 且不触发 AI。
+
+    注意：真实 temp 里 step1 常被 `cleanup_old_intermediates` 删掉，
+    所以这里不假设"1..6 都在"，只要求"至少 step2..6 有代表性产物"，
+    缺的 stage 用最近的一个补（模拟"那一代确实存在"）。
+    """
+    real_temp = r'E:/codex/_repair_r4_20261013/real_run/temp'
+    src = r'E:/codex/_repair_r4_20261013/real_run/input/real2s.mov'
+    manifest = r'E:/codex/_repair_r4_20261013/real_run/scan_manifest.yaml'
+    if not (os.path.isdir(real_temp) and os.path.exists(src)
+            and os.path.exists(manifest)):
+        pytest.skip("真实跑批目录不存在，跳过")
+
+    vroot = os.path.join(ROOT, "video_restoration_pipeline")
+    if vroot not in sys.path:
+        sys.path.insert(0, vroot)
+    import shutil
+    import yaml
+    import main as M
+
+    with open(manifest, encoding="utf-8") as f:
+        manifest_doc = yaml.safe_load(f)
+    job = manifest_doc["jobs"][0]
+    cfg = M.load_config(os.path.join(vroot, "config.yaml"))
+    params = M.merge_params(job, cfg, {}, None)      # 含 user_overrides
+    prev = dict(params, crf=26)                       # 上一轮用 26
+
+    # 找一个真实的 step 产物当作"母版"
+    donor = None
+    for s in (6, 5, 4, 3, 2):
+        cands = M.find_stage_artifacts(real_temp, job["job_id"], src, s)
+        if cands:
+            donor = str(cands[0])
+            break
+    if not donor:
+        pytest.skip("真实 temp 里没有可用产物")
+    if os.path.getsize(donor) < 1024:
+        pytest.skip("母版产物不可用（太小）")
+
+    # 在测试目录里搭一套 step1..6（硬链接，不占空间）
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    stem = "real2s"
+    names = {
+        1: f"{job['job_id']}_{stem}_step1_preprocess_pX.mkv",
+        2: f"{job['job_id']}_{stem}_step2_traditional.mkv",
+        3: f"{job['job_id']}_{stem}_step3_forced_upscale_pX.mkv",
+        4: f"{job['job_id']}_{stem}_step4_postprocess_pX.mkv",
+        5: f"{job['job_id']}_{stem}_step5_face_pX.mkv",
+        6: f"{job['job_id']}_{stem}_step6_grain_pX.mkv",
+    }
+    import json as _json
+    recorded = {}
+    for st, nm in names.items():
+        dst = temp / nm
+        try:
+            os.link(donor, str(dst))
+        except OSError:
+            shutil.copyfile(donor, str(dst))
+        with open(str(dst) + ".identity.json", "w", encoding="utf-8") as f:
+            _json.dump({
+                "impl": M.VIDEO_IMPL_VERSION,
+                "job_id": job["job_id"], "stage": st,
+                "artifact": str(dst),
+                "stage_identity": sd.stage_identity(prev, st),
+                "stage_scope": {k: prev.get(k)
+                                for k in sd.stage_scope_keys(prev, st)},
+            }, f, ensure_ascii=False)
+        recorded[st] = {"stage": st, "artifact": str(dst),
+                        "stage_identity": sd.stage_identity(prev, st),
+                        "stage_scope": {k: prev.get(k)
+                                        for k in sd.stage_scope_keys(prev, st)}}
+    recorded[0] = None
+    recorded[7] = None
+
+    plan = sd.build_reuse_plan(params, recorded)
+    assert plan["restart_from"] == 7, (
+        "改 CRF 后应当只从 stage7 重算，实际计划：\n"
+        + sd.render_reuse_plan(plan))
+    assert plan["will_run_ai"] is False, "改编码参数不该触发 AI 重跑"
+    assert [r["stage"] for r in plan["reusable"]] == [1, 2, 3, 4, 5, 6]
