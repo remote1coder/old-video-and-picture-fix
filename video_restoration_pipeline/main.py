@@ -1030,7 +1030,9 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                     for _art in _produced:
                         record_stage_artifact_identity(
                             _art, job, config, stage_num, input_path,
-                            job_logger)
+                            job_logger,
+                            # ID-08：把本次实际消费的上游绑进侧车
+                            upstream_artifact=params.get("upstream_artifact"))
                     # ID-04：记下本次产出，供下一个 stage 作为精确上游
                     if _produced:
                         _last_produced[stage_num] = _produced
@@ -1311,9 +1313,20 @@ def intermediate_identity_path(artifact: str) -> str:
     return str(artifact) + ".identity.json"
 
 
+def _read_exec_fingerprint(artifact: str) -> Optional[Dict[str, Any]]:
+    """读 stage 自己写的 `.exec.json`；没有就返回 None（不猜）。"""
+    try:
+        from exec_fingerprint import read_exec_sidecar
+        return read_exec_sidecar(artifact)
+    except Exception:
+        return None
+
+
 def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
                                    config: Dict[str, Any], stage_num: int,
-                                   input_path: str, logger=None) -> bool:
+                                   input_path: str, logger=None,
+                                   upstream_artifact: Optional[str] = None
+                                   ) -> bool:
     """R2-07 补完：给**每个中间产物**写身份侧车。
 
     之前 resume 只能"按文件名找到 + 能解码"就复用（A17 复现的缺陷）。
@@ -1333,6 +1346,17 @@ def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
         "artifact_digest": _artifact_digest(artifact),
         "source_identity": build_input_identity(input_path),
         "params_identity": build_params_identity(config, job, logger),
+        # ID-08（第七轮）：把**上游产物**也绑进来。
+        # 旧侧车只记 source_identity（原始素材）与 params_identity，
+        # 完全没有"这份中间产物是由哪一份上游产物做出来的"——
+        # 于是上游换了一版（同参数、同输入、不同中间结果）也察觉不到。
+        "upstream_artifact": (str(upstream_artifact)
+                              if upstream_artifact else None),
+        "upstream_digest": (_artifact_digest(upstream_artifact)
+                            if upstream_artifact else None),
+        # ID-07（第七轮）：并入"实际执行"记录（后端/实际模型/权重指纹/工具版本）。
+        # 配置里写的是请求；这里记的是真的跑了什么。
+        "exec": _read_exec_fingerprint(artifact),
         "recorded_at": datetime.now().astimezone().isoformat(),
     }
     try:
@@ -1351,7 +1375,10 @@ def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
 
 def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
                                   config: Dict[str, Any],
-                                  logger=None) -> Tuple[bool, str]:
+                                  logger=None,
+                                  expected_stage: Optional[int] = None,
+                                  expected_upstream: Optional[str] = None
+                                  ) -> Tuple[bool, str]:
     """R2-07 补完：这个中间产物**是不是**本次 job / 本次输入 / 本次参数产出的。
 
     "能解码"只证明文件没坏，证明不了它属于本次任务。
@@ -1390,6 +1417,29 @@ def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
                        "matches the current parameters (file kept)")
     if recorded_params != build_params_identity(config, job, logger):
         return False, "effective parameters changed since it was produced"
+    # ID-08（第七轮）：侧车记了 stage，却从来没比对过 —— 于是
+    # "把 step3 的文件塞进 step5 的位置"这种错配发现不了。
+    if expected_stage is not None:
+        recorded_stage = data.get("stage")
+        if recorded_stage is None:
+            return False, ("identity sidecar does not record which stage "
+                           "produced this artifact")
+        if int(recorded_stage) != int(expected_stage):
+            return False, (f"artifact was produced by stage {recorded_stage}, "
+                           f"expected stage {expected_stage}")
+
+    # ID-08：上游摘要链。上游换了一版（同输入同参数、不同中间结果）时，
+    # 只看 source/params 是察觉不到的。
+    if expected_upstream:
+        rec_up = data.get("upstream_digest")
+        cur_up = _artifact_digest(expected_upstream)
+        if not rec_up or not cur_up:
+            return False, ("upstream digest missing on one side; cannot prove "
+                           "this intermediate came from the current upstream")
+        if str(rec_up) != str(cur_up):
+            return False, ("upstream artifact changed since this intermediate "
+                           "was produced")
+
     # R3-06 / B08：内容摘要必须一致（等长替换也要能发现）；
     # 任一侧拿不到摘要 → unproven，拒绝复用。
     recorded_digest = data.get("artifact_digest")
@@ -1845,7 +1895,8 @@ def main():
                         # R3-06：FAILED 恢复入口同样必须过逐产物身份门 ——
                         # 只查"能解码"会把别的输入/参数产出的文件当成自己的成果。
                         ok_id, why = intermediate_identity_matches(
-                            cand, job, config, logger)
+                            cand, job, config, logger,
+                            expected_stage=stage_num)
                         if not ok_id:
                             logger.info(
                                 "RESUME_ARTIFACT_IDENTITY_REJECTED",

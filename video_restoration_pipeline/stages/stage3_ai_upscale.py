@@ -1307,6 +1307,9 @@ def main():
         window_dirs.append((frames_dir, win_output_dir))
         all_frame_mappings.append((win_start, len(frames)))
 
+    # ID-07：执行指纹容器（AI 分支里填，落盘处读；空表示没走到 AI）
+    _exec_fp = None
+
     # FIX-P8-9: Batch process all windows with single model load
     if window_dirs:
         result = run_realesrgan_batch(window_dirs, model, scale,
@@ -1339,6 +1342,21 @@ def main():
                         backend = "cpu"
 
             gpu_oom_retry_done = True
+
+        # ID-07（第七轮）：把**实际执行**记下来（后端/模型/倍数/权重指纹）。
+        # 注意这里读的是循环后**已被降级改写**的 backend/model/scale ——
+        # 配置里写的是"请求"，这里记的是"真的跑了什么"。
+        try:
+            from exec_fingerprint import build_exec_fingerprint
+            _exec_fp = build_exec_fingerprint(
+                model=model, scale=scale,
+                model_path=str(Path(model_dir) / f"{model}.pth"),
+                backend=("cpu" if backend == "cpu" else "gpu"),
+                fallback_reason=(params.get("_oom_fallback_reason") or None),
+                logger=logger)
+        except Exception as _fp_exc:      # 记录失败不能中断超分
+            _exec_fp = None
+            logger.warning("STAGE3_EXEC_FP_FAIL", str(_fp_exc))
 
         # Non-OOM failure
         if result is not True:
@@ -1598,6 +1616,21 @@ def main():
             Path(concat_path).unlink(missing_ok=True)
         except Exception:
             pass
+
+    # ID-07：执行指纹落到产物旁边（与身份侧车并列，互不覆盖）
+    if _exec_fp:
+        try:
+            from exec_fingerprint import write_exec_sidecar
+            if write_exec_sidecar(output_path, _exec_fp):
+                logger.info("STAGE3_EXEC_FINGERPRINT",
+                            "Recorded what actually ran (backend/model/"
+                            "weights/tools) next to the artifact",
+                            backend=_exec_fp.get("backend"),
+                            model=_exec_fp.get("requested_model"),
+                            weights_sha256=(_exec_fp.get("model_weights")
+                                            or {}).get("sha256"))
+        except Exception as _we:
+            logger.warning("STAGE3_EXEC_SIDECAR_FAIL", str(_we))
 
     logger.info("STAGE3_DONE", "AI upscaling complete",
                 total_frames=len(output_frames), output_path=output_path)
