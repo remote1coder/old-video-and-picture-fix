@@ -550,6 +550,11 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                     frames=_total_frames, timeout_s=_ai_timeout,
                     stdout_tail=str(getattr(_te, "stdout", "") or "")[-800:],
                     stderr_tail=str(getattr(_te, "stderr", "") or "")[-800:])
+            if _trace_fh is not None:
+                try:
+                    _trace_fh.close()
+                except Exception:
+                    pass
             return False
         # FIX-R6-03: 失败必须留证据。原实现无条件删脚本 + 只返回 False，
         # 子进程真实 traceback（参数非法/架构不匹配/import 失败）全部丢失
@@ -856,7 +861,10 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "    raise\n"
             )
         # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
-        cmd = [ai_py, script_path]
+        #
+        # `-u` 很关键：子进程卡住时，缓冲的 stdout 会让诊断日志**空白**，
+        # 看起来就像"什么都没发生"。无缓冲后至少能看到它停在哪一行。
+        cmd = [ai_py, "-u", script_path]
 
         # B9-后续（第七轮）：**批量路径原来固定 timeout=7200（两小时）**。
         # 这就是"卡了约 2 小时"的字面来源：子进程一旦不返回，父进程要
@@ -869,14 +877,62 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                                       if n.endswith(".png")])
             except OSError:
                 pass
+        if _batch_frames == 0 and logger:
+            # 实测踩过：传了 Git Bash 风格路径（/e/codex/...），Windows 的
+            # os.listdir 抛 OSError 被上面吞掉，frames 变 0，子进程空跑
+            # 却返回 True —— 表面上"成功"，实际一个字节都没产出。
+            # 这里必须喊出来。
+            logger.warning(
+                "STAGE3_NO_FRAMES",
+                "No .png frames found in any window directory; the AI "
+                "subprocess would do nothing and still exit 0. Check that "
+                "paths are Windows-style (E:/...) and that extraction ran.",
+                windows=[list(w) for w in window_dirs][:3])
         _batch_timeout = max(300, min(7200, _batch_frames * 30))
         if logger:
             logger.info("STAGE3_AI_SUBPROC_START",
                         "Launching AI subprocess under cancel-guard",
                         frames=_batch_frames, timeout_s=_batch_timeout,
                         interpreter=ai_py)
+        # 诊断开关：把子进程的 stdout/stderr **实时**写到文件。
+        # `capture_output=True` 要等进程结束才拿得到内容 —— 正好在最需要
+        # 线索的"卡住"场景下什么都没有。这里 line-buffered 落盘。
+        _trace_path = None
+        # 注意：本函数签名**没有 params**（只有 window_dirs/model/scale/
+        # gpu_id/logger）。第一版这里写了 `params.get(...)`，直接
+        # NameError —— 而且被外层 `except Exception` 记成
+        # "STAGE3_AI_LAUNCH_FAIL"，看起来像 AI 起不来。
+        # 改成从窗口的帧目录推断输出位置。
+        _trace_dir = "."
+        if window_dirs:
+            try:
+                _trace_dir = os.path.dirname(
+                    os.path.abspath(window_dirs[0][0])) or "."
+            except Exception:
+                _trace_dir = "."
+        if True:
+            try:
+                _trace_path = os.path.join(
+                    _trace_dir,
+                    f"ai_subproc_{os.getpid()}_{os.path.basename(str(script_path))}.log")
+                _trace_fh = open(_trace_path, "w", encoding="utf-8",
+                                 buffering=1)
+                if logger:
+                    logger.info("STAGE3_AI_SUBPROC_TRACE",
+                                "AI subprocess output is being streamed to "
+                                "this file (so a hang is diagnosable)",
+                                path=_trace_path)
+            except Exception:
+                _trace_fh = None
+        else:
+            _trace_fh = None
+
         try:
-            if _cancel_guard is not None:
+            if _trace_fh is not None:
+                r = subprocess.run(cmd, stdout=_trace_fh,
+                                   stderr=subprocess.STDOUT, text=True,
+                                   timeout=_batch_timeout, shell=False, env=env)
+            elif _cancel_guard is not None:
                 r = _cancel_guard.run_managed(
                     cmd, capture_output=True, text=True, timeout=_batch_timeout,
                     shell=False, env=env, logger=logger)
@@ -894,6 +950,11 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                     "the orchestrator (that makes .venv_r4 hang with zero CPU).",
                     frames=_batch_frames, timeout_s=_batch_timeout,
                     stderr_tail=str(getattr(_te, "stderr", "") or "")[-800:])
+            if _trace_fh is not None:
+                try:
+                    _trace_fh.close()
+                except Exception:
+                    pass
             return False
         # FIX-R6-03: 失败必须留证据（同 run_realesrgan；原实现静默 False）
         if r.returncode == 83:
@@ -1678,7 +1739,11 @@ def main():
     _src_color = {}
     try:
         from media_io import probe_color as _probe_color
-        _src_color = _probe_color(input_path) or {}
+        # 注意：main() 里的输入是 `args.input`，**没有** `input_path`
+        # 这个局部变量。第一版写成 `input_path` → NameError → 被
+        # `except Exception` 吞成 "STAGE3_COLOR_PROBE_FAIL" → 颜色探测
+        # 从未真正生效，中间产物依旧不带标签（COL-04 白做）。
+        _src_color = _probe_color(args.input) or {}
     except Exception as _ce:
         logger.warning("STAGE3_COLOR_PROBE_FAIL", str(_ce))
     _color_opts: List[str] = []
