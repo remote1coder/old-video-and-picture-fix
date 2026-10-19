@@ -755,6 +755,50 @@ def _run_single_job(job: Dict[str, Any],
             )
 
             if rc == 0 or rc == 3:
+                # 身份记录（第七轮）：与视频链用**同一套** `stage_identity`
+                # + `stage_scope` schema，便于跨链追溯"这张图是哪套参数
+                # 产出的"。
+                #
+                # 照片链**不做** plan/裁剪：单张处理是秒级，最小重算省不了
+                # 什么；视频是数万帧小时级，才值得那套复杂度。
+                try:
+                    sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+                    from stage_deps import photo_stage_identity, \
+                        photo_stage_scope_keys
+                    _stage_no = stage_idx + 1
+                    _ident_path = Path(
+                        params.get("temp_dir", "./temp")) / \
+                        f"{job_id}_stage_identities.json"
+                    _ident = {}
+                    if _ident_path.exists():
+                        try:
+                            import json as _json
+                            _ident = _json.loads(
+                                _ident_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            _ident = {}
+                    import json as _json2
+                    _ident[str(_stage_no)] = {
+                        "stage": _stage_no,
+                        "stage_name": stage_name,
+                        "stage_identity": photo_stage_identity(
+                            params, _stage_no),
+                        "stage_scope": {
+                            k: params.get(k) for k in
+                            photo_stage_scope_keys(params, _stage_no)},
+                        "rc": rc,
+                    }
+                    _ident_path.parent.mkdir(parents=True, exist_ok=True)
+                    _ident_path.write_text(
+                        _json2.dumps(_ident, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+                    logger.info("PHOTO_STAGE_IDENTITY",
+                                "Recorded stage-local parameter identity",
+                                stage=_stage_no, stage_name=stage_name,
+                                sidecar=str(_ident_path))
+                except Exception as _ie:
+                    logger.warning("PHOTO_STAGE_IDENTITY_FAIL", str(_ie))
+
                 # FIX-P10-2: v6.32 §7.1 output verification for stage1
                 if stage_name == "stage1_preprocess":
                     output_ok = _verify_stage_output(

@@ -35,6 +35,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 __all__ = [
     "STAGE_NAMES",
+    "PHOTO_STAGE_NAMES",
+    "photo_param_affects_stage",
+    "photo_stage_identity",
+    "photo_stage_scope_keys",
     "GLOBAL_PARAMS",
     "param_affects_stage",
     "stage_scope_keys",
@@ -317,3 +321,97 @@ def render_reuse_plan(plan: Dict[str, Any]) -> str:
     for n in plan.get("notes") or []:
         lines.append(n)
     return "\n".join(lines)
+
+
+# ===========================================================================
+# 照片链（第七轮）：同一套局部身份 schema，但**不做 plan/裁剪**
+# ===========================================================================
+#
+# 为什么照片链不做"最小重算"：
+#
+#   照片是**单张**处理，整条链是秒级；而视频是数万帧、小时级。
+#   "改 CRF 只重跑编码"在视频上能省几小时，在照片上只省几秒 ——
+#   引入 plan/裁剪的复杂度不划算。
+#
+# 但**身份记录必须一致**：两条链的侧车都要有 `stage_identity` +
+# `stage_scope`，否则跨链追溯（"这张图是用哪套参数产出的"）就断了。
+
+#: 照片链的 stage 名（与 `photo_restoration_pipeline/stages/` 对应）
+PHOTO_STAGE_NAMES: Dict[int, str] = {
+    1: "preprocess",
+    2: "ai_pre_and_traditional",
+    3: "ai_upscale",
+    4: "ai_face",
+    5: "postprocess",
+    6: "encode",
+}
+
+#: 照片链的参数作用域（精确键）
+_PHOTO_STAGE_KEYS: Dict[int, Set[str]] = {
+    1: {"deband_threshold", "scratch_remove", "scratch_remove_strength",
+        "denoise_strength", "descreen", "photo_rotate", "photo_crop"},
+    2: {"deblock_strength", "traditional_strength", "psf_handling",
+        "ai_pre_enabled", "pre_denoise"},
+    3: {"ai_enabled", "upscale_model", "upscale_scale", "model_dir",
+        "max_scale", "lanczos_target", "ban_intermediate_pixels",
+        "ban_original_input_pixels", "force_allow_banned_upscale",
+        "force_traditional_first", "gpu_memory_fallback", "gpu_priority"},
+    4: {"ai_enabled", "face_restore", "face_detect_threshold",
+        "face_detect_threshold_lowres", "face_detect_fallback",
+        "face_detect_lowres_max_dimension", "gfpgan_model",
+        "codeformer_fidelity"},
+    5: {"unsharp_enabled", "unsharp_strength", "gblur_enabled", "gblur_sigma",
+        "eq_enabled", "eq_contrast", "eq_saturation", "eq_brightness",
+        "sharpen_enabled", "grain_synthesis", "grain_strength"},
+    6: {"crf", "encoder", "pix_fmt", "photo_bit_depth", "archival_mode",
+        "avif_params", "avif_rgb444_params", "jpeg_quality", "tiff_compression",
+        "icc_profile", "output_format"},
+}
+
+_PHOTO_STAGE_PREFIXES: Dict[int, Tuple[str, ...]] = {
+    1: ("deband", "scratch", "denoise", "descreen", "photo_"),
+    2: ("deblock", "traditional_", "psf_", "ai_pre", "pre_denoise"),
+    3: ("upscale", "ai_model", "ai_max", "ai_gpu"),
+    4: ("ai_face", "face_", "gfpgan", "codeformer"),
+    5: ("unsharp", "gblur", "eq_", "sharpen", "grain_"),
+    6: ("crf", "encoder", "pix_fmt", "avif", "archival", "jpeg_",
+        "tiff_", "icc_", "output_format", "photo_bit_depth"),
+}
+
+
+def _photo_claimants(key: str) -> Set[int]:
+    k = _norm_key(key)
+    out: Set[int] = set()
+    for s, keys in _PHOTO_STAGE_KEYS.items():
+        if k in {_norm_key(x) for x in keys}:
+            out.add(s)
+    for s, prefs in _PHOTO_STAGE_PREFIXES.items():
+        if any(k.startswith(p) for p in prefs):
+            out.add(s)
+    return out
+
+
+def photo_param_affects_stage(key: str, stage: int) -> bool:
+    """照片链版：这个参数是否影响该 stage。语义与视频链一致。"""
+    k = _norm_key(key)
+    if k in NON_SEMANTIC_PARAMS:
+        return False
+    if k in GLOBAL_PARAMS:
+        return True
+    who = _photo_claimants(k)
+    if who:
+        return stage in who
+    return True
+
+
+def photo_stage_scope_keys(params: Dict[str, Any], stage: int) -> List[str]:
+    return sorted(k for k in (params or {})
+                  if photo_param_affects_stage(k, stage))
+
+
+def photo_stage_identity(params: Dict[str, Any], stage: int) -> str:
+    """照片链某个 stage 的局部参数身份。"""
+    subset = {k: (params or {})[k] for k in photo_stage_scope_keys(params, stage)}
+    payload = json.dumps(subset, sort_keys=True, ensure_ascii=False,
+                         default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
