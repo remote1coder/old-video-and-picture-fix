@@ -398,6 +398,8 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 "import os\n"
                 "import glob\n"
                 "import numpy as np\n"
+                # COL-03：16bit 帧必须用 cv2 读写（PIL 会静默降 8bit）
+                "import cv2\n"
                 "import gc\n"
                 f"scale = {scale}\n"
                 f"model_path = {repr(model_path)}\n"
@@ -422,11 +424,24 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 "保存返回的 BGR：两次错配恰好抵消，\n"
                 "        # 最终颜色看着是对的，但**模型实际处理的是 R/B "
                 "互换的图**。\n"
-                "        _rgb = np.array(Image.open(fp).convert('RGB'))\n"
-                "        output, _ = upsampler.enhance(\n"
-                "            _rgb[:, :, ::-1].copy(), outscale=scale)\n"
-                "        Image.fromarray(output[:, :, ::-1].copy()).save(\n"
-                "os.path.join(output_dir, os.path.basename(fp)))\n"
+                # COL-03（第七轮）：**必须用 cv2 读 16bit**。
+                # 旧代码 `Image.open(fp).convert('RGB')` 会把 rgb48 的
+                # 16bit PNG **静默降成 uint8**（实测 PIL mode=RGB，
+                # dtype=uint8），低位信息直接丢掉——而 stage3 抽帧用的是
+                # `-pix_fmt rgb48`、回编码用的是 `yuv420p16le`，整条链
+                # 本来是为 16bit 设计的。
+                # cv2.IMREAD_UNCHANGED 保留 uint16，且 cv2 本身就是 **BGR**，
+                # 与 RealESRGANer 的官方输入约定天然一致，不需要再换通道。
+                "        _arr = cv2.imread(fp, cv2.IMREAD_UNCHANGED)\n"
+                "        if _arr is None:\n"
+                "            _arr = np.array(Image.open(fp).convert('RGB'))[:, :, ::-1].copy()\n"
+                # enhance() **已经**把输出还原到输入量级并转好类型：
+                #   16bit 输入 -> (output_img*65535).round().astype(uint16)
+                #   8bit  输入 -> (output_img*255).round().astype(uint8)
+                # 所以这里直接写回，绝不能再乘一次（实测乘 65535 会让
+                # 数值爆掉、clip 后整帧只剩黑白两值）。
+                "        output, _ = upsampler.enhance(_arr, outscale=scale)\n"
+                "        cv2.imwrite(os.path.join(output_dir, os.path.basename(fp)), output)\n"
                 "    del upsampler\n"
                 "    gc.collect()\n"
                 "    if torch.cuda.is_available():\n"
@@ -675,6 +690,8 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "import os\n"
                 "import glob\n"
                 "import numpy as np\n"
+                # COL-03：16bit 帧必须用 cv2 读写（PIL 会静默降 8bit）
+                "import cv2\n"
                 "import gc\n"
                 f"model_path = {repr(model_path)}\n"
                 f"scale = {scale}\n"
@@ -692,11 +709,13 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "os.path.join(frames_dir, '*.png'))):\n"
                 "            # COL-01：官方接口输入 BGR/输出 BGR"
                 "（见单窗路径说明）\n"
-                "            _rgb = np.array(Image.open(fp).convert('RGB'))\n"
-                "            output, _ = upsampler.enhance(\n"
-                "                _rgb[:, :, ::-1].copy(), outscale=scale)\n"
-                "            Image.fromarray(output[:, :, ::-1].copy()).save(\n"
-                "os.path.join(output_dir, os.path.basename(fp)))\n"
+                # COL-03：同单窗路径——cv2 保留 16bit，且是 BGR
+                "            _arr = cv2.imread(fp, cv2.IMREAD_UNCHANGED)\n"
+                "            if _arr is None:\n"
+                "                _arr = np.array(Image.open(fp).convert('RGB'))[:, :, ::-1].copy()\n"
+                # 同单窗：enhance() 已还原量级与类型，直接写回
+                "            output, _ = upsampler.enhance(_arr, outscale=scale)\n"
+                "            cv2.imwrite(os.path.join(output_dir, os.path.basename(fp)), output)\n"
                 "    del upsampler\n"
                 "    gc.collect()\n"
                 "    if torch.cuda.is_available():\n"
