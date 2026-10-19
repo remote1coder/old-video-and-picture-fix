@@ -938,6 +938,52 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         else:
             return 81, "Invalid stage number"
     else:
+        # ID 第 8 点（第七轮）：跑之前先把**复用计划**算出来并记账。
+        #
+        # 旧行为只有一个粗粒度的 `resume_from_stage`（由 FAILED 降级逻辑
+        # 决定），从来没有回答过"哪些阶段能复用、为什么不能、会触发几次
+        # 昂贵的 AI"。现在按 stage 的**局部身份**逐级判定：
+        # 换 CRF 只让 stage7 失效、换日志级别不失效、换人脸模型不影响
+        # 传统降噪；上游失效则下游一律失效（传播）。
+        _reuse_plan = None
+        try:
+            from stage_deps import (build_reuse_plan,
+                                    render_reuse_plan)
+            _recorded: Dict[int, Optional[Dict[str, Any]]] = {}
+            _temp = params.get("temp_dir", "./temp")
+            for _sn in range(8):
+                _cands = find_stage_artifacts(_temp, job_id, input_path, _sn)
+                _rec = None
+                for _c in _cands:
+                    _side = str(_c) + ".identity.json"
+                    if os.path.exists(_side):
+                        try:
+                            with open(_side, "r", encoding="utf-8") as _f:
+                                _d = json.load(_f)
+                            if int(_d.get("stage", -1)) == _sn:
+                                _rec = _d
+                                _rec.setdefault("artifact", _c)
+                                break
+                        except Exception:
+                            continue
+                _recorded[_sn] = _rec
+            _reuse_plan = build_reuse_plan(params, _recorded)
+            job_logger.info(
+                "STAGE_REUSE_PLAN",
+                "Computed a per-stage reuse plan before running",
+                restart_from=_reuse_plan.get("restart_from"),
+                will_run_ai=_reuse_plan.get("will_run_ai"),
+                reusable=[r["stage"] for r in _reuse_plan.get("reusable", [])],
+                invalidated=[{"stage": d["stage"],
+                              "reason": d["reason"],
+                              "keys": d.get("changed_keys", [])[:5]}
+                             for d in _reuse_plan.get("invalidated", [])],
+                stale_files=len(_reuse_plan.get("stale_files", [])))
+            job_logger.info("STAGE_REUSE_PLAN_TEXT",
+                            "\n" + render_reuse_plan(_reuse_plan))
+        except Exception as _rp_exc:
+            job_logger.warning("STAGE_REUSE_PLAN_FAIL", str(_rp_exc))
+
         # BUG-044 fix: resume from last completed stage + 1 when available
         resume_from = job.get("resume_from_stage")
         if resume_from is not None:
@@ -945,6 +991,18 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             job_logger.info("RESUME_STAGE", f"Resuming job from stage {resume_from}")
             # Clear one-shot resume marker so re-runs don't keep skipping
             job.pop("resume_from_stage", None)
+        elif _reuse_plan and _reuse_plan.get("restart_from") is not None \
+                and not job.get("force_full_run"):
+            # 计划说前 N 个 stage 可复用 → 从第一个失效的 stage 开始，
+            # 而不是从头重跑（这正是"最小重算"的实际价值）。
+            _rf = int(_reuse_plan["restart_from"])
+            if _rf > 0:
+                stages = [(n, s) for n, s in stages if n >= _rf]
+                job_logger.info(
+                    "STAGE_MIN_RERUN",
+                    f"Reusing stages before {_rf} per the per-stage identity "
+                    f"plan; starting at stage {_rf}",
+                    restart_from=_rf)
         elif params.get("cleanup_intermediates", True):
             # FIX-NEW-V-07 / R6-10: 全新（非 resume）运行必须先清空本 job 的
             # 全部陈旧中间产物。keep_steps 是"保留最近 N 个阶段"，而
@@ -1045,7 +1103,9 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                             _art, job, config, stage_num, input_path,
                             job_logger,
                             # ID-08：把本次实际消费的上游绑进侧车
-                            upstream_artifact=params.get("upstream_artifact"))
+                            upstream_artifact=params.get("upstream_artifact"),
+                            # ID 第 8 点：局部身份需要"实际执行的参数"
+                            params=params)
                     # ID-04：记下本次产出，供下一个 stage 作为精确上游
                     if _produced:
                         _last_produced[stage_num] = _produced
@@ -1340,6 +1400,25 @@ def intermediate_identity_path(artifact: str) -> str:
     return str(artifact) + ".identity.json"
 
 
+def _stage_identity_for(params: Dict[str, Any], stage_num: int) -> Optional[str]:
+    """ID 第 8 点：局部参数身份（失败不影响登记）。"""
+    try:
+        from stage_deps import stage_identity
+        return stage_identity(params, stage_num)
+    except Exception:
+        return None
+
+
+def _stage_scope_snapshot(params: Dict[str, Any],
+                          stage_num: int) -> Dict[str, Any]:
+    """把影响本 stage 的参数值一起存下来，便于解释"为什么重算"。"""
+    try:
+        from stage_deps import stage_scope_keys
+        return {k: params.get(k) for k in stage_scope_keys(params, stage_num)}
+    except Exception:
+        return {}
+
+
 def _read_color_description(artifact: str) -> Dict[str, Any]:
     """COL-04：探测并返回该产物的实际颜色描述（失败时 probed=False）。"""
     try:
@@ -1362,7 +1441,8 @@ def _read_exec_fingerprint(artifact: str) -> Optional[Dict[str, Any]]:
 def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
                                    config: Dict[str, Any], stage_num: int,
                                    input_path: str, logger=None,
-                                   upstream_artifact: Optional[str] = None
+                                   upstream_artifact: Optional[str] = None,
+                                   params: Optional[Dict[str, Any]] = None
                                    ) -> bool:
     """R2-07 补完：给**每个中间产物**写身份侧车。
 
@@ -1394,6 +1474,11 @@ def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
         # ID-07（第七轮）：并入"实际执行"记录（后端/实际模型/权重指纹/工具版本）。
         # 配置里写的是请求；这里记的是真的跑了什么。
         "exec": _read_exec_fingerprint(artifact),
+        # ID 第 8 点（第七轮）：本 stage 的**局部**参数身份。
+        # 只含影响本 stage 的参数 —— 换 CRF 只让 stage7 失效，
+        # 换日志级别不失效，换人脸模型不影响传统降噪。
+        "stage_identity": _stage_identity_for(params, stage_num),
+        "stage_scope": _stage_scope_snapshot(params, stage_num),
         # COL-04（第七轮）：记录这一代**实际**的颜色表示。字段分开保留
         # （pix_fmt/range/matrix/primaries/transfer），不塌缩成一个
         # "standard"；探测失败时 probed=False，字段一律 None，
