@@ -31,6 +31,7 @@ import argparse
 import glob
 import subprocess
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -232,16 +233,29 @@ def _snapshot_has_failure(snapshot: Dict[str, Dict[str, Optional[str]]]) -> bool
 
 
 def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
-                      logger=None) -> None:
-    """R3-03: 把每个目标路径恢复成提交前的内容。
+                      logger=None) -> Dict[str, Any]:
+    """R3-03 / PUB-02（第七轮）：把每个目标路径恢复成提交前的内容。
+
+    返回**可直接核验的逐文件结果**（旧实现返回 None，调用方无法知道
+    部分恢复失败，却仍打印"Previous generation restored"）：
+
+    ```
+    {
+      "restored":  [path, ...],       # 从备份拷回成功
+      "removed":   [path, ...],       # 本次新建、已正确删除
+      "failed":    [{"path","error"}],# 恢复动作本身失败
+      "impossible":[path, ...],       # 备份失败/缺失，未改动（没得恢复）
+      "fully_restored": bool,         # = not failed and not impossible
+    }
+    ```
 
     * ``backed_up``  → 从备份拷回；
     * ``absent``     → 删除本次新建的文件；
     * ``backup_failed`` → **不动**（没有备份可恢复，删掉就等于销毁旧产物），
-      并记 `STAGE6_RESTORE_IMPOSSIBLE`，绝不声称"完整旧代已恢复"。
+      记 `STAGE6_RESTORE_IMPOSSIBLE`，绝不声称"完整旧代已恢复"。
     """
-    restored = 0
-    impossible = 0
+    result: Dict[str, Any] = {"restored": [], "removed": [], "failed": [],
+                              "impossible": [], "fully_restored": False}
     for path, entry in snapshot.items():
         state = entry.get("state")
         backup = entry.get("backup")
@@ -253,27 +267,56 @@ def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
                 # 越少的系统调用越好；跨卷失败时再退回复制。
                 try:
                     os.replace(backup, path)
-                    restored += 1
+                    result["restored"].append(path)
                     continue
                 except OSError:
                     pass
                 shutil.copyfile(backup, path)
-                restored += 1
+                result["restored"].append(path)
             elif state == BACKUP_ABSENT and os.path.exists(path):
                 os.remove(path)
+                result["removed"].append(path)
             elif state == BACKUP_FAILED:
-                impossible += 1
+                result["impossible"].append(path)
+            elif state == BACKUP_OK:
+                # PUB-02（测试抓到的真实漏洞）：snapshot 声明"备份已成功"，
+                # 但备份文件此刻不可用（被外部删除 / 损坏 / 被清理）。
+                # 旧实现的三个分支都不匹配 → **静默跳过该目标** →
+                # fully_restored 仍为 True，等于假报"完整恢复"。
+                # 这里必须显式记为失败，阻止假报成功。
+                result["failed"].append({
+                    "path": path,
+                    "error": "declared backup is missing or unreadable",
+                })
+                if logger:
+                    logger.error("STAGE6_ROLLBACK_BACKUP_MISSING",
+                                 f"Snapshot claims a backup for {path} but it "
+                                 "is not readable; cannot restore this target",
+                                 path=path, backup=backup)
         except OSError as e:
+            # PUB-02：不再静默吞掉 —— 记录到结构化结果，由调用方决定
+            # 是否进入 RECOVERY_REQUIRED，绝不假报"已完整恢复"。
+            result["failed"].append({"path": path, "error": str(e)})
             if logger:
                 logger.error("STAGE6_ROLLBACK_FAIL",
                              f"Could not restore {path}: {e}", path=path)
-    if impossible and logger:
+
+    result["fully_restored"] = (not result["failed"]
+                               and not result["impossible"])
+    if result["impossible"] and logger:
         logger.error("STAGE6_RESTORE_IMPOSSIBLE",
-                     f"{impossible} path(s) had no usable backup and were left "
-                     "untouched; the previous generation could NOT be fully "
-                     "restored — do not report a clean rollback",
-                     impossible_paths=[p for p, e in snapshot.items()
-                                       if e.get("state") == BACKUP_FAILED])
+                     f"{len(result['impossible'])} path(s) had no usable backup "
+                     "and were left untouched; the previous generation could NOT "
+                     "be fully restored — do not report a clean rollback",
+                     impossible_paths=result["impossible"])
+    if logger:
+        logger.info("STAGE6_ROLLBACK_RESULT",
+                    f"restored={len(result['restored'])} "
+                    f"removed={len(result['removed'])} "
+                    f"failed={len(result['failed'])} "
+                    f"impossible={len(result['impossible'])}",
+                    fully_restored=result["fully_restored"])
+    return result
     if logger:
         logger.info("STAGE6_PUBLISH_ROLLBACK",
                     f"Rollback finished: {restored} restored, "
@@ -281,11 +324,24 @@ def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
 
 
 def _fail(logger, status_path: str, operation: str, reason: str,
-          paths: Optional[List[str]] = None) -> None:
+          paths: Optional[List[str]] = None,
+          preserve_valid_status: bool = False,
+          recovery_required: bool = False,
+          rollback_detail: Optional[Dict[str, Any]] = None) -> None:
     """RV-12: clean this run's temp artifacts and record an honest FAILED.
 
     The status sidecar is what lets the scheduler and the next run tell
     "failed" apart from "an old, still valid product".
+
+    PUB-03（第七轮）：**当前有效成品状态**与**本次失败 attempt 状态**必须分开。
+
+    * ``preserve_valid_status=True`` —— 回滚已完整恢复旧代，旧代仍是有效
+      成品。此时**不覆写**固定 status（否则会把一份好产物标成 FAILED，
+      下次运行误判为需要重跑，甚至触发清理删除它）。本次失败记到
+      `<status>.attempt-<pid>-<ms>.json`。
+    * ``recovery_required=True`` —— 回滚**没有**完整恢复，磁盘处于未知
+      混合状态。此时覆写固定 status 为 ``RECOVERY_REQUIRED`` 是正确的：
+      必须阻止下一次运行把这些路径当成有效产物。
     """
     for p in paths or []:
         try:
@@ -293,12 +349,36 @@ def _fail(logger, status_path: str, operation: str, reason: str,
                 os.remove(p)
         except Exception:
             pass
-    _write_json_sidecar(status_path, {
-        "status": "FAILED",
+
+    payload: Dict[str, Any] = {
+        "status": "RECOVERY_REQUIRED" if recovery_required else "FAILED",
         "stage": 6,
         "failed_operation": operation,
         "reason": str(reason)[:2000],
-    })
+    }
+    if rollback_detail is not None:
+        payload["rollback"] = {
+            "restored": rollback_detail.get("restored", []),
+            "removed": rollback_detail.get("removed", []),
+            "failed": rollback_detail.get("failed", []),
+            "impossible": rollback_detail.get("impossible", []),
+            "fully_restored": rollback_detail.get("fully_restored", False),
+        }
+
+    if preserve_valid_status:
+        # 旧代完好 → 固定 status 不动，只落一个 attempt 级记录
+        attempt_sidecar = (f"{status_path}.attempt-"
+                           f"{os.getpid()}-{int(time.time() * 1000)}.json")
+        _write_json_sidecar(attempt_sidecar, payload)
+        if logger:
+            logger.info("STAGE6_ATTEMPT_FAILURE_RECORDED",
+                        "This attempt failed but the previously published "
+                        "generation was fully restored and remains valid; "
+                        "the fixed status sidecar was left untouched",
+                        attempt_sidecar=attempt_sidecar)
+    else:
+        _write_json_sidecar(status_path, payload)
+
     if cancel_guard is not None:
         cancel_guard.release_outputs()
 
@@ -1137,16 +1217,43 @@ def main():
                      f"Publish aborted at {abort.operation}: {abort.reason}; "
                      "rolling the whole generation back",
                      operation=abort.operation)
-        _rollback_publish(snapshot, logger)
-        logger.warning("STAGE6_PUBLISH_ROLLBACK",
-                       "Previous generation restored; no mixed-generation "
-                       "output is left behind")
-        _fail(logger, status_path, abort.operation, abort.reason, paths=[])
+        # PUB-02/03（第七轮）：按**可核验的回滚结果**分流，不再无条件
+        # 宣布"Previous generation restored"；也不再把当前有效代的
+        # status 覆写成 FAILED（旧代若完好，它仍然是有效成品）。
+        _rb = _rollback_publish(snapshot, logger)
+        if _rb["fully_restored"]:
+            logger.warning("STAGE6_PUBLISH_ROLLBACK",
+                           "Previous generation restored and verified; no "
+                           "mixed-generation output is left behind",
+                           restored=_rb["restored"], removed=_rb["removed"])
+            # 旧代仍有效 → 固定 status 保持原样（可能是 SUCCESS），
+            # 本次失败只记到 attempt 级 sidecar。
+            _fail(logger, status_path, abort.operation, abort.reason,
+                  paths=[], preserve_valid_status=True)
+        else:
+            logger.error("STAGE6_RECOVERY_REQUIRED",
+                         "Rollback did NOT fully restore the previous "
+                         "generation; manual recovery is required before the "
+                         "next run may treat these paths as valid",
+                         failed=_rb["failed"], impossible=_rb["impossible"],
+                         restored=_rb["restored"])
+            _fail(logger, status_path, abort.operation, abort.reason,
+                  paths=[], recovery_required=True,
+                  rollback_detail=_rb)
         return 82
     except OSError as e:
         logger.error("STAGE6_PUBLISH_FAIL", f"Could not publish the output: {e}")
-        _rollback_publish(snapshot, logger)
-        _fail(logger, status_path, "publish", str(e), paths=[])
+        _rb = _rollback_publish(snapshot, logger)
+        if _rb["fully_restored"]:
+            _fail(logger, status_path, "publish", str(e), paths=[],
+                  preserve_valid_status=True)
+        else:
+            logger.error("STAGE6_RECOVERY_REQUIRED",
+                         "Rollback after publish failure did NOT fully "
+                         "restore the previous generation",
+                         failed=_rb["failed"], impossible=_rb["impossible"])
+            _fail(logger, status_path, "publish", str(e), paths=[],
+                  recovery_required=True, rollback_detail=_rb)
         return 82
 
     # 已发布：守卫不再删除任何产物

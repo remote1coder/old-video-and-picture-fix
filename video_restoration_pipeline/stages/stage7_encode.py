@@ -20,6 +20,8 @@ import argparse
 import subprocess
 import datetime
 import re
+import time
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -1028,6 +1030,41 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
     return 0
 
 
+def _same_volume(a: str, b: str) -> bool:
+    """PUB-01: 两个路径是否在同一卷（决定 os.replace 能否原子成功）。
+
+    跨卷时 os.replace 会抛 OSError（WinError 17 / EXDEV），不能靠它
+    完成发布，必须先 copy 到目标端再删源。
+    """
+    try:
+        return os.stat(os.path.dirname(os.path.abspath(a)) or ".").st_dev == \
+               os.stat(os.path.dirname(os.path.abspath(b)) or ".").st_dev
+    except Exception:
+        # 判断不了就按"跨卷"处理（更保守：走 copy 路径）
+        return False
+
+
+def _discard_attempt_tmp(path: str, logger=None) -> None:
+    """PUB-01: 丢弃本次 attempt 的暂存文件。
+
+    只删 `.attempt-*.partial` 这种**本次 attempt 新建**的文件；
+    绝不触碰最终成品路径。
+    """
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+            if logger:
+                logger.info("STAGE7_ATTEMPT_DISCARDED",
+                            "Discarded this attempt's staging file; the "
+                            "previously published output is untouched",
+                            staging_path=path)
+    except Exception as exc:
+        if logger:
+            logger.warning("STAGE7_ATTEMPT_DISCARD_FAIL",
+                           f"Cannot remove staging file: {exc}",
+                           staging_path=path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -1126,14 +1163,40 @@ def main():
                    f"WSL redirect: {output_path} -> {redirected_path}")
         output_path = redirected_path
 
-    # NEW-V-06: 编码开始前登记最终产物（WSL 重定向后的真实写入目标）——
-    # 取消时删掉半截成品并写 FAILED 记录，否则"取消"在文件系统层面
-    # 与"成功"无法区分（半截文件往往还是非空的）。
+    # PUB-01（第七轮）：编码**绝不直接写最终成品**。
+    #
+    # 旧行为：`ffmpeg ... -y output_path` 直接写最终路径，且下面那行
+    # `watch_outputs(output_path, ...)` 用的是默认 `delete_output=True`
+    # ——于是编码失败或用户取消时，取消守卫会把 output_path 删掉，
+    # 而这个路径上可能正是**上一次成功发布的成品**。一次失败的 attempt
+    # 能毁掉已有的好结果。
+    #
+    # 新行为：
+    #   * 所有字节先写进本次 attempt 独占的暂存文件 `.attempt-<pid>-<ts>.partial`；
+    #   * 取消守卫只监控这个暂存文件（删它无损，它本来就只属于本次 attempt）；
+    #   * 编码 + 校验（非空 / A-V 同步）全部通过后，才用 os.replace 发布到
+    #     output_path（同盘是单次原子替换；跨盘回退为 copy + unlink）。
+    #   * output_path 在整个过程中**从未被写**，失败/取消时保持原样。
+    _attempt_id = f"{os.getpid()}-{int(time.time() * 1000)}"
+    # 注意：**必须保留原扩展名**。ffmpeg 靠扩展名推断 muxer，若命名为
+    # `xxx.mkv.attempt-1-2.partial` 会报
+    #   "Unable to find a suitable output format for '...partial'"
+    # 实测（第七轮）踩了一次：改成 `.partial` 后缀后真实编码直接 rc=84。
+    # 正确形态：`clip_restored.attempt-<id>.mkv`（仍是本次 attempt 独占）。
+    _out_stem, _out_ext = os.path.splitext(output_path)
+    _publish_tmp = f"{_out_stem}.attempt-{_attempt_id}{_out_ext}"
+
+    # NEW-V-06: 编码开始前登记**本次 attempt 的暂存产物**——取消时删掉
+    # 半截文件并写 FAILED 记录，但不触碰既有成品。
     if _cancel_guard is not None:
-        _cancel_guard.watch_outputs(output_path, logger=logger, stage=7)
+        _cancel_guard.watch_outputs(_publish_tmp, logger=logger, stage=7,
+                                    # 显式声明：这个路径是本次 attempt 新建的，
+                                    # 删除安全；不是用户已有的成品。
+                                    delete_output=True)
 
     logger.info("STAGE7_START", "Final encoding",
-                input=input_source, output=output_path)
+                input=input_source, output=output_path,
+                attempt_id=_attempt_id, staging_path=_publish_tmp)
 
     # SVT-AV1 parameters
     crf = params.get("crf", 24)
@@ -1559,7 +1622,7 @@ def main():
         # +genpts" per v7.32 §3.10.9) — placed here before the output path so
         # FFmpeg regenerates container PTS at mux time without modifying samples.
         "-fflags", "+genpts",
-        "-y", output_path,
+        "-y", _publish_tmp,
     ])
 
     try:
@@ -1573,13 +1636,35 @@ def main():
             r = subprocess.run(video_cmd, capture_output=True, text=True, errors="replace",
                                timeout=3600*2, shell=False)
         # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
-        if r.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 0:
+        # PUB-01: 校验对象是**本次 attempt 的暂存文件**，不是最终路径。
+        if r.returncode == 0 and Path(_publish_tmp).exists() and Path(_publish_tmp).stat().st_size > 0:
             # FIX-P7-4: Validate A/V sync on final muxed output (not separate files)
             if has_audio:
-                sync_result = _validate_av_sync(output_path, logger)
+                sync_result = _validate_av_sync(_publish_tmp, logger)
                 if sync_result != 0:
+                    # 校验失败：丢弃本次暂存，既有成品保持不变
+                    _discard_attempt_tmp(_publish_tmp, logger)
                     return sync_result
-            
+
+            # PUB-01 发布：暂存 → 最终（同盘原子；跨盘回退 copy+unlink）
+            try:
+                if os.path.exists(output_path) and not _same_volume(
+                        _publish_tmp, output_path):
+                    # 跨盘：先完整复制到目标端，再删暂存
+                    shutil.copy2(_publish_tmp, output_path)
+                    os.unlink(_publish_tmp)
+                else:
+                    os.replace(_publish_tmp, output_path)
+                logger.info("STAGE7_PUBLISHED",
+                            "Attempt staged file promoted to the final "
+                            "path after validation",
+                            output=output_path, attempt_id=_attempt_id)
+            except Exception as _pub_exc:
+                logger.error("STAGE7_PUBLISH_FAIL",
+                             f"Cannot promote staged output: {_pub_exc}")
+                _discard_attempt_tmp(_publish_tmp, logger)
+                return 82
+
             # WSL redirect: copy back to original Linux path
             if original_output_path:
                 if wsl_copy_back(output_path, original_output_path):
@@ -1599,12 +1684,16 @@ def main():
             return 0
         else:
             logger.error("STAGE7_FAILED", f"Encoding failed: {r.stderr[:300]}")
+            # PUB-01: 编码失败只丢本次暂存，既有成品保持不变
+            _discard_attempt_tmp(_publish_tmp, logger)
             return 84
     except subprocess.TimeoutExpired:
         logger.error("STAGE7_TIMEOUT", "Encoding timed out")
+        _discard_attempt_tmp(_publish_tmp, logger)
         return 87
     except Exception as e:
         logger.error("STAGE7_ERROR", str(e))
+        _discard_attempt_tmp(_publish_tmp, logger)
         return 82
 
 
