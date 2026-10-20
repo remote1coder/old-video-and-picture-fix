@@ -25,7 +25,7 @@ import subprocess
 import shutil
 import re
 from pathlib import Path
-from typing import Optional  # R4: 真实运行时 NameError: Optional 未导入
+from typing import List, Optional  # R4: 真实运行时 NameError: Optional 未导入
 
 import numpy as np
 
@@ -1135,6 +1135,33 @@ def main():
     }
     color_meta_path = str(Path(temp_dir) /
         f"{args.job_id}_{Path(input_name).stem}_color_meta.json")
+
+    # FIX-2026-10-20（G6 实测挖出的架构缺陷）：宽色域 → sRGB 的转换需要
+    # ICC **二进制**，但 G'MIC 重写像素时不会带上它 —— 实测所有中间产物
+    # （_16bit.tif / .deblock.tif / .deband.tif / step5_postprocess.tif）
+    # 的 ICC 全部为无，于是 stage6 的 _extract_source_icc() 必然读不到，
+    # 任何 AdobeRGB/ProPhoto/DisplayP3 素材都 COLOR_FAILED（rc=86）。
+    # 而 stage1 只把 ICC 的**名字**写进了 color_meta，二进制从未传递。
+    #
+    # 修法：按 stage6 自己写盘的同一命名落一份 sidecar，stage6 读不到
+    # 工作文件时回退读它（见 stage6_encode.py 的 STAGE6_ICC_SIDECAR）。
+    icc_sidecar = str(Path(temp_dir) /
+        f"{args.job_id}_{Path(input_name).stem}_source.icc")
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(working_input) as _im:
+            _icc_bytes = _im.info.get("icc_profile")
+        if _icc_bytes:
+            Path(icc_sidecar).write_bytes(_icc_bytes)
+            color_meta["icc_path"] = icc_sidecar
+            logger.info("STAGE1_ICC_SIDECAR",
+                        "Saved source ICC binary for wide-gamut conversion",
+                        path=icc_sidecar, profile_size=len(_icc_bytes))
+    except Exception as _ice:
+        # 拿不到二进制不阻断 stage1（sRGB 素材不需要它），但必须留痕
+        logger.warning("STAGE1_ICC_SIDECAR_FAIL",
+                       f"Could not save source ICC sidecar: {_ice}")
+
     try:
         with open(color_meta_path, "w", encoding="utf-8") as f:
             json.dump(color_meta, f, indent=2)
@@ -1197,10 +1224,37 @@ def main():
     working_path = str(Path(temp_dir) /
         f"{args.job_id}_{Path(input_name).stem}_16bit.tif")
 
+    # FIX-2026-10-20（G6 实跑挖出，R16 修法没覆盖到的一角）：
+    # G'MIC `-o X.tif,uint16` 只改**容器位深**，不拉伸值域 —— 8-bit 输入转出去
+    # 仍是 0-255 装在 uint16 里（R16 记录的"名实不符"）。
+    # R16 的修法（media_io.load_image_rgb_uint8 逐通道自适应）覆盖了 Python 侧
+    # **所有读取方**，但覆盖不到 G'MIC 自己：紧接着的 denoise_haar /
+    # denoise_patchpca 都按真正的 16-bit 尺度运算这个文件，产出**混合值域**
+    # 数据（实测 deblock 后 ch0/ch2 仍是 0-244 而 ch1 冲到 65532）。
+    # 最终 avifenc 拿到"16-bit 容器里装着 0-255"的图 → 成品纯黑。
+    # 实测：普通 sRGB JPEG 与 ProPhoto TIFF **都中招**，全链 rc 一直是 0，
+    # 契约、CICP、头部核验全部正常，只有像素是黑的。
+    # 根因修法：8-bit 量级输入在转档时就把值域真正拉伸到 16-bit。
+    _stretch: List[str] = []
+    try:
+        import media_io as _mio
+        _arr, _ = _mio.read_image_array(working_input)
+        if _arr is not None and int(_arr.max()) <= 255:
+            _stretch = ["-mul", "257"]
+            logger.info("STAGE1_BITSTRETCH",
+                        "Source is 8-bit range; stretching to real 16-bit "
+                        "before G'MIC processing (value range, not just "
+                        "container depth)",
+                        src_max=int(_arr.max()))
+    except Exception as _bse:
+        # 读不出就不拉伸（保持原行为），但必须留痕 —— 静默跳过会重现黑图
+        logger.warning("STAGE1_BITSTRETCH_SKIPPED",
+                       f"Could not determine source value range: {_bse}")
+
     # BUG-049 fix: Explicitly check gmic returncode
     try:
         # R4：`-type ushort` 在 G'MIC 4.x 已移除，改为按版本选择 16-bit 输出写法
-        cmd = ["gmic", working_input] + _gmic_16bit_output_args(working_path)
+        cmd = ["gmic", working_input] + _stretch + _gmic_16bit_output_args(working_path)
         r = subprocess.run(cmd, capture_output=True, timeout=120, shell=False)
         if r.returncode != 0:
             stderr = (r.stderr or b"").decode("utf-8", errors="replace")[:500]

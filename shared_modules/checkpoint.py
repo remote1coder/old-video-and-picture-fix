@@ -279,6 +279,19 @@ def unlink_artifact_with_sidecars(path) -> int:
                 removed += 1
         except OSError:
             pass
+    # FIX-2026-10-20（G6）：stage1 落的源 ICC sidecar 命名不是"目标+后缀"
+    # 而是 `{job_id}_{stem}_source.icc`（与 stage6 写盘同名，见两侧注释），
+    # 按 job_id + stem 前缀单独找。留着它不会有害，但会积累无用二进制。
+    try:
+        _stem = target.name.split("_step")[0]
+        for _icc in target.parent.glob(f"{_stem}_*_source.icc"):
+            try:
+                _icc.unlink()
+                removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
     return removed
 
 
