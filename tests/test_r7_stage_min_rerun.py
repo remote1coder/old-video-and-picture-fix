@@ -131,18 +131,57 @@ def test_plan_crf_only_restarts_at_encode():
 
 
 def test_plan_ai_model_change_restarts_at_upscale_and_propagates():
-    """换 AI 模型 → stage3 及其下游全部失效，stage1/2 保留。"""
-    p = {"crf": 24, "ai_upscale_model": "x4v3"}
+    """换 AI 模型 → stage3 及其下游全部失效，stage1/2 保留。
+
+    FIX-2026-10-21：参数补上 `ai_enabled: True`。真实运行时 `ai_enabled` 一定
+    来自 `config.ai.enabled`（经 merge_params 的 ai_config 展开），不会缺失。
+    原来这里不写它，却断言 `will_run_ai is True` —— 那是把"有 ai_upscale_model"
+    当成了"AI 会跑"，与 main.py 的 `ai_enabled and not (ai_banned and not
+    force_allow)` 不符（见 build_reuse_plan 的 FIX 注释）。
+    """
+    p = {"crf": 24, "ai_enabled": True, "ai_upscale_model": "x4v3"}
     rec = {s: _rec(s, sd.stage_identity(p, s)) for s in range(1, 8)}
     p2 = dict(p, ai_upscale_model="x4plus")
     plan = sd.build_reuse_plan(p2, rec)
     assert plan["restart_from"] == 3
     assert plan["will_run_ai"] is True
+    assert plan["ai_skip_reason"] is None
     assert [r["stage"] for r in plan["reusable"]] == [1, 2]
     reasons = {d["stage"]: d["reason"] for d in plan["invalidated"]}
     assert reasons[3] == "params-changed"
     for s in (4, 5, 6, 7):
         assert reasons[s] == "upstream-invalidated"
+
+
+def test_plan_does_not_claim_ai_when_disabled():
+    """FIX-2026-10-21：AI 没启用时不能谎报 will_run_ai=true。
+
+    16 分钟 1080p 全默认实跑时，复用计划报 will_run_ai=true 而实际一条 AI
+    日志都没有 —— 用户会按"要跑几小时"预估时间。必须如实报 False + 原因。
+    """
+    p = {"crf": 24, "ai_enabled": False, "ai_upscale_model": "x4v3",
+         "face_restore": "GFPGAN"}
+    plan = sd.build_reuse_plan(p, {})
+    assert plan["will_run_ai"] is False
+    assert "ai.enabled=false" in plan["ai_skip_reason"]
+
+
+def test_plan_does_not_claim_ai_when_banned():
+    """>=1080p 素材被 ban 时，即使 ai_enabled=true 也不跑 AI。"""
+    p = {"crf": 24, "ai_enabled": True, "ai_upscale_banned": True,
+         "force_allow_banned_upscale": False, "face_restore": "GFPGAN"}
+    plan = sd.build_reuse_plan(p, {})
+    assert plan["will_run_ai"] is False
+    assert "ai_upscale_banned" in plan["ai_skip_reason"]
+
+
+def test_plan_will_run_ai_when_banned_but_forced():
+    """显式 force_allow_banned_upscale=true 时，ban 不再阻止 AI。"""
+    p = {"crf": 24, "ai_enabled": True, "ai_upscale_banned": True,
+         "force_allow_banned_upscale": True, "face_restore": "GFPGAN"}
+    plan = sd.build_reuse_plan(p, {})
+    assert plan["will_run_ai"] is True
+    assert plan["ai_skip_reason"] is None
 
 
 def test_plan_missing_identity_blocks_reuse_but_keeps_files():
