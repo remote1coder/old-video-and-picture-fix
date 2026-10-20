@@ -1969,6 +1969,14 @@ def main():
                             model=_exec_fp.get("requested_model"),
                             weights_sha256=(_exec_fp.get("model_weights")
                                             or {}).get("sha256"))
+            else:
+                # FIX-2026-10-20：写失败原来是静默的（只有 True 分支有日志）。
+                # 后果是 exec 指纹缺失 → resume 时上游摘要对不上 → 重算，
+                # 方向是安全的，但**不可见**：看不出为什么每次都重算。
+                logger.warning("STAGE3_EXEC_SIDECAR_EMPTY",
+                               "Exec fingerprint sidecar was not written; "
+                               "resume will fall back to recompute",
+                               output=output_path)
         except Exception as _we:
             logger.warning("STAGE3_EXEC_SIDECAR_FAIL", str(_we))
 

@@ -338,7 +338,14 @@ class CancelGuard:
                 ),
                 "exit_code": EXIT_INTERRUPTED,
             }
-            self._write_json(status_path, payload)
+            # FIX-2026-10-20：写失败原来是静默的（返回值没人看）。
+            # 信号处理器内不能抛异常，但"没写成"这件事本身必须留下痕迹 ——
+            # 否则取消后没有 FAILED 记录，下次运行看不出上次是取消的，
+            # 只能看到一个"莫名缺失"的产物。
+            if not self._write_json(status_path, payload):
+                sys.stderr.write(
+                    f"[cancel_guard] FAILED sidecar could not be written: "
+                    f"{status_path}\n")
 
         if self._logger is not None:
             try:
