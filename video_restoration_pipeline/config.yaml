@@ -17,6 +17,14 @@ global:
   preset_max_quality: true
   pix_fmt: "yuv420p10le"
   color_range: "limited"
+  # FIX-2026-10-20（第六轮 §2.5 待办）：色彩保真校验门。
+  # stage7 在发布前比对「原始输入 vs 本次编码成品」的 RGB 三通道均值，
+  # 最大绝对差超过阈值即记录。默认只 WARNING —— 阈值需要先在一批真实
+  # 素材上标定（不同内容天然有差异），且开启 AI 超分时 GAN 模型本身就
+  # 会带来可测色偏（第六轮实测 R/B 比从 1.007 漂到 0.955）。
+  # 探测失败（读不出/一个点都没抽到）记 STAGE7_COLOR_SKIPPED，不假装通过。
+  color_drift_threshold: 8.0    # 0-255 的 RGB 通道均值最大绝对差
+  color_drift_enforce: false    # true 时超阈值丢弃暂存并返回 86（不覆盖既有成品）
   platform: "auto"
   gpu_priority: ["cuda", "rocm", "mps", "cpu"]
   # 防抖默认 auto：抽样测全局位移后决定（见 stage1.detect_shakiness）

@@ -86,6 +86,77 @@ _ENCODER_ALIASES = {
 }
 
 
+#: FIX-2026-10-20（第六轮 §2.5 待办）：色彩保真校验门的默认阈值与行为。
+#: 单位是 0-255 的 RGB 通道均值绝对差。默认只 WARNING 不阻断 ——
+#: 阈值需要先在一批真实素材上标定（不同内容天然有差异），
+#: 且开启 AI 超分时 GAN 模型本身就会带来可测的色偏
+#: （第六轮实测 R/B 比从 1.007 漂到 0.955）。要阻断需显式
+#: `color_drift_enforce: true`。
+COLOR_DRIFT_DEFAULT_THRESHOLD = 8.0
+#: 色彩探测的采样位置，按**时长比例**取（10% / 50% / 90%）。
+#: 不用固定秒数：短片（几秒）在 5/30/90 秒一个点都取不到，
+#: 实测会让探测静默返回 None、色彩门形同虚设。
+COLOR_PROBE_FRACTIONS = (0.1, 0.5, 0.9)
+
+
+def _probe_duration(path: str, logger=None) -> float:
+    """读容器时长（秒）。失败返回 0.0。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, errors="replace", timeout=60,
+            shell=False)
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return float(r.stdout.strip())
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE7_COLOR_PROBE_ERROR",
+                           f"duration probe failed: {e}")
+    return 0.0
+
+
+def _probe_rgb_mean(path: str, logger=None) -> Optional[List[float]]:
+    """在若干时间点抽帧，算 RGB 三通道均值（0-255）。
+
+    失败（文件读不出 / 一个点都没抽到）返回 None，由调用方决定放行。
+    用 `-f rawvideo -pix_fmt rgb24` 直接拿像素，不经过 PIL/cv2，
+    避免再踩一次"读法不对导致数值错"的坑（R16 病族）。
+    """
+    try:
+        import numpy as np
+        dur = _probe_duration(path, logger)
+        offsets = ([f * dur for f in COLOR_PROBE_FRACTIONS] if dur > 0
+                   else [0.0])
+        per_frame: List[List[float]] = []
+        for off in offsets:
+            cmd = ["ffmpeg", "-hide_banner", "-v", "error",
+                   "-ss", f"{max(0.0, off):.3f}", "-i", str(path),
+                   "-frames:v", "1", "-vf", "scale=160:-2",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=120,
+                                   shell=False)
+            except Exception:
+                continue
+            if r.returncode != 0 or not r.stdout:
+                continue
+            buf = np.frombuffer(r.stdout, dtype=np.uint8)
+            n = (buf.size // 3) * 3
+            if n <= 0:
+                continue
+            px = buf[:n].reshape(-1, 3).astype(np.float64)
+            per_frame.append([float(px[:, i].mean()) for i in range(3)])
+        if not per_frame:
+            return None
+        k = len(per_frame)
+        return [sum(f[i] for f in per_frame) / k for i in range(3)]
+    except Exception as e:
+        if logger:
+            logger.warning("STAGE7_COLOR_PROBE_ERROR", str(e))
+        return None
+
+
 class AudioDegradeNotAllowed(Exception):
     """FIX-R3-08 补完：明确要求的音频算法不可用，且未授权降级。
 
@@ -1888,6 +1959,64 @@ def main():
                     # 校验失败：丢弃本次暂存，既有成品保持不变
                     _discard_attempt_tmp(_publish_tmp, logger)
                     return sync_result
+
+            # FIX-2026-10-20（第六轮 §2.5 待办）：色彩保真校验门。
+            #
+            # 为什么加：第六轮修完"中间产物丢色彩元数据 → 误判 BT.601 →
+            # 成品偏紫"之后，实测发现**偏色是多环节累积**的，不是单一 bug：
+            #   R/B 比  源帧 1.007 → AI 超分后 0.979 → step6 后 0.943 → 成品 0.955
+            # 而流水线从不在输出前比对源与成品的色彩分布，所以这类漂移
+            # 一直是**不可见**的。
+            #
+            # 为什么放在这里（A/V 校验之后、发布之前）：此刻成品还是
+            # 本次 attempt 的暂存文件，`color_drift_enforce: true` 时
+            # 可以丢弃暂存、保住既有成品 —— 与 PUB-01 的语义一致。
+            # 放在发布之后就只剩告警意义了。
+            #
+            # 为什么默认只 WARNING：阈值需要先在一批真实素材上标定
+            # （不同内容天然有差异），且开启 AI 时 GAN 模型本身就带来
+            # 可测色偏。设为 error 需显式 `color_drift_enforce: true`。
+            try:
+                _thr = float(params.get("color_drift_threshold",
+                                        COLOR_DRIFT_DEFAULT_THRESHOLD))
+                _enforce = bool(params.get("color_drift_enforce", False))
+                _src_mean = _probe_rgb_mean(args.input, logger)
+                _out_mean = _probe_rgb_mean(_publish_tmp, logger)
+                if _src_mean and _out_mean and all(v > 0 for v in _src_mean + _out_mean):
+                    _delta = max(abs(_src_mean[i] - _out_mean[i])
+                                 for i in range(3))
+                    _rb_src = _src_mean[0] / _src_mean[2]
+                    _rb_out = _out_mean[0] / _out_mean[2]
+                    _fields = dict(
+                        src_mean=[round(v, 2) for v in _src_mean],
+                        out_mean=[round(v, 2) for v in _out_mean],
+                        delta=round(_delta, 2), threshold=_thr,
+                        src_r_over_b=round(_rb_src, 4),
+                        out_r_over_b=round(_rb_out, 4),
+                        rb_drift=round(abs(_rb_src - _rb_out), 4),
+                        enforce=_enforce)
+                    if _delta > _thr:
+                        _msg = ("Colour drift between original input and "
+                                "encoded output exceeds threshold")
+                        if _enforce:
+                            logger.error("STAGE7_COLOR_DRIFT", _msg, **_fields)
+                            _discard_attempt_tmp(_publish_tmp, logger)
+                            return 86
+                        logger.warning("STAGE7_COLOR_DRIFT", _msg, **_fields)
+                    else:
+                        logger.info("STAGE7_COLOR_OK",
+                                    "Colour distribution within threshold",
+                                    **_fields)
+                else:
+                    # 探测失败（读不出/一个点都没抽到）→ 如实记"未校验"，
+                    # 不假装通过，也不阻断。
+                    logger.warning("STAGE7_COLOR_SKIPPED",
+                                   "Could not probe RGB means on one side; "
+                                   "colour fidelity left unchecked",
+                                   src_probed=_src_mean is not None,
+                                   out_probed=_out_mean is not None)
+            except Exception as _ce:
+                logger.warning("STAGE7_COLOR_DRIFT_ERROR", str(_ce))
 
             # PUB-01 发布：暂存 → 最终（同盘原子；跨盘回退 copy+unlink）
             #
