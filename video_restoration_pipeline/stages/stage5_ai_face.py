@@ -2057,7 +2057,12 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
         pass
 
     # Output path (shared between both paths)
-    param_hash = params.get("param_hash", job_id)
+    # FIX-2026-10-20: merge_params() 从不注入 params["param_hash"]，原来退化成
+    # job_id —— 同 job 内恒定不变，于是改 face_restore / static_segment_duration
+    # 等参数**不改变文件名**，陈旧同名产物会被当成可复用（参数修改看似没生效）。
+    # 改为就地计算（与 stage1/3/4 同一模式），以本 stage 的实际输入为身份基准。
+    from checkpoint import compute_param_hash as _cph
+    param_hash = _cph(args.input, params)
     output_path = os.path.join(
         temp_dir,
         f"{job_id}_{Path(args.input).stem}_step5_face_p{param_hash}.mkv"
