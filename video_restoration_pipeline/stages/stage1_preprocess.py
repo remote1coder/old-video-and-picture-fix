@@ -624,7 +624,23 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
 
     # Deinterlace (QTGMC)
     field_segments = params.get("field_segments", [])
-    use_segmented = bool(field_segments) and not is_psf and deinterlace == "QTGMC"
+    # FIX-2026-10-21（16 分钟 1080p 真实素材实跑）：必须同时要求
+    # **整体场序不是 unknown**。
+    #
+    # 实测：1920x1080 progressive 素材，classify 的场序分段检测误判出
+    # tt×20 / bb×14 / progressive×6 共 40 段，而**整体** field_order 是
+    # unknown。旧条件只看 `field_segments` 非空，于是出现两个后果：
+    #   1. 日志声称 `field_order=unknown, skipping QTGMC deinterlace
+    #      (conservative)`（见上方 STAGE1_UNKNOWN_FIELD_ORDER）；
+    #   2. vpy 却对 34 个隔行段跑 QTGMC(Preset='Slower', FPSDivisor=2)
+    #      —— 帧率从 29.97 减半到 14.985，progressive 内容被当隔行
+    #      去隔行（糊掉细节），Slower 预设还让 1080p×28840 帧跑几小时。
+    #
+    # 两个字段互相矛盾时，以"整体判不出"为准，走保守跳过 —— 与日志
+    # 已经声明的策略保持一致，也让"日志 == 行为"重新成立。
+    use_segmented = (bool(field_segments) and not is_psf
+                     and deinterlace == "QTGMC"
+                     and params.get("field_order") != "unknown")
 
     if use_segmented:
         # FIX-W15: force InputType=0 for true interlaced (tt/bb) segments per
