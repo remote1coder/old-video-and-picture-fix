@@ -711,6 +711,21 @@ def resolve_color_space(working_path: str, params: Dict[str, Any],
     # --- wide-gamut source: a real transform is mandatory -------------------
     allow_degrade = bool(params.get("allow_unconverted_colorspace", False))
     icc_bytes = _extract_source_icc(working_path)
+    if not icc_bytes:
+        # FIX-2026-10-20（G6 实测）：中间产物一律不带 ICC（G'MIC 重写像素时
+        # 丢掉），而宽色域转换必须有它。stage1 检测到 ICC 时会按**同一命名**
+        # 落一份 sidecar（见 stage1 的 STAGE1_ICC_SIDECAR），这里回退读它。
+        _icc_sidecar = Path(temp_dir) / f"{job_id}_{stem}_source.icc"
+        try:
+            if _icc_sidecar.is_file():
+                icc_bytes = _icc_sidecar.read_bytes()
+                logger.info("STAGE6_ICC_SIDECAR",
+                            "Working file carries no ICC; using the sidecar "
+                            "saved by stage1",
+                            path=str(_icc_sidecar),
+                            profile_size=len(icc_bytes))
+        except OSError as _ice:
+            logger.warning("STAGE6_ICC_SIDECAR_FAIL", str(_ice))
     source_icc_file: Optional[str] = None
     src_profile = None
     try:
