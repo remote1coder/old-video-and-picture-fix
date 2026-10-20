@@ -45,7 +45,8 @@ from publish_lock import acquire_target_locks, TargetLockTimeout  # noqa: E402
 # 持久 journal（第七轮）：让硬终止后"上次做到哪一步"可判断
 from publish_journal import (  # noqa: E402
     JOURNAL_SCHEMA, PHASE_PREPARED, PHASE_COMMITTED,
-    PHASE_RECOVERY_REQUIRED, file_digest, journal_path_for, write_journal)
+    PHASE_RECOVERY_REQUIRED, file_digest, journal_path_for, write_journal,
+    read_journal, validate_journal_paths, classify_recovery)
 
 try:  # FIX-V01/V05: encode-boundary contracts
     sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
@@ -236,6 +237,138 @@ def _snapshot_has_failure(snapshot: Dict[str, Dict[str, Optional[str]]]) -> bool
     """R3-03: 有任何一个目标备份失败 → 提交必须先停，不能动旧产物。"""
     return any(entry.get("state") == BACKUP_FAILED
                for entry in snapshot.values())
+
+
+def _recover_prior_publish(work_output_path: str,
+                           extra_targets: Optional[List[str]] = None,
+                           logger=None) -> Dict[str, Any]:
+    """A4 方案 1：进入发布临界区前，按 journal 收拾上一次未完成的事务。
+
+    **判断层早已就绪，缺的只是这个调用点。**
+    `publish_journal` 里的 `read_journal` / `validate_journal_paths` /
+    `classify_recovery` 都已实现，`tests/test_r7_kill9_recovery.py` 还用
+    **真 kill -9**（`TerminateProcess`，子进程没有任何机会跑清理代码）
+    演练过"旧成品完好 + journal 停在 PREPARED + classify_recovery 给出
+    明确结论"。但**生产路径从来没读过 journal** —— 于是硬杀后残留的
+    `.pubbak` 与可能存在的混合代一直没人处理。
+
+    沿用 publish_journal 的原则：
+    * 用**内容摘要**识别新旧代，不相信阶段字段；
+    * 有任何目标匹配不上已记录的代 → `KEEP_AND_ASK`，**绝不自动恢复**；
+    * journal 是磁盘数据不是可信指令，先过路径归属校验。
+
+    返回 `{"status": ..., "action": ..., "report": ...}`：
+      `none`           没有上次事务的记录（journal 不存在/读不出）
+      `already_new`    上次已完整提交，只需清残留
+      `rolled_back`    上次是混合代/未提交，已用备份恢复旧代
+      `needs_human`    状态无法判定，保留现场等人工（调用方应失败）
+    """
+    jp = journal_path_for(work_output_path)
+    doc = read_journal(jp)
+    if doc is None:
+        return {"status": "none", "action": None, "report": None}
+
+    # 路径归属校验：journal 可能被外部改写，恢复/清理前必须确认它指的
+    # 每个路径都落在本次事务授权的根目录内。
+    roots: List[str] = []
+    for p in ([work_output_path] + list(extra_targets or [])):
+        if p:
+            roots.append(str(Path(p).resolve().parent))
+    problems = validate_journal_paths(doc, roots)
+    if problems:
+        if logger:
+            logger.error("STAGE6_JOURNAL_UNTRUSTED",
+                         "Prior publish journal failed path validation; "
+                         "leaving everything untouched",
+                         journal=jp, problems=problems[:5])
+        return {"status": "needs_human", "action": None,
+                "report": {"problems": problems}}
+
+    rep = classify_recovery(doc)
+    rec = str(rep.get("recommendation") or "")
+    if logger:
+        logger.info("STAGE6_PRIOR_PUBLISH_CHECK",
+                    "Recovered the state of a previous publish transaction",
+                    journal=jp, phase=rep.get("phase"),
+                    recommendation=rec,
+                    targets={k: v.get("state")
+                             for k, v in (rep.get("targets") or {}).items()})
+
+    if rec.startswith("KEEP_AND_ASK"):
+        # 不猜：保留现场，让调用方失败并等人工介入。
+        return {"status": "needs_human", "action": None, "report": rep}
+
+    if rec.startswith("ALREADY_COMMITTED"):
+        # 上次已完整提交。清掉这次事务的 journal 与备份残留即可。
+        _purge_publish_residue(jp, rep, logger)
+        return {"status": "already_new", "action": "purged", "report": rep}
+
+    # ROLLBACK_SAFE（全是旧代，恢复是 no-op）与 MIXED（混合代，必须恢复）
+    # 都走同一条路：按 journal 记录的备份把每个目标恢复成旧代。
+    snapshot: Dict[str, Dict[str, Optional[str]]] = {}
+    for t in (doc.get("targets") or []):
+        r = (doc.get("records") or {}).get(t) or {}
+        bk = r.get("backup")
+        if bk and os.path.exists(bk):
+            snapshot[t] = {"state": BACKUP_OK, "backup": bk}
+        elif r.get("existed") is False:
+            snapshot[t] = {"state": BACKUP_ABSENT, "backup": None}
+        else:
+            snapshot[t] = {"state": BACKUP_FAILED, "backup": None}
+    rb = _rollback_publish(snapshot, logger)
+    if not rb.get("fully_restored"):
+        if logger:
+            logger.error("STAGE6_PRIOR_PUBLISH_ROLLBACK_FAILED",
+                         "Could not fully restore the previous generation "
+                         "from journal backups; leaving everything untouched",
+                         failed=rb.get("failed"),
+                         impossible=rb.get("impossible"))
+        return {"status": "needs_human", "action": None,
+                "report": {"rollback": rb}}
+    _purge_publish_residue(jp, rep, logger)
+    return {"status": "rolled_back", "action": "rolled_back",
+            "report": {"recovery": rep, "rollback": rb}}
+
+
+def _purge_publish_residue(journal_path: str, report: Dict[str, Any],
+                           logger=None) -> None:
+    """删掉一次已了结事务留下的 journal 与 `.pubbak` 备份。
+
+    只删 journal 里**记录过**的备份路径，不做目录遍历猜测
+    （`publish_journal` 的 docstring 专门批评过"发现备份就回滚"是猜测）。
+    """
+    removed: List[str] = []
+    for t, info in (report.get("targets") or {}).items():
+        bk = info.get("backup")
+        if bk and os.path.isfile(bk):
+            try:
+                os.remove(bk)
+                removed.append(bk)
+            except OSError:
+                pass
+    try:
+        if os.path.exists(journal_path):
+            os.remove(journal_path)
+            removed.append(journal_path)
+    except OSError:
+        pass
+    # 备份文件都删掉后，`.pubbak` 目录通常是空的 —— 顺手移除。
+    # 用 rmdir 而不是 rmtree：**只有目录为空才会成功**，万一里面还有
+    # journal 没记录到的文件（不该有，但不猜），就留着不动。
+    for d in {str(Path(b).parent)
+              for b in (info.get("backup")
+                        for info in (report.get("targets") or {}).values())
+              if b}:
+        try:
+            if os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
+                removed.append(d)
+        except OSError:
+            pass
+    if removed and logger:
+        logger.info("STAGE6_PRIOR_PUBLISH_RESIDUE_PURGED",
+                    "Removed journal and backups of a concluded transaction",
+                    removed=removed)
 
 
 def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
@@ -1164,6 +1297,35 @@ def main():
     # 契约是下一次 resume/验收的依据，与媒体不同代会让下游读到自相矛盾的记录。
     commit_targets.append(contract_path)
     commit_targets.append(status_path)
+
+    # --- A4 方案 1：先收拾上一次未完成的事务，再开始这一次 ---
+    # 提交协议是"备份 + 逐个 os.replace + 失败整批回滚"，整组**不是**原子的。
+    # PublishAbort 与取消信号都能回滚，但 kill -9 / 断电时 finally 和取消钩子
+    # 都跑不到 —— 磁盘上可能留下混合代（新 AVIF + 旧 TIFF）加一堆没有归属
+    # 信息的 `.pubbak`。判断层（read_journal + validate_journal_paths +
+    # classify_recovery）与 kill -9 演练早在第七轮就绪，缺的只是这个调用点。
+    #
+    # 放在这里（而不是进程启动时）的理由：此刻才确定这次事务要动哪些文件，
+    # 可以用作 journal 路径归属校验的授权根目录。
+    _prior = _recover_prior_publish(work_output_path, commit_targets, logger)
+    if _prior.get("status") == "needs_human":
+        # 状态无法判定 —— 不猜、不动，让人工介入。此时动任何文件都可能
+        # 把一次可恢复的残留变成不可恢复的损失。
+        logger.error("STAGE6_PRIOR_PUBLISH_UNRESOLVED",
+                     "A previous publish transaction could not be resolved "
+                     "automatically; refusing to start a new one",
+                     report=_prior.get("report"))
+        _fail(logger, status_path, "prior_publish_recovery",
+              "unresolved prior publish transaction; inspect the journal "
+              "and .pubbak manually",
+              paths=[tmp_avif] + round_artifacts)
+        return 82
+    if _prior.get("status") == "rolled_back" and logger:
+        logger.warning("STAGE6_PRIOR_PUBLISH_RECOVERED",
+                       "Rolled a previous uncommitted publish back to the "
+                       "old generation before starting this one",
+                       report=_prior.get("report"))
+
     # FIX-A3：同 tmp_avif，备份目录也带 job 维度（见上方说明）。
     backup_dir = f"{work_output_path}{_iso}.pubbak"
     snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
