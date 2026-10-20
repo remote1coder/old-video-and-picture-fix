@@ -194,8 +194,7 @@ project_root/
 │       ├── stage3_ai_upscale.py     # AI放大
 │       ├── stage4_ai_face.py        # 面部修复（GFPGAN/CodeFormer）
 │       ├── stage5_postprocess.py    # 后处理（局部遮罩 + 颗粒合成 + 人像色彩匹配）
-│       ├── stage6_encode.py         # AVIF最终编码
-│       └── stage2_traditional_check.py  # 历史遗留，不在默认链
+│       └── stage6_encode.py         # AVIF最终编码
 │
 ├── shared_modules/                  # 共享模块（两边共用）
 │   ├── checkpoint.py                # 断点续传 / 身份与参数哈希

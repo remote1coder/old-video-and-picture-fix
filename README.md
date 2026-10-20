@@ -225,8 +225,7 @@ wins (see "Version & Specifications" below).
 │       ├── stage3_ai_upscale.py
 │       ├── stage4_ai_face.py
 │       ├── stage5_postprocess.py
-│       ├── stage6_encode.py
-│       └── stage2_traditional_check.py   # legacy, not in the default chain
+│       └── stage6_encode.py
 │
 ├── shared_modules/                  # Shared modules
 │   ├── checkpoint.py                # Checkpoint / resume support
@@ -476,8 +475,7 @@ python photo_restoration_pipeline/main.py \
 │       ├── stage3_ai_upscale.py      # AI 放大
 │       ├── stage4_ai_face.py         # 人脸修复
 │       ├── stage5_postprocess.py     # 后处理（局部遮罩 + 颗粒合成）
-│       ├── stage6_encode.py          # AVIF 最终编码
-│       └── stage2_traditional_check.py   # 历史遗留，不在默认链
+│       └── stage6_encode.py          # AVIF 最终编码
 │
 ├── shared_modules/                  # 共享模块
 │   ├── checkpoint.py                # 断点续传 / 参数哈希 / 身份校验
