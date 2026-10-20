@@ -7,7 +7,11 @@
 global:
   output_dir: "./output"
   temp_dir: "./temp"
-  encoder: "svtav1"
+  # FIX-2026-10-20: 原名 `encoder: "svtav1"` —— stage7 实际读的是
+  # `video_encoder`，且 "svtav1" 不是 ffmpeg 的编码器名（应为 libsvtav1），
+  # 所以这一项此前从未生效（生效的一直是代码默认值，巧合结果相同）。
+  # 现两个键都认，并做了简写归一；推荐用下面的标准写法。
+  video_encoder: "libsvtav1"   # 可选 libx265（= x265，CRF 18 + preset slow）
   crf: 24
   preset: 4
   preset_max_quality: true

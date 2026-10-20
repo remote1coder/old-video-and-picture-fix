@@ -80,7 +80,8 @@ _STAGE_KEYS: Dict[int, Set[str]] = {
         "gfpgan_model", "codeformer_fidelity"},
     6: {"grain_strength", "grain_factory3", "grain_enabled",
         "grain_seed"},
-    7: {"crf", "preset", "encoder", "pix_fmt", "color_range",
+    7: {"crf", "preset", "encoder", "video_encoder", "pix_fmt",
+        "color_range",
         "svt_tile_cols", "svt_tile_rows", "preset_max_quality",
         "audio_bitrate", "audio_codec", "audio_channels",
         "audio_noise_reduce", "audio_normalize"},
@@ -96,7 +97,8 @@ _STAGE_PREFIXES: Dict[int, Tuple[str, ...]] = {
     4: ("unsharp", "gblur", "eq_", "sharpen", "contrast", "saturation"),
     5: ("ai_face", "face_", "gfpgan", "codeformer", "ai_static"),
     6: ("grain", "ai_grain"),
-    7: ("crf", "preset", "encoder", "pix_fmt", "svt_", "color_range",
+    7: ("crf", "preset", "encoder", "video_encoder", "pix_fmt", "svt_",
+        "color_range",
         "audio_", "bitrate"),
 }
 

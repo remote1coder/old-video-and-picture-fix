@@ -6,7 +6,11 @@
 global:
   output_dir: "./output"
   temp_dir: "./temp"
-  encoder: "avifenc"
+  # FIX-2026-10-20: 这一项是**记录性**字段，代码不读它。照片链的编码参数
+  # 全部来自 photo.avif_params / photo.avif_rgb444_params（位深/YUV/range/
+  # CICP/speed），由 shared_modules/media_io.build_avifenc_cmd() 组装。
+  # 下面的 crf/preset 同理对照片 AVIF 无效（那是视频概念）。
+  encoder: "avifenc"   # 仅供参考，非配置项
   crf: 24
   preset: 4
   # FIX-P10-9: Removed pix_fmt and color_range (video-only concepts)
