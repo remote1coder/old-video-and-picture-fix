@@ -239,10 +239,32 @@ wins (see "Version & Specifications" below).
 │   ├── media_io.py                  # Media probing / IO helpers
 │   ├── cancel_guard.py              # Cancellation / interrupt guard
 │   ├── ai_runtime.py                # AI interpreter resolution
-│   └── dat_runtime.py               # DAT model runtime
+│   ├── dat_runtime.py               # DAT model runtime
+│   ├── color_probe.py               # Colour-fidelity probe (stage6/stage7 shared)
+│   ├── artifact_verify.py           # Output verification (frame count / order)
+│   ├── exec_fingerprint.py          # Execution fingerprint for identity checks
+│   ├── publish_journal.py           # Publish transaction journal (crash recovery)
+│   ├── publish_lock.py              # Per-target publish lock
+│   └── gpen/                        # GPEN architecture (upstream yangxy/GPEN)
+│       └── face_model/              #   FullGenerator + op (pure-PyTorch fallback)
 │
 └── models/                          # AI model weights directory
 ```
+
+### Colour Fidelity Guard
+
+Both pipelines compare the **RGB channel means of the original input vs the
+encoded output** before publishing, and record the result. Threshold is
+`color_drift_threshold` (default `60.0`, in 0-255 units); set
+`color_drift_enforce: true` to fail instead of only warning.
+
+The default 60 is deliberately loose — it catches *whole-image collapse*
+(black/white/lost content, which measures ~116 on a black frame) while letting
+legitimate wide-gamut conversion through (~27 for ProPhoto→sRGB). Fine-grained
+colour drift needs a per-material calibrated value; setting it too tight
+produces frequent false positives and the log stops being read.
+
+Photo pipeline config lives under `photo:`; video pipeline under `global:`.
 
 ### Version & Specifications
 
@@ -489,10 +511,33 @@ python photo_restoration_pipeline/main.py \
 │   ├── media_io.py                  # 媒体探测 / IO 辅助
 │   ├── cancel_guard.py              # 取消 / 中断守卫（rc=88）
 │   ├── ai_runtime.py                # AI 子进程解释器解析
-│   └── dat_runtime.py               # DAT 模型运行时
+│   ├── dat_runtime.py               # DAT 模型运行时
+│   ├── color_probe.py               # 色彩保真探测（stage6/stage7 共用）
+│   ├── artifact_verify.py           # 产物核对（帧数 / 帧序 / 非黑图）
+│   ├── exec_fingerprint.py          # 执行指纹（并入身份判据）
+│   ├── publish_journal.py           # 发布事务 journal（硬杀后恢复）
+│   ├── publish_lock.py              # 逐目标发布锁
+│   └── gpen/                        # GPEN 架构（上游 yangxy/GPEN）
+│       └── face_model/              #   FullGenerator + op（纯 PyTorch 回退）
 │
 └── models/                          # AI 模型权重目录
 ```
+
+### 色彩保真校验
+
+两条链在**发布前**比对「原始输入 vs 编码成品」的 RGB 三通道均值并记录结果。
+阈值是 `color_drift_threshold`（默认 `60.0`，0-255 单位）；把
+`color_drift_enforce` 设为 `true` 则超阈值时失败而不只是告警。
+
+默认 60 是**刻意宽松**的 —— 它抓的是**整幅崩坏**（纯黑/纯白/内容丢失，
+纯黑帧实测约 116），而合法的宽色域转换（ProPhoto→sRGB 实测约 27）会被放行。
+细微色偏需要按素材单独标定；阈值设太紧会频繁误报，日志就没人看了。
+
+照片链配置在 `photo:` 段，视频链在 `global:` 段。
+
+同类开关：`require_16bit_color_conversion`（默认 `false`）。宽色域→sRGB 走
+PIL ImageCms，而 Pillow 的 CMS 只支持 8-bit；置 `true` 会在这种降级发生时
+直接失败（rc=86），而不是交出 8-bit 精度的母版。
 
 ### 版本与规范说明
 
