@@ -63,7 +63,10 @@ def _get_model_for_scale(model: str, scale: int) -> str:
             return f"DAT_2_x{scale}"
         return f"DAT_x{scale}"
     elif family == "GPEN":
-        return f"GPEN_x{scale}"
+        # FIX-2026-10-20：GPEN 是**同分辨率人脸修复**模型（blind face
+        # restoration），没有 x2/x4 变体。原来返回 GPEN_x{scale} →
+        # 去找根本不存在的 GPEN_x2.pth。固定为官方推荐的 512 版。
+        return "GPEN-BFR-512"
     return f"RealESRGAN_x{scale}plus"
 
 
@@ -274,96 +277,151 @@ def _run_dat_pytorch(input_path: str, output_path: str, model: str,
 def _run_gpen_pytorch(input_path: str, output_path: str, model: str,
                       scale: int, model_dir: str, use_gpu: bool,
                       bit_depth: int = 8) -> bool:
-    """Run GPEN model via PyTorch backend.
+    """Run GPEN via PyTorch backend.
 
-    GPEN is a GAN-based full-body portrait enhancer per v6.32 §4.
-    Best for photos where the person occupies 1/3 to 2/3 of the frame.
-    NOT suitable for face closeups (use GFPGAN/CodeFormer instead).
+    GPEN = GAN Prior Embedded Network for **blind face restoration**
+    （CVPR2021，上游 ``yangxy/GPEN``）。⚠️ **它不是超分模型**：
+    输出与输入同分辨率，因此 `scale` 对 GPEN 没有意义
+    （`_get_model_for_scale` 对它固定返回 ``GPEN-BFR-512``）。
 
-    Model weights: GPEN_x2.pth / GPEN_x4.pth (yangxy/GPEN GitHub).
+    FIX-2026-10-20 重写 —— 原来这一路是"静默产出垃圾"：
+      1. **架构错**：旧代码用 ``RRDBNet(num_block=23, scale=scale)`` 载权重，
+         而 GPEN 的真架构是 ``FullGenerator``（StyleGAN2 生成器 + encoder）。
+         实测用 RRDBNet 载一个结构不符的权重会得到
+         missing=702 / unexpected=515，而 ``strict=False`` **不报错**，
+         权重保持 PyTorch 默认随机初始化 → 输出是噪声，rc 仍为 0。
+      2. **文件名错**：旧代码找 ``GPEN_x2.pth`` / ``GPEN_x4.pth``；
+         上游权重实际叫 ``GPEN-BFR-512.pth``。
+      3. **现在**：``shared_modules/gpen`` 的真架构 + 载入后强制
+         ``missing == 0 and unexpected == 0``，否则返回 False（rc=83）。
+
+    流程与照片链 stage4 的 CodeFormer 分支同构：facexlib 检测/对齐 →
+    GPEN 修复每个 crop → 回贴。之所以不直接对整图跑：GPEN 是在
+    **对齐后的 512×512 人脸 crop** 上训练的，整图跑不仅效果差，
+    还会被 512 的分辨率上限卡死。
+
+    产物布局：结果按同名写回 `output_path`，位深跟随 `bit_depth`
+    （16 → TIFF zlib；8 → PNG）。
     """
-    model_path = os.path.join(model_dir, f"{model}.pth")
+    model_path = os.path.join(model_dir, "GPEN-BFR-512.pth")
     if not os.path.exists(model_path):
-        return False
+        # 兼容：用户可能按旧命名或别的变体放过权重
+        for alt in (f"{model}.pth", "GPEN-BFR-256.pth"):
+            cand = os.path.join(model_dir, alt)
+            if os.path.exists(cand):
+                model_path = cand
+                break
+        else:
+            return False
     try:
         import torch
-        from PIL import Image
         import numpy as np
-
-        device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
-
-        # FIX-NEW-V-14 / R16: 同 dat_runtime——PIL 读 G'MIC 的 uint16 TIFF
-        # 会得到全 0（黑图），改走 media_io 的值域自适应读取。
+        import cv2
+        import sys
         from media_io import load_image_rgb_uint8 as _ldr
-        img_np = _ldr(input_path).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
+        from gpen import FullGenerator
 
-        # Try loading as GPEN architecture
-        gpen_model = None
-        try:
-            # GPEN uses rrdbnet_arch or similar from basicsr
-            from basicsr.archs.rrdbnet_arch import RRDBNet
-            # GPEN typically wraps an RRDBNet backbone with a discriminator
-            # The super-resolution variant uses RRDBNet directly
-            gpen_model = RRDBNet(
-                num_in_ch=3, num_out_ch=3,
-                num_feat=64, num_block=23,
-                num_grow_ch=32, scale=scale,
-            )
-            state_dict = torch.load(model_path, map_location=device,
-                                    weights_only=False)
-            # GPEN state dicts may have 'params' or 'params_ema' keys
-            if 'params' in state_dict:
-                sd = state_dict['params']
-            elif 'params_ema' in state_dict:
-                sd = state_dict['params_ema']
-            else:
-                sd = state_dict
-            gpen_model.load_state_dict(sd, strict=False)
-            gpen_model.eval().to(device)
-        except Exception as e:
-            import sys
-            print(f"GPEN architecture load failed for {model}: {e}",
-                  file=sys.stderr)
+        device = torch.device(
+            "cuda" if use_gpu and torch.cuda.is_available() else "cpu")
 
-        if gpen_model is None:
-            return False
-
-        try:
-            with torch.no_grad():
-                output = gpen_model(img_tensor)
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as oom:
-            # FIX-P1-1: release VRAM on CUDA OOM before fallback (see DAT).
-            import time as _time
-            try:
-                del gpen_model
-            except Exception:
-                pass
-            del img_tensor
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                _time.sleep(0.1)
-            import sys
-            print(f"GPEN CUDA OOM for {model}: {oom}", file=sys.stderr)
-            return False
-        output = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        # FIX-P12-6: PIL I;16 only supports 2D arrays; for 3-channel 16-bit,
-        # use tifffile to save as TIFF (PIL cannot save RGB uint16 directly).
-        # Fallback: save as 8-bit PNG if tifffile unavailable.
-        if bit_depth == 16:
-            output_16 = np.clip(output * 65535.0, 0, 65535).astype(np.uint16)
-            try:
-                import tifffile
-                tifffile.imwrite(output_path, output_16, compression="zlib")
-            except ImportError:
-                output_8 = (output_16 // 256).astype(np.uint8)
-                Image.fromarray(output_8).save(output_path)
+        # ---- 载入：架构 + 权重必须严格配套，否则宁可不跑 ----
+        gpen = FullGenerator(512, 512, 8, channel_multiplier=2, narrow=1,
+                             device=device)
+        ckpt = torch.load(model_path, map_location="cpu")
+        if isinstance(ckpt, dict) and ("params" in ckpt or "params_ema" in ckpt):
+            inner = ckpt.get("params", ckpt.get("params_ema"))
         else:
-            output_8 = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-            Image.fromarray(output_8).save(output_path)
+            inner = ckpt
+        missing, unexpected = gpen.load_state_dict(inner, strict=False)
+        if missing or unexpected:
+            # FIX-2026-10-20：这一条是本次修复的核心。旧实现用 strict=False
+            # 且不看返回值，结构不符时权重全是随机初始化却照样推理。
+            print(f"GPEN weights/arch mismatch: missing={len(missing)} "
+                  f"unexpected={len(unexpected)} "
+                  f"(first missing: {missing[:3]})", file=sys.stderr)
+            return False
+        gpen.eval().to(device)
+
+        # ---- 输入：RGB（media_io 做值域自适应，绕开 PIL 读 uint16 TIFF 得全 0）----
+        img_rgb = _ldr(input_path)
+
+        # ---- 人脸检测 / 对齐 / 回贴（与 stage4 CodeFormer 同一套依赖）----
+        from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+        helper = FaceRestoreHelper(upscale_factor=1, face_size=512)
+        # facexlib 的 read_image/paste 期望 BGR（cv2 约定）
+        helper.read_image(img_rgb[:, :, ::-1].copy())
+        helper.get_face_landmarks_5(only_center_face=False, resize=640,
+                                    eye_dist_threshold=5)
+        helper.align_warp_face()
+        # ⚠️ 这个检查**必须在 align_warp_face() 之后**：cropped_faces 是
+        # align_warp_face() 裁剪出来的产物，在它之前判断恒为空。
+        # 同一个坑今天在 CodeFormer 上已经踩过一次（输出与输入逐像素相同、
+        # MAE=0.000 而 rc=0），这里不能再犯。
+        if not helper.cropped_faces:
+            # 无人脸：GPEN 无从发挥。原样输出但不声称修复过 ——
+            # 调用方（stage3）会照常记 DONE，这里至少不产垃圾。
+            _write_gpen_result(img_rgb, output_path, bit_depth)
+            return True
+
+        for cropped in helper.cropped_faces:
+            # cropped_faces 是 RGB uint8，官方归一化 (x/255 - 0.5)/0.5
+            t = torch.from_numpy(np.asarray(cropped, dtype=np.float32) / 255.0)
+            t = ((t - 0.5) / 0.5).permute(2, 0, 1).unsqueeze(0).to(device)
+            try:
+                with torch.no_grad():
+                    out, _ = gpen(t)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as oom:
+                # FIX-P1-1: release VRAM on CUDA OOM before fallback (see DAT).
+                import time as _time
+                try:
+                    del gpen
+                except Exception:
+                    pass
+                del t
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    _time.sleep(0.1)
+                print(f"GPEN CUDA OOM for {model}: {oom}", file=sys.stderr)
+                return False
+            out = out.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            restored = np.clip(out * 0.5 + 0.5, 0.0, 1.0)
+            helper.add_restored_face(
+                (restored * 255.0).clip(0, 255).astype(np.uint8))
+
+        helper.get_inverse_affine(None)
+        # paste 返回 BGR（与 read_image 的输入一致），转回 RGB 再落盘
+        result_bgr = helper.paste_faces_to_input_image(
+            upsample_img=img_rgb[:, :, ::-1].copy())
+        _write_gpen_result(result_bgr[:, :, ::-1], output_path, bit_depth)
         return True
-    except Exception:
+    except Exception as _ge:
+        import sys
+        print(f"GPEN inference failed for {model}: {_ge}", file=sys.stderr)
         return False
+
+
+def _write_gpen_result(rgb: "np.ndarray", output_path: str,
+                       bit_depth: int = 8) -> None:
+    """把 RGB 数组按位深落盘（16 → TIFF zlib；8 → PNG）。
+
+    FIX-P12-6 的延续：PIL 的 I;16 只支持 2D，3 通道 16-bit 必须走 tifffile；
+    且 TIFF 不能用 LZW（tifffile 解 LZW 需要未装的 imagecodecs）。
+    """
+    import numpy as np
+    if bit_depth == 16:
+        out16 = np.clip(np.asarray(rgb, dtype=np.float64) * 65535.0 / 255.0,
+                        0, 65535).astype(np.uint16)
+        try:
+            import tifffile
+            tifffile.imwrite(output_path, out16, compression="zlib")
+        except ImportError:
+            out8 = (out16 // 257).astype(np.uint8)
+            from PIL import Image
+            Image.fromarray(out8).save(output_path)
+    else:
+        out8 = np.clip(np.asarray(rgb), 0, 255).astype(np.uint8)
+        from PIL import Image
+        Image.fromarray(out8).save(output_path)
 
 
 # ---------------------------------------------------------------------------
