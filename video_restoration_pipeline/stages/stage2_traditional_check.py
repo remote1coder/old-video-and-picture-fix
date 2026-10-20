@@ -162,8 +162,14 @@ def main():
                 # FIX-P7-5: Copy stage1 output to step2_traditional intermediate
                 # so stage7 can find it in the fallback chain
                 import shutil
-                param_hash = params.get("param_hash", "")
-                step2_name = f"{job_id}_{Path(input_name).stem}_step2_traditional_p{param_hash}.mkv" if param_hash else f"{job_id}_{Path(input_name).stem}_step2_traditional.mkv"
+                # FIX-2026-10-20: merge_params() 从不注入 params["param_hash"]，
+                # 原来这里取到空串 → step2 文件名完全没有 _p{hash} 段，
+                # 与 v7.32 §3.10.19 的命名契约不符。改为就地计算（与
+                # stage1/3/4 一致），以**本 stage 的实际输入**为身份基准。
+                from checkpoint import compute_param_hash
+                param_hash = compute_param_hash(stage1_output, params)
+                step2_name = (f"{job_id}_{Path(input_name).stem}"
+                              f"_step2_traditional_p{param_hash}.mkv")
                 step2_path = os.path.join(temp_dir, step2_name)
                 try:
                     if not os.path.exists(step2_path):

@@ -366,7 +366,12 @@ def main() -> int:
         return 86
 
     # FIX-P9-4: output filename must include param_hash per v7.3 §3.10.19
-    param_hash = params.get("param_hash", job_id)
+    # FIX-2026-10-20: merge_params() 从不注入 params["param_hash"]，原来退化成
+    # job_id（与 stage5 同族）—— 改 g1str/g2str/g3str 等颗粒参数不改变文件名，
+    # 陈旧产物会被复用。改为就地计算，以本 stage 的实际输入 input_source
+    # 为身份基准（注意 input_source 可能来自回退链，与 args.input 不同）。
+    from checkpoint import compute_param_hash
+    param_hash = compute_param_hash(input_source, params)
     # FIX-R5-06: 同 input_source，输出路径也转绝对路径。ffmpeg 按进程 cwd
     # 解析相对路径本来是对的，但转绝对后可彻底摆脱 cwd 依赖（vspipe 的
     # chdir 不影响 ffmpeg，这里是防御性的）。
