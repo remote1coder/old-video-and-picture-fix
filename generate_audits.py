@@ -619,21 +619,6 @@ AUDITS["photo_stage1_preprocess-audit.md"] = """# photo_stage1_preprocess.py 审
 功能实现但存在静默失败和精度丢失问题。
 """
 
-AUDITS["photo_stage2_traditional_check-audit.md"] = """# photo_stage2_traditional_check.py 审查报告
-
-## 文件信息
-- **路径**: photo_restoration_pipeline/stages/stage2_traditional_check.py
-- **行数**: 5016
-- **用途**: 照片 stage1 输出质量验证
-
-## 关键发现
-- **强制转 8bit RGB**: img.convert("RGB") 导致 16bit 输入丢失精度。
-
-## 总体评估
-**合规度: 65%**
-校验逻辑存在但精度处理不当。
-"""
-
 AUDITS["photo_stage3_ai_upscale-audit.md"] = """# photo_stage3_ai_upscale.py 审查报告
 
 ## 文件信息

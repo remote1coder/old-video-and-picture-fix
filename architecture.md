@@ -260,7 +260,8 @@ Returns exit code 80 if any required dependency is missing.
 - `CORE_QUALITY_PARAMS` 未包含 `enable_channel_correction` /
   `frc_target_fps` / `aspect_ratio_correction`：改这三项不会改变
   `param_hash`，可能复用旧中间产物（低影响）
-- 照片链遗留 `stage2_traditional_check.py`，不在默认 6 步链上
+- 照片链 `stage2_traditional_check.py` 曾是遗留死代码，已于 2026-10-20 删除
+  （`git rm`；视频链同名 stage 是活跃的，与它无关）
 - 视频链 AI 推理必须走外部解释器（`ai_runtime`），编排器 R72 无 torch
 - 依赖检查的 spawn 合规扫描是静态文本匹配（`# spawn-safe:` 可人工抑制）
 - WSL2 相关路径逻辑在本机（Windows 原生）不触发，属未实测分支
