@@ -450,14 +450,30 @@ def run_gfpgan(input_dir: str, output_dir: str, model_path: str = "",
 
 
 def run_codeformer(input_dir: str, output_dir: str, model_path: str = "",
-                   upscale: int = 2) -> bool:
+                   upscale: int = 2, logger=None) -> bool:
     """Run CodeFormer on a directory of frames.
 
-    Uses inference_codeformer.py script or Python API fallback.
+    两条路径：优先 `inference_codeformer.py` CLI，回退到 Python API。
+
+    FIX-2026-10-20: 回退分支原来是**空实现**（V-P-043 时代的"信号失败"）：
+    拿到 AI 解释器后直接 `return False`。只要 CLI 脚本不在（PATH 里没有、
+    `Path(ai_py).parent` 下也没有），选 CodeFormer 就必然 rc=83，
+    而 CLI 仍暴露在 `config.yaml` 与 `--face-restore` 里。
+    现在按照片链 stage4 同一套依赖补全推理：
+    **facexlib**（检测/对齐/回贴）+ **`basicsr.archs.codeformer_arch`**（架构）。
+    注意 `codeformer` 这个包在项目和 .venv_r4 里都不存在
+    （FIX-NEW-V-19 / R22），架构只能从 basicsr 拿。
+
+    产物布局：结果按**同名文件**写进 `output_dir/`。stage5 的 blend-back
+    把 `face_output_dir` 本身列为第一候选目录（:2212-2217），
+    与 run_gfpgan 的 Python API 回退同一约定。
     """
-    # FIX-R6-02: AI 解释器（R72 编排器没有 basicsr/codeformer）
-    ai_py = _resolve_ai_python()
+    # FIX-R6-02: AI 解释器（R72 编排器没有 basicsr/torch）
+    ai_py = _resolve_ai_python(logger)
     if ai_py is None:
+        if logger:
+            logger.error("STAGE5_AI_INTERPRETER_MISSING",
+                         "找不到具备 torch/basicsr 的 AI 解释器")
         return False
 
     # Try inference_codeformer.py script
@@ -482,13 +498,137 @@ def run_codeformer(input_dir: str, output_dir: str, model_path: str = "",
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=1800, shell=False)
-            return r.returncode == 0
-        except Exception:
-            pass
+            if r.returncode == 0:
+                return True
+            if logger:
+                logger.warning("STAGE5_CODEFORMER_CLI_FAIL",
+                               f"inference_codeformer.py rc={r.returncode}; "
+                               f"falling back to Python API")
+        except Exception as e:
+            if logger:
+                logger.warning("STAGE5_CODEFORMER_CLI_ERROR",
+                               f"CLI 执行异常，回退 Python API: {e}")
 
-    # V-P-043 fix: CodeFormer fallback returns False instead of copying original frames
-    # True CodeFormer inference requires full setup; signal failure so caller can skip
-    return False
+    # Fallback: Python API（与 run_gfpgan 同一结构：写临时 .py 再执行，
+    # 不用 `python -c` —— R4 教训：复合语句不能用 `;` 串成一行）
+    if not model_path:
+        models_dir = SCRIPT_DIR.parent.resolve() / "models"
+        # FIX-NEW-V-16 的大小写教训：不同平台/版本权重名大小写不一致
+        # （照片链实测是小写 codeformer.pth，规范文档写的是 CodeFormer.pth）。
+        # 两个都试，避免大小写敏感平台上静默找不到。
+        for name in ("codeformer.pth", "CodeFormer.pth"):
+            cand = models_dir / name
+            if cand.exists():
+                model_path = str(cand)
+                break
+    if not model_path or not os.path.exists(model_path):
+        if logger:
+            logger.error("STAGE5_CODEFORMER_MODEL_MISSING",
+                         f"CodeFormer 权重不存在: "
+                         f"{model_path or '<models/ 下未找到>'}")
+        return False
+
+    try:
+        project_root = str(SCRIPT_DIR.parent.resolve())
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False,
+                                          encoding="utf-8") as fh:
+            script_path = fh.name
+            # facexlib 按 cwd 解析检测权重，先把 models/ 的权重链接进
+            # models/facexlib/weights/（与 run_gfpgan 同一处理，FIX-R6-08）。
+            fh.write(
+                "import os, glob, sys, shutil\n"
+                "import cv2, torch, numpy as np\n"
+                f"root = {project_root!r}\n"
+                "wdir = os.path.join(root, 'models', 'facexlib', 'weights')\n"
+                "os.makedirs(wdir, exist_ok=True)\n"
+                "for _n in ('detection_Resnet50_Final.pth', "
+                "'parsing_parsenet.pth'):\n"
+                "    _src = os.path.join(root, 'models', _n)\n"
+                "    _dst = os.path.join(wdir, _n)\n"
+                "    if os.path.exists(_src) and not os.path.exists(_dst):\n"
+                "        try:\n"
+                "            os.link(_src, _dst)\n"
+                "        except OSError:\n"
+                "            shutil.copy2(_src, _dst)\n"
+                "from facexlib.utils.face_restoration_helper import "
+                "FaceRestoreHelper\n"
+                "from basicsr.archs.codeformer_arch import CodeFormer\n"
+                "device = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
+                "helper = FaceRestoreHelper(upscale_factor=1, face_size=512)\n"
+                "net = CodeFormer(dim_embd=512, codebook_size=1024, "
+                "n_head=8,\n"
+                "                 n_layers=9, "
+                "connect_list=['32','64','128','256']).to(device)\n"
+                f"ckpt = torch.load({model_path!r}, map_location=device)\n"
+                "net.load_state_dict("
+                "ckpt['params_ema'] if 'params_ema' in ckpt else ckpt)\n"
+                "net.eval()\n"
+                f"os.makedirs({output_dir!r}, exist_ok=True)\n"
+                "n_ok = 0\n"
+                "n_face = 0\n"
+                f"for f in sorted(glob.glob("
+                f"os.path.join({input_dir!r}, '*.png'))):\n"
+                "    img = cv2.imread(f, cv2.IMREAD_COLOR)\n"
+                "    if img is None:\n"
+                "        continue\n"
+                "    helper.clean_all()\n"
+                "    helper.read_image(img)\n"
+                "    helper.get_face_landmarks_5("
+                "only_center_face=False, resize=640,\n"
+                "                            eye_dist_threshold=5)\n"
+                "    helper.align_warp_face()\n"
+                "    if not helper.cropped_faces:\n"
+                "        # 无人脸：原样拷回，保证输出与输入一一对应，"
+                "否则 blend-back 找不到目标帧。\n"
+                "        # ⚠️ 这个检查必须在 align_warp_face() **之后**：\n"
+                "        # cropped_faces 是 align_warp_face() 裁剪出来的产物，\n"
+                "        # 在它之前判断恒为空 —— 实测那样写会静默走原图分支，\n"
+                "        # 输出与输入逐像素相同（MAE=0.000）而 rc 仍是 0。\n"
+                f"        cv2.imwrite(os.path.join({output_dir!r}, "
+                f"os.path.basename(f)), img)\n"
+                "        n_ok += 1\n"
+                "        continue\n"
+                "    for cropped_face in helper.cropped_faces:\n"
+                "        face_t = torch.from_numpy("
+                "cropped_face / 255.).permute(2, 0, 1)\n"
+                "        face_t = face_t.unsqueeze(0).float().to(device)\n"
+                "        with torch.no_grad():\n"
+                "            output = net(face_t, w=0.9, adain=True)[0]\n"
+                "        restored = (output.squeeze(0).permute(1, 2, 0)"
+                ".cpu().numpy() * 255)\n"
+                "        restored = restored.clip(0, 255).astype(np.uint8)\n"
+                "        helper.add_restored_face(restored)\n"
+                "        n_face += 1\n"
+                "    helper.get_inverse_affine(None)\n"
+                "    result = helper.paste_faces_to_input_image("
+                "upsample_img=img)\n"
+                f"    cv2.imwrite(os.path.join({output_dir!r}, "
+                f"os.path.basename(f)), result)\n"
+                "    n_ok += 1\n"
+                "print('FRAMES_DONE', n_ok, 'FACES', n_face)\n"
+            )
+        r = subprocess.run([ai_py, script_path], capture_output=True, text=True,
+                           errors="replace", timeout=1800, shell=False,
+                           cwd=project_root)
+        if r.returncode == 0:
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return True
+        if logger:
+            # 保留脚本与 stderr 尾部：AI 子进程失败是最难复现的一类，
+            # 不能再写裸 except 把现场吞掉（STAGE3_AI_SUBPROC_FAIL 同族）。
+            logger.error("STAGE5_CODEFORMER_SUBPROC_FAIL",
+                         f"CodeFormer subprocess rc={r.returncode}; "
+                         f"script={script_path}",
+                         stderr_tail=(r.stderr or "")[-1200:])
+        return False
+    except Exception as e:
+        if logger:
+            logger.error("STAGE5_CODEFORMER_ERROR", str(e))
+        return False
 
 
 def _get_frame_pts(video_path: str) -> List[float]:
@@ -2171,7 +2311,8 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                              width=video_width, height=video_height,
                              logger=logger)
     elif face_restore == "CodeFormer":
-        success = run_codeformer(face_frames_dir, face_output_dir)
+        success = run_codeformer(face_frames_dir, face_output_dir,
+                                 logger=logger)
     else:
         logger.error("STAGE5_UNKNOWN",
                      f"Unknown face restore: {face_restore}")
