@@ -45,6 +45,41 @@ def run_cmd(cmd: List[str], capture: bool = True, timeout: int = 30) -> Tuple[in
         return -1, "", "Command timed out"
 
 
+def check_avifdec() -> Tuple[bool, str]:
+    """FIX-2026-10-20: avifdec 是 16-bit 归档档的唯一解码出口，但从未进预检。
+
+    照片链 stage6 有两处硬依赖它：
+    1. 16-bit AVIF 的 depth-extension 必须 `--depth 16 --sato` 才能还原。
+       实测（media_io.py:768-781）：`avifdec --sato` → MAE=0.0000；
+       单独 `avifdec --depth 16` → MAE=3.5024 / MAX=15，**丢低 4 位**。
+       `--sato` 对应 AVIF v1.2.0 的 sample transforms，libavif <1.4 没有。
+    2. 发布前 `media_io.read_avif_header()` 用 `avifdec --info` 回读真实
+       头部，与契约声称的 matrix 逐项比对，不一致则拒绝出库（rc=86）。
+
+    查找顺序与 `media_io._avifdec_binary()` 一致（PATH，再退回
+    tests/_out/tools），但不 import media_io，避免预检层依赖图像 IO 层。
+
+    Returns:
+        (ok, detail)
+    """
+    binary = shutil.which("avifdec")
+    if not binary:
+        here = Path(__file__).resolve().parent.parent
+        for cand in (here / "tests" / "_out" / "tools" / "avifdec.exe",
+                     here / "tests" / "_out" / "tools" / "avifdec"):
+            if cand.exists():
+                binary = str(cand)
+                break
+    if not binary:
+        return False, ("avifdec not found (needed to decode 16-bit archival "
+                       "AVIF and to verify the published header)")
+    code, out, _ = run_cmd([binary, "--help"])
+    if code == 0 and "--sato" not in (out or ""):
+        return False, (f"avifdec at {binary} lacks --sato; 16-bit archival "
+                       f"decode would silently lose the low 4 bits")
+    return True, f"avifdec ok ({binary})"
+
+
 def check_external_tools(pipeline_type: str = "photo") -> List[str]:
     """Check external tools. Photo skips video-specific tools."""
     if pipeline_type == "photo":
@@ -66,6 +101,14 @@ def check_external_tools(pipeline_type: str = "photo") -> List[str]:
     for tool, desc in required.items():
         if not shutil.which(tool):
             missing.append(f"  - {tool}: {desc}")
+
+    # FIX-2026-10-20: avifdec 只在 photo 链需要（16-bit 归档解码 +
+    # 发布前头部回读），但它有 PATH 之外的查找路径与能力要求，
+    # 不能简单塞进上面的 required 字典。
+    if pipeline_type == "photo":
+        ok, detail = check_avifdec()
+        if not ok:
+            missing.append(f"  - avifdec: {detail}")
 
     # VapourSynth: only for video pipeline
     if pipeline_type != "photo":
