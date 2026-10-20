@@ -80,6 +80,15 @@ photo:
   # 即专门抓"整体崩坏"，不抓细微色偏。默认只 WARNING，阻断需 enforce。
   color_drift_threshold: 60.0
   color_drift_enforce: false
+  # 宽色域（AdobeRGB / ProPhoto / DisplayP3）→ sRGB 的转换走 PIL ImageCms，
+  # 而 Pillow 的 CMS **只支持 8-bit**（C-API 限制）。转换后的像素是
+  # **正确的 sRGB**，但量化发生在 8-bit 网格上，母版会如实记
+  # `precision_loss: true`（实测：普通 sRGB 路径母版 16-bit 无损，
+  # 只有宽色域转换路径是 8-bit）。
+  # 设为 true 则**拒绝**这种降级（rc=86），而不是交出 8-bit 精度的母版。
+  # 默认 false：8-bit 量化误差约 0.4%，肉眼基本不可见，为此让整张照片
+  # 失败不划算；有严苛归档需求时再打开。
+  require_16bit_color_conversion: false
   avif_params:
     depth: 10
     yuv: "420"
