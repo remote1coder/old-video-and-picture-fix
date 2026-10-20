@@ -1324,10 +1324,16 @@ def main():
                              failed=_rb["failed"], impossible=_rb["impossible"])
                 _fail(logger, status_path, "publish", str(e), paths=[],
                       recovery_required=True, rollback_detail=_rb)
-            write_journal(_journal_path,
-                          dict(_journal_base,
-                               phase=PHASE_RECOVERY_REQUIRED,
-                               rollback=_rb))
+            # FIX-2026-10-20：恢复信息写不下去 = 下次启动不知道需要人工恢复。
+            # 这一行原来是静默的（返回值没人看）。
+            if not write_journal(_journal_path,
+                                 dict(_journal_base,
+                                      phase=PHASE_RECOVERY_REQUIRED,
+                                      rollback=_rb)):
+                logger.error("STAGE6_JOURNAL_RECOVERY_FAIL",
+                             "Could not record RECOVERY_REQUIRED; the next "
+                             "run will not know manual recovery is needed",
+                             journal=_journal_path)
             return 82
 
         # 已发布：守卫不再删除任何产物
@@ -1340,9 +1346,20 @@ def main():
             _r = dict(_journal_records.get(_t) or {})
             _r["new_digest"] = file_digest(_t)
             _done_records[_t] = _r
-        write_journal(_journal_path,
-                      dict(_journal_base, phase=PHASE_COMMITTED,
-                           records=_done_records))
+        # FIX-2026-10-20：journal 写失败**不能静默**。
+        # 此刻媒体已经发布（上面的 os.replace 已完成），若 journal 仍停在
+        # PREPARED / COMMITTING，下次启动会认为"未提交"——可能重复发布，
+        # 或把已发布的成品当成发布残留处理。"发布了却记不下状态"
+        # 比"没发布"更危险，所以这里必须让本次运行失败。
+        if not write_journal(_journal_path,
+                             dict(_journal_base, phase=PHASE_COMMITTED,
+                                  records=_done_records)):
+            logger.error("STAGE6_JOURNAL_COMMIT_FAIL",
+                         "Output was promoted but the COMMITTED phase could "
+                         "not be recorded; the next run may treat this "
+                         "publish as uncommitted and re-publish",
+                         journal=_journal_path)
+            return 82
 
         logger.info("STAGE6_DONE", "Photo encoding complete", output=publish_output_path)
         return 0
