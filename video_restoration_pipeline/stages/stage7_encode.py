@@ -69,6 +69,22 @@ def _get_audio_layout(audio_path: str) -> dict:
 #: afftdn，因为每组都要起一个 arnndn 实例，实例数与声道数成正比。
 _MAX_PER_CHANNEL_ARNNDN = 8
 
+#: FIX-2026-10-20: config 的 global 段历史上写的是 `encoder: "svtav1"`，
+#: 而 stage7 读的是 `video_encoder` 且默认值拼写成 "libsvtav1" —— 改 config
+#: 的 encoder 完全不生效（生效的一直是默认值，只是巧合结果相同）。
+#: 这两个键现在都认，并把常见简写归一成 ffmpeg 真实编码器名；
+#: 不归一的话 `svtav1` 这种写法会让 ffmpeg 直接报 Unknown encoder。
+_ENCODER_ALIASES = {
+    "svtav1": "libsvtav1",
+    "svt-av1": "libsvtav1",
+    "av1": "libsvtav1",
+    "x265": "libx265",
+    "hevc": "libx265",
+    "x264": "libx264",
+    "h264": "libx264",
+    "avc": "libx264",
+}
+
 
 class AudioDegradeNotAllowed(Exception):
     """FIX-R3-08 补完：明确要求的音频算法不可用，且未授权降级。
@@ -1365,7 +1381,12 @@ def main():
     # 结果：只要素材有音轨，stage7 必然 rc=84。
     # 修法：video_cmd 只放输入（所有 -i），output_opts 放全部输出侧选项，
     # 最后先 extend 输出选项再写输出路径。
-    video_encoder = params.get("video_encoder", "libsvtav1")
+    # FIX-2026-10-20: 兼容 config 里的旧键名 `encoder`（见 _ENCODER_ALIASES
+    # 上方注释：原来只读 video_encoder，改 config 的 encoder 无任何效果）。
+    _raw_enc = (params.get("video_encoder")
+                or params.get("encoder") or "libsvtav1")
+    video_encoder = _ENCODER_ALIASES.get(
+        str(_raw_enc).strip().lower(), str(_raw_enc).strip())
     common_prefix = ["ffmpeg", "-hide_banner", "-v", "error", "-y"]
     video_cmd = common_prefix + ["-i", input_source]
     output_opts: List[str] = []
