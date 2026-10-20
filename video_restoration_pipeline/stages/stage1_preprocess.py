@@ -971,9 +971,38 @@ def _check_combed_and_fallback(vs_path: Path, params: dict, logger) -> bool:
     return needs_srestore
 
 
-def check_deinterlace_quality(video_path: str, logger=None) -> Tuple[bool, float]:
-    """Check deinterlace output quality using ffmpeg idet."""
+def check_deinterlace_quality(video_path: str, logger=None,
+                              timeout: Optional[float] = None
+                              ) -> Tuple[bool, float, str]:
+    """Check deinterlace output quality using ffmpeg idet.
+
+    FIX-2026-10-21（16 分钟 1080p 真实素材实跑）：
+    原实现把**三种本质不同的情况**压成同一个 `(False, 0.0)`：
+    真的 0% progressive、idet 超时、idet 报错。调用方无法区分，一律判
+    "去隔行质量差"→ 触发 fallback。实测 24GB / 28840 帧的 1080p 中间产物，
+    `ffmpeg -vf idet` 在 300 秒内跑不完，直接被判成"质量 0.0% < 95%"。
+
+    现在返回 `(ok, pct, status)`，status 三态：
+
+    * ``"ok"``         真的达到阈值
+    * ``"low"``        真的低于阈值（才该 fallback）
+    * ``"inconclusive"`` idet **没给出结论**：超时 / 报错 / stats 为空 /
+      Undetermined 占多数。此时**不应 fallback** —— 这是与 stage2 的
+      `STAGE2_IDET_INCONCLUSIVE` 同一条原则：判不出来 ≠ 不合格。
+
+    超时按文件大小自适应：idet 要解码整条流，24GB 与 400MB 差两个数量级，
+    固定 300 秒对长片必然不够。
+    """
     try:
+        import os as _os
+        _gb = 0.0
+        try:
+            _gb = _os.path.getsize(video_path) / float(1 << 30)
+        except OSError:
+            pass
+        # 基线 300s，每 GB 再给 25s；上限 3600s 避免异常值挂死
+        _timeout = timeout if timeout is not None else min(3600.0,
+                                                         300.0 + 25.0 * _gb)
         cmd = [
             "ffmpeg", "-hide_banner", "-v", "info",
             "-i", video_path,
@@ -981,9 +1010,13 @@ def check_deinterlace_quality(video_path: str, logger=None) -> Tuple[bool, float
             "-f", "null", "-"
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                          timeout=300, shell=False)
+                          timeout=_timeout, shell=False)
         if r.returncode != 0:
-            return False, 0.0
+            if logger:
+                logger.warning("STAGE1_DEINT_CHECK_FAIL",
+                               "idet returned non-zero; quality left unchecked",
+                               returncode=r.returncode, timeout=_timeout)
+            return False, 0.0, "inconclusive"
 
         stderr = r.stderr
         stats = {}
@@ -996,18 +1029,35 @@ def check_deinterlace_quality(video_path: str, logger=None) -> Tuple[bool, float
 
         total = sum(stats.values())
         if total == 0:
-            return False, 0.0
+            if logger:
+                logger.warning("STAGE1_DEINT_CHECK_FAIL",
+                               "idet produced no statistics; quality left "
+                               "unchecked", timeout=_timeout)
+            return False, 0.0, "inconclusive"
 
         prog_pct = stats.get("progressive", 0) / total * 100
+        undet_pct = stats.get("undetermined", 0) / total * 100
+        # Undetermined 占多数 = idet 没给结论（与 stage2 同一条原则）
+        if undet_pct >= 50.0:
+            if logger:
+                logger.warning("STAGE1_DEINT_INCONCLUSIVE",
+                               "idet could not classify most frames; the "
+                               "deinterlace gate does not apply",
+                               progressive_pct=round(prog_pct, 1),
+                               undetermined_pct=round(undet_pct, 1),
+                               frames=total)
+            return False, prog_pct, "inconclusive"
+
         is_good = prog_pct >= 95.0
         if logger:
             logger.info("STAGE1_DEINT_CHECK",
                        f"Deinterlace quality: Progressive={prog_pct:.1f}%")
-        return is_good, prog_pct
+        return is_good, prog_pct, ("ok" if is_good else "low")
     except Exception as e:
         if logger:
-            logger.warning("STAGE1_DEINT_CHECK_FAIL", f"Failed: {e}")
-        return False, 0.0
+            logger.warning("STAGE1_DEINT_CHECK_FAIL",
+                           f"Failed: {e}; quality left unchecked")
+        return False, 0.0, "inconclusive"
 
 
 def check_ivtc_quality(video_path: str, logger=None,
@@ -1380,8 +1430,18 @@ def main():
             # V-P-023 fix: deinterlace quality check for segmented field order
             field_segments = params.get("field_segments", [])
             if field_segments:
-                is_good, prog_pct = check_deinterlace_quality(inter_path, logger)
-                if not is_good:
+                is_good, prog_pct, _dq_status = check_deinterlace_quality(
+                    inter_path, logger)
+                if _dq_status == "inconclusive":
+                    # FIX-2026-10-21：idet 没给结论（超时/报错/stats 空/
+                    # Undetermined 占多数）→ 记 WARNING 并放行，**不 fallback**。
+                    # 旧行为把它当"质量 0%"→ fallback → 但 fallback 又复用
+                    # 已产出的中间产物（STAGE1_SKIP: Intermediate exists），
+                    # 最终 Stage 2 output file missing → rc=86。
+                    logger.warning("STAGE1_DEINT_UNCHECKED",
+                                   "Deinterlace quality could not be verified; "
+                                   "continuing without the gate")
+                elif not is_good:
                     logger.warning("STAGE1_DEINT_FALLBACK",
                                   f"Deinterlace quality {prog_pct:.1f}% < 95%, progressive ratio too low")
                     # FIX-W12: Per v7.32 §3.10.13, deinterlace quality <95% must
@@ -1390,6 +1450,23 @@ def main():
                     # field_segments), not merely log a warning. ORIGINAL only
                     # logged WARNING and continued, producing a low-quality
                     # interlace artifact as if it were a clean progressive output.
+                    #
+                    # FIX-2026-10-21：**必须先删掉这次产出的中间产物**。
+                    # main.py 的 fallback 是"重跑 stage1（清空 field_segments）"，
+                    # 而 stage1 开头有 `Intermediate exists → STAGE1_SKIP` 的复用
+                    # 判断 —— 不清掉的话 fallback 只是空转，最终 Stage 2 找不到
+                    # 输出而 rc=86。实测正是如此。
+                    try:
+                        if inter_path and os.path.exists(inter_path):
+                            os.remove(inter_path)
+                            logger.info("STAGE1_DEINT_FALLBACK_CLEANUP",
+                                        "Removed the low-quality intermediate "
+                                        "so the fallback re-run actually "
+                                        "re-renders instead of being skipped",
+                                        path=inter_path)
+                    except OSError as _de:
+                        logger.warning("STAGE1_DEINT_FALLBACK_CLEANUP_FAIL",
+                                       str(_de))
                     return 86
 
             # V-P-024 fix: PSF frame rate verification

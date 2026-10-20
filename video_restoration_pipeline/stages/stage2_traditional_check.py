@@ -101,8 +101,20 @@ def main():
     # Check deinterlace quality with idet
     threshold = params.get("deinterlace_progressive_threshold", 95.0)
     try:
+        import os as _os
         import subprocess
         import re
+        # FIX-2026-10-21（16 分钟 1080p 实跑）：固定 300 秒对长片必然不够 ——
+        # idet 要解码整条流，实测 24GB / 28840 帧的 1080p 中间产物直接超时，
+        # 而超时被当成"0% progressive"判失败。超时按大小自适应，且超时/报错
+        # 一律记 IDET_INCONCLUSIVE（判不出来 ≠ 不合格），与 file segment 的
+        # 场序检查保持同一条原则。
+        _gb = 0.0
+        try:
+            _gb = _os.path.getsize(stage1_output) / float(1 << 30)
+        except OSError:
+            pass
+        _idet_timeout = min(3600.0, 300.0 + 25.0 * _gb)
         cmd = [
             "ffmpeg", "-hide_banner", "-v", "info",
             "-i", stage1_output,
@@ -110,8 +122,14 @@ def main():
             "-f", "null", "-"
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                          timeout=300, shell=False)
-        if r.returncode == 0:
+                          timeout=_idet_timeout, shell=False)
+        if r.returncode != 0:
+            logger.warning("STAGE2_IDET_INCONCLUSIVE",
+                           "idet returned non-zero; the deinterlace gate does "
+                           "not apply",
+                           returncode=r.returncode, timeout=_idet_timeout)
+            stats = {}
+        else:
             stats = {}
             for line in r.stderr.splitlines():
                 if "Multi frame detection:" in line:
@@ -193,29 +211,30 @@ def main():
                     logger.warning("STAGE2_FRAMERATE_CHECK", f"Frame rate check failed: {e}")
 
                 logger.info("TRADITIONAL_GATE", "Traditional restoration completed, proceeding to AI stages")
-
-                # FIX-P7-5: Copy stage1 output to step2_traditional intermediate
-                # so stage7 can find it in the fallback chain
-                import shutil
-                # FIX-2026-10-20: merge_params() 从不注入 params["param_hash"]，
-                # 原来这里取到空串 → step2 文件名完全没有 _p{hash} 段，
-                # 与 v7.32 §3.10.19 的命名契约不符。改为就地计算（与
-                # stage1/3/4 一致），以**本 stage 的实际输入**为身份基准。
-                from checkpoint import compute_param_hash
-                param_hash = compute_param_hash(stage1_output, params)
-                step2_name = (f"{job_id}_{Path(input_name).stem}"
-                              f"_step2_traditional_p{param_hash}.mkv")
-                step2_path = os.path.join(temp_dir, step2_name)
-                try:
-                    if not os.path.exists(step2_path):
-                        shutil.copyfile(stage1_output, step2_path)
-                        logger.info("STAGE2_COPY", f"Copied stage1 output to {step2_path}")
-                except Exception as copy_err:
-                    logger.warning("STAGE2_COPY_WARN", f"Failed to copy stage1 to step2 path: {copy_err}")
-
-                return 0
     except Exception as e:
         logger.warning("STAGE2_CHECK_FAIL", f"Quality check failed: {e}")
+
+    # FIX-2026-10-21（16 分钟 1080p 实跑）：step2 中间产物的复制**必须无条件执行**。
+    #
+    # 旧结构把它放在 `if total > 0:` 的成功路径里（末尾 `return 0`），于是
+    # idet 超时/报错走 except 时会直接 `return 0` —— **宣称成功却没有产物**，
+    # main.py 随后报 `TRADITIONAL_GATE_BLOCK: Stage 2 output file missing`，
+    # 整个 job 以 rc=86 结束。实测 24GB 中间产物 idet 300s 超时即命中。
+    #
+    # 只有"真的低质量并 return 86"那条路才不需要复制（stage1 会被 fallback
+    # 重做）。
+    try:
+        import shutil
+        from checkpoint import compute_param_hash
+        param_hash = compute_param_hash(stage1_output, params)
+        step2_name = (f"{job_id}_{Path(input_name).stem}"
+                      f"_step2_traditional_p{param_hash}.mkv")
+        step2_path = os.path.join(temp_dir, step2_name)
+        if not os.path.exists(step2_path):
+            shutil.copyfile(stage1_output, step2_path)
+            logger.info("STAGE2_COPY", f"Copied stage1 output to {step2_path}")
+    except Exception as copy_err:
+        logger.warning("STAGE2_COPY_WARN", f"Failed to copy stage1 to step2 path: {copy_err}")
 
     logger.info("STAGE2_DONE", "Verification passed (basic)")
     return 0
