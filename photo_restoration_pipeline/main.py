@@ -446,11 +446,16 @@ def cleanup_old_intermediates(temp_dir: str, job_id: str,
     人脸检测必然零命中）。
     """
     try:
-        sys.path.insert(0, str(SCRIPT_DIR))
+        # FIX-2026-10-20: checkpoint 在 **shared_modules** 下，不在
+        # photo_restoration_pipeline/ 下。原来插的是 SCRIPT_DIR，只是恰好靠
+        # classify.py:450 把 shared_modules 塞进 sys.path 才没崩 —— 属隐式耦合。
+        sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
         from checkpoint import cleanup_old_intermediates as coi
         coi(temp_dir, job_id, current_step=current_step)
-    except Exception:
-        pass
+    except Exception as e:
+        # 不能静默：清理失败会让陈旧中间产物一直堆积而无任何提示。
+        print(f"[WARN] cleanup_old_intermediates failed: {e}",
+              file=sys.stderr)
 
 
 def _is_retryable_error(returncode: int, stderr: str = "") -> bool:
@@ -565,7 +570,11 @@ def _run_single_job(job: Dict[str, Any],
     # Initialize logger for PARAM_OVERRIDE recording
     # FIX-P11-3: MOVED before confidence check — original placement caused
     # NameError when logger.warning() was called before logger was defined
-    sys.path.insert(0, str(SCRIPT_DIR))
+    # FIX-2026-10-20: logger 在 **shared_modules** 下，不在
+    # photo_restoration_pipeline/ 下。原来插 SCRIPT_DIR 靠 classify 的
+    # sys.path 副作用兜底，任何绕过 classify 的入口都会在这里
+    # ModuleNotFoundError（进程直接崩，退出码 1 落在 80-113 之外）。
+    sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
     from logger import get_logger
     logger = get_logger(log_dir=log_dir, job_id=job_id)
 
@@ -663,7 +672,8 @@ def _run_single_job(job: Dict[str, Any],
     try:
         if params.get("cleanup_intermediates", True) and \
                 not job.get("resume_from_stage"):
-            sys.path.insert(0, str(SCRIPT_DIR))
+            # FIX-2026-10-20: checkpoint 在 shared_modules 下（同 449/568 两处）。
+            sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
             from checkpoint import cleanup_all_intermediates as _cai
             _purged = _cai(temp_dir, job_id)
             logger.info("STALE_INTERMEDIATES_PURGED",
@@ -671,8 +681,11 @@ def _run_single_job(job: Dict[str, Any],
                         temp_dir=temp_dir, purged=_purged)
         else:
             cleanup_old_intermediates(temp_dir, job_id)
-    except Exception:
-        pass
+    except Exception as _e:
+        # 原来静默 pass：陈旧产物清不掉时毫无提示，而它们的后果是
+        # 上游产物被错误复用（比"没清理"本身更难排查）。
+        print(f"[WARN] stale-intermediate cleanup failed: {_e}",
+              file=sys.stderr)
 
     # Disk space check (WSL redirect handled inside check_wsl_space)
     # FIX-P10-8: Use merged params (not raw config) for upscale_scale
