@@ -277,8 +277,29 @@ def build_reuse_plan(
                                     "changed_keys": []})
 
     restart_from = first_invalid if first_invalid is not None else None
-    will_run_ai = bool(restart_from is not None
-                       and any(s >= restart_from for s in ai_stages))
+    # FIX-2026-10-21（16 分钟真实素材实跑发现）：
+    # `will_run_ai` 原来**只看** restart_from 与 ai_stages 的位置关系，
+    # 完全不看 AI 到底有没有被启用、有没有被尺寸规则禁掉。于是：
+    #   * 全默认（config `ai.enabled: false`）→ 报 will_run_ai=true；
+    #   * 1920x1080 素材（`ai_upscale_banned: true`，判据 height>=1080
+    #     or width>=1920）→ 同样报 true。
+    # 而 main.py 的 stage 调度用的是
+    # `ai_enabled and not (ai_banned and not force_allow)` —— 两者**直接矛盾**。
+    # 复用计划是给用户预估"这次要跑多久"的，谎报"要跑几小时 AI"比不报更糟。
+    ai_enabled = bool(params.get("ai_enabled", False))
+    ai_banned = bool(params.get("ai_upscale_banned", False))
+    force_allow = bool(params.get("force_allow_banned_upscale", False))
+    face_restore = str(params.get("face_restore") or "")
+    ai_skip_reason: Optional[str] = None
+    if not ai_enabled:
+        ai_skip_reason = "ai.enabled=false (pass --ai-enabled to turn it on)"
+    elif ai_banned and not force_allow:
+        ai_skip_reason = ("ai_upscale_banned (input >=1080p) and "
+                          "force_allow_banned_upscale=false")
+    # stage5 还需要人脸模型名非空（与 main.py 的 gate 一致）
+    effective_ai_stages = [s for s in ai_stages if s != 5 or face_restore]
+    will_run_ai = bool(ai_skip_reason is None and restart_from is not None
+                       and any(s >= restart_from for s in effective_ai_stages))
 
     if result_artifact:
         notes.append(
@@ -291,6 +312,8 @@ def build_reuse_plan(
         "stale_files": [p for p in stale if p],
         "restart_from": restart_from,
         "will_run_ai": will_run_ai,
+        # None = 本次会跑 AI；否则说明为什么不跑（含 --ai-enabled 提示）
+        "ai_skip_reason": ai_skip_reason,
         "notes": notes,
     }
 
@@ -320,6 +343,8 @@ def render_reuse_plan(plan: Dict[str, Any]) -> str:
     rf = plan.get("restart_from")
     lines.append(f"从 stage {rf if rf is not None else '(无需重算)'} 开始")
     lines.append(f"是否触发 AI 阶段: {'是' if plan.get('will_run_ai') else '否'}")
+    if not plan.get("will_run_ai") and plan.get("ai_skip_reason"):
+        lines.append(f"  原因: {plan['ai_skip_reason']}")
     for n in plan.get("notes") or []:
         lines.append(n)
     return "\n".join(lines)
