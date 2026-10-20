@@ -1341,6 +1341,52 @@ def main():
                        "old generation before starting this one",
                        report=_prior.get("report"))
 
+    # --- FIX-2026-10-20（G6 实跑的教训）：发布前的色彩保真守卫 -----------
+    #
+    # 为什么加：8-bit 输入的照片链曾长期产出**纯黑成品**而 rc=0 —— 契约、
+    # CICP、avifdec 头部核验全部正常，只有像素是黑的。那次是靠人工拿
+    # avifdec 解出来算 mean 才发现的。这里把这一步变成例行守卫，让
+    # "整体崩坏"（黑/白/内容丢失）不可能再带着 rc=0 流出去。
+    #
+    # 判据与视频链 stage7 **同一份实现**（shared_modules/color_probe.py），
+    # 这里只决定"超了阈值要不要失败"。阈值默认 60.0，实测标定：
+    #   纯黑成品 delta≈116 → 拦；ProPhoto→sRGB delta≈26.7 → 放行；
+    #   普通 sRGB 正常处理 delta≈1 → 放行。
+    # 即它专门抓"整体崩坏"，不抓细微色偏（后者需针对素材标定更严的值）。
+    try:
+        from color_probe import (COLOR_DRIFT_DEFAULT_THRESHOLD,
+                                 check_color_drift)
+        _thr = float(params.get("color_drift_threshold",
+                                COLOR_DRIFT_DEFAULT_THRESHOLD))
+        _enforce = bool(params.get("color_drift_enforce", False))
+        _drift = check_color_drift(args.input, tmp_avif, threshold=_thr,
+                                   enforce=_enforce, logger=logger)
+        _fields = {k: v for k, v in _drift.items() if k != "status"}
+        if _drift["status"] == "drift":
+            _msg = ("Colour drift between original input and encoded output "
+                    "exceeds threshold")
+            if _enforce:
+                logger.error("STAGE6_COLOR_DRIFT", _msg, **_fields)
+                # tmp_avif / tmp_tiff 是本次 attempt 的暂存，round_artifacts 是
+                # 本轮其余临时产物，都要丢掉，否则 .partial 会留在 output 目录。
+                # 既有成品一个字节都不动（PUB-01 语义），与视频链 stage7 的
+                # _discard_attempt_tmp 对称。tmp_tiff 未写时为 ""，_fail 会跳过。
+                _fail(logger, status_path, "color_drift",
+                      f"delta={_drift['delta']:.2f} > {_thr}",
+                      paths=[tmp_avif, tmp_tiff] + round_artifacts)
+                return 86
+            logger.warning("STAGE6_COLOR_DRIFT", _msg, **_fields)
+        elif _drift["status"] == "ok":
+            logger.info("STAGE6_COLOR_OK",
+                        "Colour distribution within threshold", **_fields)
+        else:
+            # 探测失败 → 如实记"未校验"，不假装通过，也不阻断。
+            logger.warning("STAGE6_COLOR_SKIPPED",
+                           "Could not probe RGB means on one side; colour "
+                           "fidelity left unchecked")
+    except Exception as _ce:
+        logger.warning("STAGE6_COLOR_DRIFT_ERROR", str(_ce))
+
     # FIX-A3：同 tmp_avif，备份目录也带 job 维度（见上方说明）。
     backup_dir = f"{work_output_path}{_iso}.pubbak"
     snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)

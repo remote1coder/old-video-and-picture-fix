@@ -66,6 +66,20 @@ photo:
   channel_correction_soft_compress: true
   channel_correction_float_precision: "float32"
   photo_bit_depth: 16
+  # FIX-2026-10-20（G6 实跑的教训）：发布前的色彩保真守卫。
+  # stage6 在发布前比对「原始输入 vs 本次编码暂存」的 RGB 三通道均值，
+  # 最大绝对差超过阈值即记录。
+  #
+  # 起因：8-bit 输入的照片链曾长期产出**纯黑成品**而 rc=0 —— 契约、CICP、
+  # avifdec 头部核验全部正常，只有像素是黑的。那次靠人工拿 avifdec 解出来
+  # 算 mean 才发现。这个守卫让"整体崩坏"不可能再带着 rc=0 流出去。
+  #
+  # 阈值 60.0 的标定依据（shared_modules/color_probe.py 的 docstring）：
+  #   纯黑成品 delta≈116 → 拦；ProPhoto→sRGB delta≈26.7 → 放行；
+  #   普通 sRGB 正常处理 delta≈1 → 放行。
+  # 即专门抓"整体崩坏"，不抓细微色偏。默认只 WARNING，阻断需 enforce。
+  color_drift_threshold: 60.0
+  color_drift_enforce: false
   avif_params:
     depth: 10
     yuv: "420"

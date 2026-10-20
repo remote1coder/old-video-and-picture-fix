@@ -22,8 +22,12 @@ global:
   # 最大绝对差超过阈值即记录。默认只 WARNING —— 阈值需要先在一批真实
   # 素材上标定（不同内容天然有差异），且开启 AI 超分时 GAN 模型本身就
   # 会带来可测色偏（第六轮实测 R/B 比从 1.007 漂到 0.955）。
-  # 探测失败（读不出/一个点都没抽到）记 STAGE7_COLOR_SKIPPED，不假装通过。
-  color_drift_threshold: 8.0    # 0-255 的 RGB 通道均值最大绝对差
+  # 阈值 60.0 的标定依据（shared_modules/color_probe.py 的 docstring）：
+  #   纯黑成品 delta≈116 → 拦；ProPhoto→sRGB delta≈26.7 → 放行；
+  #   普通 sRGB 正常处理 delta≈1 → 放行。
+  # 即它专门抓"整体崩坏"（黑/白/内容丢失），**不抓细微色偏**。
+  # 要抓细微色偏需针对素材标定更严的值，设严了会频繁误报、反而没人看日志。
+  color_drift_threshold: 60.0   # 0-255 的 RGB 通道均值最大绝对差
   color_drift_enforce: false    # true 时超阈值丢弃暂存并返回 86（不覆盖既有成品）
   platform: "auto"
   gpu_priority: ["cuda", "rocm", "mps", "cpu"]
