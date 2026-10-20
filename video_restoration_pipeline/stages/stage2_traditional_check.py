@@ -100,119 +100,141 @@ def main():
 
     # Check deinterlace quality with idet
     threshold = params.get("deinterlace_progressive_threshold", 95.0)
-    try:
-        import os as _os
-        import subprocess
-        import re
-        # FIX-2026-10-21（16 分钟 1080p 实跑）：固定 300 秒对长片必然不够 ——
-        # idet 要解码整条流，实测 24GB / 28840 帧的 1080p 中间产物直接超时，
-        # 而超时被当成"0% progressive"判失败。超时按大小自适应，且超时/报错
-        # 一律记 IDET_INCONCLUSIVE（判不出来 ≠ 不合格），与 file segment 的
-        # 场序检查保持同一条原则。
-        _gb = 0.0
+    # FIX-2026-10-21（16 分钟 1080p 实跑）：**没做去隔行就不该验证去隔行质量**。
+    #
+    # stage1 在 `field_order == "unknown"` 时会跳过 QTGMC（保守策略，日志
+    # STAGE1_UNKNOWN_FIELD_ORDER），vpy 里只有 SetFieldBased(clip, 0)。
+    # 而 stage2 仍然跑 idet 门禁 —— 实测该 82GB 产物的元数据明明是
+    # `field_order=progressive`、vpy 也显式 SetFieldBased(0)，idet 却判
+    # TFF:2742 / Progressive:237（91% 隔行）。
+    #
+    # 原因是**防抖**：haf.Stab（DepanStabilize）对每帧做亚像素垂直位移，
+    # 改变了行间相关性，而 idet 正是靠行间相关性判断隔行的。所以
+    # "做过防抖的 progressive 输出"天生会被 idet 误判为隔行。
+    #
+    # 这个门禁的唯一目的是验证"QTGMC 把隔行去干净了"。既然没做去隔行，
+    # 它就不适用 —— 记 INCONCLUSIVE 放行，而不是判失败。
+    _fo_for_gate = str(params.get("field_order") or "")
+    if _fo_for_gate == "unknown":
+        logger.warning("STAGE2_IDET_INCONCLUSIVE",
+                       "field_order=unknown: stage1 skipped QTGMC, so there "
+                       "is no deinterlace to verify. The gate does not apply",
+                       field_order=_fo_for_gate)
+        stats = {}
+    else:
         try:
-            _gb = _os.path.getsize(stage1_output) / float(1 << 30)
-        except OSError:
-            pass
-        _idet_timeout = min(3600.0, 300.0 + 25.0 * _gb)
-        cmd = [
-            "ffmpeg", "-hide_banner", "-v", "info",
-            "-i", stage1_output,
-            "-vf", "idet",
-            "-f", "null", "-"
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                          timeout=_idet_timeout, shell=False)
-        if r.returncode != 0:
-            logger.warning("STAGE2_IDET_INCONCLUSIVE",
-                           "idet returned non-zero; the deinterlace gate does "
-                           "not apply",
-                           returncode=r.returncode, timeout=_idet_timeout)
-            stats = {}
-        else:
-            stats = {}
-            for line in r.stderr.splitlines():
-                if "Multi frame detection:" in line:
-                    for key in ("TFF", "BFF", "Progressive", "Undetermined"):
-                        m = re.search(rf"{key}:\s*(\d+)", line)
-                        if m:
-                            stats[key.lower()] = int(m.group(1))
-            total = sum(stats.values())
-            if total > 0:
-                prog_pct = stats.get("progressive", 0) / total * 100
-                undet = stats.get("undetermined", 0)
-                undet_pct = undet / total * 100
-                # FIX-2026-10-21（全链路实测 + 联网核实 ffmpeg 语义）：
-                #
-                # `Undetermined` 是 idet 的**"无法分类"** —— 官方
-                # doc/filters.texi 写的是 "Cumulative number of frames that
-                # could not be classified"；vf_idet.c 里它既不满足
-                # TFF/BFF 的 interlace_threshold，也不满足 PROGRESSIVE 的
-                # progressive_threshold。
-                #
-                # 旧实现把 "不是 progressive 的帧" 一并算进分母，于是
-                # **任何 idet 判不出的素材都会被当成不合格误杀**。实测：
-                # 2 秒的逐行片与 2 秒的真隔行（field_order=tt）片，
-                # idet 都输出 TFF:0 BFF:0 Progressive:0 Undetermined:50 /
-                # :25 —— 门禁一律报 Progressive=0.0% 并 return 86。
-                #
-                # 官方判定口径也支持这一点：InterlaceInfo.Type() 只在
-                # Determined > Undetermined 时才下结论，且帧数 <250 直接
-                # 返回 ErrShortStream。
-                #
-                # 因此：Undetermined 占多数 = idet 没给结论，此时应记
-                # "未校验"并放行，而不是判失败。
-                inconclusive = float(params.get(
-                    "deinterlace_idet_inconclusive_pct", 50.0))
-                if undet_pct >= inconclusive:
-                    logger.warning(
-                        "STAGE2_IDET_INCONCLUSIVE",
-                        f"idet could not classify {undet_pct:.1f}% of "
-                        f"frames (>= {inconclusive}%): the deinterlace "
-                        "gate does not apply. Recording as unchecked, "
-                        "not as a failure",
-                        progressive_pct=round(prog_pct, 1),
-                        undetermined_pct=round(undet_pct, 1),
-                        frames=total,
-                        stats=stats)
-                elif prog_pct >= threshold:
-                    logger.info("STAGE2_DONE", f"Verification passed: {prog_pct:.1f}% progressive")
-                else:
-                    logger.error("STAGE2_LOW_PROGRESSIVE",
-                                f"Progressive={prog_pct:.1f}% < threshold={threshold}%")
-                    return 86
+            import os as _os
+            import subprocess
+            import re
+            # FIX-2026-10-21（16 分钟 1080p 实跑）：固定 300 秒对长片必然不够 ——
+            # idet 要解码整条流，实测 24GB / 28840 帧的 1080p 中间产物直接超时，
+            # 而超时被当成"0% progressive"判失败。超时按大小自适应，且超时/报错
+            # 一律记 IDET_INCONCLUSIVE（判不出来 ≠ 不合格），与 file segment 的
+            # 场序检查保持同一条原则。
+            _gb = 0.0
+            try:
+                _gb = _os.path.getsize(stage1_output) / float(1 << 30)
+            except OSError:
+                pass
+            _idet_timeout = min(3600.0, 300.0 + 25.0 * _gb)
+            cmd = [
+                "ffmpeg", "-hide_banner", "-v", "info",
+                "-i", stage1_output,
+                "-vf", "idet",
+                "-f", "null", "-"
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                              timeout=_idet_timeout, shell=False)
+            if r.returncode != 0:
+                logger.warning("STAGE2_IDET_INCONCLUSIVE",
+                               "idet returned non-zero; the deinterlace gate does "
+                               "not apply",
+                               returncode=r.returncode, timeout=_idet_timeout)
+                stats = {}
+            else:
+                stats = {}
+                for line in r.stderr.splitlines():
+                    if "Multi frame detection:" in line:
+                        for key in ("TFF", "BFF", "Progressive", "Undetermined"):
+                            m = re.search(rf"{key}:\s*(\d+)", line)
+                            if m:
+                                stats[key.lower()] = int(m.group(1))
+                total = sum(stats.values())
+                if total > 0:
+                    prog_pct = stats.get("progressive", 0) / total * 100
+                    undet = stats.get("undetermined", 0)
+                    undet_pct = undet / total * 100
+                    # FIX-2026-10-21（全链路实测 + 联网核实 ffmpeg 语义）：
+                    #
+                    # `Undetermined` 是 idet 的**"无法分类"** —— 官方
+                    # doc/filters.texi 写的是 "Cumulative number of frames that
+                    # could not be classified"；vf_idet.c 里它既不满足
+                    # TFF/BFF 的 interlace_threshold，也不满足 PROGRESSIVE 的
+                    # progressive_threshold。
+                    #
+                    # 旧实现把 "不是 progressive 的帧" 一并算进分母，于是
+                    # **任何 idet 判不出的素材都会被当成不合格误杀**。实测：
+                    # 2 秒的逐行片与 2 秒的真隔行（field_order=tt）片，
+                    # idet 都输出 TFF:0 BFF:0 Progressive:0 Undetermined:50 /
+                    # :25 —— 门禁一律报 Progressive=0.0% 并 return 86。
+                    #
+                    # 官方判定口径也支持这一点：InterlaceInfo.Type() 只在
+                    # Determined > Undetermined 时才下结论，且帧数 <250 直接
+                    # 返回 ErrShortStream。
+                    #
+                    # 因此：Undetermined 占多数 = idet 没给结论，此时应记
+                    # "未校验"并放行，而不是判失败。
+                    inconclusive = float(params.get(
+                        "deinterlace_idet_inconclusive_pct", 50.0))
+                    if undet_pct >= inconclusive:
+                        logger.warning(
+                            "STAGE2_IDET_INCONCLUSIVE",
+                            f"idet could not classify {undet_pct:.1f}% of "
+                            f"frames (>= {inconclusive}%): the deinterlace "
+                            "gate does not apply. Recording as unchecked, "
+                            "not as a failure",
+                            progressive_pct=round(prog_pct, 1),
+                            undetermined_pct=round(undet_pct, 1),
+                            frames=total,
+                            stats=stats)
+                    elif prog_pct >= threshold:
+                        logger.info("STAGE2_DONE", f"Verification passed: {prog_pct:.1f}% progressive")
+                    else:
+                        logger.error("STAGE2_LOW_PROGRESSIVE",
+                                    f"Progressive={prog_pct:.1f}% < threshold={threshold}%")
+                        return 86
 
-                # Frame rate validation
-                try:
-                    fr_cmd = ["ffprobe", "-hide_banner", "-v", "error",
-                              "-select_streams", "v:0",
-                              "-show_entries", "stream=r_frame_rate",
-                              "-of", "default=noprint_wrappers=1:nokey=1", stage1_output]
-                    fr = subprocess.run(fr_cmd, capture_output=True, text=True, errors="replace",
-                                        timeout=60, shell=False)
-                    if fr.returncode == 0:
-                        rate_str = fr.stdout.strip()
-                        if "/" in rate_str:
-                            num, den = map(float, rate_str.split("/"))
-                            detected_fps = num / den if den != 0 else 0
-                        else:
-                            detected_fps = float(rate_str)
-                        expected_fps = params.get("expected_fps", params.get("original_fps", 0))
-                        if expected_fps > 0:
-                            deviation = abs(detected_fps - expected_fps) / expected_fps
-                            if deviation > 0.02:
-                                logger.error("STAGE2_FRAMERATE",
-                                            f"FPS {detected_fps} deviates {deviation*100:.1f}% from expected {expected_fps}")
-                                return 86
+                    # Frame rate validation
+                    try:
+                        fr_cmd = ["ffprobe", "-hide_banner", "-v", "error",
+                                  "-select_streams", "v:0",
+                                  "-show_entries", "stream=r_frame_rate",
+                                  "-of", "default=noprint_wrappers=1:nokey=1", stage1_output]
+                        fr = subprocess.run(fr_cmd, capture_output=True, text=True, errors="replace",
+                                            timeout=60, shell=False)
+                        if fr.returncode == 0:
+                            rate_str = fr.stdout.strip()
+                            if "/" in rate_str:
+                                num, den = map(float, rate_str.split("/"))
+                                detected_fps = num / den if den != 0 else 0
                             else:
-                                logger.info("STAGE2_FRAMERATE",
-                                           f"FPS {detected_fps} matches expected {expected_fps}")
-                except Exception as e:
-                    logger.warning("STAGE2_FRAMERATE_CHECK", f"Frame rate check failed: {e}")
+                                detected_fps = float(rate_str)
+                            expected_fps = params.get("expected_fps", params.get("original_fps", 0))
+                            if expected_fps > 0:
+                                deviation = abs(detected_fps - expected_fps) / expected_fps
+                                if deviation > 0.02:
+                                    logger.error("STAGE2_FRAMERATE",
+                                                f"FPS {detected_fps} deviates {deviation*100:.1f}% from expected {expected_fps}")
+                                    return 86
+                                else:
+                                    logger.info("STAGE2_FRAMERATE",
+                                               f"FPS {detected_fps} matches expected {expected_fps}")
+                    except Exception as e:
+                        logger.warning("STAGE2_FRAMERATE_CHECK", f"Frame rate check failed: {e}")
 
-                logger.info("TRADITIONAL_GATE", "Traditional restoration completed, proceeding to AI stages")
-    except Exception as e:
-        logger.warning("STAGE2_CHECK_FAIL", f"Quality check failed: {e}")
+                    logger.info("TRADITIONAL_GATE", "Traditional restoration completed, proceeding to AI stages")
+        except Exception as e:
+            logger.warning("STAGE2_CHECK_FAIL", f"Quality check failed: {e}")
 
     # FIX-2026-10-21（16 分钟 1080p 实跑）：step2 中间产物的复制**必须无条件执行**。
     #
