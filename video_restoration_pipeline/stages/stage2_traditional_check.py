@@ -122,7 +122,42 @@ def main():
             total = sum(stats.values())
             if total > 0:
                 prog_pct = stats.get("progressive", 0) / total * 100
-                if prog_pct >= threshold:
+                undet = stats.get("undetermined", 0)
+                undet_pct = undet / total * 100
+                # FIX-2026-10-21（全链路实测 + 联网核实 ffmpeg 语义）：
+                #
+                # `Undetermined` 是 idet 的**"无法分类"** —— 官方
+                # doc/filters.texi 写的是 "Cumulative number of frames that
+                # could not be classified"；vf_idet.c 里它既不满足
+                # TFF/BFF 的 interlace_threshold，也不满足 PROGRESSIVE 的
+                # progressive_threshold。
+                #
+                # 旧实现把 "不是 progressive 的帧" 一并算进分母，于是
+                # **任何 idet 判不出的素材都会被当成不合格误杀**。实测：
+                # 2 秒的逐行片与 2 秒的真隔行（field_order=tt）片，
+                # idet 都输出 TFF:0 BFF:0 Progressive:0 Undetermined:50 /
+                # :25 —— 门禁一律报 Progressive=0.0% 并 return 86。
+                #
+                # 官方判定口径也支持这一点：InterlaceInfo.Type() 只在
+                # Determined > Undetermined 时才下结论，且帧数 <250 直接
+                # 返回 ErrShortStream。
+                #
+                # 因此：Undetermined 占多数 = idet 没给结论，此时应记
+                # "未校验"并放行，而不是判失败。
+                inconclusive = float(params.get(
+                    "deinterlace_idet_inconclusive_pct", 50.0))
+                if undet_pct >= inconclusive:
+                    logger.warning(
+                        "STAGE2_IDET_INCONCLUSIVE",
+                        f"idet could not classify {undet_pct:.1f}% of "
+                        f"frames (>= {inconclusive}%): the deinterlace "
+                        "gate does not apply. Recording as unchecked, "
+                        "not as a failure",
+                        progressive_pct=round(prog_pct, 1),
+                        undetermined_pct=round(undet_pct, 1),
+                        frames=total,
+                        stats=stats)
+                elif prog_pct >= threshold:
                     logger.info("STAGE2_DONE", f"Verification passed: {prog_pct:.1f}% progressive")
                 else:
                     logger.error("STAGE2_LOW_PROGRESSIVE",
