@@ -502,14 +502,82 @@ def _carry_icc_to_output(output_path: str, icc: Optional[bytes],
     return bool(ok)
 
 
-def _write_color_matched(output_path: str, arr: "np.ndarray") -> None:
-    """R2-02: 按数组真实位深写出色彩匹配结果（不用 Pillow 的 8-bit save）。"""
+def _promote_temp_to_output(temp_path: str, output_path: str) -> None:
+    """把中间临时文件落到 output_path，**按扩展名决定最终格式**。
+
+    FIX-2026-10-21（全链路实测，R23 病族）：中间产物用 `.pre_grain.tif`
+    / `.pre_color_match.tif`（TIFF 能无损带 16-bit），而 8-bit 档位的
+    输出名是 `..._step5_postprocess.png`。旧代码直接
+    `_promote_temp_to_output(grain_temp, output_path)` —— **改名不改内容**，于是
+    磁盘上是 TIFF 字节配 .png 名（实测文件头 `II*\\0`），avifenc 报
+    `Unrecognized file format` → stage6 rc=84。
+
+    扩展名相同才允许直接 move；不同就必须真正转格式。
+    """
+    import shutil as _sh
+    src_ext = Path(temp_path).suffix.lower()
+    dst_ext = Path(output_path).suffix.lower()
+    if src_ext == dst_ext:
+        _sh.move(temp_path, output_path)
+        return
     if _media_io is not None:
         try:
-            if getattr(arr, "dtype", None) == np.uint16:
+            arr, _meta = _media_io.read_image_array(temp_path)
+            if dst_ext in (".tif", ".tiff"):
                 _media_io.write_tiff(output_path, arr)
             else:
-                _media_io.write_png(output_path, arr)
+                out = arr
+                if getattr(arr, "dtype", None) == np.uint16:
+                    # 目标是 8-bit 容器 → 真正降位，而不是改个名字
+                    out = (np.asarray(arr, dtype=np.float64) / 257.0
+                           ).clip(0, 255).astype(np.uint8)
+                _media_io.write_png(output_path, out)
+            os.remove(temp_path)
+            return
+        except Exception:
+            pass
+    # 兜底：PIL 按目标扩展名重新编码
+    from PIL import Image as _PILImage
+    with _PILImage.open(temp_path) as _im:
+        _im.convert("RGB").save(output_path)
+    try:
+        os.remove(temp_path)
+    except OSError:
+        pass
+
+
+def _write_color_matched(output_path: str, arr: "np.ndarray") -> None:
+    """R2-02: 按数组真实位深写出色彩匹配结果（不用 Pillow 的 8-bit save）。
+
+    FIX-2026-10-21（全链路实测，R23 病族第四次现身）：原实现按 **dtype**
+    决定写 TIFF 还是 PNG，**完全不看 output_path 的扩展名**：
+
+    ```python
+    if arr.dtype == np.uint16:
+        _media_io.write_tiff(output_path, arr)   # 哪怕路径叫 .png
+    ```
+
+    而 `photo_bit_depth=8` 档位的输出名正是 `..._step5_postprocess.png`。
+    于是写出了 **TIFF 字节配 .png 名**（实测文件头 `II*\\0`），
+    avifenc 直接报 `Unrecognized file format` → stage6 rc=84。
+
+    现在按**扩展名**分派（与 R23 对 `run_dat_file` 的修法一致）：
+    * `.tif/.tiff` → `write_tiff`（避开 PIL 对 .tif 默认 LZW）
+    * 其它（PNG）→ `write_png`；8-bit 档位要求的是真 8-bit 文件，
+      所以 uint16 输入先降到 uint8 再写（否则会写出 16-bit PNG 冒充 8-bit）。
+    """
+    ext = Path(output_path).suffix.lower()
+    if _media_io is not None:
+        try:
+            if ext in (".tif", ".tiff"):
+                _media_io.write_tiff(output_path, arr)
+            else:
+                out_arr = arr
+                if getattr(arr, "dtype", None) == np.uint16:
+                    # 8-bit 档位：真正降到 uint8（不是把 16-bit PNG 改个名）
+                    out_arr = (np.asarray(arr, dtype=np.float64) / 257.0
+                               ).clip(0, 255).astype(np.uint8)
+                _media_io.write_png(output_path, out_arr)
             return
         except Exception:
             pass
@@ -908,7 +976,14 @@ def _add_grain_python(input_path: str, output_path: str,
         result = np.clip(result, 0.0, 1.0)
 
         out_depth = bit_depth if bit_depth in (8, 16) else input_depth
-        if out_depth == 16:
+        # FIX-2026-10-21（全链路实测，R23 病族）：**不能只看 out_depth**，
+        # 必须同时看 output_path 的扩展名。`photo_bit_depth=8` 档位的输出名是
+        # `..._step5_postprocess.png`，若 out_depth 被判成 16（bit_depth 没传
+        # 进来时默认 16），旧代码会用 tifffile 写出 TIFF 字节配 .png 名
+        # （实测文件头 `II*\0`），avifenc 报 `Unrecognized file format`
+        # → stage6 rc=84。PNG 路径必须是真 PNG。
+        _ext = os.path.splitext(output_path)[1].lower()
+        if out_depth == 16 and _ext in (".tif", ".tiff"):
             out_arr = (result * 65535.0).astype(np.uint16)
             try:
                 import tifffile
@@ -1782,7 +1857,7 @@ def main():
                                "Grain synthesis failed; DEGRADED result "
                                "accepted via allow_stage5_degrade",
                                skipped_operations=["grain_synthesis"])
-                shutil.move(grain_temp, output_path)
+                _promote_temp_to_output(grain_temp, output_path)
                 _carry_icc_to_output(output_path, input_icc, logger)
                 # 降级结果不写缓存身份：下次运行必须重跑完整处理，不能被复用
                 _write_json_sidecar(
@@ -1797,7 +1872,7 @@ def main():
                             output=output_path)
                 return 0
         else:
-            shutil.move(grain_temp, output_path)
+            _promote_temp_to_output(grain_temp, output_path)
         # R3-07 / B06：源 ICC 必须跟着像素走到最终产物；写不进去（或回读
         # 不一致）就不能算成功。默认 require_icc_preserved=True。
         if input_icc:
