@@ -47,27 +47,113 @@ COLOR_DRIFT_DEFAULT_THRESHOLD = 60.0
 #: 采样位置，按时长比例取。
 COLOR_PROBE_FRACTIONS = (0.1, 0.5, 0.9)
 
+#: 静态图扩展名 —— 这些**不能**走 ffmpeg 采样路径。
+#: 实测：ffmpeg 对 JPEG 用 `-f rawvideo -pix_fmt rgb24` 会 rc=0 但输出 0 字节
+#: （对单帧图片 `-ss` 也定位不到帧），于是探测静默返回 None、守卫形同虚设。
+IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp",
+                        ".webp"})
+
 
 def probe_duration(path: str, logger=None) -> float:
-    """读容器时长（秒）。失败返回 0.0。"""
+    """读容器时长（秒）。失败或非数字返回 0.0。
+
+    静态图的 ffprobe 输出是 ``N/A`` —— 早期实现直接 ``float()`` 会抛异常并被
+    记成 WARNING 噪音。非数字静默当 0.0 处理。
+    """
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
             capture_output=True, text=True, errors="replace", timeout=60,
             shell=False)
-        if r.returncode == 0 and (r.stdout or "").strip():
-            return float(r.stdout.strip())
+        raw = (r.stdout or "").strip() if r.returncode == 0 else ""
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                return 0.0
     except Exception as e:
         if logger:
             logger.warning("COLOR_PROBE_ERROR", f"duration probe failed: {e}")
     return 0.0
 
 
-def probe_rgb_mean(path: str, logger=None) -> Optional[List[float]]:
-    """按时长比例抽 3 帧，算 RGB 三通道均值（0-255）。
+def _probe_image_mean(path: str, logger=None) -> Optional[List[float]]:
+    """静态图：直接读整图算 RGB 均值。
 
-    失败（文件读不出 / 一个点都没抽到）返回 None，由调用方决定放行。
+    走 ``media_io.load_image_rgb_uint8`` —— 值域自适应，是本项目对
+    "uint16 容器装 8-bit 值域"这类文件的正规读法（R16 病族）。
+    """
+    try:
+        import numpy as np
+        from media_io import load_image_rgb_uint8
+        arr = np.asarray(load_image_rgb_uint8(path), dtype=np.float64)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            return None
+        return [float(arr[:, :, i].mean()) for i in range(3)]
+    except Exception as e:
+        if logger:
+            logger.warning("COLOR_PROBE_ERROR", str(e))
+        return None
+
+
+def _probe_avif_mean(path: str, logger=None) -> Optional[List[float]]:
+    """AVIF 成品：先用 avifdec 解码，再按静态图读。
+
+    ``media_io`` 不读 AVIF（avifenc 只接受 jpg/jpeg/png/y4m 作为**输入**），
+    成品必须经 avifdec。
+
+    ``--sato`` 先试：归档档是 12-bit 主图 + depth-extension item，
+    没有它解出来的 16-bit PNG 会丢低 4 位（media_io 契约里已实测：
+    ``--depth 16`` 单独用 MAE=3.5024，``--sato`` 才 MAE=0.0000）。
+    解码失败再回退到不带 --sato，避免老版本 avifdec 不认这个参数。
+    """
+    import shutil
+    import tempfile
+    dec = shutil.which("avifdec")
+    if not dec:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "dec.png"
+            for args in (["--sato"], []):
+                try:
+                    r = subprocess.run([dec] + args + [str(path), str(out)],
+                                       capture_output=True, timeout=120,
+                                       shell=False)
+                except Exception:
+                    continue
+                if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                    return _probe_image_mean(str(out), logger)
+            return None
+    except Exception as e:
+        if logger:
+            logger.warning("COLOR_PROBE_ERROR", str(e))
+        return None
+
+
+def probe_rgb_mean(path: str, logger=None) -> Optional[List[float]]:
+    """算 RGB 三通道均值（0-255），按文件类型走不同的读法。
+
+    * 静态图（jpg/png/tif…）→ ``media_io`` 读整图
+    * AVIF（照片链成品）    → avifdec 解码后读
+    * 其它（视频链 mkv/mp4）→ ffmpeg 按时长比例抽 3 帧
+
+    失败返回 None，由调用方记 ``*_SKIPPED`` —— 不假装通过，也不阻断。
+    """
+    ext = Path(path).suffix.lower()
+    if ext == ".avif":
+        return _probe_avif_mean(path, logger)
+    if ext in IMAGE_EXTS:
+        return _probe_image_mean(path, logger)
+    return _probe_video_mean(path, logger)
+
+
+def _probe_video_mean(path: str, logger=None) -> Optional[List[float]]:
+    """视频：按时长比例抽 3 帧。
+
+    采样点按**时长比例**（10/50/90%），不用固定秒数 —— 几秒的短片在
+    5/30/90 秒一个点都取不到，实测会让探测静默返回 None、守卫形同虚设。
     """
     try:
         import numpy as np
