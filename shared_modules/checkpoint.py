@@ -300,7 +300,8 @@ def cleanup_old_intermediates(temp_dir: str,
                               keep_steps: int = 2,
                               current_step: Optional[int] = None,
                               cleanup_intermediates: bool = True,
-                              current_param_hash: Optional[str] = None) -> None:
+                              current_param_hash: Optional[str] = None,
+                              current_run_hashes: Optional[set] = None) -> None:
     """Remove old intermediate files, keeping the most recent keep_steps stages.
 
     Per v6.32 §7.5: cleanup_intermediates option (default True).
@@ -314,7 +315,12 @@ def cleanup_old_intermediates(temp_dir: str,
         current_param_hash: FIX-CK-R2-04 — when set, intermediate files whose
             param_hash does not match are treated as orphans (input file was
             replaced/modified) and deleted per v7.32 §3.10.19.
-    """
+        current_run_hashes: FIX-2026-10-22 — 本轮运行**实际产出过**的
+            param_hash 集合。存在时按"集合成员"判定孤儿（推荐）：同一轮里
+            不同 step 的 hash 天然不同（各自以上一步产物为身份基准），
+            只按单个 `current_param_hash` 比较会把**上一步的合法产物**
+            误判成孤儿、连 keep_steps 的保留位一起清掉。
+        """
     # FIX-R2-P1-1: Respect cleanup_intermediates config option per v6.32 §7.5
     if not cleanup_intermediates:
         return
@@ -342,10 +348,22 @@ def cleanup_old_intermediates(temp_dir: str,
 
             # FIX-CK-R2-04: delete orphan-hash intermediates (input changed)
             # per v7.32 §3.10.19 before considering them for keep_steps.
-            if current_param_hash:
+            #
+            # FIX-2026-10-22：这段逻辑此前**从未被执行** —— 所有生产调用点
+            # 都没传 `current_param_hash`，于是"跨轮次/跨参数"的陈旧产物永不被
+            # 回收（实测：E 盘回收站里 2.2 TB 的 _repair_r4_20261013 残渣，
+            # 单次整链中间产物可达 100 GB）。
+            #
+            # 判据用 `current_run_hashes` 集合而不是单个 hash：同一轮里每个
+            # step 的 param_hash **本就不同**（各自以其输入为身份基准），
+            # 单个值比较会把上一步的合法产物误判成孤儿。
+            _valid = current_run_hashes
+            if _valid is None and current_param_hash:
+                _valid = {current_param_hash}
+            if _valid:
                 m_hash = re.search(r'_p([0-9a-f]+)\.', f.name)
                 f_hash = m_hash.group(1) if m_hash else None
-                if f_hash and f_hash != current_param_hash:
+                if f_hash and f_hash not in _valid:
                     unlink_artifact_with_sidecars(f)
                     continue
 

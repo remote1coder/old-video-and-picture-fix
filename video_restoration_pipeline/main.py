@@ -12,6 +12,7 @@ v7.32 Compliance:
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -34,6 +35,23 @@ from manifest_loader import (  # noqa: E402
 )
 from checkpoint import (cleanup_old_intermediates, cleanup_all_intermediates,  # noqa: E402
                          check_wsl_space)
+
+
+def _current_run_param_hashes(last_produced: Dict[int, Any]) -> set:
+    """本轮运行**实际产出过**的 param_hash 集合 —— 孤儿回收的判据基准。
+
+    中间产物命名是 `{job}_{input}_step{N}_{op}_p{hash}.mkv`，其中 hash 由各
+    stage 以**自己的输入**（上一步产物）为身份基准算出。所以同一轮里不同
+    step 的 hash **天然不同**，判定"是否本轮产物"必须用集合，拿单个值去
+    比会把上一步的合法产物误判成孤儿。
+    """
+    hashes: set = set()
+    for paths in (last_produced or {}).values():
+        for p in paths or []:
+            m = re.search(r"_p([0-9a-f]+)\.", os.path.basename(str(p)))
+            if m:
+                hashes.add(m.group(1))
+    return hashes
 
 
 def parse_args():
@@ -1331,7 +1349,10 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                         if params.get("cleanup_intermediates", True):
                             temp_dir = params.get("temp_dir", "./temp")
                             keep_steps = params.get("keep_steps", 2)
-                            cleanup_old_intermediates(temp_dir, job_id, keep_steps)
+                            cleanup_old_intermediates(
+                                temp_dir, job_id, keep_steps,
+                                current_run_hashes=_current_run_param_hashes(
+                                    _last_produced))
                         continue
                     else:
                         job_logger.error("IVTC_SRESTORE_FAIL",
@@ -1350,7 +1371,10 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                     if params.get("cleanup_intermediates", True):
                         temp_dir = params.get("temp_dir", "./temp")
                         keep_steps = params.get("keep_steps", 2)
-                        cleanup_old_intermediates(temp_dir, job_id, keep_steps)
+                        cleanup_old_intermediates(
+                            temp_dir, job_id, keep_steps,
+                            current_run_hashes=_current_run_param_hashes(
+                                _last_produced))
                     exit_code2, stderr2 = run_stage(
                         script_name, job, params, args.get("config"))
                     if exit_code2 in (0, 3):
@@ -1399,8 +1423,9 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             # FIX-NEW-V-07 / R6-10: 传 current_step，让判定走
             # "step < current_step 且不在保留集" 的显式语义，而不是
             # current_step=None 时"按 step 号降序取前 keep_steps 个"。
-            cleanup_old_intermediates(temp_dir, job_id, keep_steps,
-                                      current_step=stage_num)
+            cleanup_old_intermediates(
+                temp_dir, job_id, keep_steps, current_step=stage_num,
+                current_run_hashes=_current_run_param_hashes(_last_produced))
 
     logger.info("JOB_DONE", f"Job {job_id} complete")
     # RV-09: 成功后写下"这个产物是用哪个输入/哪套参数做出来的"，
