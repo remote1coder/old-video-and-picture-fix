@@ -1036,6 +1036,32 @@ def _run_single_job(job: Dict[str, Any],
                                 f"Failed to copy back {f.name}: {e}")
                     return 82  # IO error
 
+    # FIX-2026-10-22：**成功发布后清理本 job 的中间产物**。
+    #
+    # 原来只在 job **开始时**清"上一次同 job 的残留"，跑完却不收尾。
+    # 实测（1346 张真实照片跑批）：单张留下 ~330 MB 中间产物
+    # （16bit TIFF + deblock + deband 各 36 MB、step5 TIFF 128 MB、
+    #  enc_input PNG 128 MB），全量跑完会累积到 **~445 GB**。
+    # 而这些产物对已完成的任务毫无价值 —— 成品已发布，重跑会重新生成。
+    #
+    # `cleanup_old_intermediates` 按 `{job_id}_` 前缀过滤，只清本 job，
+    # 所以必须先清本 job 再进入下一张，否则会跨 job 无限累积。
+    #
+    # `--keep-intermediates` 会把 cleanup_intermediates 置 False，此时跳过。
+    if params.get("cleanup_intermediates", True):
+        try:
+            sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+            from checkpoint import cleanup_all_intermediates as _cai
+            _n = _cai(temp_dir, job_id)
+            if _n:
+                logger.info("INTERMEDIATES_CLEANED",
+                            f"Removed {_n} intermediate file(s) after publish",
+                            count=_n)
+        except Exception as _e:
+            # 不静默：清不掉会持续吃盘，必须留痕
+            logger.warning("INTERMEDIATES_CLEANUP_FAIL",
+                           f"Post-publish cleanup failed: {_e}")
+
     return 0
 
 
