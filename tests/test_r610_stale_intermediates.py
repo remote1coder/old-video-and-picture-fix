@@ -92,6 +92,34 @@ def test_resume_run_does_not_purge(tmp_path):
     assert (tmp / "job_002_in_step2_x.mkv").exists(), "不得波及其他 job"
 
 
+def test_orphan_hash_intermediates_are_reclaimed(tmp_path):
+    """跨轮次的陈旧产物必须回收 —— 这是 keep_steps 唯一抓不到的一类。
+
+    2026-10-22 实测：`cleanup_old_intermediates` 的 `current_param_hash`
+    形参**没有任何生产调用点传入**（video main.py 三处、photo main.py 一处
+    全部缺省），FIX-CK-R2-04 这段孤儿回收逻辑是**死代码**。后果是上一轮
+    留下的高 step 产物永远不会被清理：实测 E 盘回收站里来自
+    `_repair_r4_20261013` 的残渣达 2.2 TB，单份整链中间产物约 100 GB。
+
+    关键在于陈旧产物的 step 号可能比当前 step **更大**（上次跑到 step6 就失败
+    了，这次从更早的 stage 重来），按"step 号范围"保留会放过它，只能靠 hash 判据。
+    """
+    d = tmp_path
+    _mk(d, "job_001_in_step1_preprocess_p111.mkv")   # 本轮更早的 step
+    _mk(d, "job_001_in_step5_face_p555.mkv")            # 本轮当前 step
+    _mk(d, "job_001_in_step6_grain_p999.mkv")          # 上一轮残留（孤儿）
+
+    checkpoint.cleanup_old_intermediates(
+        str(d), "job_001", keep_steps=2, current_step=5,
+        current_run_hashes={"111", "555"})
+
+    left = list(os.listdir(str(d)))
+    assert not any("p999" in f for f in left), \
+        "上一轮的孤儿产物（step6/p999）必须回收：keep_steps 按 step 号算抓不到它"
+    assert any("p555" in f for f in left), \
+        "本轮当前 step 产物绝不可删"
+
+
 def test_unlink_returns_count(tmp_path):
     """FIX-NEW-V-07: 删除函数返回计数，供调用方记日志。"""
     tmp = tmp_path / "temp"

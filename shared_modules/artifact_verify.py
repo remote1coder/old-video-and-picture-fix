@@ -311,6 +311,27 @@ def verify_output(source_path: str, output_path: str,
                                          "message": "成品不存在"}],
                 "source": src, "output": out, "checks": {}}
 
+    # FIX-2026-10-22：源不可读时必须**明确失败**，不能静默放行。
+    #
+    # 原来只判了 `out["exists"]`，从没判过 `src["exists"]`。于是源丢失
+    # （或被删、或路径写错）时，下面 5 项判据全部退化成 `ok: None`
+    # （"未校验"），issues 里一个 error 都没有 → 返回 `ok=True`。
+    #
+    # 实测（2026-10-22，E 盘清理把 real_run/ 下的测试样本删掉后）：
+    #   verify_output(缺失的源, 59 帧成品) → ok=True
+    # 明明一项都没核对，结论却是通过 —— 与 R16「全黑图 rc=0」、
+    # manifest「0 jobs RC=0」同一族：**指标正常、结论错误**。
+    #
+    # 核对是发布前的最后一道防线，它自己绝不能在"没核对"时报通过。
+    if not src["exists"] or src.get("error"):
+        return {"ok": False,
+                "issues": [{"level": "error",
+                            "code": "SOURCE_UNREADABLE",
+                            "message": f"源不可读（{src.get('error') or 'file not found'}）："
+                                       f"帧数/时长/首末帧/黑图全部无法核对，"
+                                       f"拒绝判为通过"}],
+                "source": src, "output": out, "checks": {}}
+
     # 1) 时长 —— **按帧粒度判断，不用固定百分比**
     #
     # 第一版用 3% 相对误差，结果在 1 秒 25 帧的短素材上误报：1 帧的 PTS

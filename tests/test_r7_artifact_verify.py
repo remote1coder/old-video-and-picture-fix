@@ -128,7 +128,9 @@ def test_good_output_passes():
     assert r["checks"]["frames"]["allowed"] == [60]
 
 
-@pytest.mark.skipif(not os.path.exists(BAD59), reason="需要 59 帧样本")
+@pytest.mark.skipif(not (HAS_FFMPEG and os.path.exists(SRC)
+                         and os.path.exists(BAD59)),
+                    reason="需要真实样本（源 + 59 帧成品）")
 def test_off_by_one_output_fails_with_specific_code():
     """59 帧（模拟丢帧）必须报 FRAME_COUNT_OFF_BY_ONE，而不是默默通过。"""
     r = av.verify_output(SRC, BAD59, {"deinterlace": "QTGMC",
@@ -136,6 +138,22 @@ def test_off_by_one_output_fails_with_specific_code():
     assert r["ok"] is False
     codes = [i["code"] for i in r["issues"] if i["level"] == "error"]
     assert "FRAME_COUNT_OFF_BY_ONE" in codes, codes
+
+
+@pytest.mark.skipif(not (HAS_FFMPEG and os.path.exists(BAD59)),
+                    reason="需要 59 帧成品样本")
+def test_unreadable_source_is_reported_instead_of_silent_pass():
+    """源不可读时必须报 SOURCE_UNREADABLE，绝不能"一项没核却判通过"。
+
+    2026-10-22 实测：verify_output 原本只判 `out["exists"]`，源被删掉后
+    5 项判据全部退化成 `ok: None`（"未校验"），issues 里零 error
+    → 返回 ok=True。核对是最后一道防线，它自己必须会报错。
+    """
+    r = av.verify_output("/nonexistent/src.mov", BAD59,
+                         {"deinterlace": "QTGMC", "qtgmc_fps_divisor": 1})
+    assert r["ok"] is False
+    codes = [i["code"] for i in r["issues"] if i["level"] == "error"]
+    assert "SOURCE_UNREADABLE" in codes, codes
 
 
 def test_missing_output_is_reported():
