@@ -125,3 +125,37 @@ def test_watchdog_text_mode_still_detects_stall():
         run_managed([sys.executable, "-c", code], timeout=120,
                     progress_watch=lambda: 0, inactivity_timeout=2,
                     poll_interval=1, capture_output=True, text=True)
+
+
+def test_progress_marker_counts_stage7_attempt_files(tmp_path):
+    """stage7 写的是 `{stem}.attempt-{pid}-{ts}.mkv`，成品是 `{stem}.avif`。
+
+    2026-10-21 实测踩到：若用 basename（**含扩展名**）做前缀，两者匹配不上
+    —— attempt 文件被排除在进度标记之外，于是"明明在写"却被判停滞并杀掉
+    （rc=87，日志 `Stage stalled: no progress for 1800s`）。
+    前缀必须用 **stem（不含扩展名）**。
+    """
+    from pathlib import Path
+
+    out_path = str(tmp_path / "job1_restored.avif")
+    stem = Path(out_path).stem
+
+    # 复现 run_stage 里的匹配逻辑
+    def marker() -> int:
+        total = 0
+        for fn in os.listdir(str(tmp_path)):
+            if not fn.startswith(stem):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(str(tmp_path), fn))
+            except OSError:
+                pass
+        return total
+
+    Path(out_path).write_bytes(b"a" * 100)
+    attempt = tmp_path / "job1_restored.attempt-1234-1792596944119.mkv"
+    attempt.write_bytes(b"b" * 700)
+    (tmp_path / "unrelated_job.avif").write_bytes(b"c" * 999999)
+
+    # 100 (avif) + 700 (attempt) = 800；无关文件必须排除
+    assert marker() == 800, f"marker={marker()}"
