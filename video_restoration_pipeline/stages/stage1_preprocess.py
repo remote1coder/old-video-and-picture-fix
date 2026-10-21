@@ -1428,8 +1428,24 @@ def main():
                         return 84
 
             # V-P-023 fix: deinterlace quality check for segmented field order
+            #
+            # FIX-2026-10-21（16 分钟长片实测）：条件必须与 vpy 生成侧一致 ——
+            # **只有真的做了分段去隔行才验证去隔行质量**。
+            #
+            # 旧条件只看 `field_segments` 非空，于是出现两次浪费：
+            #   1. stage1 已经因为 field_order=unknown 跳过了 QTGMC（见
+            #      use_segmented 的 FIX 注释），却仍然对 82GB 产物跑 idet
+            #      —— 实测要 **39 分钟**；
+            #   2. 这 39 分钟里 temp 目录一个字节不涨，于是被 inactivity
+            #      watchdog 判成"卡死"（STAGE_STALLED），整个 job rc=87。
+            #
+            # 而且这个检查与 stage2 的 idet 门禁**重复**（同一个文件、
+            # 同一个判据）。没做去隔行时两边都不该跑。
             field_segments = params.get("field_segments", [])
-            if field_segments:
+            _did_segmented_deint = (bool(field_segments)
+                                    and str(params.get("field_order")
+                                            or "") != "unknown")
+            if _did_segmented_deint:
                 is_good, prog_pct, _dq_status = check_deinterlace_quality(
                     inter_path, logger)
                 if _dq_status == "inconclusive":
