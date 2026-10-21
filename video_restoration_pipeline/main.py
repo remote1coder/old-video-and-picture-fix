@@ -441,7 +441,11 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
                     or params.get("temp_dir_original") or "")
         out_path = params.get("output_path") or ""
         out_dir = os.path.dirname(out_path) if out_path else ""
-        out_stem = os.path.basename(out_path) if out_path else ""
+        # 注意用 **stem（不含扩展名）**：stage7 的暂存文件是
+        # `{stem}.attempt-{pid}-{ts}.mkv`，而成品是 `{stem}.avif`——
+        # 若用 basename（含扩展名）做前缀，两者匹配不上，attempt 文件会被
+        # 排除在进度标记之外 → 明明在写却被判停滞（2026-10-21 实测踩到）。
+        out_stem = Path(out_path).stem if out_path else ""
         try:
             inactivity = float(params.get("stage_inactivity_timeout", 600.0))
         except (TypeError, ValueError):
