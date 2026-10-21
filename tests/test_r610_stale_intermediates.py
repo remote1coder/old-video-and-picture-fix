@@ -120,6 +120,80 @@ def test_orphan_hash_intermediates_are_reclaimed(tmp_path):
         "本轮当前 step 产物绝不可删"
 
 
+def test_photo_chain_passes_current_run_hashes():
+    """照片链的清理调用必须传 `current_run_hashes`。
+
+    2026-10-22 实测：`cleanup_old_intermediates` 的 `current_param_hash`
+    形参在**所有**生产调用点都缺省 —— video 链三处 + photo 链一处
+    （photo 链连本轮产出跟踪都没有）。孤儿回收逻辑是死代码，
+    上一轮遗留的中间产物（实测单份 ~100 GB）永不清理，跨轮次累积。
+
+    本用例锁定 photo 链的接线：必须有本轮产出跟踪 + 传集合判据。
+    """
+    import inspect
+    import photo_restoration_pipeline.main as pmain
+    src = inspect.getsource(pmain)
+    # 接线：清理调用必须带 current_run_hashes
+    assert "current_run_hashes=" in src, \
+        "photo 链清理调用必须传 current_run_hashes（孤儿回收判据）"
+    # 机制：必须有"本轮实际产出"的跟踪（执行前后快照差集）
+    assert "_snapshot_job_files" in src, \
+        "photo 链必须跟踪本轮实际产出，否则集合判据无基准"
+    # 机制：集合判据从产物文件名提取 hash
+    assert "_current_run_param_hashes" in src, \
+        "photo 链必须有 hash 提取函数（对标视频链同名函数）"
+
+
+def test_photo_snapshot_detects_new_and_rewritten(tmp_path):
+    """快照差集必须能识别「新增」和「被改写」两类本轮产物。
+
+    只认新增会漏掉"同名覆盖"——参数完全相同时 stage 会覆盖旧文件，
+    名字不变但内容变了，它的 hash 仍应被算作本轮合法产物。
+    """
+    import photo_restoration_pipeline.main as pmain
+    tmp = tmp_path / "temp"
+    tmp.mkdir()
+    (tmp / "job_001_x_step1_preprocess_paaa.tif").write_bytes(b"old")
+    (tmp / "job_001_x_step3_upscale_pbbb.tif").write_bytes(b"prev-round")
+
+    pre = pmain._snapshot_job_files(str(tmp), "job_001")
+    assert set(pre) == {"job_001_x_step1_preprocess_paaa.tif",
+                        "job_001_x_step3_upscale_pbbb.tif"}
+
+    # 本轮：改写 step1（同名）、新增 step4（新名）
+    (tmp / "job_001_x_step1_preprocess_paaa.tif").write_bytes(b"new-longer")
+    (tmp / "job_001_x_step4_face_pccc.tif").write_bytes(b"fresh")
+
+    post = pmain._snapshot_job_files(str(tmp), "job_001")
+    produced = [n for n, sig in post.items() if pre.get(n) != sig]
+    assert "job_001_x_step1_preprocess_paaa.tif" in produced, \
+        "同名改写必须被识别为本轮产物（否则孤儿回收会误删它）"
+    assert "job_001_x_step4_face_pccc.tif" in produced, \
+        "新增文件必须被识别为本轮产物"
+    assert "job_001_x_step3_upscale_pbbb.tif" not in produced, \
+        "上一轮遗留、本轮未触碰的文件不得算作本轮产物"
+
+    hashes = pmain._current_run_param_hashes(produced)
+    assert hashes == {"aaa", "ccc"}, f"应提取本轮 hash，实际 {hashes}"
+
+
+def test_photo_accumulates_across_stages_not_per_stage():
+    """判据必须**跨 stage 累积**，不能只反映本 stage 的产出。
+
+    2026-10-22 端到端实测踩到：第一版用「本 stage 执行前快照」做差集，
+    结果本轮**更早 stage** 的产物（快照时已存在、不在差集里）hash 不在
+    合法集合 → 被孤儿回收误删 → 下游 stage 找不到输入。
+    视频链 `_last_produced` 是跨 stage 累积的 dict，语义必须对齐。
+    """
+    import inspect
+    import photo_restoration_pipeline.main as pmain
+    src = inspect.getsource(pmain)
+    assert "_run_produced_paths" in src, \
+        "photo 链必须有跨 stage 累积的本轮产出列表"
+    assert "_run_produced_paths.extend(" in src, \
+        "必须 extend 累积，不能每次 stage 覆盖（覆盖即漏掉更早 stage 的产物）"
+
+
 def test_unlink_returns_count(tmp_path):
     """FIX-NEW-V-07: 删除函数返回计数，供调用方记日志。"""
     tmp = tmp_path / "temp"
