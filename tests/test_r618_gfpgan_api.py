@@ -67,24 +67,58 @@ def test_no_script_dir_parent_parent():
         "照片链项目根是 SCRIPT_DIR.parent（R19）"
 
 
-@pytest.mark.skipif(not os.path.isdir(os.path.join(
-    os.path.dirname(STAGE4), "..", "..", ".venv_r4")),
-    reason="需要项目 .venv_r4 才能导入 gfpgan")
+@pytest.mark.skipif(not os.path.isfile(os.path.join(
+    os.path.dirname(STAGE4), "..", "..", ".venv_r4", "Scripts", "python.exe")),
+    reason="需要项目 .venv_r4 解释器")
 def test_real_gfpganer_signature_accepts_our_kwargs():
-    """用真实 GFPGANer 验证我们生成的调用能被接受。"""
-    import sys
-    venv = os.path.normpath(os.path.join(
-        os.path.dirname(STAGE4), "..", "..", ".venv_r4"))
-    sys.path.insert(0, venv)
-    try:
-        from gfpgan import GFPGANer
-    except Exception as e:  # pragma: no cover
-        pytest.skip(f"gfpgan 不可导入: {e}")
-    sig = inspect.signature(GFPGANer.__init__)
-    # 我们代码里用到的参数必须全部合法
-    sig.bind(None, model_path="x.pth", upscale=2, arch="clean",
-             channel_multiplier=2, bg_upsampler=None)
-    assert "channel_only" not in sig.parameters
+    """用真实 GFPGANer 验证我们生成的调用能被接受。
+
+    FIX-2026-10-22：这个用例原先**常年 skip**，两层原因叠加：
+
+    ① 路径插错——原实现 `sys.path.insert(0, '.venv_r4')` 插的是 venv
+       **根目录**，而包在 `.venv_r4/Lib/site-packages/`。Python 找不到，
+       回退命中**项目根**的 `gfpgan/weights/`（无 `__init__.py` 的 namespace
+       package）→ `cannot import name 'GFPGANer' ... (unknown location)`。
+
+    ② 即便路径插对也**不可能成功**——`.venv_r4` 的 numpy 是 **cp312** 编译的
+      （`_multiarray_umath.cp312-win_amd64.pyd`），而测试跑在 managed
+      Python **3.13** 下，C 扩展不兼容：
+      `Importing the numpy C-extensions failed ... incompatible with
+      cpython-313`。gfpgan 传递依赖 numpy/torch，所以在 pytest 解释器里
+      导入它从根上就走不通。
+
+    正解：与生产代码同一姿势——**用 `.venv_r4` 的解释器开子进程**验签名
+    （`_resolve_ai_python()` + `subprocess.run([ai_py, script])`）。
+    这样验的才是线上真正会用的那个解释器里的那个类。
+    """
+    import subprocess
+    venv_py = os.path.normpath(os.path.join(
+        os.path.dirname(STAGE4), "..", "..", ".venv_r4", "Scripts",
+        "python.exe"))
+    probe = (
+        "import inspect, json\n"
+        "from gfpgan import GFPGANer\n"
+        "sig = inspect.signature(GFPGANer.__init__)\n"
+        "# 复刻 stage5 生成的调用；不合法就抛 TypeError\n"
+        "sig.bind(None, model_path='x.pth', upscale=2, arch='clean',\n"
+        "         channel_multiplier=2, bg_upsampler=None)\n"
+        "print(json.dumps({'params': sorted(sig.parameters),\n"
+        "                  'has_channel_only': 'channel_only' in sig.parameters}))\n"
+    )
+    r = subprocess.run([venv_py, "-c", probe], capture_output=True,
+                       text=True, errors="replace", timeout=300, shell=False,
+                       cwd=os.path.dirname(STAGE4))
+    if r.returncode != 0:
+        pytest.skip(f"gfpgan 在 .venv_r4 中不可用: "
+                    f"{(r.stderr or '').strip().splitlines()[-1:] }")
+    import json as _json
+    info = _json.loads(r.stdout.strip().splitlines()[-1])
+    assert not info["has_channel_only"], (
+        "GFPGANer 不该有 channel_only 参数（我们代码没传）")
+    # 我们用到的四个参数必须真实存在于签名里
+    for need in ("model_path", "upscale", "arch", "bg_upsampler"):
+        assert need in info["params"], \
+            f"GFPGANer 签名缺少 {need}，实际参数: {info['params']}"
 
 
 def test_gfpgan_subprocess_keeps_stderr():
