@@ -349,7 +349,12 @@ def _calculate_timeout(video_duration: float, has_ai: bool = False,
     if has_ai:
         per_minute += 300 * scale  # +5 min per video minute, also scaled
     timeout = base + int(video_duration / 60) * int(per_minute)
-    return min(timeout, 3600 * 4)  # Cap at 4 hours
+    # FIX-2026-10-21（方案 A）：4 小时硬顶对长片 + AI 根本不够。
+    # 16 分钟 1080p **纯传统链**的 stage7 实测就要 3 小时；开了 AI 后
+    # 1080p×28840 帧的推理量级远超 4 小时。而"卡死"现在由 inactivity
+    # watchdog 负责（见 run_stage），这个 timeout 只作**最终保险**，
+    # 防"一直在写但写了三天"这类真正的失控，因此放到 48 小时。
+    return min(timeout, 3600 * 48)  # Final safety net, not a work estimate
 
 
 def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
@@ -411,17 +416,62 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
         width=int(job.get("original_width") or params.get("original_width") or 0),
         height=int(job.get("original_height") or params.get("original_height") or 0))
 
-    # Run with timeout
+    # Run under inactivity watchdog (FIX-2026-10-21)
+    #
+    # 为什么不再用固定的 subprocess.run(timeout=...)：判断"卡死"的正确证据是
+    # **产出不再增长**，而不是"总耗时超过某个猜出来的数"。画面复杂度、GPU
+    # 降频、并发负载都会让总耗时成倍波动 —— 16 分钟 1080p 纯传统链的 stage7
+    # 实测就要 3 小时，而开了 AI 之后"4 小时上限"必然不够。
+    #
+    # 新语义：
+    #   * `stage_inactivity_timeout`（默认 600s）内 temp 目录一个字节没长 →
+    #     判卡死（rc=87，带 STAGE_STALLED 日志）。这是**有证据**的判定。
+    #   * 总 timeout 只作最终保险（默认 48h），防"一直在写但写了三天"。
+    #   * 慢机器 / 复杂画面只要还在推进就不会被杀。
+    #
+    # 延迟导入：main.py 在模块级并不把 shared_modules 放进 sys.path，
+    # 只有 run_stage 执行时子进程的 PYTHONPATH 才包含它。
+    from cancel_guard import run_managed as _cg_run_managed
+    from cancel_guard import StageStalled as _CgStageStalled
     try:
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SCRIPT_DIR.parent)
 
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                          timeout=timeout, env=env, shell=False)
+        temp_dir = (params.get("temp_dir")
+                    or params.get("temp_dir_original") or "")
+        try:
+            inactivity = float(params.get("stage_inactivity_timeout", 600.0))
+        except (TypeError, ValueError):
+            inactivity = 600.0
+
+        def _progress_marker() -> int:
+            """temp 目录总字节数 —— 所有耗时 stage 都在这里写中间产物。"""
+            total = 0
+            try:
+                for _root, _dirs, _files in os.walk(temp_dir):
+                    for _fn in _files:
+                        try:
+                            total += os.path.getsize(os.path.join(_root, _fn))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            return total
+
+        r = _cg_run_managed(
+            cmd, timeout=timeout, logger=None,
+            progress_watch=_progress_marker if temp_dir else None,
+            inactivity_timeout=inactivity if temp_dir else None,
+            capture_output=True, text=True, errors="replace", env=env,
+            shell=False)
         stderr = r.stderr if r.stderr else ""
         return r.returncode, stderr
+    except _CgStageStalled as e:
+        return 87, (f"Stage stalled: no progress for "
+                    f"{e.inactivity_timeout:.0f}s "
+                    f"(last marker={e.last_progress})")
     except subprocess.TimeoutExpired:
-        return 87, f"Stage timed out after {timeout}s"  # Resource不足 (timeout)
+        return 87, f"Stage exceeded the final safety limit ({timeout}s)"
     except Exception as e:
         return 82, str(e)  # IO error
     finally:
