@@ -149,6 +149,17 @@ The two pipelines use **different interpreters**; mixing them fails:
   be raised, otherwise `_run_single_job` skips it silently (returns 3).
 - Failed jobs resume automatically from `last_completed_stage + 1`, so AI
   inference is not repeated.
+- **Long clips (>15 min) take hours, not minutes.** A 16-minute 1080p clip
+  needs roughly 4–5 h end to end; stage7's AV1 encode alone is ~3 h.
+  Stall detection is a **no-progress watchdog**, not a time estimate:
+  a stage is killed (exit `87`, log `STAGE_STALLED`) only when its output stops
+  growing for `stage_inactivity_timeout` seconds (config, default `1800`).
+  This is independent of resolution, machine speed and picture complexity.
+  **The threshold must exceed the longest known silent interval** — at `600`
+  it killed healthy stage7 encodes, because stage7 writes to `output/` as
+  `{stem}.attempt-{pid}-{ts}.mkv` and a prefix built from the basename
+  (*with* extension) never matched it, so the marker froze at the temp
+  directory size. The prefix must be the **stem** (extension stripped).
 
 #### Verifying output content (do not skip this)
 
@@ -427,6 +438,14 @@ python photo_restoration_pipeline/main.py \
   **照片链还有第二道门限**：job 自身的 `confidence` 也必须一并调高，
   否则 `_run_single_job` 会静默跳过（返回 3）。
 - 中途失败的任务会按 `last_completed_stage + 1` 自动续跑，不重复 AI 推理。
+- **长片（>15 分钟）以小时计，不是分钟。** 16 分钟 1080p 全链约 4~5 小时，
+  其中 stage7 的 AV1 编码单步就约 3 小时。判卡死用的是**无进展看门狗**
+  而非时长估算：某 stage 的产出连续 `stage_inactivity_timeout` 秒不再增长
+  才杀（config 可调，默认 `1800`），与分辨率、机器性能、画面复杂度无关。
+  **阈值必须大于「最长的已知静默区间」** —— 设过 `600`，结果误杀了健康的
+  stage7 编码：stage7 把成品写到 `output/` 下的
+  `{stem}.attempt-{pid}-{ts}.mkv`，而用**含扩展名**的 basename 做前缀永远
+  匹配不上它，标记于是冻结在 temp 目录大小。前缀必须用 **stem**（去扩展名）。
 
 #### 必须核对产物内容（不要跳过）
 
