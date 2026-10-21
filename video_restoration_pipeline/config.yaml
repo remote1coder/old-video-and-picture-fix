@@ -44,7 +44,18 @@ global:
   #   看门狗负责"卡死"（有证据），48 小时 timeout 只作最终保险。
   #
   # 设为 0 或负数关闭看门狗（只留 48 小时保险）。
-  stage_inactivity_timeout: 600
+  #
+  # **阈值必须大于"最长的已知静默区间"**（2026-10-21 实测校正）：
+  #   * 原设 600s，结果 stage7 在编码的某个阶段有 >10 分钟不写盘，
+  #     被误判为卡死（STAGE_STALLED，rc=87）。真实静默区间未精确测量。
+  #   * stage1 曾在写完 82GB 后跑 39 分钟的 idet 质量检查（只读不写）——
+  #     那是重复检查，已修（只有真做了分段去隔行才验证），不再产生静默。
+  #   * 现设 1800s（30 分钟）覆盖已知场景，同时保证真卡死在半小时内暴露。
+  # 尝试过但**不可用**的第二信号（2026-10-21 实测）：
+  #   * I/O 计数（GetProcessIoCounters）：缓存命中时 ReadTransferCount 不增长；
+  #   * CPU 时间（GetProcessTimes）：实测进程跑满 5 秒 CPU，时间戳纹丝不动。
+  # 若将来要更短的发现时间，唯一可靠办法是让 stage 自己上报心跳。
+  stage_inactivity_timeout: 1800
   platform: "auto"
   gpu_priority: ["cuda", "rocm", "mps", "cpu"]
   # 防抖默认 auto：抽样测全局位移后决定（见 stage1.detect_shakiness）
