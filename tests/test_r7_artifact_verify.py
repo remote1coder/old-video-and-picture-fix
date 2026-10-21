@@ -140,6 +140,91 @@ def test_off_by_one_output_fails_with_specific_code():
     assert "FRAME_COUNT_OFF_BY_ONE" in codes, codes
 
 
+# ---------------------------------------------------------------------------
+# 自包含版本：不依赖任何仓库外素材，用 lavfi 现场生成
+# ---------------------------------------------------------------------------
+#
+# 为什么要有这一组：上面的用例依赖三个外部文件（SRC / GOOD / BAD59），
+# 2026-10-22 磁盘清理把它们删掉后，这组用例整体失效（SRC 缺失时甚至
+# 不是跳过、而是假装通过）。帧数判据是**纯算术**，与画面内容无关，
+# 完全可以自包含验证 —— 这样它永远不会再被外部文件的状态绑架。
+#
+# 注意两组并存的理由：真实样本那组额外覆盖「真实编码产物能否通过」
+# （含 pHash / 时长 / 黑图判据在真实数据上的表现），自包含组只保证
+# 帧数判据本身不回退。
+
+
+def _mk_video(path, n_frames, extra_vf=""):
+    """用 lavfi 生成精确 n_frames 帧的 h264 视频。
+
+    注意 `d` 必须足够长：`-frames:v` 只能**截断**、不能补足，
+    原料帧数不足时会静默给出更少的帧（2026-10-22 实测踩到：
+    `d=1:r=30` 只产 30 帧，请求 60 帧实际只得 30）。
+    这里按请求帧数 +2s 余量给原料。
+    """
+    need_d = n_frames / 30.0 + 2.0
+    vf = f"scale=1920:1080:flags=lanczos{extra_vf}"
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi",
+           "-i", f"testsrc2=s=640x360:d={need_d:.1f}:r=30",
+           "-frames:v", str(n_frames),
+           "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast",
+           "-pix_fmt", "yuv420p", "-y", path]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       errors="replace", timeout=180)
+    if r.returncode != 0 or not os.path.exists(path):
+        pytest.skip(f"无法生成测试视频: {(r.stderr or '')[:150]}")
+    # 防御：帧数不对就明说，不要让后续断言报看不懂的错
+    got = av.probe_media_facts(path).get("frames")
+    if got != n_frames:
+        pytest.skip(f"生成的帧数不符（要 {n_frames}，实得 {got}）")
+    return path
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="需要 ffmpeg")
+def test_selfcontained_frame_count_off_by_one(tmp_path):
+    """自包含：源 60 帧 / 产物 59 帧 → FRAME_COUNT_OFF_BY_ONE。
+
+    与上面的真实样本版断言同一个判据，但不依赖任何外部文件。
+    """
+    src = _mk_video(str(tmp_path / "src.mkv"), 60)
+    bad = _mk_video(str(tmp_path / "bad59.mkv"), 59)
+
+    r = av.verify_output(src, bad, {"deinterlace": "QTGMC",
+                                    "qtgmc_fps_divisor": 1})
+    assert r["ok"] is False
+    codes = [i["code"] for i in r["issues"] if i["level"] == "error"]
+    assert "FRAME_COUNT_OFF_BY_ONE" in codes, codes
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="需要 ffmpeg")
+def test_selfcontained_frame_count_mismatch_is_error(tmp_path):
+    """自包含：差 2 帧以上 → FRAME_COUNT_MISMATCH（不是 OFF_BY_ONE）。"""
+    src = _mk_video(str(tmp_path / "src.mkv"), 60)
+    bad = _mk_video(str(tmp_path / "bad55.mkv"), 55)
+
+    r = av.verify_output(src, bad, {"deinterlace": "QTGMC",
+                                    "qtgmc_fps_divisor": 1})
+    assert r["ok"] is False
+    codes = [i["code"] for i in r["issues"] if i["level"] == "error"]
+    assert "FRAME_COUNT_MISMATCH" in codes, codes
+    assert "FRAME_COUNT_OFF_BY_ONE" not in codes, \
+        "差 5 帧不该报 OFF_BY_ONE（那是专属于差 1 帧的）"
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="需要 ffmpeg")
+def test_selfcontained_exact_frame_count_passes(tmp_path):
+    """自包含：帧数精确相等时帧数判据必须通过（正例，防误报）。"""
+    src = _mk_video(str(tmp_path / "src.mkv"), 60)
+    ok = _mk_video(str(tmp_path / "ok60.mkv"), 60)
+
+    r = av.verify_output(src, ok, {"deinterlace": "QTGMC",
+                                   "qtgmc_fps_divisor": 1})
+    assert r["checks"]["frames"]["ok"] is True, av.render_verdict(r)
+    assert r["checks"]["frames"]["allowed"] == [60]
+    # 帧数判据通过即整体通过（pHash/时长在自包含同源素材上应无告警）
+    assert r["ok"] is True, av.render_verdict(r)
+
+
 @pytest.mark.skipif(not (HAS_FFMPEG and os.path.exists(BAD59)),
                     reason="需要 59 帧成品样本")
 def test_unreadable_source_is_reported_instead_of_silent_pass():
