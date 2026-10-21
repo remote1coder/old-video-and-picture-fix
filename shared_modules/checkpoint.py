@@ -242,6 +242,26 @@ def compute_param_hash(input_path: str, params: Dict[str, Any]) -> str:
     })
 
 
+def safe_input_stem(input_path: str) -> str:
+    """输入文件名 → 可用于中间产物命名 / glob 的安全片段。
+
+    FIX-2026-10-22（真实素材实测）：这个规范化**必须全链一致**。
+
+    `build_intermediate_name` 早就把空格换成 `_`，但 photo 链各 stage 里
+    还有十几处直接用 `Path(input_name).stem`（**原始** stem，含空格）。
+    两边不一致的后果（1346 张真实照片跑批实测）：
+      * stage1 的 `working_path` = `job_007_002 (2)_16bit.tif`（带空格）
+        → G'MIC `-o "...002 (2)_16bit.tif,uint16"` 参数解析失败，
+          打印 -o 用法帮助并返回 -1 → STAGE1_CONVERT_FAIL → rc=84；
+      * 即使 stage1 侥幸过了，下游用 `{job}_{原始stem}_step1_preprocess*`
+        去 glob，而产物实际叫 `{job}_{空格已换成_的stem}_step1_preprocess*`
+        —— 永远匹配不上。
+    实测：只把空格换成 `_`（`job_007_002_(2)_16bit.tif`）G'MIC 即正常。
+    """
+    return (Path(input_path).stem
+            .replace(" ", "_").replace("/", "_").replace("\\", "_"))
+
+
 def build_intermediate_name(job_id: str,
                             input_path: str,
                             step: int,
@@ -249,7 +269,7 @@ def build_intermediate_name(job_id: str,
                             param_hash: str,
                             ext: str = "mkv") -> str:
     """Build intermediate file name: {job_id}_{input_name}_step{N}_{operation}_p{param_hash}.{ext}"""
-    safe_name = Path(input_path).stem.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    safe_name = safe_input_stem(input_path)
     return f"{job_id}_{safe_name}_step{step}_{operation}_p{param_hash}.{ext}"
 
 

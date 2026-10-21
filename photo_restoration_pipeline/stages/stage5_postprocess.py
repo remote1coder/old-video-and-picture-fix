@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+from checkpoint import safe_input_stem  # noqa: E402
 
 from logger import get_logger  # noqa: E402
 
@@ -1377,7 +1378,7 @@ def main():
     input_source = None
     for pat in ["step4_face*", "step3_upscale*", "step2_ai_pre*",
                 "step1_preprocess*"]:
-        pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
+        pattern = f"{job_id}_{safe_input_stem(input_name)}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
         # NEW-V-04: 过滤掉 .status.json / .cache.json 之类的侧车文件
         candidates = [
@@ -1400,7 +1401,7 @@ def main():
         _up = os.path.join(temp_dir, f"{job_id}_upscaled")
         if os.path.isdir(_up):
             _c = glob.glob(os.path.join(
-                _up, f"{Path(input_name).stem}_x*"))
+                _up, f"{safe_input_stem(input_name)}_x*"))
             _c = [p for p in _c if Path(p).suffix.lower()
                   in {".tif", ".tiff", ".png"}]
             if _c:
@@ -1418,17 +1419,17 @@ def main():
     bit_depth = params.get("photo_bit_depth", 16)
     if bit_depth == 16:
         output_path = os.path.join(temp_dir,
-            f"{job_id}_{Path(input_name).stem}_step5_postprocess.tif")
+            f"{job_id}_{safe_input_stem(input_name)}_step5_postprocess.tif")
     else:
         output_path = os.path.join(temp_dir,
-            f"{job_id}_{Path(input_name).stem}_step5_postprocess.png")
+            f"{job_id}_{safe_input_stem(input_name)}_step5_postprocess.png")
 
     # FIX-V07: 缓存命中必须比对身份，不再只判断"文件存在且非空"。
     # ORIGINAL: `if exists(output_path) and size>0: return 3` —— 改了颗粒/位深等
     # 参数仍会复用旧产物，且 V06 的失败副本也会命中。
     # RV-11: 人脸元数据也影响像素，所以必须先读出来再算身份。
     face_boxes, face_landmarks = _read_face_metadata(
-        temp_dir, job_id, Path(input_name).stem)
+        temp_dir, job_id, safe_input_stem(input_name))
     cache_identity = compute_stage5_cache_identity(
         input_source, params, bit_depth,
         face_boxes=face_boxes, face_landmarks=face_landmarks)
@@ -1637,7 +1638,7 @@ def main():
                 flif_img = Image.fromarray(flif_arr)
             if flif_img is not None:
                 flif_ok = _extract_flif_chrominance(
-                    flif_img, temp_dir, job_id, Path(input_name).stem,
+                    flif_img, temp_dir, job_id, safe_input_stem(input_name),
                     logger=logger
                 )
             else:

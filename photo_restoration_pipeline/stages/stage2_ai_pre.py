@@ -37,7 +37,8 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from checkpoint import compute_param_hash, build_intermediate_name  # noqa: E402
+from checkpoint import (compute_param_hash, build_intermediate_name,  # noqa: E402
+                         safe_input_stem)
 
 
 def _sRGB_to_linear(c: np.ndarray) -> np.ndarray:
@@ -386,7 +387,7 @@ def main():
     input_name = Path(args.input).name
 
     # Find stage1 output - sort by mtime for deterministic selection
-    pattern = f"{job_id}_{Path(input_name).stem}_step1_preprocess*"
+    pattern = f"{job_id}_{safe_input_stem(input_name)}_step1_preprocess*"
     candidates = glob.glob(os.path.join(temp_dir, pattern))
     if not candidates:
         logger.error("STAGE2_NO_INPUT", "Stage 1 output not found")

@@ -24,7 +24,8 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from checkpoint import compute_param_hash, build_intermediate_name, gpu_memory_check  # noqa: E402
+from checkpoint import (compute_param_hash, build_intermediate_name,  # noqa: E402
+                         gpu_memory_check, safe_input_stem)
 
 
 #: FIX-2026-10-22：AI 推理解释器缓存。
@@ -121,7 +122,7 @@ def _resolve_input_source(temp_dir: str, job_id: str, input_name: str,
 
     Returns: (path, source_type) or (None, "") if no valid source
     """
-    stem = Path(input_name).stem
+    stem = safe_input_stem(input_name)
     # Stage 1 preprocess is the only allowed source for AI upscale
     pattern = f"{job_id}_{stem}_step1_preprocess*"
     candidates = glob.glob(os.path.join(temp_dir, pattern))
@@ -655,7 +656,7 @@ def main():
         job_id = args.job_id
         input_name = Path(args.input).name
         # Check stage 1 output exists
-        stage1_pattern = f"{job_id}_{Path(input_name).stem}_step1_preprocess*"
+        stage1_pattern = f"{job_id}_{safe_input_stem(input_name)}_step1_preprocess*"
         stage1_candidates = glob.glob(os.path.join(temp_dir, stage1_pattern))
         if not stage1_candidates:
             logger.error("STAGE3_NO_TRADITIONAL",
@@ -758,7 +759,7 @@ def main():
     # Upscale directory
     upscale_dir = os.path.join(temp_dir, f"{job_id}_upscaled")
     os.makedirs(upscale_dir, exist_ok=True)
-    output_file = os.path.join(upscale_dir, f"{Path(input_name).stem}_x{scale}.png")
+    output_file = os.path.join(upscale_dir, f"{safe_input_stem(input_name)}_x{scale}.png")
 
     # GPU memory pre-check and fallback
     try:
@@ -818,7 +819,7 @@ def main():
     # When 16-bit, use TIFF extension for output
     if bit_depth == 16:
         output_file = os.path.join(
-            upscale_dir, f"{Path(input_name).stem}_x{scale}.tif")
+            upscale_dir, f"{safe_input_stem(input_name)}_x{scale}.tif")
 
     # FIX-P12-ext: Model fallback chain per v6.32 §4 / v7.32 §3.1
     # Photo upscale priority: DAT (best for photos) -> Real-ESRGAN (general)
