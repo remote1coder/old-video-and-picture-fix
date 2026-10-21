@@ -464,7 +464,119 @@ def _kill_quietly(proc: Any) -> None:
         pass
 
 
-def run_managed(cmd, timeout=None, logger=None, **kwargs):
+class StageStalled(Exception):
+    """子进程连续 ``inactivity_timeout`` 秒**没有任何进展**。
+
+    与 ``subprocess.TimeoutExpired`` 的区别很重要：
+    超时是"总耗时超过预设值"（依赖我们对耗时的猜测）；停滞是"进程还活着
+    但产出不再增长"（有直接证据）。
+
+    FIX-2026-10-21（16 分钟 1080p 长片）：纯传统链的 stage7 编码实测就要
+    3 小时，而旧的固定 4 小时上限在开了 AI 之后必然不够 —— 因为
+    "AI 要跑多久"根本没法靠 Σ(duration × 系数) 猜到。慢机器 / 画面复杂 /
+    GPU 降频都会让实际耗时成倍变化，但**只要还在推进就不该被杀**。
+    """
+
+    def __init__(self, cmd, inactivity_timeout: float,
+                 last_progress: Any = None):
+        super().__init__(
+            f"stage made no progress for {inactivity_timeout:.0f}s "
+            f"(last marker={last_progress})")
+        self.cmd = cmd
+        self.inactivity_timeout = inactivity_timeout
+        self.last_progress = last_progress
+
+
+def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
+                             inactivity_timeout, poll_interval):
+    """轮询子进程进度，无进展超阈值则杀掉并抛 :class:`StageStalled`。
+
+    用线程读 stdout/stderr —— 不能再用 ``communicate()``，它是阻塞的，
+    而且管道写满会把子进程卡住（deadlock），那样 watchdog 反而制造了卡死。
+    """
+    import threading
+    import time as _time
+
+    chunks = {"out": [], "err": []}
+
+    def _pump(pipe, key):
+        try:
+            for line in iter(pipe.readline, b""):
+                chunks[key].append(line)
+        except BaseException:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except BaseException:
+                pass
+
+    threads = []
+    for pipe, key in ((proc.stdout, "out"), (proc.stderr, "err")):
+        if pipe is not None:
+            t = threading.Thread(target=_pump, args=(pipe, key), daemon=True)
+            t.start()
+            threads.append(t)
+
+    started = _time.monotonic()
+    try:
+        last_mark = progress_watch()
+    except BaseException:
+        last_mark = None
+    last_change = started
+    next_poll = started + poll_interval
+    stalled = False
+    hard_timeout = False
+
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            now = _time.monotonic()
+            if timeout is not None and (now - started) >= timeout:
+                hard_timeout = True
+                break
+            if inactivity_timeout is not None and now >= next_poll:
+                next_poll = now + poll_interval
+                try:
+                    mark = progress_watch()
+                except BaseException:
+                    mark = last_mark
+                if mark != last_mark:
+                    last_mark = mark
+                    last_change = now
+                elif (now - last_change) >= inactivity_timeout:
+                    stalled = True
+                    break
+            _time.sleep(1.0)  # 每秒查一次进程状态，开销可忽略
+    finally:
+        if stalled or hard_timeout:
+            _kill_quietly(proc)
+        for t in threads:
+            t.join(timeout=10)
+
+    out = b"".join(chunks["out"])
+    err = b"".join(chunks["err"])
+    if stalled:
+        if logger is not None:
+            try:
+                logger.error(
+                    "STAGE_STALLED",
+                    f"No progress for {inactivity_timeout:.0f}s "
+                    f"(last marker={last_mark}); child killed. "
+                    "This is evidence of a hang, not of slowness.",
+                    inactivity_timeout=inactivity_timeout,
+                    last_progress=last_mark)
+            except BaseException:
+                pass
+        raise StageStalled(cmd, inactivity_timeout, last_mark)
+    if hard_timeout:
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    return out, err, proc.returncode
+
+
+def run_managed(cmd, timeout=None, logger=None, progress_watch=None,
+                inactivity_timeout=None, poll_interval=30.0, **kwargs):
     """Run a child process under cancel-guard supervision.
 
     ``subprocess.run`` cannot be interrupted: a cancellation kills only the
@@ -483,6 +595,22 @@ def run_managed(cmd, timeout=None, logger=None, **kwargs):
       working);
     * ``BaseException`` (e.g. ``KeyboardInterrupt`` when the guard is not
       installed) -> child killed and reaped, then re-raised.
+
+    Inactivity watchdog (FIX-2026-10-21)
+    ------------------------------------
+    ``progress_watch``
+        可调用对象，返回一个"进度标记"（int/float/任何可比较值）。
+        提供它就启用看门狗：每 ``poll_interval`` 秒取一次标记，
+        若**连续 ``inactivity_timeout`` 秒标记不变**，判定卡死 ——
+        杀掉子进程并抛 :class:`StageStalled`。
+    ``inactivity_timeout``
+        无进展阈值（秒）。仅在给了 ``progress_watch`` 时生效。
+    ``poll_interval``
+        采样间隔（秒），默认 30。
+
+    为什么要它：判断"卡死"的正确证据是**产出不再增长**，而不是
+    "总耗时超过某个猜出来的数字"。画面复杂度、GPU 降频、并发负载都会
+    让总耗时成倍波动，但一个还在推进的进程无论多慢都不该被杀。
     """
     import subprocess
 
@@ -500,13 +628,20 @@ def run_managed(cmd, timeout=None, logger=None, **kwargs):
 
     proc = subprocess.Popen(cmd, **kwargs)
     guard.watch_process(proc)
+    out = err = b""
     try:
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_quietly(proc)
-            raise
-        returncode = proc.returncode
+        if progress_watch is None:
+            # 原路径：行为与改动前完全一致
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_quietly(proc)
+                raise
+            returncode = proc.returncode
+        else:
+            out, err, returncode = _supervise_with_watchdog(
+                proc, cmd, timeout, logger, progress_watch,
+                inactivity_timeout, poll_interval)
     except BaseException:
         # 取消/中断/超时都已先收掉子进程，再按原语义向上传递
         _kill_quietly(proc)
