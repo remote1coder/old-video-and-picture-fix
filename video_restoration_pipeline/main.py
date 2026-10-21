@@ -319,19 +319,36 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     return params
 
 
-def _calculate_timeout(video_duration: float, has_ai: bool = False) -> int:
-    """Calculate stage timeout based on video duration and complexity.
+def _calculate_timeout(video_duration: float, has_ai: bool = False,
+                       width: int = 0, height: int = 0) -> int:
+    """Calculate stage timeout based on video duration **and resolution**.
 
-    Base: 10 minutes setup + 2 min per minute of video
-    AI upscale: +5 min per minute (frame extraction + model inference)
-    Max: 4 hours
+    FIX-2026-10-21（16 分钟 1080p 实跑）：旧公式只看时长
+        timeout = 600 + int(duration/60) * 120
+    对 962 秒的素材给出 **42 分钟**，而 stage7 的 AV1 编码实测跑了
+    **3 小时** —— 于是被判超时（rc=87，与"磁盘不足"共用同一个码）。
+    公式**完全不看分辨率**：1080p 和 480p 拿一样的超时，差 6.75 倍工作量。
+
+    现在以 640x480 为基准按像素数缩放，并给 CPU 滤镜（颗粒合成）与
+    编码单独留出余量：
+
+    * base 10 分钟（setup）；
+    * 每视频分钟：480p 基准 2 分钟，按像素比线性放大；
+    * 开 AI 时再加 5 分钟/视频分钟（同样按像素放大）；
+    * 上限 4 小时。
+
+    实测校准：962s / 1920x1080 / 无 AI → 600 + 16 × (120×6.75) ≈ 3.8 小时，
+    覆盖实测的 stage1 7min + stage6 24min + stage7 3h。
     """
     base = 600  # 10 min setup
-    per_minute = 120  # 2 min per video minute
+    per_minute_480p = 120  # 2 min per video minute at 640x480
+    # 像素比（以 640x480 为基准），限制在 [1, 12] 避免异常值
+    px = float((width or 640) * (height or 480))
+    scale = min(12.0, max(1.0, px / (640.0 * 480.0)))
+    per_minute = per_minute_480p * scale
     if has_ai:
-        per_minute = 420  # 7 min per video minute (2 + 5 for AI)
-
-    timeout = base + int(video_duration / 60) * per_minute
+        per_minute += 300 * scale  # +5 min per video minute, also scaled
+    timeout = base + int(video_duration / 60) * int(per_minute)
     return min(timeout, 3600 * 4)  # Cap at 4 hours
 
 
@@ -387,7 +404,12 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     # Dynamic timeout
     video_duration = params.get("duration", 0) or _get_video_duration(job["input_path"])
     has_ai = params.get("ai_enabled", False)
-    timeout = _calculate_timeout(video_duration, has_ai)
+    # FIX-2026-10-21：把分辨率传进去 —— 旧调用只传时长，1080p 与 480p
+    # 拿一样超时（实测 962s/1080p 的 stage7 需要 3 小时，旧公式只给 42 分钟）。
+    timeout = _calculate_timeout(
+        video_duration, has_ai,
+        width=int(job.get("original_width") or params.get("original_width") or 0),
+        height=int(job.get("original_height") or params.get("original_height") or 0))
 
     # Run with timeout
     try:
