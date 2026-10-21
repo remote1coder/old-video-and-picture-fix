@@ -94,6 +94,42 @@ def merge_params(config: Dict[str, Any],
     if isinstance(paths_cfg, dict):
         type_key = (detected_class.lower()
                     if detected_class else "digital_photo")
+        # FIX-2026-10-22：`user_overrides.path` 应能切换分型参数组。
+        #
+        # 起因（真实素材实测）：1346 张老照片是**用数码相机翻拍打印照片**
+        # （FUJIFILM FinePix F10，带完整曝光参数），分类器据
+        # `_looks_like_camera_capture()` 判成 DIGITAL_PHOTO / 0.90 ——
+        # 而内容其实是需要修复的老照片。于是丢掉了一整套修复参数：
+        #   scan_print    : scratch_remove=true/20、deblock=25、deband=1.2、grain=true
+        #   digital_photo : scratch_remove=false/0、deblock=15、deband=0.8、grain=false
+        # 即划痕修复与颗粒合成全部关闭，修复效果大打折扣。
+        #
+        # 自动识别"翻拍打印件"属于 recapture detection（需半色调网点/
+        # 抖动/表面高光等特征 + 训练分类器），本轮不做；这里先提供
+        # **确定性的人工开关**：manifest 里写
+        #   user_overrides: {path: scan_print}
+        # 即可强制走老照片参数组。
+        #
+        # 与视频链 FIX-NEW-V-10 同族：那边也有"path 应能覆盖查表键"的修复。
+        # 注意必须在这里**预读**——user_overrides 在 Layer 5 才应用，
+        # 而 paths 选组发生在 Layer 2。
+        _uo_pre = (cli_overrides.get("user_overrides")
+                   if isinstance(cli_overrides, dict) else None)
+        if isinstance(_uo_pre, dict):
+            _path_override = _uo_pre.get("path")
+            if isinstance(_path_override, str) and _path_override.strip():
+                _new_key = _path_override.strip().lower()
+                if _new_key in paths_cfg and _new_key != type_key:
+                    if logger:
+                        msg = (f"path override: {type_key} -> {_new_key} "
+                               f"(source=user_overrides)")
+                        if hasattr(logger, "param_override"):
+                            logger.param_override(
+                                "path", type_key, _new_key,
+                                source="user_overrides")
+                        else:
+                            logger.info("PARAM_OVERRIDE", msg)
+                    type_key = _new_key
         if type_key in paths_cfg:
             type_paths = paths_cfg[type_key]
             if isinstance(type_paths, dict):
@@ -1108,7 +1144,22 @@ def main():
     # Build common CLI params
     cli_params = {}
     if args.output:
-        cli_params["output_path"] = args.output
+        _out = args.output
+        # FIX-2026-10-22：单文件模式下 `--output` 若指向**已存在的目录**，
+        # 必须拼上文件名，不能把目录本身当成输出路径。
+        #
+        # 实测（真实素材）：`--input 003.JPG --output E:\...\one`
+        #   → params["output_path"] = "E:\...\one"
+        #   → stage6 把 `output.job_test.partial` 重命名到该目录
+        #   → `[WinError 5] Access is denied: '...partial' -> '...one'`
+        #   → 留下 .partial + output.status.json = RECOVERY_REQUIRED，
+        #     而**进程退出码仍是 0**，看起来"成功"。
+        # 批量模式不受影响（manifest 里每个 job 都有自己的 output_path，
+        # 后写入覆盖）。这里只在目标确实是目录（或以分隔符结尾）时补齐。
+        if os.path.isdir(_out) or _out.endswith(("/", "\\")):
+            _stem = Path(args.input).stem if args.input else "output"
+            _out = str(Path(_out) / f"{_stem}_restored.avif")
+        cli_params["output_path"] = _out
     if args.crf is not None:
         cli_params["crf"] = args.crf
     if args.preset is not None:

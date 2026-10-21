@@ -117,6 +117,19 @@ photo:
   gmic_windows_disable_delayed_expansion: true
   gmic_windows_shell: false
   gmic_windows_whitelist: "[a-zA-Z0-9_\\-\\.\\/\\\\]"
+  # FIX-2026-10-22：路径校验默认**不再**用上面那条白名单。
+  #
+  # 实测（G'MIC 4.0.5 + shell=False 的 argv 传递）：只有逗号 `,` 会破坏
+  # G'MIC 的参数解析；括号 `()`、方括号 `[]`、`#` `&` `'` `+`、空格、中文
+  # **全部正常**。而白名单 `[a-zA-Z0-9_\-./\\:]` 会把括号判成非法，于是
+  # 真实照片里极其常见的 Windows 重名文件（`001(1).JPG`）让整批素材在
+  # stage1 直接 rc=84：
+  #   STAGE1_DEBAND_FAIL "G'MIC path contains forbidden characters"
+  #
+  # 现在默认走黑名单 + 路径分量首字符检查（见 stage1_preprocess.
+  # _GMIC_FORBIDDEN_CHARS），只拒绝实证会坏的字符。
+  # 有特殊合规要求时可把下面设为 true，恢复严格白名单（会拒掉括号/中文名）。
+  gmic_strict_whitelist: false
   # v6.3 Stage 4 selective local processing
   local_mask_denoise: true
   local_mask_edge_threshold: 0.05
