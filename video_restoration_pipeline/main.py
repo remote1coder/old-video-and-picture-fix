@@ -439,13 +439,29 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
 
         temp_dir = (params.get("temp_dir")
                     or params.get("temp_dir_original") or "")
+        out_path = params.get("output_path") or ""
+        out_dir = os.path.dirname(out_path) if out_path else ""
+        out_stem = os.path.basename(out_path) if out_path else ""
         try:
             inactivity = float(params.get("stage_inactivity_timeout", 600.0))
         except (TypeError, ValueError):
             inactivity = 600.0
 
         def _progress_marker() -> int:
-            """temp 目录总字节数 —— 所有耗时 stage 都在这里写中间产物。"""
+            """进度标记 = temp 中间产物 + 本 job 的成品/暂存。
+
+            FIX-2026-10-21（16 分钟长片实测）：第一版只统计 temp_dir，结果
+            **stage7 必然被误判停滞** —— 因为它把成品写到 `output/`，不在
+            temp 里：`{job}_restored.attempt-{pid}-{ts}.mkv`。
+            实测 10 分钟（正好等于默认 600s）后被 watchdog 杀掉，rc=87，
+            而日志里连 STAGE_STALLED 都没有（当时传了 logger=None）。
+
+            所以必须同时看：
+            * temp_dir 下所有中间产物（stage1/2/6 都写这里）；
+            * output 目录里**以本 job 成品名为前缀**的文件
+              （`.attempt-*` 暂存 / `.partial` / 成品本身）。
+              只取前缀匹配，避免同目录其他 job 的文件掩盖停滞。
+            """
             total = 0
             try:
                 for _root, _dirs, _files in os.walk(temp_dir):
@@ -456,12 +472,25 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
                             pass
             except OSError:
                 pass
+            if out_dir and out_stem:
+                try:
+                    for _fn in os.listdir(out_dir):
+                        if not _fn.startswith(out_stem):
+                            continue
+                        try:
+                            total += os.path.getsize(
+                                os.path.join(out_dir, _fn))
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
             return total
 
+        _watch_on = bool(temp_dir or out_dir) and inactivity > 0
         r = _cg_run_managed(
             cmd, timeout=timeout, logger=None,
-            progress_watch=_progress_marker if temp_dir else None,
-            inactivity_timeout=inactivity if temp_dir else None,
+            progress_watch=_progress_marker if _watch_on else None,
+            inactivity_timeout=inactivity if _watch_on else None,
             capture_output=True, text=True, errors="replace", env=env,
             shell=False)
         stderr = r.stderr if r.stderr else ""
@@ -1252,7 +1281,14 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 job_logger.info("TRADITIONAL_GATE",
                                "Traditional restoration skipped (already done), proceeding to AI stages")
         else:
-            job_logger.error("STAGE_FAILED", f"Stage {stage_num} failed: {exit_code}")
+            # FIX-2026-10-21：**必须把 stderr 记进来**。原来只记 exit_code，
+            # 于是 "Stage 7 failed: 87" 完全看不出是停滞、最终保险还是别的 ——
+            # 16 分钟长片实测就因此多花了一轮排查（87 还被超时和磁盘不足复用）。
+            job_logger.error(
+                "STAGE_FAILED",
+                f"Stage {stage_num} failed: {exit_code}"
+                + (f" | {stderr[-500:]}" if stderr else ""),
+                stderr=(stderr[-2000:] if stderr else None))
             # FIX-P6-7: VFM _Combed validation failed → auto-fallback to sRestore
             # per v7.32 §3.10.13
             if stage_num == 1 and exit_code == 86:
