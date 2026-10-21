@@ -97,3 +97,31 @@ def test_watchdog_disabled_keeps_old_behaviour(tmp_path):
                     capture_output=True, text=True)
     assert r.returncode == 0
     assert "done" in r.stdout
+
+
+def test_watchdog_with_text_mode_does_not_spin_or_crash():
+    """text=True 时管道是**文本流** —— 这是最容易踩的一个坑。
+
+    旧实现用 ``iter(pipe.readline, b"")`` 当哨兵：text 模式下 readline
+    返回 **str**，永不等于 bytes 哨兵 ``b""`` → 读到 EOF 后无线空转
+    （线程 100% CPU，进程永不结束），且返回的 str 会被上层 ``.decode()``
+    → AttributeError。run_stage 正好传 text=True，所以这是**必现**路径。
+    """
+    code = 'import sys; print("hello"); sys.stderr.write("errline")'
+    r = run_managed([sys.executable, "-c", code], timeout=60,
+                    progress_watch=lambda: 1, inactivity_timeout=10,
+                    poll_interval=1, capture_output=True, text=True)
+    assert r.returncode == 0
+    assert isinstance(r.stdout, str), f"stdout type={type(r.stdout)}"
+    assert "hello" in r.stdout
+    assert isinstance(r.stderr, str)
+    assert "errline" in r.stderr
+
+
+def test_watchdog_text_mode_still_detects_stall():
+    """text=True 下停滞检测同样要工作（不能因兼容 str 而失效）。"""
+    code = 'import time; print("start", flush=True); time.sleep(40)'
+    with pytest.raises(StageStalled):
+        run_managed([sys.executable, "-c", code], timeout=120,
+                    progress_watch=lambda: 0, inactivity_timeout=2,
+                    poll_interval=1, capture_output=True, text=True)
