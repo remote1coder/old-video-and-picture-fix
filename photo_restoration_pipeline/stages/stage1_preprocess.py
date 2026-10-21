@@ -33,7 +33,8 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from checkpoint import compute_param_hash, build_intermediate_name  # noqa: E402
+from checkpoint import (compute_param_hash, build_intermediate_name,  # noqa: E402
+                         safe_input_stem)
 
 # FIX-P11-12: Photo-specific exit codes per v6.32 §7.7 / v7.32 exit code scheme
 # All custom exit codes must be in 80-113 range
@@ -1140,7 +1141,7 @@ def main():
     if needs_conv:
         logger.info("STAGE1_COLOR_DETECT", f"Detected {color_mode}, converting to RGB")
         rgb_path = str(Path(temp_dir) /
-            f"{args.job_id}_{Path(input_name).stem}_rgb.tif")
+            f"{args.job_id}_{safe_input_stem(input_name)}_rgb.tif")
         if not _convert_to_rgb(input_path, rgb_path, logger):
             logger.error("STAGE1_COLOR_FAIL", "Color conversion failed")
             return PHOTO_ERR_COLOR_CONV
@@ -1170,7 +1171,7 @@ def main():
         "user_override": (user_cs != "auto"),
     }
     color_meta_path = str(Path(temp_dir) /
-        f"{args.job_id}_{Path(input_name).stem}_color_meta.json")
+        f"{args.job_id}_{safe_input_stem(input_name)}_color_meta.json")
 
     # FIX-2026-10-20（G6 实测挖出的架构缺陷）：宽色域 → sRGB 的转换需要
     # ICC **二进制**，但 G'MIC 重写像素时不会带上它 —— 实测所有中间产物
@@ -1182,7 +1183,7 @@ def main():
     # 修法：按 stage6 自己写盘的同一命名落一份 sidecar，stage6 读不到
     # 工作文件时回退读它（见 stage6_encode.py 的 STAGE6_ICC_SIDECAR）。
     icc_sidecar = str(Path(temp_dir) /
-        f"{args.job_id}_{Path(input_name).stem}_source.icc")
+        f"{args.job_id}_{safe_input_stem(input_name)}_source.icc")
     try:
         from PIL import Image as _PILImage
         with _PILImage.open(working_input) as _im:
@@ -1236,7 +1237,7 @@ def main():
         "degraded_channels": degradation.get("channels", []),
     }
     meta_path = str(Path(temp_dir) /
-        f"{args.job_id}_{Path(input_name).stem}_channel_meta.json")
+        f"{args.job_id}_{safe_input_stem(input_name)}_channel_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(channel_meta, f, indent=2)
     logger.info("STAGE1_CHANNEL_META", f"Saved channel metadata: {meta_path}")
@@ -1258,7 +1259,7 @@ def main():
 
     # Convert to 16bit TIFF for processing
     working_path = str(Path(temp_dir) /
-        f"{args.job_id}_{Path(input_name).stem}_16bit.tif")
+        f"{args.job_id}_{safe_input_stem(input_name)}_16bit.tif")
 
     # FIX-2026-10-20（G6 实跑挖出，R16 修法没覆盖到的一角）：
     # G'MIC `-o X.tif,uint16` 只改**容器位深**，不拉伸值域 —— 8-bit 输入转出去
@@ -1305,7 +1306,7 @@ def main():
     # ORIGINAL: grain extraction was after scratch removal (line 609-613), wrong order
     if params.get("grain_synthesis", True):
         grain_out = str(Path(temp_dir) /
-            f"{args.job_id}_{Path(input_name).stem}_grain.tif")
+            f"{args.job_id}_{safe_input_stem(input_name)}_grain.tif")
         extract_grain_pattern(working_path, grain_out, params, logger)
 
     # Scratch removal
@@ -1460,7 +1461,7 @@ def main():
     if inter_path_p.exists():
         # FIX-P11-8: Cleanup intermediates if requested per v7.32 §3.10.17
         if args.cleanup_intermediates:
-            stem = f"{args.job_id}_{Path(input_name).stem}"
+            stem = f"{args.job_id}_{safe_input_stem(input_name)}"
             for suffix in [".channel.tif", ".scratch.tif", ".deblock.tif",
                            ".deband.tif", "_grain.tif", "_rgb.tif",
                            "_16bit.tif", "_color_meta.json",

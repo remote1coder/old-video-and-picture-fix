@@ -31,6 +31,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+from checkpoint import safe_input_stem  # noqa: E402
 
 try:  # AI 解释器解析（与视频链 stage5 同一模块）
     import ai_runtime as _ai_runtime
@@ -709,7 +710,7 @@ def _resolve_input_source(temp_dir: str, job_id: str,
     Only traditional-processed or AI-upscaled sources are valid.
     Bans raw original input.
     """
-    stem = Path(input_name).stem
+    stem = safe_input_stem(input_name)
     # FIX-P10-1: updated search order for new stage numbering
     for pat in ["step3_upscale*", "step2_ai_pre*",
                 "step1_preprocess*"]:
@@ -801,7 +802,7 @@ def main():
     bit_depth = params.get("photo_bit_depth", 8)
     out_ext = "tif" if bit_depth == 16 else "png"
     output_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step4_face.{out_ext}")
+        f"{job_id}_{safe_input_stem(input_name)}_step4_face.{out_ext}")
 
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return 3
@@ -851,7 +852,7 @@ def main():
     os.makedirs(face_dir, exist_ok=True)
     # FIX-M12-11: blended intermediate also uses .tif for 16bit chain.
     blended_path = os.path.join(temp_dir,
-        f"{job_id}_{Path(input_name).stem}_step4_face_blended.{out_ext}")
+        f"{job_id}_{safe_input_stem(input_name)}_step4_face_blended.{out_ext}")
 
     success = False
     # FIX-NEW-V-17 / R20: 修复图是按**输入文件名**写出的（GFPGAN 走
@@ -932,7 +933,7 @@ def main():
         else:
             _landmarks_ser.append(None)
     face_meta_path = os.path.join(
-        temp_dir, f"{job_id}_{Path(input_name).stem}_face_boxes.json")
+        temp_dir, f"{job_id}_{safe_input_stem(input_name)}_face_boxes.json")
     try:
         with open(face_meta_path, "w", encoding="utf-8") as f:
             json.dump({"face_boxes": face_boxes,

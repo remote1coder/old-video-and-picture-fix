@@ -39,7 +39,7 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from checkpoint import wsl_redirect_path, wsl_copy_back  # noqa: E402
+from checkpoint import wsl_redirect_path, wsl_copy_back, safe_input_stem  # noqa: E402
 # PUB-04（第七轮）：发布目标互斥锁（逐路径加锁，非集合摘要）
 from publish_lock import acquire_target_locks, TargetLockTimeout  # noqa: E402
 # 持久 journal（第七轮）：让硬终止后"上次做到哪一步"可判断
@@ -1026,7 +1026,7 @@ def main():
     # FIX-P10-1: input search order step5 > step4 > step3 > step2 > step1
     input_source = None
     for pat in ["step5_postprocess*", "step4_face*", "step3_upscale*", "step2_ai_pre*", "step1_preprocess*"]:
-        pattern = f"{job_id}_{Path(input_name).stem}_{pat}"
+        pattern = f"{job_id}_{safe_input_stem(input_name)}_{pat}"
         candidates = glob.glob(os.path.join(temp_dir, pattern))
         # NEW-V-04: 侧车文件（.status.json / .cache.json）也是 stepN_* 前缀，
         # 不过滤就会被当成"最新产物"选中，随后 Pillow 抛
@@ -1050,7 +1050,7 @@ def main():
         _up = os.path.join(temp_dir, f"{job_id}_upscaled")
         if os.path.isdir(_up):
             _c = glob.glob(os.path.join(
-                _up, f"{Path(input_name).stem}_x*"))
+                _up, f"{safe_input_stem(input_name)}_x*"))
             _c = [p for p in _c if Path(p).suffix.lower()
                   in {".tif", ".tiff", ".png"}]
             if _c:
@@ -1067,7 +1067,7 @@ def main():
         output_dir = params.get("output_dir", "./output")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir,
-            f"{Path(input_name).stem}_restored.avif")
+            f"{safe_input_stem(input_name)}_restored.avif")
 
     # FIX-R5-08: 与视频链 stage7（FIX-R5-07）同型——显式 output_path
     # 既不转绝对路径也不建父目录：相对路径按进程 cwd 解析，manifest 是
@@ -1117,7 +1117,7 @@ def main():
             status_path=status_path)      # 取消记录写在发布路径旁
 
     # --- FIX-V04: 色彩契约（必需转换失败即阻断）---
-    _stem = Path(input_name).stem
+    _stem = safe_input_stem(input_name)
     color = resolve_color_space(input_source, params, temp_dir, job_id, _stem,
                                 logger)
     if color["status"] == COLOR_FAILED:
