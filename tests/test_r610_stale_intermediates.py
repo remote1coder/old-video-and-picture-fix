@@ -207,10 +207,15 @@ def test_unlink_returns_count(tmp_path):
         tmp / "nonexistent.mkv") == 0
 
 
-@pytest.mark.skipif(sys.platform == "win32",
-                    reason="main.py 的 purge 分支需在真实运行中验证")
 def test_main_has_purge_branch():
-    """静态守卫：main.py 全新运行分支必须调 cleanup_all_intermediates。"""
+    """静态守卫：main.py 全新运行分支必须调 cleanup_all_intermediates。
+
+    FIX-2026-10-22：原实现带 `skipif(sys.platform == "win32")`，理由是
+    "purge 分支需在真实运行中验证"——但本用例是**纯源码静态检查**
+    （inspect.getsource + 字符串断言），与运行平台毫无关系。
+    实测在 Windows 上三条断言全部通过，那个 skipif 是过时且错误的保守判断，
+    导致该守卫在本机常年不生效。已移除。
+    """
     import inspect
     import main as vmain
     src = inspect.getsource(vmain.process_job)
@@ -218,6 +223,9 @@ def test_main_has_purge_branch():
     assert "STALE_INTERMEDIATES_PURGED" in src
     assert "current_step=stage_num" in src, \
         "循环内清理必须传 current_step，不能再依赖降序取前 N 个"
+    # FIX-2026-10-22：孤儿回收的判据也必须接线，否则 logic 是死代码
+    assert "current_run_hashes" in src, \
+        "循环内清理必须传 current_run_hashes（跨轮次孤儿回收判据）"
 
 
 def test_photo_main_cleanup_passes_current_step():
