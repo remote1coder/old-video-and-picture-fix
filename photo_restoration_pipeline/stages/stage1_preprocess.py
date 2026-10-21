@@ -262,16 +262,49 @@ def _build_gmic_whitelist_re(params: dict):
         return re.compile(r"[a-zA-Z0-9_\-\./\\:]+")
 
 
-def _validate_gmic_path(path: str, wl_re) -> str:
-    """Resolve and whitelist-validate a path passed to G'MIC.
+#: G'MIC 参数解析里**实证会坏**的字符。
+#:
+#: FIX-2026-10-22（真实素材实测，G'MIC 4.0.5 + `shell=False` 的 argv 传递）：
+#:   `,`  → 失败（G'MIC 用它分隔参数列表）
+#:   `(` `)` `[` `]` `#` `&` `'` `+` 空格 中文 → **全部正常**
+#:
+#: 原实现用**白名单** `[a-zA-Z0-9_\-./\\:]` 校验路径，于是真实照片里极其
+#: 常见的括号名（Windows 重名文件 `001(1).JPG`）被判非法：
+#:
+#:   STAGE1_DEBAND_FAIL "G'MIC path contains forbidden characters:
+#:                       ...\job_001_001(1)_16bit.tif"
+#:   → stage1 rc=84 → 整批 8 张照片全部失败
+#:
+#: 白名单把"合法文件名"和"危险字符"混为一谈，代价是整批素材跑不动；
+#: shell=False 下不存在 shell 注入面，真正要防的只有 G'MIC 自己的解析。
+#: 故改为黑名单 + 路径分量首字符检查。
+_GMIC_FORBIDDEN_CHARS = (",",)
 
-    FIX-R11-8: Per v7.32 §3.10.25, paths fed to G'MIC must be resolved and
-    validated to reject shell metacharacters / spaces. Raises ValueError.
+
+def _validate_gmic_path(path: str, wl_re=None) -> str:
+    """校验并返回喂给 G'MIC 的绝对路径。
+
+    FIX-2026-10-22：判据由"白名单"改为"黑名单 + 首字符检查"，
+    理由见 `_GMIC_FORBIDDEN_CHARS` 的实测记录。
+
+    Args:
+        wl_re: 可选的严格白名单正则。仅在 config 显式打开
+            `gmic_strict_whitelist` 时传入（默认不传 = 不启用）。
     """
     p = str(Path(path).resolve())
-    if not wl_re.fullmatch(p):
+    for ch in _GMIC_FORBIDDEN_CHARS:
+        if ch in p:
+            raise ValueError(
+                f"G'MIC path contains {ch!r}, which breaks G'MIC argument "
+                f"parsing: {p}")
+    for part in Path(p).parts:
+        if part.startswith("-"):
+            raise ValueError(
+                f"G'MIC path has a component starting with '-' "
+                f"(G'MIC would read it as a command): {p}")
+    if wl_re is not None and not wl_re.fullmatch(p):
         raise ValueError(
-            f"G'MIC path contains forbidden characters (not in whitelist): {p}")
+            f"G'MIC path rejected by gmic_strict_whitelist: {p}")
     return p
 
 
@@ -373,8 +406,11 @@ def run_gmic(input_path: str, output_path: str, *gmic_args,
     Returns:
         (success: bool, stderr: str) tuple per Bug 11.20 fix.
     """
-    # FIX-R11-8: Resolve + whitelist-validate paths per v7.32 §3.10.25.
-    wl_re = _build_gmic_whitelist_re(params)
+    # FIX-R11-8 / FIX-2026-10-22: 路径校验。默认走黑名单（放行括号/中文等
+    # 合法文件名）；只有 config 显式打开 gmic_strict_whitelist 才启用白名单。
+    wl_re = None
+    if (params or {}).get("gmic_strict_whitelist"):
+        wl_re = _build_gmic_whitelist_re(params)
     try:
         safe_in = _validate_gmic_path(input_path, wl_re)
         safe_out = _validate_gmic_path(output_path, wl_re)

@@ -452,6 +452,13 @@ def run_gfpgan(input_path: str, output_dir: str,
         version = params.get("face_restore_version", version)
         upscale = params.get("face_restore_upscale", upscale)
 
+    # FIX-2026-10-22：AI 推理子进程必须用**能跑 torch/gfpgan 的解释器**。
+    # 本函数原来用 `sys.executable` —— 编排解释器是 R72 时它没有
+    # torch/gfpgan，人脸修复必然失败；而同一文件里 `_detect_faces_via_facexlib`
+    # 早已走 `_resolve_ai_python()`（日志有 AI_INTERPRETER_RESOLVED），
+    # 两处不一致。统一到解析结果，解析不到才退回 sys.executable。
+    _ai_py = _resolve_ai_python() or sys.executable
+
     try:
         # Try inference_gfpgan.py script if available
         gfpgan_script = shutil.which("inference_gfpgan.py")
@@ -459,7 +466,7 @@ def run_gfpgan(input_path: str, output_dir: str,
             # Search common locations
             for candidate in [
                 Path.home() / ".local" / "bin" / "inference_gfpgan.py",
-                Path(sys.executable).parent / "inference_gfpgan.py",
+                Path(_ai_py).parent / "inference_gfpgan.py",
             ]:
                 if candidate.exists():
                     gfpgan_script = str(candidate)
@@ -467,7 +474,7 @@ def run_gfpgan(input_path: str, output_dir: str,
 
         if gfpgan_script:
             cmd = [
-                sys.executable, gfpgan_script,
+                _ai_py, gfpgan_script,
                 "-i", input_path,
                 "-o", output_dir,
                 "-v", version,
@@ -508,7 +515,7 @@ def run_gfpgan(input_path: str, output_dir: str,
         # 可能拿到错误/空数据），输出统一走 BGR 写回。
         shm = str(SCRIPT_DIR.parent.resolve() / "shared_modules")
         cmd = [
-            sys.executable, "-c",
+            _ai_py, "-c",
             f"import sys; sys.path.insert(0, {shm!r}); "
             f"from gfpgan import GFPGANer; "
             f"from basicsr.utils import img2tensor, tensor2img; "
@@ -554,13 +561,15 @@ def run_codeformer(input_path: str, output_dir: str,
     Bug 11.13 fix: fallback no longer copies original; it attempts real
     inference or returns False so the caller knows CodeFormer failed.
     """
+    # FIX-2026-10-22：同 run_gfpgan —— AI 子进程必须用能跑 torch 的解释器
+    _ai_py = _resolve_ai_python() or sys.executable
     try:
         # Try inference_codeformer.py script
         cf_script = shutil.which("inference_codeformer.py")
         if not cf_script:
             for candidate in [
                 Path.home() / ".local" / "bin" / "inference_codeformer.py",
-                Path(sys.executable).parent / "inference_codeformer.py",
+                Path(_ai_py).parent / "inference_codeformer.py",
             ]:
                 if candidate.exists():
                     cf_script = str(candidate)
@@ -568,7 +577,7 @@ def run_codeformer(input_path: str, output_dir: str,
 
         if cf_script:
             cmd = [
-                sys.executable, cf_script,
+                _ai_py, cf_script,
                 "-i", input_path,
                 "-o", output_dir,
                 "--face_upsample",
@@ -681,7 +690,7 @@ def run_codeformer(input_path: str, output_dir: str,
             "    import traceback; traceback.print_exc()",
             "    sys.exit(1)",
         ]
-        cmd = [sys.executable, "-c", chr(10).join(_code_lines)]
+        cmd = [_ai_py, "-c", chr(10).join(_code_lines)]
         r = subprocess.run(
             cmd, capture_output=True, text=True, errors="replace", timeout=900, shell=False)
         if r.returncode != 0:

@@ -27,6 +27,46 @@ from logger import get_logger  # noqa: E402
 from checkpoint import compute_param_hash, build_intermediate_name, gpu_memory_check  # noqa: E402
 
 
+#: FIX-2026-10-22：AI 推理解释器缓存。
+#: 探针要起子进程 import torch（约 1~2 秒），1346 张图每张探一次就是几十分钟
+#: 纯开销，所以进程内只解析一次。
+_AI_PY_CACHE: dict = {}
+
+
+def _ai_python() -> str:
+    """返回"能跑 torch/realesrgan"的解释器；解析不到时退回 sys.executable。
+
+    为什么必须有这一层（2026-10-22 真实素材实测）：
+    编排解释器可能是 `tools_r4/vs_portable/r72/python.exe` —— 它只有
+    VapourSynth，**没有 torch / realesrgan**。原来这里直接写
+    `sys.executable`，于是三个 AI 后端依次失败：
+
+        ModuleNotFoundError: No module named 'realesrgan'
+        STAGE3_MODEL_FALLBACK realesr-gener-x4v3 → RealESRGAN_x2plus → DAT_x2
+        STAGE3_AI_SKIP_TRADITIONAL  All AI backends failed
+
+    结果：**以为跑了 AI 超分，实际交付的还是传统输出**（只是日志里写了
+    一行降级）。stage4 早已走 ai_runtime 解析（日志有
+    AI_INTERPRETER_RESOLVED），照片链 stage3 一直漏着这一层。
+    """
+    if "py" in _AI_PY_CACHE:
+        return _AI_PY_CACHE["py"]
+    py = sys.executable
+    try:
+        import ai_runtime as _ai_rt
+        resolved = _ai_rt.resolve_ai_interpreter()
+        if resolved:
+            py = resolved
+        else:
+            sys.stderr.write(
+                "stage3: 未找到具备 AI 推理栈的解释器，退回编排解释器 "
+                f"({sys.executable})；AI 超分很可能全部失败\n")
+    except Exception as e:
+        sys.stderr.write(f"stage3: ai_runtime 解析失败({e})，退回 sys.executable\n")
+    _AI_PY_CACHE["py"] = py
+    return py
+
+
 def _get_model_basename(model: str) -> str:
     """Extract model family from full model name.
 
@@ -200,7 +240,7 @@ def _run_realesrgan_python(input_path: str, output_path: str, model: str,
             + save_code_8
         )
         cmd = [
-            sys.executable, "-c",
+            _ai_python(), "-c",
             # R4：**必须用换行，不能用 `;` 串成一行**。
             # Python 语法不允许在分号后接复合语句（if / for / try）：
             # `x=1; if True: pass` 直接 SyntaxError。
