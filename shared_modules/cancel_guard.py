@@ -487,6 +487,44 @@ class StageStalled(Exception):
         self.last_progress = last_progress
 
 
+def _kill_tree_quietly(proc: Any) -> None:
+    """Kill a child **and all of its descendants**; never raises.
+
+    FIX-2026-10-21：watchdog 判停滞时要杀的往往不是直接子进程本身，而是
+    它内部再起的 ``vspipe`` / ``ffmpeg`` / ``avifenc``。只杀 stage 脚本
+    会让这些孙进程变成孤儿继续写文件 —— 那正是本模块存在的理由（RV-12：
+    "killing only the Python stage leaves the encoder writing")。
+
+    而这些孙子进程登记在 **stage 脚本自己**的 CancelGuard 实例里，
+    父进程看不到，所以只能按进程树杀：
+    * Windows：``taskkill /F /T /PID``（/T = 含子孙）
+    * POSIX：``os.killpg``（run_managed 已用 CREATE_NEW_PROCESS_GROUP /
+      setsid 建了独立进程组）
+    """
+    import subprocess as _sp
+
+    pid: Optional[int] = None
+    try:
+        pid = int(proc.pid)
+    except BaseException:
+        pid = None
+
+    if pid:
+        if os.name == "nt":
+            try:
+                _sp.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=30, shell=False)
+            except BaseException:
+                pass
+        else:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except BaseException:
+                pass
+    # 兜底：即使上面的树杀失败，至少收掉直接子进程并 reap
+    _kill_quietly(proc)
+
+
 def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
                              inactivity_timeout, poll_interval):
     """轮询子进程进度，无进展超阈值则杀掉并抛 :class:`StageStalled`。
@@ -500,8 +538,16 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
     chunks = {"out": [], "err": []}
 
     def _pump(pipe, key):
+        """把管道内容抽干，直到 EOF。
+
+        必须用 ``for line in pipe`` 而不是
+        ``iter(pipe.readline, b"")``：当 Popen 以 ``text=True`` 建流时，
+        readline 返回 **str**，永远不等于 bytes 哨兵 ``b""`` ——
+        读到 EOF 后会无限空转，线程 100% CPU 且假死。
+        （FIX-2026-10-21：run_stage 正好传 text=True。）
+        """
         try:
-            for line in iter(pipe.readline, b""):
+            for line in pipe:
                 chunks[key].append(line)
         except BaseException:
             pass
@@ -551,7 +597,9 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
             _time.sleep(1.0)  # 每秒查一次进程状态，开销可忽略
     finally:
         if stalled or hard_timeout:
-            _kill_quietly(proc)
+            # 必须杀整棵进程树：stage 脚本内部还会起 vspipe/ffmpeg，
+            # 只杀脚本本身会留下继续写文件的孤儿（RV-12）。
+            _kill_tree_quietly(proc)
         for t in threads:
             t.join(timeout=10)
 
@@ -650,6 +698,11 @@ def run_managed(cmd, timeout=None, logger=None, progress_watch=None,
         guard.unwatch_process(proc)
 
     if text:
-        out = (out or b"").decode("utf-8", "replace")
-        err = (err or b"").decode("utf-8", "replace")
+        # watchdog 路径下 _pump 收集到的已经是 str（Popen(text=True) 建的是
+        # 文本流），只有 communicate() 路径给的是 bytes —— 必须按类型判断，
+        # 否则对 str 调 .decode 会 AttributeError。
+        if isinstance(out, (bytes, bytearray)):
+            out = bytes(out).decode("utf-8", "replace")
+        if isinstance(err, (bytes, bytearray)):
+            err = bytes(err).decode("utf-8", "replace")
     return subprocess.CompletedProcess(cmd, returncode, out, err)
