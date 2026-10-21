@@ -26,6 +26,7 @@ v7.3 §1.1-1.6 Compliance:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -434,8 +435,50 @@ def _check_disk_space(input_path: str,
         return True
 
 
+def _current_run_param_hashes(produced_paths) -> set:
+    """本轮运行**实际产出过**的 param_hash 集合 —— 孤儿回收的判据基准。
+
+    与视频链 `main._current_run_param_hashes` 同义：照片链产物命名
+    `{job}_{stem}_step{N}_{op}_p{hash}.{ext}` 里的 hash 也是各 stage 以
+    **自己的输入**为身份基准算的，同一轮里不同 step 的 hash 天然不同。
+    所以判定"是否本轮产物"必须用集合，拿单个值去比会把上一步的合法
+    产物误判成孤儿。
+    """
+    hashes: set = set()
+    for p in produced_paths or []:
+        m = re.search(r"_p([0-9a-f]+)\.", os.path.basename(str(p)))
+        if m:
+            hashes.add(m.group(1))
+    return hashes
+
+
+def _snapshot_job_files(temp_dir: str, job_id: str) -> Dict[str, tuple]:
+    """拍下 temp 目录里本 job 现有文件的 {文件名: (mtime_ns, size)} 指纹。
+
+    用于"执行前/执行后"做差集，识别本轮**真正新增或被改写**的产物
+    （视频链 R6-10 同族做法）。返回空 dict 表示目录不可读。
+    """
+    out: Dict[str, tuple] = {}
+    try:
+        t = Path(temp_dir)
+        if not t.is_dir():
+            return out
+        for p in t.iterdir():
+            if not (p.is_file() and p.name.startswith(f"{job_id}_")):
+                continue
+            try:
+                st = p.stat()
+                out[p.name] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                continue
+    except OSError:
+        return {}
+    return out
+
+
 def cleanup_old_intermediates(temp_dir: str, job_id: str,
-                              current_step=None) -> None:
+                              current_step=None,
+                              current_run_hashes: Optional[set] = None) -> None:
     """Clean old intermediate files.
 
     FIX-NEW-V-12 / R10（与视频链 R6-10 同族）：必须传 current_step。
@@ -444,6 +487,11 @@ def cleanup_old_intermediates(temp_dir: str, job_id: str,
     默认 2，于是每个 stage 跑完就把它**刚产出**的中间产物删掉
     （实测 stage3 的 step3_upscale 被删，stage4 找不到输入、
     人脸检测必然零命中）。
+
+    FIX-2026-10-22：`current_run_hashes` 必须传。与视频链 `7a157d6` /
+    R6-10 同族的那个病——`checkpoint.cleanup_old_intermediates` 的
+    `current_param_hash` 形参**没有任何生产调用点传入**，孤儿回收逻辑
+    是死代码：上一轮遗留的中间产物永不清理，跨轮次累积。
     """
     try:
         # FIX-2026-10-20: checkpoint 在 **shared_modules** 下，不在
@@ -451,7 +499,8 @@ def cleanup_old_intermediates(temp_dir: str, job_id: str,
         # classify.py:450 把 shared_modules 塞进 sys.path 才没崩 —— 属隐式耦合。
         sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
         from checkpoint import cleanup_old_intermediates as coi
-        coi(temp_dir, job_id, current_step=current_step)
+        coi(temp_dir, job_id, current_step=current_step,
+           current_run_hashes=current_run_hashes)
     except Exception as e:
         # 不能静默：清理失败会让陈旧中间产物一直堆积而无任何提示。
         print(f"[WARN] cleanup_old_intermediates failed: {e}",
@@ -710,6 +759,12 @@ def _run_single_job(job: Dict[str, Any],
     # FIX-P10-10: force_traditional_first gate bound to stage1
     traditional_stage_completed = False
 
+    # FIX-2026-10-22：本轮运行**跨 stage 累积**的实际产出路径列表。
+    # 孤儿回收的判据基准。必须累积而非每次替换——只拍"本 stage 前"会漏掉
+    # 本轮更早 stage 的产物（它们在快照时已存在，不在差集里），其 hash
+    # 不在合法集合中会被孤儿回收误删。2026-10-22 端到端实测踩到并修正。
+    _run_produced_paths: List[str] = []
+
     for stage_idx, (stage_script, is_ai_stage) in enumerate(stages):
         stage_name = stage_script.replace(".py", "")
         retry_count = 0
@@ -761,6 +816,11 @@ def _run_single_job(job: Dict[str, Any],
 
         while True:
             is_retry = retry_count > 0
+            # FIX-2026-10-22：执行前快照本 job 在 temp 里的文件指纹，
+            # 用于事后识别"本轮实际产出"——孤儿回收的判据基准。
+            # 不用"事后 glob 全部"，否则上一轮遗留的陈旧产物也会被算进来，
+            # 判据失效（这正是 current_param_hash 死代码的病根）。
+            _pre_files = _snapshot_job_files(temp_dir, job_id)
             rc, stderr = _run_stage(
                 stage_script, job_id, input_path,
                 config_path, params, stage_idx,
@@ -874,8 +934,22 @@ def _run_single_job(job: Dict[str, Any],
                 # 否则共享实现走 current_step=None 分支会删掉本 stage
                 # 刚产出的中间产物（实测 stage3 的 step3_upscale 被删，
                 # stage4 找不到输入 → 人脸检测必然零命中）。
-                cleanup_old_intermediates(temp_dir, job_id,
-                                          current_step=stage_idx + 1)
+                # FIX-2026-10-22: 再传 current_run_hashes（本轮实际产出的
+                # hash 集合），否则"跨轮次/跨参数"的孤儿产物永不回收。
+                # 差集为空（如 rc=3 跳过、本 stage 无产物）时传空集合，
+                # 共享实现会跳过孤儿判定、只走 keep_steps，行为与旧版一致。
+                _post_files = _snapshot_job_files(temp_dir, job_id)
+                _new_this_stage = [
+                    str(Path(temp_dir) / _n)
+                    for _n, _sig in _post_files.items()
+                    if _pre_files.get(_n) != _sig
+                ]
+                # 跨 stage 累积：判据必须覆盖本轮**所有**已跑 stage 的产物
+                _run_produced_paths.extend(_new_this_stage)
+                cleanup_old_intermediates(
+                    temp_dir, job_id, current_step=stage_idx + 1,
+                    current_run_hashes=_current_run_param_hashes(
+                        _run_produced_paths))
                 break  # Success or skip
             elif _is_retryable_error(rc, stderr):
                 retry_count += 1
