@@ -1562,6 +1562,8 @@ def main():
     # FIX-2026-10-22：统计空窗口。空窗口本身不算错（尾窗可能不满），
     # 但**成片空**说明 total_frames 估错或抽取失败——必须留痕。
     empty_windows = 0
+    # FIX-2026-10-23：连续空窗口计数，用于提前终止（见循环内注释）。
+    consecutive_empty = 0
 
     for win_start in range(0, total_frames, win_size):
         win_end = min(win_start + win_size, total_frames)
@@ -1579,11 +1581,35 @@ def main():
                                          pts_map=all_pts_map)
         if not frames:
             empty_windows += 1
+            consecutive_empty += 1
             logger.warning("STAGE3_WINDOW_EMPTY",
                            f"No frames in window {win_start}",
                            empty_so_far=empty_windows,
                            expected_total=total_frames)
+            # FIX-2026-10-23：连续空窗口要**提前终止**，而不是把剩下的
+            # 上百个窗口挨个试一遍。
+            #
+            # 为什么会有连续空窗口：`_count_video_frames` 的快速路径用
+            # `-count_packets`，它对**含负 PTS 参考帧**的文件会**高估**——
+            # 实测 `-c copy` 剪切的片段里 651 个包只有 599 帧是"可显示"的，
+            # 另 52 帧是负 PTS 的解码参考帧（ffmpeg 官方论坛的解释：
+            # 参考帧可以给负 PTS「可解码但不显示」，或从 0 编号
+            # 「那它们也会被显示，剪切就不精确了」）。
+            # 所以包数 > 显示帧数时，尾部窗口必然空。
+            #
+            # 注意：**不能**用 `-avoid_negative_ts make_zero` 去"救回"那些帧
+            # ——那会把不可见的参考帧变成可见，片头平白多出画面，
+            # 属于**改内容**，与本项目「只改画面质量不改内容」的原则冲突。
+            if consecutive_empty >= 3:
+                logger.warning(
+                    "STAGE3_WINDOW_LOOP_EARLY_STOP",
+                    f"Stopped after {consecutive_empty} consecutive empty "
+                    f"windows at {win_start}; total_frames={total_frames} is "
+                    f"likely an overcount (packet count vs displayable frames).",
+                    total_frames=total_frames, stopped_at=win_start)
+                break
             continue
+        consecutive_empty = 0
 
         # FIX-P8-8: Collect PTS for VFR encoding
         for _, pts in frames:
