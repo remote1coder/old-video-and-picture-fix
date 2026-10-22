@@ -1084,48 +1084,88 @@ def extract_frames_with_pts(video_path: str, output_dir: str,
 
 
 def _count_video_frames(video_path: str) -> int:
-    """Count total frames in video using ffprobe."""
+    """Count total frames in video. 返回 0 表示**确定不了**（调用方必须报错）。
+
+    FIX-2026-10-22：加 `-count_packets` 快速路径。
+
+    实测（38 MB 的 1080p AV1 成品）：
+        -count_frames   → 580 帧，**19.4 s**（要逐帧解码）
+        -count_packets  → 580 帧，**0.30 s**（只解复用）
+        nb_frames(元数据) → N/A
+    也就是说 `-count_frames` 的耗时随**文件大小**线性增长，而本函数原来给它
+    60 秒固定超时。stage1 产出的 1.6 GB 16-bit 无损 mkv 需要十几分钟，
+    必然超时；随后 `duration × fps` 兜底又因为 vspipe 产出的 mkv
+    `format=duration` 是 **N/A** 而失败 → 返回 0。
+
+    后果（2026-10-22 实测，1080p/20s 强制 AI）：调用方落到写死的
+    `total_frames = 30000`，于是对 599 帧的素材切出 **118 个窗口**，
+    其中 **115 个是空的**，白烧约 25 分钟，还让 AI 子进程在空目录上打转。
+
+    现在的顺序：元数据 → 解复用数包 → 逐帧解（超时按大小放宽）→ 时长×帧率。
+    对本项目自产的 mkv/ffv1/av1，1 packet = 1 frame，第二步即为准确值。
+    """
+    def _probe(extra_args, timeout):
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-hide_banner", "-v", "error"] + extra_args
+                + [video_path],
+                capture_output=True, text=True, errors="replace",
+                timeout=timeout, shell=False)
+            if r.returncode == 0:
+                for ln in r.stdout.strip().splitlines():
+                    ln = ln.strip()
+                    if ln:
+                        return ln
+        except Exception:
+            pass
+        return ""
+
+    # 1) 容器元数据里的 nb_frames —— 瞬间，且权威
+    v = _probe(["-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1"], 15)
+    if v.isdigit() and int(v) > 0:
+        return int(v)
+
+    # 2) -count_packets —— 只解复用，快 60~70 倍。命中即返回，**不要**再跑
+    #    慢的 -count_frames（本函数早期版本就是忘了提前 return，实测多花 19 s）。
+    #    对本项目产出的 mkv/ffv1/h264/av1，1 packet 恒等于 1 frame。
+    v = _probe(["-select_streams", "v:0", "-count_packets",
+                "-show_entries", "stream=nb_read_packets",
+                "-of", "default=noprint_wrappers=1:nokey=1"], 120)
+    if v.isdigit() and int(v) > 0:
+        return int(v)
+
+    # 3) -count_frames —— 需要逐帧解码，超时按文件大小放宽（每 10 MB 给 1 s）
     try:
-        r = subprocess.run(
-            ["ffprobe", "-hide_banner", "-v", "error",
-             "-select_streams", "v:0",
-             "-count_frames",
-             "-show_entries", "stream=nb_read_frames",
-             "-of", "default=noprint_wrappers=1:nokey=1",
-             video_path],
-            capture_output=True, text=True, errors="replace", timeout=60, shell=False
-        )
-        if r.returncode == 0:
-            return int(r.stdout.strip())
+        size_mb = os.path.getsize(video_path) / (1024.0 * 1024.0)
+    except OSError:
+        size_mb = 0.0
+    dec_timeout = max(60, min(3600, int(size_mb / 10.0)))
+    v = _probe(["-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=noprint_wrappers=1:nokey=1"], dec_timeout)
+    if v.isdigit() and int(v) > 0:
+        return int(v)
+
+    # 4) 时长 × 帧率
+    try:
+        dur_s = _probe(["-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1"], 30)
+        fps_s = _probe(["-select_streams", "v:0",
+                        "-show_entries", "stream=r_frame_rate",
+                        "-of", "default=noprint_wrappers=1:nokey=1"], 30)
+        if dur_s and fps_s:
+            duration = float(dur_s)
+            parts = fps_s.split("/")
+            fps = (float(parts[0]) / float(parts[1])) if len(parts) == 2 \
+                else float(parts[0])
+            if duration > 0 and fps > 0:
+                return int(duration * fps)
     except Exception:
         pass
-    # Fallback: use duration * fps
-    try:
-        dur_r = subprocess.run(
-            ["ffprobe", "-hide_banner", "-v", "error",
-             "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1",
-             video_path],
-            capture_output=True, text=True, errors="replace", timeout=30, shell=False
-        )
-        fps_r = subprocess.run(
-            ["ffprobe", "-hide_banner", "-v", "error",
-             "-select_streams", "v:0",
-             "-show_entries", "stream=r_frame_rate",
-             "-of", "default=noprint_wrappers=1:nokey=1",
-             video_path],
-            capture_output=True, text=True, errors="replace", timeout=30, shell=False
-        )
-        if dur_r.returncode == 0 and fps_r.returncode == 0:
-            duration = float(dur_r.stdout.strip())
-            fps_parts = fps_r.stdout.strip().split("/")
-            if len(fps_parts) == 2:
-                fps = float(fps_parts[0]) / float(fps_parts[1])
-            else:
-                fps = float(fps_parts[0])
-            return int(duration * fps)
-    except Exception:
-        pass
+
+    # 5) 全部失败 → 返回 0，由调用方显式报错（不再猜 30000）
     return 0
 
 
@@ -1464,8 +1504,23 @@ def main():
     # 256-frame sliding window processing
     win_size = params.get("ai_window_size", 256)
     total_frames = _count_video_frames(stage2_output)
-    if total_frames == 0:
-        total_frames = 30000  # fallback: ~20min @ 25fps
+    if total_frames <= 0:
+        # FIX-2026-10-22：原来这里静默 `total_frames = 30000`。
+        #
+        # 实测后果（1080p / 20s / 599 帧，强制 AI）：按 30000 切出 **118 个
+        # 窗口**，其中 **115 个是空的**（每窗还要起一次 vspipe 抽取），
+        # 白烧约 25 分钟，且 `STAGE3_WINDOW Processing frames ...` 的日志
+        # 与实际帧数完全脱节，排查时极具误导性。
+        #
+        # 帧数确定不了属于输入/IO 异常（v7.32 §3.10.18：82 = IO 错误），
+        # 必须显式失败 —— 猜一个数继续跑只会产出可疑结果。
+        logger.error(
+            "STAGE3_FRAME_COUNT_FAIL",
+            f"Cannot determine the frame count of {stage2_output}; "
+            "refusing to guess a window count "
+            "(tried nb_frames / -count_packets / -count_frames / "
+            "duration×fps).")
+        return 82
 
     output_dir = str(Path(temp_dir) / f"{job_id}_upscaled")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -1504,6 +1559,9 @@ def main():
     window_dirs: List[Tuple[str, str]] = []
     all_pts: List[float] = []  # FIX-P8-8: PTS for VFR
     all_frame_mappings: List[Tuple[int, int]] = []  # (win_start, count)
+    # FIX-2026-10-22：统计空窗口。空窗口本身不算错（尾窗可能不满），
+    # 但**成片空**说明 total_frames 估错或抽取失败——必须留痕。
+    empty_windows = 0
 
     for win_start in range(0, total_frames, win_size):
         win_end = min(win_start + win_size, total_frames)
@@ -1520,8 +1578,11 @@ def main():
                                          logger, actual_fps,
                                          pts_map=all_pts_map)
         if not frames:
+            empty_windows += 1
             logger.warning("STAGE3_WINDOW_EMPTY",
-                           f"No frames in window {win_start}")
+                           f"No frames in window {win_start}",
+                           empty_so_far=empty_windows,
+                           expected_total=total_frames)
             continue
 
         # FIX-P8-8: Collect PTS for VFR encoding
@@ -1602,6 +1663,21 @@ def main():
                 logger.error("STAGE3_WINDOW_OOM",
                             "GPU OOM after retry exhausted")
             all_success = False
+
+    # FIX-2026-10-22：成片空窗口必须留痕。
+    # 正常情况最多只有"尾窗不满"，不会出现大片空窗；出现就说明
+    # total_frames 明显偏大（旧版猜 30000 时的典型症状：118 窗里 115 空）。
+    _planned_windows = (total_frames + win_size - 1) // win_size if win_size else 0
+    if empty_windows and (_planned_windows and
+                          empty_windows >= max(3, _planned_windows // 4)):
+        logger.error(
+            "STAGE3_MOSTLY_EMPTY_WINDOWS",
+            f"{empty_windows}/{_planned_windows} windows had no frames while "
+            f"total_frames={total_frames}. The frame count is almost certainly "
+            f"wrong (or extraction is failing); output will be short.",
+            empty_windows=empty_windows, planned=_planned_windows,
+            total_frames=total_frames)
+        all_success = False
 
     # Collect upscaled frames from window outputs
     for win_start, frame_count in all_frame_mappings:
