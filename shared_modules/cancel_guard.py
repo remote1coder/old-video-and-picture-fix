@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -619,6 +620,19 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
                 pass
         raise StageStalled(cmd, inactivity_timeout, last_mark)
     if hard_timeout:
+        # FIX-2026-10-22：这里原来直接写 `subprocess.TimeoutExpired`，但本模块
+        # **从未在模块级导入 subprocess** —— 只有 `_kill_tree_quietly()` 内部
+        # 写了 `import subprocess as _sp`（函数局部、且是别名），另有
+        # run_managed() 内部单独 `import subprocess`（只在该函数内生效）。
+        #
+        # 后果（真实复现）：1080p 隔行源跑 stage1 硬超时时，本该抛
+        # TimeoutExpired，实际抛的是
+        #     NameError: name 'subprocess' is not defined
+        # 于是上层只看到
+        #     STAGE_FAILED  Stage 1 failed: 82 | name 'subprocess' is not defined
+        # —— **真正的"超时"原因被完全掩盖**，排查方向被带偏。
+        #
+        # 已在模块头部补 `import subprocess`。
         raise subprocess.TimeoutExpired(cmd, timeout)
     return out, err, proc.returncode
 
