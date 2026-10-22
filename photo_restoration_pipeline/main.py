@@ -1137,6 +1137,21 @@ def main():
     # FIX-P10-6: Add missing run modes per v7.32 §3.3
     parser.add_argument("--scan", action="store_true",
                        help="Scan directories and generate manifest")
+    # FIX-2026-10-22：色彩偏色**只读诊断**模式。
+    #
+    # 为什么需要：素材是相机翻拍的老照片/文档，"画面里的黄"既可能是染料
+    # 退化（可修），也可能是物体本色（米色卡纸、红嫁衣——属内容，不可动）。
+    # 现有 stage2 的退化判据只看全局通道均值差，会把红色婚礼照这类
+    # 暖色场景误判成褪色（实测 150 张里 23% 触发，其中多数并非褪色）。
+    #
+    # 本模式**一个像素都不改**，只输出：每张的中性参考 R/B、
+    # 三通道量程占比、是否建议校正。判据见 shared_modules/color_diagnose.py
+    # （中性参考偏色 + 蓝通道量程塌缩，双条件同时满足才建议）。
+    parser.add_argument("--diagnose-color", action="store_true",
+                       help="Colour-cast diagnosis only (read-only, "
+                            "modifies no pixels). Writes "
+                            "<output>/color_cast_report.json and "
+                            "color_cast_summary.txt, then exits.")
     parser.add_argument("--output-manifest",
                        default="batch_manifest.yaml",
                        help="Output path for generated manifest")
@@ -1235,6 +1250,39 @@ def main():
     # FIX-P10-2: Propagate --no-wsl-redirect to cli_params per v7.32 §3.10.10
     if args.no_wsl_redirect:
         cli_params["no_wsl_redirect"] = True
+
+    # FIX-2026-10-22: --diagnose-color 只读诊断（不改任何像素）
+    if args.diagnose_color:
+        _diag_inputs = []
+        if args.input:
+            _diag_inputs.append(args.input)
+        if args.input_dir:
+            _diag_inputs.append(args.input_dir)
+        if not _diag_inputs:
+            parser.error("--diagnose-color requires --input or --input-dir")
+
+        sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+        from color_diagnose import diagnose_paths  # noqa: E402
+
+        # 报告落在 --output 指定的目录；未指定时落在 cwd/color_diagnose
+        _diag_out = args.output or os.path.join(os.getcwd(),
+                                                "color_diagnose")
+        rep = diagnose_paths(_diag_inputs, _diag_out, params=config.get(
+            "photo", {}), logger=None)
+        s = rep["summary"]
+        print("[diagnose-color] 已扫描 %d 张，建议校正 %d 张"
+              % (s["total"], s["recommend_count"]))
+        for v, n in sorted(s["by_verdict"].items()):
+            print("  %-14s %5d 张" % (v, n))
+        if s["recommend_files"]:
+            print("  建议校正的文件：")
+            for p in s["recommend_files"][:20]:
+                print("    " + p)
+            if len(s["recommend_files"]) > 20:
+                print("    ...（共 %d 个，见报告）" % len(s["recommend_files"]))
+        print("  报告: " + rep["report_json"])
+        print("  摘要: " + rep["summary_txt"])
+        return 0
 
     # FIX-P10-6: --scan mode per v7.32 §3.3
     if args.scan:
