@@ -92,6 +92,24 @@ def parse_args():
     # ISSUE-V-MAIN-001 / BUG-047: AI CLI overrides (highest priority per v7.3 §3.10.12)
     parser.add_argument("--ai-enabled", action="store_true",
                         help="Enable AI upscale (overrides config.ai.enabled)")
+    # FIX-2026-10-22：补上与照片链对齐的 CLI 开关。
+    #
+    # **注意措辞**：视频链并非"没有放行入口"——能力一直存在，有三条路：
+    #   1. `config.yaml` 的 `ai.force_allow_banned_upscale: false`（第 261 行）
+    #   2. manifest 的 `user_overrides: {force_allow_banned_upscale: true}`
+    #      （merge_params 第 6 层应用，实测 params 里能拿到 True）
+    #   3. stage3 自己被 ban 时的报错也提示"Use force_allow_banned_upscale
+    #      to override"
+    #
+    # 缺的只是**命令行**入口：照片链一直有 `--force-allow-banned-upscale`，
+    # 视频链没有，而对单个素材临时放行时改 config / 编辑 manifest 都很别扭
+    # （config 是全局的，manifest 要手改 YAML）。这里补的是易用性缺口。
+    parser.add_argument("--force-allow-banned-upscale", action="store_true",
+                        help="Override the AI-upscale ban for this run "
+                             "(e.g. 1080p source). Equivalent to config "
+                             "ai.force_allow_banned_upscale=true or manifest "
+                             "user_overrides. Produces >1080p output; "
+                             "use deliberately.")
     parser.add_argument("--ai-upscale-factor", type=int, choices=[2, 4], default=None,
                         help="AI upscale factor 2x or 4x (overrides config.ai.upscale_scale)")
     parser.add_argument("--face-restore", choices=["GFPGAN", "CodeFormer", ""], default=None,
@@ -337,26 +355,48 @@ def merge_params(job: Dict[str, Any], config: Dict[str, Any],
     return params
 
 
+#: 硬超时的"最终保险"默认值（小时）。
+#:
+#: 职责划分（2026-10-21 起的设计，见 config.yaml 与 run_stage 注释）：
+#:   * **看门狗**（`stage_inactivity_timeout`）负责判"卡死"——证据是
+#:     temp 目录在阈值内一个字节没长（STAGE_STALLED，rc=87）；
+#:   * **硬超时**只作最终保险，防"一直在写但写了三天"这类真失控。
+DEFAULT_HARD_TIMEOUT_HOURS = 48.0
+
+
 def _calculate_timeout(video_duration: float, has_ai: bool = False,
-                       width: int = 0, height: int = 0) -> int:
-    """Calculate stage timeout based on video duration **and resolution**.
+                       width: int = 0, height: int = 0,
+                       hard_hours: float = DEFAULT_HARD_TIMEOUT_HOURS) -> int:
+    """返回 stage 的**最终保险**超时（秒）—— 不是工作估算。
 
-    FIX-2026-10-21（16 分钟 1080p 实跑）：旧公式只看时长
-        timeout = 600 + int(duration/60) * 120
-    对 962 秒的素材给出 **42 分钟**，而 stage7 的 AV1 编码实测跑了
-    **3 小时** —— 于是被判超时（rc=87，与"磁盘不足"共用同一个码）。
-    公式**完全不看分辨率**：1080p 和 480p 拿一样的超时，差 6.75 倍工作量。
+    FIX-2026-10-22：修一个"注释与实现相反"的缺陷。
 
-    现在以 640x480 为基准按像素数缩放，并给 CPU 滤镜（颗粒合成）与
-    编码单独留出余量：
+    2026-10-21 已经把"判死"机制换成**看门狗**（temp 目录在
+    `stage_inactivity_timeout` 内没长 → 判卡死，有证据）。config 与
+    run_stage 的注释都明确写着：
 
-    * base 10 分钟（setup）；
-    * 每视频分钟：480p 基准 2 分钟，按像素比线性放大；
-    * 开 AI 时再加 5 分钟/视频分钟（同样按像素放大）；
-    * 上限 4 小时。
+        看门狗负责"卡死"（有证据），48 小时 timeout 只作最终保险。
+        慢机器 / 复杂画面只要还在推进就不会被杀。
 
-    实测校准：962s / 1920x1080 / 无 AI → 600 + 16 × (120×6.75) ≈ 3.8 小时，
-    覆盖实测的 stage1 7min + stage6 24min + stage7 3h。
+    但实现是 `return min(estimate, 3600*48)` —— **估算值继续当判死线**，
+    48h 只是它的上限。于是估算准不准直接决定健康任务会不会被杀：
+
+      * 20s / 1920x1080 / 开 AI：`int(20/60) == 0` → 分辨率缩放与 AI 开销
+        **全被乘零**，只剩 base **600s**；
+      * 962s / 1920x1080：给 3.8h，而实测 stage7 单独就要 3h（仅 27% 余量）。
+
+    实测后果（2026-10-22，1080p 隔行素材强制开 AI）：stage1 的 QTGMC
+    反交错处理 651 帧，**正常推进、正常写盘**，跑到第 600 秒被硬超时杀掉
+    —— 正是设计要避免的"慢的被杀"。更糟的是这次杀进程又撞上
+    cancel_guard 的 `subprocess` NameError（已修），报错连"超时"都看不出来。
+
+    现在按注释本意实现：**估算只作参考与告警，硬超时恒取保险值**。
+
+    为什么不用 `max(estimate, hard)`：那样估算一旦超过 48h（例如 1 小时
+    4K + AI 的估算达 84h）就重新变成判死线，等于把刚修掉的毛病又装回去。
+    改成：估算超过保险值时往 stderr 打一条告警，提示调高
+    `stage_hard_timeout_hours` —— 让"要不要放宽"由人决定，而不是被一个
+    猜出来的数字静默决定。
     """
     base = 600  # 10 min setup
     per_minute_480p = 120  # 2 min per video minute at 640x480
@@ -366,13 +406,19 @@ def _calculate_timeout(video_duration: float, has_ai: bool = False,
     per_minute = per_minute_480p * scale
     if has_ai:
         per_minute += 300 * scale  # +5 min per video minute, also scaled
-    timeout = base + int(video_duration / 60) * int(per_minute)
-    # FIX-2026-10-21（方案 A）：4 小时硬顶对长片 + AI 根本不够。
-    # 16 分钟 1080p **纯传统链**的 stage7 实测就要 3 小时；开了 AI 后
-    # 1080p×28840 帧的推理量级远超 4 小时。而"卡死"现在由 inactivity
-    # watchdog 负责（见 run_stage），这个 timeout 只作**最终保险**，
-    # 防"一直在写但写了三天"这类真正的失控，因此放到 48 小时。
-    return min(timeout, 3600 * 48)  # Final safety net, not a work estimate
+    # 估算值（参考用）。短视频按"不满一分钟计一分钟"，否则会被截断成 0，
+    # 让参考值失真到看不出分辨率/AI 的影响。
+    _minutes = max(1.0, float(video_duration) / 60.0)
+    estimate = base + int(_minutes * per_minute)
+    hard = int(max(0.1, float(hard_hours)) * 3600)
+    if estimate > hard:
+        # 不作判死，只提示：让操作者知道"校准估算已经超过保险值"。
+        sys.stderr.write(
+            "WARN: stage 估算耗时 %ds (%.1fh) 已超过硬超时保险值 %ds (%.1fh)。"
+            "硬超时不会按估算判死；若该素材确实需要更久，请调高 config 的 "
+            "stage_hard_timeout_hours。\n"
+            % (estimate, estimate / 3600.0, hard, hard / 3600.0))
+    return hard
 
 
 def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
@@ -429,10 +475,18 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     has_ai = params.get("ai_enabled", False)
     # FIX-2026-10-21：把分辨率传进去 —— 旧调用只传时长，1080p 与 480p
     # 拿一样超时（实测 962s/1080p 的 stage7 需要 3 小时，旧公式只给 42 分钟）。
+    # FIX-2026-10-22：硬超时改为**最终保险**（默认 48h，走
+    # `stage_hard_timeout_hours`），判死交给下面的看门狗。
+    try:
+        _hard_hours = float(params.get("stage_hard_timeout_hours")
+                            or DEFAULT_HARD_TIMEOUT_HOURS)
+    except (TypeError, ValueError):
+        _hard_hours = DEFAULT_HARD_TIMEOUT_HOURS
     timeout = _calculate_timeout(
         video_duration, has_ai,
         width=int(job.get("original_width") or params.get("original_width") or 0),
-        height=int(job.get("original_height") or params.get("original_height") or 0))
+        height=int(job.get("original_height") or params.get("original_height") or 0),
+        hard_hours=_hard_hours)
 
     # Run under inactivity watchdog (FIX-2026-10-21)
     #
@@ -1001,6 +1055,12 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         cli_overrides["ai_face_restore"] = _face_restore
     if _ai_model is not None:
         cli_overrides["ai_upscale_model"] = _ai_model
+    # FIX-2026-10-22：强制放行 AI 封禁（1080p 素材）。
+    # stage3/4/5 的挂载条件用的是 `not (ai_banned and not force_allow)`，
+    # 所以这个键必须在 merge_params **之前**进 cli_overrides，
+    # 否则 stage 列表里根本不会有 stage3 → AI 静默不执行。
+    if args.get("force_allow_banned_upscale"):
+        cli_overrides["force_allow_banned_upscale"] = True
 
     # Merge params
     params = merge_params(job, config, cli_overrides, logger)
