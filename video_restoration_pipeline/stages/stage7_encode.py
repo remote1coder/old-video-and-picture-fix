@@ -1376,9 +1376,10 @@ def main():
 
     # Video encoding with audio sync flags
     # BUG-041 fix: defer svtav1-params construction until all parameters are known
-    # FIX-R7-S7-A4: -fflags +genpts is an OUTPUT option ("封装时使用 -fflags +genpts"
-    # per v7.32 §3.10.9). ORIGINAL placed it before -i (input side). It is now
-    # added on the output side below, before the output path.
+    #
+    # 注：`FIX-R7-S7-A4` 曾声称 `-fflags +genpts` 是输出侧选项并把它移到
+    # 输出路径之前。这与 ffmpeg 文档相悖——`-fflags` 是 **input** 选项，
+    # 只对紧随其后的输入生效。已按文档改回 `-i` 之前（见上方 video_cmd）。
     # FIX-R7-S7-13: support libx265 (HEVC) as an alternative encoder per v6.32
     # Part 3 ("libsvtav1 或 libx265"). config video_encoder selects the codec;
     # libsvtav1 remains the default. libx265 uses -preset slow -crf 18.
@@ -1397,8 +1398,19 @@ def main():
     video_encoder = _ENCODER_ALIASES.get(
         str(_raw_enc).strip().lower(), str(_raw_enc).strip())
     common_prefix = ["ffmpeg", "-hide_banner", "-v", "error", "-y"]
-    video_cmd = common_prefix + ["-i", input_source]
+    # FIX-2026-10-23：`-fflags` 是 **input** 选项，必须写在 `-i` 之前才生效。
+    #
+    # 原实现把 `-fflags +genpts` 放在**输出路径之前**（见下方 output 块），
+    # 那时它已被当成输出侧标志 —— 按 ffmpeg 文档，`-fflags` 只对
+    # **紧随其后的输入文件**生效，放在 `-i` 之后等于没写。
+    # 后果：本意是"封装时重建一份干净的容器 PTS"，实际从未执行，
+    # 输入里被摊薄/不均的时间戳被原样交给 muxer。
+    video_cmd = common_prefix + ["-fflags", "+genpts", "-i", input_source]
     output_opts: List[str] = []
+    # FIX-2026-10-23：显式指定 passthrough，禁止 ffmpeg 为了凑恒定
+    # 帧率而复制/丢弃帧。默认值 `auto` 会按 muxer 能力选 cfr 或 vfr，
+    # 两者都会改变帧数（cfr 复制+丢弃，vfr 丢弃时间戳重复的帧）。
+    output_opts.extend(["-fps_mode", "passthrough"])
     if video_encoder == "libx265":
         # x265 CRF 18 ≈ visually lossless; preset slow per v6.32 Part 3.
         output_opts.extend(["-c:v", "libx265",
@@ -1870,10 +1882,6 @@ def main():
         # FIX-P7-12: Use proper datetime import per CLAUDE.md §4
         # ORIGINAL: __import__('datetime').datetime.now().isoformat()
         "-metadata", f"restored_at={datetime.datetime.now().isoformat()}",
-        # FIX-R7-S7-A4: -fflags +genpts is an OUTPUT option ("封装时使用 -fflags
-        # +genpts" per v7.32 §3.10.9) — placed here before the output path so
-        # FFmpeg regenerates container PTS at mux time without modifying samples.
-        "-fflags", "+genpts",
         "-y", _publish_tmp,
     ])
 
