@@ -82,6 +82,18 @@ global:
   # 打开此项可拿到产物，但产物仍带漂移，日志记 ERROR 且元数据跟随，
   # 不等于验过。
   allow_sync_fail_publish: false
+  # ---- 全链核对（原始素材 vs 成品）----
+  # stage7 原有的两道核对都只看局部（编码这一跳 / 成品内部音视频），
+  # "源片 → 成品"的帧数丢失与时长漂移此前从未自动核对。
+  full_chain_verify: true
+  # frames_only  帧数拦 + 时长/漂移**只记录**（默认，误杀最低）
+  # relative     帧数拦 + 时长拦（源片 vs 成品，相对判据）
+  # absolute     再加"成品自身是否满足绝对阈值"（实测老素材约 31% 会失败）
+  # 结果一律写入 `<output>.fullchain.json`，便于事后筛选。
+  full_chain_verify_mode: frames_only
+  # 校验失败仍强制出片（默认 false）。打开后仍会记 ERROR 并把问题
+  # 写进 fullchain.json 跟随文件 —— **不等于验过**。
+  allow_verify_fail_publish: false
   # 音画同步阈值（毫秒）。默认按 ITU-R BT.1359-1 可接受线（+90/−185ms）
   # 的约 2 倍取 —— 老磁带/古董手机素材本身可能带原始偏移，硬卡标准值会误杀。
   # 四类素材差异很大，所以全部开放手动调整（设非正数则退回默认值）。
