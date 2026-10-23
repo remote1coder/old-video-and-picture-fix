@@ -477,16 +477,30 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     # 拿一样超时（实测 962s/1080p 的 stage7 需要 3 小时，旧公式只给 42 分钟）。
     # FIX-2026-10-22：硬超时改为**最终保险**（默认 48h，走
     # `stage_hard_timeout_hours`），判死交给下面的看门狗。
+    # FIX-2026-10-24：`stage_hard_timeout_hours` 设 **0 或负数 = 完全禁用
+    # 硬超时**（有的素材确实要跑非常久，48 小时也不够）。
     try:
-        _hard_hours = float(params.get("stage_hard_timeout_hours")
-                            or DEFAULT_HARD_TIMEOUT_HOURS)
+        _hard_hours = float(params.get("stage_hard_timeout_hours",
+                                       DEFAULT_HARD_TIMEOUT_HOURS))
     except (TypeError, ValueError):
         _hard_hours = DEFAULT_HARD_TIMEOUT_HOURS
-    timeout = _calculate_timeout(
-        video_duration, has_ai,
-        width=int(job.get("original_width") or params.get("original_width") or 0),
-        height=int(job.get("original_height") or params.get("original_height") or 0),
-        hard_hours=_hard_hours)
+
+    if _hard_hours <= 0:
+        # 硬超时停用。此时唯一防线是下面的看门狗；若看门狗也关了，
+        # 就是真的不限时（用户明确要求，需自行承担风险）。
+        timeout = None
+        logger.warning("STAGE_HARD_TIMEOUT_DISABLED",
+                       "stage_hard_timeout_hours<=0: the hard timeout is OFF; "
+                       "only the inactivity watchdog (if enabled) can stop a "
+                       "stalled stage", job_id=job.get("job_id", ""))
+    else:
+        timeout = _calculate_timeout(
+            video_duration, has_ai,
+            width=int(job.get("original_width")
+                      or params.get("original_width") or 0),
+            height=int(job.get("original_height")
+                       or params.get("original_height") or 0),
+            hard_hours=_hard_hours)
 
     # Run under inactivity watchdog (FIX-2026-10-21)
     #

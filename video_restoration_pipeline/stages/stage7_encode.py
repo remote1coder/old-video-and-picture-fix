@@ -1075,10 +1075,32 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
     a = intervals["a"]
     v_start, a_start = v["content_start"], a["content_start"]
     v_end, a_end = v["raw_end"], a["raw_end"]
-    start_diff = abs(v_start - a_start)
-    end_diff = abs(v_end - a_end)
-    dur_diff = abs(v["raw_span"] - a["raw_span"])
-    diff_ms = max(start_diff, end_diff, dur_diff) * 1000
+    # FIX-2026-10-24：阈值按 ITU-R BT.1359-1 分级，并**区分方向**。
+    #
+    # 原实现用 `abs()` 取三项最大值后统一按 500ms 判 —— 方向信息在 abs()
+    # 里就丢了，而标准给出的窗口是**明显不对称**的：
+    #     声音超前：可察觉 +45ms、可接受 +90ms
+    #     声音滞后：可察觉 −125ms、可接受 −185ms
+    #   （声音滞后比超前容忍约 2.7 倍：自然界里声音总是晚到，大脑更宽容）
+    # 原 500ms 阈值 ≈ 可接受上限 185ms 的 2.7 倍，明显偏松。
+    #
+    # 这里取绝对值最大的那一项，并**保留其符号**来决定方向：
+    #   signed > 0 → 声音滞后（可放宽）；signed < 0 → 声音超前（要严）。
+    # 阈值取标准可接受线的约 2 倍（400 / 200），因为老磁带素材本身
+    # 可能带原始偏移，按 185ms 直接卡会大量误杀。
+    start_signed = a_start - v_start
+    end_signed = a_end - v_end
+    dur_signed = a["raw_span"] - v["raw_span"]
+    _name, _signed = max(
+        (("start", start_signed), ("end", end_signed), ("dur", dur_signed)),
+        key=lambda x: abs(x[1]))
+    diff_ms = abs(_signed) * 1000
+    audio_lags = _signed > 0
+    fail_ms = 400.0 if audio_lags else 200.0
+    warn_ms = 185.0 if audio_lags else 90.0
+    # 兼容既有 _detail() 与日志里用到的三个分量（保持绝对值语义）
+    start_diff, end_diff, dur_diff = (
+        abs(start_signed), abs(end_signed), abs(dur_signed))
 
     def _detail():
         return dict(video_content_start=v_start, video_raw_end=v_end,
@@ -1089,13 +1111,24 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
                     duration_drift_ms=dur_diff * 1000,
                     encoder_priming_ms=priming_ms)
 
-    if diff_ms > 500:
+    if diff_ms > fail_ms:
         logger.error("STAGE7_SYNC_FAIL",
-                     f"AV sync difference {diff_ms:.0f}ms exceeds 500ms threshold "
+                     f"AV sync difference {diff_ms:.0f}ms exceeds "
+                     f"{fail_ms:.0f}ms threshold "
+                     f"({'audio lags' if audio_lags else 'audio leads'} video; "
+                     f"ITU-R BT.1359-1 acceptability is "
+                     f"{'185ms' if audio_lags else '90ms'}) "
                      f"(start {start_diff * 1000:.0f}ms / end {end_diff * 1000:.0f}ms "
                      f"/ drift {dur_diff * 1000:.0f}ms)", **_detail())
         return 86
-    elif diff_ms > 300:
+    elif diff_ms > warn_ms:
+        logger.warning("STAGE7_SYNC_WARN",
+                       f"AV sync difference {diff_ms:.0f}ms exceeds "
+                       f"{warn_ms:.0f}ms "
+                       f"({'audio lags' if audio_lags else 'audio leads'})",
+                       **_detail())
+        return 0  # Continue but warn
+    elif diff_ms > 0:
         logger.warning("STAGE7_SYNC_WARN",
                        f"AV sync difference {diff_ms:.0f}ms exceeds 300ms threshold, "
                        "sync processing recommended", **_detail())
@@ -1797,6 +1830,20 @@ def main():
                 logger)
             if extracted:
                 audio_path = extracted
+                # FIX-2026-10-24：回退分支必须同步更新 has_audio。
+                #
+                # 原实现只改了 `audio_path`（混音用的是它，所以音轨确实
+                # 进了成品），却没更新 `has_audio`。而音画同步校验的
+                # 条件是 `if has_audio:` —— 于是出现：
+                #     音轨已混入 ✓ / 同步校验被跳过 ✗
+                #     → 日志却写 "promoted ... after validation"
+                #
+                # 实测（2026-10-23）：中间音轨缺失时走此分支，成品视频
+                # 21.035s / 音频 20.03s（漂移约 1.0s，远超 500ms 阈值），
+                # 仍然 rc=0 发布。把同一份成品直接喂给
+                # `_validate_av_sync()` 会返回 86 —— 校验本身是对的，
+                # 只是根本没被调用。
+                has_audio = True
                 audio_layout = _get_audio_layout(audio_path)
                 audio_filter = _build_audio_filter(
                     audio_path, params, logger, tempo_ratio=tempo_ratio,
@@ -1902,9 +1949,26 @@ def main():
             if has_audio:
                 sync_result = _validate_av_sync(_publish_tmp, logger)
                 if sync_result != 0:
-                    # 校验失败：丢弃本次暂存，既有成品保持不变
-                    _discard_attempt_tmp(_publish_tmp, logger)
-                    return sync_result
+                    # FIX-2026-10-24：加**强制出片**逃生门。
+                    #
+                    # 收紧同步阈值后，一批"时间轴本身就不规整"的老素材
+                    # 会从"悄悄出片"变成"判失败"。这是质量管控的进步，
+                    # 但会让这些素材拿不到任何产物。
+                    #
+                    # `allow_sync_fail_publish: true` 时仍然发布，但：
+                    #   1) 写 ERROR 日志 + `timing_state` 元数据跟随文件；
+                    #   2) 退出码仍为 0，问题不掩盖、可追溯。
+                    # 默认关闭 —— 漂移超限就该拦。
+                    _force = bool(params.get("allow_sync_fail_publish", False))
+                    if not _force:
+                        _discard_attempt_tmp(_publish_tmp, logger)
+                        return sync_result
+                    logger.error(
+                        "STAGE7_SYNC_FAIL_FORCE_PUBLISHED",
+                        "A/V sync check FAILED but allow_sync_fail_publish "
+                        "is on: publishing anyway. The artifact carries the "
+                        "drift; do not treat it as verified.",
+                        rc=sync_result, path=_publish_tmp)
 
             # FIX-2026-10-20（第六轮 §2.5 待办）：色彩保真校验门。
             #
