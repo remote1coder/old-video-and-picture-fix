@@ -1003,6 +1003,19 @@ def _probe_audio_presence(path: str) -> str:
     return "present" if r.stdout.strip() else "absent"
 
 
+def _force_publish_enabled(params: dict, key: str) -> bool:
+    """强制出片开关是否打开（纯函数，便于单测）。
+
+    stage7 有三道独立的核对门，每道都可能判失败：
+        1. 音画同步（成品内部）      → allow_sync_fail_publish
+        2. 全链核对（源片 vs 成品）  → allow_verify_fail_publish
+        3. 机械核对（step6 vs 成品） → allow_verify_fail_publish
+    三处统一走这里，避免"新加一道门却忘了带强制开关"——
+    实测 2026-10-24 第 3 道门就曾是无条件 return 86，绕不过去。
+    """
+    return bool((params or {}).get(key, False))
+
+
 def _fullchain_blockers(checks: dict, mode: str,
                         sync_abs_rc: int = 0) -> List[str]:
     """全链核对：按模式决定**哪些判据要拦**（纯函数，便于单测）。
@@ -2060,7 +2073,7 @@ def main():
                     #   1) 写 ERROR 日志 + `timing_state` 元数据跟随文件；
                     #   2) 退出码仍为 0，问题不掩盖、可追溯。
                     # 默认关闭 —— 漂移超限就该拦。
-                    _force = bool(params.get("allow_sync_fail_publish", False))
+                    _force = _force_publish_enabled(params, "allow_sync_fail_publish")
                     if not _force:
                         _discard_attempt_tmp(_publish_tmp, logger)
                         return sync_result
@@ -2177,8 +2190,8 @@ def main():
                 # 与音画同步一致：加**强制出片**逃生门。
                 # `allow_verify_fail_publish: true` 时仍然发布，但记 ERROR，
                 # 且问题写进 `<output>.fullchain.json` 跟随文件，不等于验过。
-                _fc_force = bool(params.get("allow_verify_fail_publish",
-                                            False))
+                _fc_force = _force_publish_enabled(
+                        params, "allow_verify_fail_publish")
                 if not _fc_force:
                     logger.error(
                         "STAGE7_FULLCHAIN_BLOCKED",
@@ -2300,11 +2313,34 @@ def main():
                                  "Output failed the mechanical check",
                                  sidecar=_side,
                                  verdict=render_verdict(_ver))
-                    # 核对失败不清成品（它可能仍有价值），但必须让 main
-                    # 知道这次运行不算成功 —— 退出码 86 = 验证失败。
-                    if _cancel_guard is not None:
-                        _cancel_guard.release_outputs()
-                    return 86
+                    # FIX-2026-10-24：这道门原本**没有强制开关**，无条件
+                    # return 86。于是"用户能强制跑通整个流程"这个要求
+                    # 只满足了两道门（音画同步、全链核对），第三道绕不过去。
+                    #
+                    # 实测（2026-10-24，VID_20150614_145458）：
+                    #   帧数 292→292 完全正确，但时长 15.163→15.723
+                    #   （+3.7%）触发 DURATION_MISMATCH → 作业判 86，
+                    #   成品其实已经落盘且可用。
+                    #
+                    # 现在与另两道门统一：allow_verify_fail_publish 为真时
+                    # 保留成品并按成功返回，但记 ERROR 且 verdict 留在
+                    # .verify.json 里 —— **不等于验过**。
+                    _mforce = _force_publish_enabled(
+                            params, "allow_verify_fail_publish")
+                    if _mforce:
+                        logger.error(
+                            "STAGE7_VERIFY_FAIL_FORCE_ACCEPTED",
+                            "Mechanical check FAILED but "
+                            "allow_verify_fail_publish is on: keeping the "
+                            "artifact and treating the run as SUCCESS. "
+                            "The artifact is NOT verified.",
+                            sidecar=_side, verdict=render_verdict(_ver))
+                    else:
+                        # 核对失败不清成品（它可能仍有价值），但必须让 main
+                        # 知道这次运行不算成功 —— 退出码 86 = 验证失败。
+                        if _cancel_guard is not None:
+                            _cancel_guard.release_outputs()
+                        return 86
             except Exception as _ve:
                 # 核对器自身出问题不应把一次成功的编码判死，但要留痕
                 logger.warning("STAGE7_VERIFY_ERROR", str(_ve))

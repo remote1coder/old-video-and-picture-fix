@@ -116,3 +116,33 @@ def test_config_declares_the_switches():
     # 阈值可手动调整
     assert top.get("sync_fail_ms_lag", 400) == 400
     assert top.get("sync_fail_ms_lead", 200) == 200
+
+
+# ------------------------------------------------- 强制出片必须覆盖所有门
+
+def test_force_publish_helper(s7):
+    """_force_publish_enabled 是纯函数，三种入参都要可预期。"""
+    assert s7._force_publish_enabled({}, "allow_verify_fail_publish") is False
+    assert s7._force_publish_enabled({"allow_verify_fail_publish": True},
+                                     "allow_verify_fail_publish") is True
+    assert s7._force_publish_enabled(None, "allow_verify_fail_publish") is False
+    # 不同门的 key 不能串
+    assert s7._force_publish_enabled({"allow_sync_fail_publish": True},
+                                     "allow_verify_fail_publish") is False
+
+
+def test_all_three_gates_have_a_force_switch():
+    """stage7 有三道核对门，每道都必须带强制开关。
+
+    实测 2026-10-24：机械核对门（step6 vs 成品）曾是无条件 return 86，
+    于是"用户能强制跑通整个流程"只满足了两道门。这条测试防止
+    将来再新增门禁时又漏掉强制分支。
+    """
+    import io
+    src_text = io.open(_STAGE7, encoding="utf-8", errors="replace").read()
+    for gate in ("STAGE7_SYNC_FAIL", "STAGE7_FULLCHAIN_BLOCKED",
+                 "STAGE7_VERIFY_FAIL"):
+        assert gate in src_text, f"找不到门禁事件 {gate}"
+    # 三道门都必须经由统一的强制判断，不能各自写 bool(params.get(...))
+    assert src_text.count("_force_publish_enabled(") >= 4, \
+        "强制判断没有收敛到 _force_publish_enabled（定义 1 次 + 调用 3 次）"
