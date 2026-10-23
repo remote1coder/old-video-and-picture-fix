@@ -1003,6 +1003,36 @@ def _probe_audio_presence(path: str) -> str:
     return "present" if r.stdout.strip() else "absent"
 
 
+def _fullchain_blockers(checks: dict, mode: str,
+                        sync_abs_rc: int = 0) -> List[str]:
+    """全链核对：按模式决定**哪些判据要拦**（纯函数，便于单测）。
+
+    Args:
+        checks: `artifact_verify.verify_output()` 返回的 checks 字段。
+        mode: frames_only | relative | absolute；未知值按 frames_only 处理。
+        sync_abs_rc: `absolute` 档额外跑的"成品自身绝对漂移"返回码
+            （0 = 通过，非 0 = 超限）。
+
+    Returns:
+        被拦下的判据名列表；空列表表示放行。
+
+    三档语义：
+        frames_only  只拦帧数（最硬、误杀最低），时长/漂移只记录
+        relative     + 拦时长（源片 vs 成品，相对判据）
+        absolute     + 拦成品自身绝对漂移
+    """
+    m = (mode or "frames_only").strip().lower()
+    blocked: List[str] = []
+    if (checks or {}).get("frames", {}).get("ok") is False:
+        blocked.append("FRAMES")
+    if m in ("relative", "absolute"):
+        if (checks or {}).get("duration", {}).get("ok") is False:
+            blocked.append("DURATION")
+    if m == "absolute" and sync_abs_rc != 0:
+        blocked.append("SYNC_ABSOLUTE")
+    return blocked
+
+
 def _measure_av_drift(path: str) -> Optional[float]:
     """量出某个文件音视频之间的**带符号**漂移（秒）。
 
@@ -2128,16 +2158,12 @@ def main():
                     except Exception:
                         pass
                     _ck = (_fc or {}).get("checks") or {}
-                    if _ck.get("frames", {}).get("ok") is False:
-                        _fc_blocked.append("FRAMES")
-                    if _fc_mode in ("relative", "absolute"):
-                        if _ck.get("duration", {}).get("ok") is False:
-                            _fc_blocked.append("DURATION")
+                    # absolute 档额外跑一次"不看源片基准"的绝对漂移判定
+                    _abs_rc = 0
                     if _fc_mode == "absolute":
-                        # 绝对档：不看源片基准，直接按成品自身漂移判
-                        if _validate_av_sync(_publish_tmp, logger,
-                                             params) != 0:
-                            _fc_blocked.append("SYNC_ABSOLUTE")
+                        _abs_rc = _validate_av_sync(_publish_tmp, logger,
+                                                    params)
+                    _fc_blocked = _fullchain_blockers(_ck, _fc_mode, _abs_rc)
                     logger.info("STAGE7_FULLCHAIN_VERIFY",
                                 "Full-chain verification (source vs output)",
                                 mode=_fc_mode,
