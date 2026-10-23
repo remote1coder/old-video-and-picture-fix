@@ -1601,12 +1601,20 @@ def main():
             # ——那会把不可见的参考帧变成可见，片头平白多出画面，
             # 属于**改内容**，与本项目「只改画面质量不改内容」的原则冲突。
             if consecutive_empty >= 3:
-                logger.warning(
+                logger.error(
                     "STAGE3_WINDOW_LOOP_EARLY_STOP",
                     f"Stopped after {consecutive_empty} consecutive empty "
                     f"windows at {win_start}; total_frames={total_frames} is "
                     f"likely an overcount (packet count vs displayable frames).",
                     total_frames=total_frames, stopped_at=win_start)
+                # FIX-2026-10-23：终止必须视为**失败**，不能静默继续。
+                # 连续 3 个窗口抽不出帧，既可能是"包数高估"（无害），
+                # 也可能是"抽取连续失败"（有害）。两者无法从循环内区分，
+                # 而本项目原则是"宁可失败，不可静默产出缺帧成品"
+                # （与下方 partial-window-failure 的处理保持一致）。
+                # 注：改用 -count_packets 后，包数与显示帧数通常很接近
+                # （如 651 vs 599，尾窗仍非空），此分支基本不会触发。
+                all_success = False
                 break
             continue
         consecutive_empty = 0
