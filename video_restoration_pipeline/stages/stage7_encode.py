@@ -2097,6 +2097,77 @@ def main():
             # PUB-04（第七轮）：发布瞬间必须持有目标锁。编码阶段各自写
             # attempt 独占的暂存文件，互不冲突，**不需要**长时间持锁；
             # 只有 replace 到同一个最终路径这一步需要互斥 ——
+            # FIX-2026-10-24（方案 1）：**全链核对 —— 原始素材 vs 成品**。
+            #
+            # stage7 原有的两道核对都只看局部：
+            #   * verify_output(input_source, output) → 只比"编码这一跳"
+            #   * _validate_av_sync()                → 只比成品内部的音视频
+            # 而"源片 → 成品"的帧数丢失/时长漂移，自动流程里**从未核对过**
+            # （artifact_verify 只以独立 CLI 形式存在，main.py 从不调用）。
+            #
+            # 三档模式（默认 frames_only，误杀最低）：
+            #   frames_only  帧数拦 + 时长/漂移**只记录**
+            #   relative     帧数拦 + 时长拦（源片 vs 成品，相对判据）
+            #   absolute     再加"成品自身是否满足绝对阈值"
+            # 无论哪档，结果都写进 `<output>.fullchain.json`，便于事后筛选。
+            #
+            # 帧数判据之所以安全：`expected_frame_counts()` 已覆盖
+            # IVTC(5→4)、QTGMC divisor=1(翻倍)、divisor=2(不变) 三种合法变化。
+            _fc_blocked: List[str] = []
+            if params.get("full_chain_verify", True):
+                _fc_mode = str(params.get("full_chain_verify_mode",
+                                          "frames_only")).strip().lower()
+                try:
+                    from artifact_verify import verify_output as _fc_verify
+                    _fc = _fc_verify(args.input, _publish_tmp, params)
+                    try:
+                        import json as _fcj
+                        with open(str(output_path) + ".fullchain.json",
+                                  "w", encoding="utf-8") as _f:
+                            _fcj.dump(_fc, _f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                    _ck = (_fc or {}).get("checks") or {}
+                    if _ck.get("frames", {}).get("ok") is False:
+                        _fc_blocked.append("FRAMES")
+                    if _fc_mode in ("relative", "absolute"):
+                        if _ck.get("duration", {}).get("ok") is False:
+                            _fc_blocked.append("DURATION")
+                    if _fc_mode == "absolute":
+                        # 绝对档：不看源片基准，直接按成品自身漂移判
+                        if _validate_av_sync(_publish_tmp, logger,
+                                             params) != 0:
+                            _fc_blocked.append("SYNC_ABSOLUTE")
+                    logger.info("STAGE7_FULLCHAIN_VERIFY",
+                                "Full-chain verification (source vs output)",
+                                mode=_fc_mode,
+                                blocked=_fc_blocked or None,
+                                checks=_ck)
+                except Exception as _fc_exc:
+                    logger.warning("STAGE7_FULLCHAIN_VERIFY_FAIL",
+                                   f"Full-chain verify raised: {_fc_exc}")
+
+            if _fc_blocked:
+                # 与音画同步一致：加**强制出片**逃生门。
+                # `allow_verify_fail_publish: true` 时仍然发布，但记 ERROR，
+                # 且问题写进 `<output>.fullchain.json` 跟随文件，不等于验过。
+                _fc_force = bool(params.get("allow_verify_fail_publish",
+                                            False))
+                if not _fc_force:
+                    logger.error(
+                        "STAGE7_FULLCHAIN_BLOCKED",
+                        "Full-chain verification FAILED; refusing to publish. "
+                        "Set allow_verify_fail_publish=true to force.",
+                        blocked=_fc_blocked)
+                    _discard_attempt_tmp(_publish_tmp, logger)
+                    return 86
+                logger.error(
+                    "STAGE7_FULLCHAIN_FORCE_PUBLISHED",
+                    "Full-chain verification FAILED but "
+                    "allow_verify_fail_publish is on: publishing anyway. "
+                    "The artifact is NOT verified.",
+                    blocked=_fc_blocked)
+
             # 否则两个 attempt（同 job 重试，或不同 job 撞同一 -o）
             # 会互相覆盖，且失败方回滚时可能删掉对方刚发布的结果。
             try:
