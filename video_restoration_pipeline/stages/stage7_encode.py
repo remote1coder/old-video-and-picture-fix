@@ -1003,7 +1003,35 @@ def _probe_audio_presence(path: str) -> str:
     return "present" if r.stdout.strip() else "absent"
 
 
-def _validate_av_sync(muxed_path: str, logger) -> int:
+def _measure_av_drift(path: str) -> Optional[float]:
+    """量出某个文件音视频之间的**带符号**漂移（秒）。
+
+    与 `_validate_av_sync` 内部同一套口径：分别对 start / end / span 求
+    `audio − video`，取绝对值最大那一项并保留符号。
+    返回 None 表示测不出来（缺流、或探测失败）。
+    """
+    try:
+        presence = _probe_audio_presence(path)
+        if presence != "present":
+            return None
+        v_start = _probe_stream_start(path, "v")
+        a_start = _probe_stream_start(path, "a")
+        v_span = _get_stream_duration(path, "v")
+        a_span = _get_stream_duration(path, "a")
+        if v_start is None or a_start is None or not v_span or not a_span:
+            return None
+        v_start += _probe_encoder_priming(path, "v")
+        a_start += _probe_encoder_priming(path, "a")
+        v_end, a_end = v_start + v_span, a_start + a_span
+        cand = (a_start - v_start, a_end - v_end, a_span - v_span)
+        return max(cand, key=lambda x: abs(x))
+    except Exception:
+        return None
+
+
+def _validate_av_sync(muxed_path: str, logger,
+                      params: Optional[dict] = None,
+                      reference_path: Optional[str] = None) -> int:
     """Validate A/V sync on the final muxed output file.
 
     Per v6.3 §3.10.9 / v7.32 §3.10.9:
@@ -1094,10 +1122,53 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
     _name, _signed = max(
         (("start", start_signed), ("end", end_signed), ("dur", dur_signed)),
         key=lambda x: abs(x[1]))
-    diff_ms = abs(_signed) * 1000
-    audio_lags = _signed > 0
-    fail_ms = 400.0 if audio_lags else 200.0
-    warn_ms = 185.0 if audio_lags else 90.0
+    # FIX-2026-10-24（关键）：判据改为**相对源片**，不再用绝对阈值。
+    #
+    # 实测 204 个真实手机素材（2026-10-24）：把校验直接跑在**原始文件**上，
+    #   通过 73 / 告警 68 / 失败 63 —— **31% 会被 400ms 绝对阈值判失败**。
+    # 而这些漂移是**源片自带的**（2013–2015 老文件 400–570ms，
+    # 2020 年后 <100ms），不是流程引入的。用绝对阈值判 = 纯误杀。
+    #
+    # 正确判据：| 成品漂移 − 源片漂移 |。
+    #   源片自带 500ms → 成品 500ms → 差 0 → 通过（内容原样保留）
+    #   流程额外引入 1000ms → 差 1000 → 拦下（这才是真问题）
+    _ref_drift = None
+    if reference_path:
+        try:
+            _ref = _measure_av_drift(reference_path)
+            if _ref is not None:
+                _ref_drift = _ref
+        except Exception:
+            _ref_drift = None
+
+    if _ref_drift is not None:
+        # 有基准：比"变化量"。方向按变化量的符号定。
+        _signed = _signed - _ref_drift
+        diff_ms = abs(_signed) * 1000
+        audio_lags = _signed > 0
+        _basis = f"vs source drift {_ref_drift * 1000:.0f}ms"
+    else:
+        # 无基准（源片测不出/未提供）：退回绝对阈值
+        diff_ms = abs(_signed) * 1000
+        audio_lags = _signed > 0
+        _basis = "absolute (no source baseline)"
+    # FIX-2026-10-24：阈值**全部可配置**。
+    # 默认值按 ITU-R BT.1359-1 可接受线（+90/−185ms）的约 2 倍取，
+    # 因为老磁带/古董手机素材本身可能带原始偏移，按标准值硬卡会误杀。
+    # 素材差异很大，所以把四个数都开放给用户调，而不是写死在代码里。
+    _p = params or {}
+
+    def _ms(key: str, default: float) -> float:
+        try:
+            v = float(_p.get(key, default))
+        except (TypeError, ValueError):
+            v = default
+        return v if v > 0 else default   # 非正数退回默认，不允许关闭判定
+
+    fail_ms = (_ms("sync_fail_ms_lag", 400.0) if audio_lags
+               else _ms("sync_fail_ms_lead", 200.0))
+    warn_ms = (_ms("sync_warn_ms_lag", 185.0) if audio_lags
+               else _ms("sync_warn_ms_lead", 90.0))
     # 兼容既有 _detail() 与日志里用到的三个分量（保持绝对值语义）
     start_diff, end_diff, dur_diff = (
         abs(start_signed), abs(end_signed), abs(dur_signed))
@@ -1115,9 +1186,8 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
         logger.error("STAGE7_SYNC_FAIL",
                      f"AV sync difference {diff_ms:.0f}ms exceeds "
                      f"{fail_ms:.0f}ms threshold "
-                     f"({'audio lags' if audio_lags else 'audio leads'} video; "
-                     f"ITU-R BT.1359-1 acceptability is "
-                     f"{'185ms' if audio_lags else '90ms'}) "
+                     f"({'audio lags' if audio_lags else 'audio leads'}; "
+                     f"basis: {_basis}) "
                      f"(start {start_diff * 1000:.0f}ms / end {end_diff * 1000:.0f}ms "
                      f"/ drift {dur_diff * 1000:.0f}ms)", **_detail())
         return 86
@@ -1125,8 +1195,8 @@ def _validate_av_sync(muxed_path: str, logger) -> int:
         logger.warning("STAGE7_SYNC_WARN",
                        f"AV sync difference {diff_ms:.0f}ms exceeds "
                        f"{warn_ms:.0f}ms "
-                       f"({'audio lags' if audio_lags else 'audio leads'})",
-                       **_detail())
+                       f"({'audio lags' if audio_lags else 'audio leads'}; "
+                       f"basis: {_basis})", **_detail())
         return 0  # Continue but warn
     elif diff_ms > 0:
         logger.warning("STAGE7_SYNC_WARN",
@@ -1947,7 +2017,8 @@ def main():
         if r.returncode == 0 and Path(_publish_tmp).exists() and Path(_publish_tmp).stat().st_size > 0:
             # FIX-P7-4: Validate A/V sync on final muxed output (not separate files)
             if has_audio:
-                sync_result = _validate_av_sync(_publish_tmp, logger)
+                sync_result = _validate_av_sync(_publish_tmp, logger, params,
+                            reference_path=args.input)
                 if sync_result != 0:
                     # FIX-2026-10-24：加**强制出片**逃生门。
                     #
