@@ -789,7 +789,102 @@ python photo_restoration_pipeline/main.py ... --no-wsl-redirect
 
 ---
 
-## 12. 目录名说明
+## 12. 产物核对与人工确认
+
+### 12.1 三道核对门
+
+成品发布前会跑三道**相互独立**的核对，任一失败默认返回退出码 86：
+
+| 门 | 判据 | 强制出片开关 |
+|---|---|---|
+| 音画同步 | 成品内部音视频区间 | `allow_sync_fail_publish` |
+| 全链核对 | 原始素材 vs 成品 | `allow_verify_fail_publish` |
+| 机械核对 | step6 产物 vs 成品 | `allow_verify_fail_publish` |
+
+打开强制开关后仍会发布，但会记 ERROR 级日志，且问题写进
+`<output>.fullchain.json` / `<output>.verify.json` 跟随文件 —— **不等于验过**。
+
+### 12.2 全链核对三档模式
+
+```yaml
+full_chain_verify: true
+full_chain_verify_mode: frames_only   # frames_only | relative | absolute
+```
+
+| 模式 | 帧数 | 时长/漂移 | 误杀风险 | 适用 |
+|---|---|---|---|---|
+| `frames_only`（默认） | 拦 | 只记录 | 低 | 日常批处理 |
+| `relative` | 拦 | 拦（相对源片） | 中 | 想连漂移一起管 |
+| `absolute` | 拦 | 拦 + 成品绝对漂移 | 高 | **体检**，配合强制出片 |
+
+### 12.3 漂移筛查报告（体检）
+
+```bash
+python shared_modules/fullchain_report.py <输出目录> --csv drift.csv
+```
+
+按漂移排序，标注超过 ITU-R BT.1359-1 可接受线（185 ms）的份数。
+`absolute` 档 + `allow_verify_fail_publish: true` 跑一遍，即可筛出
+"哪些素材有漂移" 而不影响出片。
+
+### 12.4 音画阈值
+
+```yaml
+sync_warn_ms_lag: 185      # 声音滞后告警
+sync_fail_ms_lag: 400      # 声音滞后失败
+sync_warn_ms_lead: 90      # 声音超前告警
+sync_fail_ms_lead: 200     # 声音超前失败
+```
+
+依据 ITU-R BT.1359-1（可察觉 +45 / −125 ms，可接受 +90 / −185 ms），
+此处取其约 2 倍，因为老素材可能自带原始偏移。设非正数退回默认值；
+**不能设成 0 来关闭判定**。
+
+### 12.5 低置信度素材的人工确认
+
+分类器对置信度 <0.80 的素材置 `needs_confirmation`，非交互批处理会 SKIP。
+三步放行：
+
+```bash
+# 1) 先看哪些会被拦
+python shared_modules/manifest_editor.py <manifest> list --low-confidence
+
+# 2) 人工核对类别后，一次确认全部（几百上千素材用这个）
+python shared_modules/manifest_editor.py <manifest> confirm --all-low-confidence
+
+# 3) 跑批次
+python video_restoration_pipeline/main.py --manifest <manifest> \
+  --config video_restoration_pipeline/config.yaml \
+  --mode batch --output <输出目录> --no-wsl-redirect \
+  --ai-enabled --ai-upscale-factor 2 --workers 1
+```
+
+`confirm` 会做四件事：清 `needs_confirmation`、把 confidence 至少抬到 0.80、
+记 `manual_confirmed` / `confirmed_at` 便于追溯、并把 `SKIP` 复位为 `PENDING`。
+
+### 12.6 超时与看门狗
+
+```yaml
+stage_hard_timeout_hours: 48        # 设 0 或负数 = 完全禁用硬超时
+stage_inactivity_timeout: 1800      # 设 0 或负数 = 关闭看门狗
+```
+
+硬超时是**最终保险**，判死主要交给看门狗（stage 输出 N 秒无增长即杀）。
+有素材要跑非常久时关掉硬超时即可；此时唯一防线是看门狗，
+若看门狗也关了就是真的不限时，需自行承担风险。
+
+### 12.7 AI 超分倍率选择
+
+| 源分辨率 | 建议倍率 | 说明 |
+|---|---|---|
+| ≤ 640×368 | 2× | 4× 对 ANALOG_TAPE 被 v6.32 §4B 硬禁 |
+| 544×960 ~ 800×480 | 2× | 4× 可用但输出体积与耗时暴涨 |
+| ≥ 1280×720 | 2× | 4× 会超 2160p，实测 7.5 小时仍被看门狗杀死 |
+
+`--force-allow-banned-upscale` 可覆盖 ANALOG_TAPE 的 4× 禁令，
+但规范明确不建议（模拟带最大 2× 到 960p）。
+
+## 13. 目录名说明
 
 **重要**：项目实际使用的目录名为：
 - `video_restoration_pipeline/` — 视频修复流水线
@@ -801,7 +896,7 @@ python photo_restoration_pipeline/main.py ... --no-wsl-redirect
 
 ---
 
-## 历史排障记录（本地）
+## 14. 历史排障记录（本地）
 
 2026-04 及之后的逐文件审查、缺陷根因与修复过程已移出本手册，
 保留在本地 `bugs.md` / `shixian.md` / `修复清单.md`（不入库）。

@@ -277,6 +277,39 @@ produces frequent false positives and the log stops being read.
 
 Photo pipeline config lives under `photo:`; video pipeline under `global:`.
 
+### Artifact Verification
+
+Before publishing, stage 7 runs **three independent gates**, each with its own
+force-publish override:
+
+| Gate | Compares | Override |
+|---|---|---|
+| A/V sync | inside the output file | `allow_sync_fail_publish` |
+| Full-chain | **original input vs output** | `allow_verify_fail_publish` |
+| Mechanical | step 6 artifact vs output | `allow_verify_fail_publish` |
+
+A/V drift is judged **relative to the source** (`|output drift − source drift|`)
+rather than against a fixed threshold — measured on 204 real phone clips,
+a fixed threshold misjudged **31%** of them (the drift is inherent to old
+sources), while the relative criterion dropped that to **1.5%**.
+
+`full_chain_verify_mode` selects how strict the full-chain gate is:
+`frames_only` (default, lowest false positives) / `relative` / `absolute`.
+Results always land in `<output>.fullchain.json`; use
+`shared_modules/fullchain_report.py <dir> --csv out.csv` to rank drift across
+a batch.
+
+Low-confidence classifications (`needs_confirmation`, <0.80) are skipped in
+non-interactive batches. Confirm them with:
+
+```bash
+python shared_modules/manifest_editor.py <manifest> list --low-confidence
+python shared_modules/manifest_editor.py <manifest> confirm --all-low-confidence
+```
+
+`stage_hard_timeout_hours` set to `0` disables the hard timeout entirely;
+`stage_inactivity_timeout` set to `0` disables the inactivity watchdog.
+
 ### Version & Specifications
 
 **The code is the single source of truth** (`main.py` / `stages/` /
@@ -557,6 +590,35 @@ python photo_restoration_pipeline/main.py \
 同类开关：`require_16bit_color_conversion`（默认 `false`）。宽色域→sRGB 走
 PIL ImageCms，而 Pillow 的 CMS 只支持 8-bit；置 `true` 会在这种降级发生时
 直接失败（rc=86），而不是交出 8-bit 精度的母版。
+
+### 成品核对体系
+
+成品发布前跑**三道相互独立**的核对门，各有对应的强制出片开关：
+
+| 门 | 对比对象 | 强制开关 |
+|---|---|---|
+| 音画同步 | 成品内部 | `allow_sync_fail_publish` |
+| 全链核对 | **原始素材 vs 成品** | `allow_verify_fail_publish` |
+| 机械核对 | step6 产物 vs 成品 | `allow_verify_fail_publish` |
+
+音画漂移按**相对源片**判定（`|成品漂移 − 源片漂移|`），不用固定阈值 ——
+实测 204 个真实手机素材，固定阈值误杀 **31%**（漂移是老素材自带的），
+改用相对判据后降到 **1.5%**。
+
+`full_chain_verify_mode` 决定全链核对的严格度：
+`frames_only`（默认，误杀最低）/ `relative` / `absolute`。
+结果一律写入 `<output>.fullchain.json`；
+用 `shared_modules/fullchain_report.py <目录> --csv out.csv` 可按漂移排序筛查整批。
+
+低置信度分类（`needs_confirmation`，<0.80）在非交互批处理中会被 SKIP，放行方式：
+
+```bash
+python shared_modules/manifest_editor.py <manifest> list --low-confidence
+python shared_modules/manifest_editor.py <manifest> confirm --all-low-confidence
+```
+
+`stage_hard_timeout_hours` 设 `0` = 完全禁用硬超时；
+`stage_inactivity_timeout` 设 `0` = 关闭看门狗。
 
 ### 版本与规范说明
 
