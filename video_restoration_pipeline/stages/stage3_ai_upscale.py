@@ -677,9 +677,63 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 
 # FIX-P8-9: Batch model loading for Python API path
 # ORIGINAL: Per-window model loading via run_realesrgan (slow for Python API)
+def _plan_frame_transport(window_dirs, params, logger=None):
+    """探测首帧尺寸并按可用内存决定传输方式（3a：只记日志，不改变行为）。
+
+    返回 plan dict（transport / buffer_frames / reason / ...）；
+    探测失败时返回 png 决策，绝不抛异常——这只是观测，不能弄坏跑批。
+    """
+    try:
+        import glob
+        import os
+        sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "shared_modules"))
+        from frame_transport import plan_transport
+    except Exception as _e:                                   # pragma: no cover
+        if logger:
+            logger.warning("STAGE3_FRAME_TRANSPORT_PROBE_FAIL", str(_e))
+        return None
+
+    # 取第一个窗口的第一张 PNG，读尺寸
+    frame_bytes = 0
+    probe_desc = "unknown"
+    try:
+        for frames_dir, _out in window_dirs:
+            pngs = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
+            if not pngs:
+                continue
+            import cv2
+            arr = cv2.imread(pngs[0], cv2.IMREAD_UNCHANGED)
+            if arr is None:
+                continue
+            h, w = arr.shape[0], arr.shape[1]
+            ch = 1 if arr.ndim == 2 else arr.shape[2]
+            frame_bytes = int(w) * int(h) * int(ch) * arr.dtype.itemsize
+            probe_desc = f"{w}x{h}x{ch}@{arr.dtype.itemsize * 8}bit"
+            break
+    except Exception as _e:                                   # pragma: no cover
+        if logger:
+            logger.warning("STAGE3_FRAME_TRANSPORT_PROBE_FAIL", str(_e))
+        return None
+
+    plan = plan_transport(frame_bytes,
+                          int(params.get("ai_frame_buffer_frames", 256) or 256),
+                          params)
+    if logger:
+        logger.info("STAGE3_FRAME_TRANSPORT_PLAN",
+                    f"frame transport decided: {plan['transport']}",
+                    transport=plan["transport"],
+                    buffer_frames=plan["buffer_frames"],
+                    frame=probe_desc,
+                    available_gb=(round(plan["available_bytes"] / 2**30, 2)
+                                  if plan.get("available_bytes") else None),
+                    reason=plan["reason"])
+    return plan
+
+
 def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                          scale: int, gpu_id: int = 0,
-                         logger=None) -> Union[bool, str]:
+                         logger=None, params: Optional[dict] = None
+                         ) -> Union[bool, str]:
     """Run Real-ESRGAN on all windows in a single model-load session.
 
     FIX-P8-9: Loads model once for Python API path, processing all windows.
@@ -693,6 +747,9 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
     （True/False/"OOM"），调用方的 OOM 降级链原样适用。
     """
     model_dir = SCRIPT_DIR.parent.resolve() / "models"
+
+    # 3a：只探测并记录传输方式决策，暂不改变行为
+    _plan_frame_transport(window_dirs, params or {}, logger)
 
     # FIX-R6-02: DAT 家族分流（DAT / DAT-2 / DAT-S / DAT-light）
     try:
@@ -1634,7 +1691,8 @@ def main():
     # FIX-P8-9: Batch process all windows with single model load
     if window_dirs:
         result = run_realesrgan_batch(window_dirs, model, scale,
-                                       gpu_id=0, logger=logger)
+                                       gpu_id=0, logger=logger,
+                                       params=params)
 
         # FIX-P8-7+P8-1: OOM downgrade only on actual OOM
         # ORIGINAL: OOM downgrade triggered on any failure (not just OOM),
