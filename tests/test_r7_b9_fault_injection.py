@@ -92,7 +92,7 @@ def _run_stage3(tmp_path, monkeypatch, first_result, model="RealESRGAN_x4plus"):
 
     calls = []
 
-    def fake_batch(window_dirs, m, scale, gpu_id=0, logger=None):
+    def fake_batch(window_dirs, m, scale, gpu_id=0, logger=None, params=None):
         calls.append({"model": m, "scale": scale, "gpu_id": gpu_id})
         if len(calls) == 1:
             return first_result                 # 注入的故障/成功
@@ -206,7 +206,7 @@ def test_gpu_oom_then_cpu_endpoint(tmp_path, monkeypatch):
 
     _seed_stage2(temp, clip, job="jobB9c")
 
-    def fake_batch(window_dirs, m, scale, gpu_id=0, logger=None):
+    def fake_batch(window_dirs, m, scale, gpu_id=0, logger=None, params=None):
         calls.append({"model": m, "scale": scale, "gpu_id": gpu_id})
         if gpu_id >= 0:
             return "OOM"                       # GPU 一直 OOM

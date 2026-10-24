@@ -65,8 +65,11 @@ def test_both_callsites_feed_bgr_to_enhance():
     src = _stage3_src()
     assert src.count("cv2.imread(fp, cv2.IMREAD_UNCHANGED)") == 2, \
         "不是两个调用点都走 cv2 读帧（通道与位深会失控）"
-    assert src.count("cv2.imwrite(os.path.join(output_dir") == 2, \
-        "不是两个调用点都用 cv2 写回"
+    # 2026-10-25：stage3 加了共享内存传输分支，其"无输出 ring"回退也走
+    # cv2.imwrite，于是写回点从 2 变 3。真正的契约是"**每个**写回点都用 cv2
+    # （保住通道与位深）"，所以断言下限而非写死的个数。
+    assert src.count("cv2.imwrite(os.path.join(output_dir") >= 2, \
+        "写回点没用 cv2（通道与位深会失控）"
     # 不允许再出现 "PIL 读出的 RGB 直接进 enhance"
     assert "np.array(img), outscale=scale" not in src
     assert "_rgb[:, :, ::-1].copy()" not in src, \
