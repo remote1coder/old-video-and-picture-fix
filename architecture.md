@@ -255,7 +255,64 @@ Returns exit code 80 if any required dependency is missing.
 
 ---
 
-## 11. 已知架构级限制（当前）
+## 11. 产物核对体系（stage7 三道门 + 全链核对）
+
+成品发布前有三道**相互独立**的核对门，每道都可被对应开关强制绕过：
+
+| 门 | 判据 | 失败退出码 | 强制开关 |
+|---|---|---|---|
+| 音画同步 | 成品**内部** 音视频区间（start / end / span） | 86 | `allow_sync_fail_publish` |
+| 全链核对 | **原始素材 vs 成品**（帧数 / 时长 / 首末帧 / 黑图 / 逐帧对齐） | 86 | `allow_verify_fail_publish` |
+| 机械核对 | **step6 产物 vs 成品**（编码这一跳） | 86 | `allow_verify_fail_publish` |
+
+三处强制判断收敛为 `stage7_encode._force_publish_enabled(params, key)`，
+并有结构性测试保证每道门都经由它（源码中出现 ≥4 次：定义 1 + 调用 3）。
+
+### 11.1 音画判据：相对源片，不用绝对阈值
+
+`_validate_av_sync()` 取 start / end / span 三项中绝对值最大者并**保留符号**，
+方向决定阈值（ITU-R BT.1359-1 的可接受线 +90 / −185 ms，此处取其约 2 倍）：
+
+    声音滞后：warn 185ms / fail 400ms
+    声音超前：warn  90ms / fail 200ms
+
+若提供了 `reference_path`（原始素材），判据改为
+`| 成品漂移 − 源片漂移 |` —— 源片自带的漂移不算流程的问题。
+实测 204 个真实素材：绝对阈值误杀率 31%，相对判据 1.5%。
+
+四个阈值均可在 config 中调整（设非正数退回默认，**不允许关闭判定**）。
+
+### 11.2 全链核对三档模式
+
+`full_chain_verify_mode`：
+
+| 模式 | 帧数 | 时长 / 漂移 | 误杀风险 |
+|---|---|---|---|
+| `frames_only`（默认） | 拦 | 只记录 | 低 |
+| `relative` | 拦 | 拦（源片 vs 成品） | 中 |
+| `absolute` | 拦 | 拦 + 成品自身绝对漂移 | 高 |
+
+结果一律写入 `<output>.fullchain.json`，即使 `frames_only` 也记录漂移，
+便于事后用 `shared_modules/fullchain_report.py` 做筛查（体检工具）。
+
+帧数判据之所以可以默认硬拦：`artifact_verify.expected_frame_counts()`
+已覆盖三种合法的帧数变化（IVTC 5→4、QTGMC divisor=1 翻倍、divisor=2 不变）。
+**注意**：源帧数必须用 `-count_frames`（显示帧数），不能用 `-count_packets`
+—— 后者对含负 PTS 参考帧的文件会高估（实测 651 vs 599）。
+
+### 11.3 人工确认入口
+
+分类器对低置信度素材（<0.80）置 `needs_confirmation`，`main.py` 门禁为：
+
+    if job.get("needs_confirmation", False) or confidence < 0.80:
+        # 非交互环境 → SKIP
+
+`manifest_editor` 提供 `list --low-confidence` 与 `confirm`（支持
+`--all-low-confidence` 批量）。确认时：清 `needs_confirmation`、
+把 confidence 至少抬到 0.80、并把 `SKIP` 复位为 `PENDING`
+（否则 scan 标的 SKIP 原样保留，批次会 "Processing 0 video jobs"）。
+
+## 12. 已知架构级限制（当前）
 
 - `CORE_QUALITY_PARAMS` 未包含 `enable_channel_correction` /
   `frc_target_fps` / `aspect_ratio_correction`：改这三项不会改变
@@ -278,7 +335,7 @@ Returns exit code 80 if any required dependency is missing.
   三个独立包均未安装）。它是 GFPGAN/CodeFormer 的内置检测实现，
   不是并列备选。CodeFormer 架构取自 `basicsr.archs.codeformer_arch`。
 
-## 12. 历史审查记录（本地）
+## 13. 历史审查记录（本地）
 
 2026-04 之后的逐文件审查、缺陷根因与修复过程已移出本文档，保存在
 本地 `bugs.md` / `shixian.md` / `修复清单.md`（不入库）。
