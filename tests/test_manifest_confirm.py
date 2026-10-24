@@ -106,3 +106,62 @@ def test_confidence_override_clamped(mpath):
     j = [x for x in load_manifest(mpath)["jobs"]
          if x["job_id"] == "job_002"][0]
     assert j["confidence"] == 1.0
+
+
+def test_confirm_resets_skip_to_pending(mpath):
+    """确认必须把 SKIP 复位成 PENDING，否则批次照样跳过、白确认一场。
+
+    scan 对低置信度 job 直接标 SKIP，confirm 只改 confidence/flag，
+    status 仍是 SKIP → "Processing 0 video jobs"。实测连踩三次。
+    """
+    from manifest_loader import load_manifest
+    # 先把两个低置信度 job 标成 SKIP（模拟 scan 的行为）
+    m = load_manifest(mpath)
+    for j in m["jobs"]:
+        if j["job_id"] in ("job_002", "job_003"):
+            j["status"] = "SKIP"
+    save_manifest(m, mpath)
+
+    assert [j["status"] for j in load_manifest(mpath)["jobs"]
+            if j["job_id"] == "job_002"] == ["SKIP"]
+
+    n = me.confirm_job(mpath, all_low_confidence=True)
+    assert n == 2
+
+    m2 = load_manifest(mpath)
+    for j in m2["jobs"]:
+        if j["job_id"] in ("job_002", "job_003"):
+            assert j["status"] == "PENDING", \
+                f"{j['job_id']} 确认后仍是 {j['status']}"
+            assert _gate_blocked(j) is False
+    # 已过线的 job 状态不该被动
+    assert [j["status"] for j in m2["jobs"]
+            if j["job_id"] == "job_001"] == ["DONE"]
+
+
+def test_confirm_all_low_confidence_is_idempotent(mpath):
+    """连跑两次 confirm，第二次也必须把 SKIP 复位。
+
+    第一轮把 confidence 抬过线后，`--all-low-confidence` 若只按
+    "当前低于门禁" 选目标，第二轮就选不中任何 job，SKIP→PENDING 复位失效
+    （实测：第二次 "Confirmed 0"，status 仍是 SKIP，批次 "Processing 0 jobs"）。
+    """
+    from manifest_loader import load_manifest
+    # 真实场景：**上一轮已经确认过**（confidence 抬过线、manual_confirmed=True），
+    # 但 status 仍是 SKIP（例如那次 confirm 被 SIGPIPE 打断，或跑在修复之前）。
+    m = load_manifest(mpath)
+    for j in m["jobs"]:
+        if j["job_id"] in ("job_002", "job_003"):
+            j["status"] = "SKIP"
+            j["confidence"] = 0.80
+            j["needs_confirmation"] = False
+            j["manual_confirmed"] = True
+    save_manifest(m, mpath)
+
+    # 此时它们已不过门禁，但 status 还卡在 SKIP —— confirm 必须仍能救出来
+    assert me.confirm_job(mpath, all_low_confidence=True) == 2
+
+    m2 = load_manifest(mpath)
+    for j in m2["jobs"]:
+        if j["job_id"] in ("job_002", "job_003"):
+            assert j["status"] == "PENDING"

@@ -180,8 +180,15 @@ def confirm_job(manifest_path: str, job_id: str = None, *,
     if all_low_confidence:
         for j in jobs:
             c = j.get("confidence", 0.0)
-            if j.get("needs_confirmation") or (
-                    isinstance(c, (int, float)) and c < 0.80):
+            _low = (j.get("needs_confirmation") or
+                    (isinstance(c, (int, float)) and c < 0.80))
+            # FIX-2026-10-24：已确认过、但 status 还是 SKIP 的也要选中。
+            # 否则 confirm 不幂等 —— 第一轮把 confidence 抬过线，第二轮
+            # `--all-low-confidence` 就选不中它，SKIP→PENDING 复位失效
+            # （实测：连跑两次 confirm，第二次 "Confirmed 0"，status 仍 SKIP）。
+            _stale_skip = (j.get("manual_confirmed") and
+                           j.get("status") == "SKIP")
+            if _low or _stale_skip:
                 targets.append(j)
     elif job_id:
         for j in jobs:
@@ -216,6 +223,15 @@ def confirm_job(manifest_path: str, job_id: str = None, *,
             j["confidence"] = _floor
         j["manual_confirmed"] = True
         j["confirmed_at"] = now
+        # FIX-2026-10-24：确认的同时把 SKIP 复位成 PENDING。
+        # 否则用户"确认"完，批次看到 status 仍是 SKIP 照样跳过，
+        # 白确认一场。实测连踩三次：
+        #   scan 对低置信度 job 直接标 SKIP → confirm 只改 confidence/flag
+        #   → status 还是 SKIP → "Processing 0 video jobs"
+        # "我确认这个素材可以处理" 的语义理应包含"把它放回待处理队列"。
+        if j.get("status") == "SKIP":
+            j["status"] = "PENDING"
+            j["error_message"] = ""
         j["updated_at"] = now
 
     _update_meta_counts(manifest)
