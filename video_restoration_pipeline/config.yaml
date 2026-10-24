@@ -82,6 +82,20 @@ global:
   # 打开此项可拿到产物，但产物仍带漂移，日志记 ERROR 且元数据跟随，
   # 不等于验过。
   allow_sync_fail_publish: false
+  # ---- 帧传输方式（stage3 AI 超分）----
+  # auto           按可用内存自适应：放得下就用共享内存（零拷贝），
+  #                放不下或窗口被压得过小则自动回退 PNG
+  # shared_memory  强制共享内存（内存不足时窗口会被压小，日志会说明）
+  # png            强制 PNG 文件中转（改动前的行为）
+  ai_frame_transport: auto
+  # 期望的窗口帧数；auto 下会按内存缩减
+  ai_frame_buffer_frames: 256
+  # 最多占用「可用内存」的比例（留 50% 给系统与其他进程）
+  ai_frame_memory_fraction: 0.5
+  # 缩减后低于此帧数就回退 PNG（太小则启动开销占比过高，反而更慢）
+  ai_frame_min_buffer_frames: 8
+  # 绝对底线：无论如何至少留这么多空闲内存（字节）。默认 1 GiB
+  ai_frame_min_free_bytes: 1073741824
   # ---- 全链核对（原始素材 vs 成品）----
   # stage7 原有的两道核对都只看局部（编码这一跳 / 成品内部音视频），
   # "源片 → 成品"的帧数丢失与时长漂移此前从未自动核对。
