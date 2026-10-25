@@ -738,6 +738,51 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 
 # FIX-P8-9: Batch model loading for Python API path
 # ORIGINAL: Per-window model loading via run_realesrgan (slow for Python API)
+def _clear_stale_frame_dirs(temp_dir, job_id, logger=None):
+    """清掉**同一 job_id** 上次跑批残留在 temp 里的帧目录。
+
+    2026-10-26 实测事故
+    -------------------
+    两次跑批都叫 `job_001`、共用 `temp/`。上一轮（585 帧素材）留下的
+    `temp/job_001_upscaled/frame_*.png` 没被清，本轮（300 帧素材）直接
+    `glob("*.png")` 把它们当成自己的输出，结果：
+        src 300 → out 585，全链核对判 FRAMES 失败（rc=86）
+    成品看起来"帧数多了"而不是"损坏"，非常隐蔽。
+
+    做法：把 `{job_id}_upscaled` 与 `{job_id}_upscaled_*` 这些**本 job
+    专属**目录下的 PNG 全删。绝不动别的 job 的目录，也不删非 PNG 文件
+    （旁边可能还有 identity.json 等侧车）。
+
+    Returns: 删除的文件数。
+    """
+    import glob as _glob
+    removed = 0
+    if not temp_dir or not job_id:
+        return 0
+    patterns = [
+        os.path.join(temp_dir, f"{job_id}_upscaled", "*.png"),
+        os.path.join(temp_dir, f"{job_id}_upscaled_*", "*.png"),
+    ]
+    victims = []
+    for pat in patterns:
+        victims.extend(_glob.glob(pat))
+    for fp in victims:
+        try:
+            os.remove(fp)
+            removed += 1
+        except OSError as _e:
+            if logger:
+                logger.warning("STAGE3_STALE_FRAME_CLEAN_FAIL",
+                               f"{fp}: {_e}")
+    if removed and logger:
+        logger.info("STAGE3_STALE_FRAME_CLEANED",
+                    "Removed stale frame PNGs left by a previous run of the "
+                    "same job_id (they would otherwise be picked up as this "
+                    "run's output)",
+                    job_id=job_id, files=removed)
+    return removed
+
+
 def _drain_ring_to_pngs(shm_name, slots, out_frame_bytes, count, out_dir,
                         width, height, channels, dtype_name, logger=None):
     """把 AI 写进输出 ring 的结果落回 PNG（下游 stage4 仍消费文件）。
@@ -1835,6 +1880,8 @@ def main():
         return 82
 
     output_dir = str(Path(temp_dir) / f"{job_id}_upscaled")
+    # 抽帧前先清掉本 job 上一轮的残留帧（否则会被当成这次的输出）
+    _clear_stale_frame_dirs(temp_dir, job_id, logger)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Get actual fps for frame extraction (v6.32 §4B)
