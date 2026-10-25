@@ -181,8 +181,10 @@ def test_shm_env_set_implies_drain_called():
     """
     import io
     src = io.open(s3.__file__, encoding="utf-8", errors="replace").read()
+    # 必须找**调用点**（`_got = _drain_ring_to_pngs(`），不能找定义
+    # （`def _drain_ring_to_pngs(`）——定义在文件前部，会误判顺序。
     i_set = src.find('env["WB_FRAME_OUT_SHM_NAME"]')
-    i_drain = src.find("_drain_ring_to_pngs(")
+    i_drain = src.find("_got = _drain_ring_to_pngs(")
     assert i_set > 0, "找不到设置 WB_FRAME_OUT_SHM_NAME 的代码"
     assert i_drain > 0, "找不到调用 _drain_ring_to_pngs 的代码"
     # drain 的调用点必须在设置点之后（收集侧在生产侧之后）
