@@ -111,8 +111,15 @@ def plan_transport(frame_bytes: int,
     if mode not in _VALID_TRANSPORTS:
         mode = DEFAULT_TRANSPORT
 
-    req = int(_cfg(params, "ai_frame_buffer_frames",
-                   DEFAULT_BUFFER_FRAMES, lo=0))
+    # 2026-10-25 修：`requested_frames` 参数此前被忽略，只从 params 读，
+    # 导致调用方传进来的窗口帧数无效（实测 ring 预算永远等于
+    # ai_frame_buffer_frames=256，窗口一大就永远"超预算"）。
+    # 现在：显式传入的优先，未传（None）才回退 params。
+    if requested_frames is None:
+        req = int(_cfg(params, "ai_frame_buffer_frames",
+                       DEFAULT_BUFFER_FRAMES, lo=0))
+    else:
+        req = int(requested_frames)
     req = max(1, req)
     fraction = _cfg(params, "ai_frame_memory_fraction",
                     DEFAULT_MEMORY_FRACTION)
