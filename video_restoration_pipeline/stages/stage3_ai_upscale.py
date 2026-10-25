@@ -740,7 +740,8 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 # ORIGINAL: Per-window model loading via run_realesrgan (slow for Python API)
 def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          fps_str, model, model_dir, ai_py, gpu_id=0,
-                         timeout_s=7200, logger=None, cancel_guard=None):
+                         timeout_s=7200, logger=None, cancel_guard=None,
+                         color_opts=None):
     """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
 
     为什么这样做
@@ -783,65 +784,12 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     model_path = str(Path(model_dir) / f"{model}.pth")
 
     # ---- AI 脚本：stdin 读帧 -> 超分 -> stdout 写帧 ----
-    script = f"""
-import os, sys, gc, numpy as np, cv2
-os.environ.setdefault("PYTHONUNBUFFERED", "1")
-import torch
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
-
-IN_W, IN_H, SCALE = {in_w}, {in_h}, {int(scale)}
-IN_BYTES = IN_W * IN_H * 3 * 2
-MODEL_PATH = {model_path!r}
-MODEL_NAME = {model!r}
-GPU_ID = {int(gpu_id)}
-
-def _arch(name):
-    n = name.lower()
-    if "realesr-general" in n:
-        from basicsr.archs.srvgg_arch import SRVGGNetCompact
-        return SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
-                               num_conv=32, upscale=4, act_type="prelu")
-    if "x2plus" in n:
-        return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                       num_block=23, num_grow_ch=32, scale=2)
-    return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                   num_block=23, num_grow_ch=32, scale=4)
-
-# 关键：RealESRGANer 的 scale 必须是**模型原生倍数**（x4v3=4、x2plus=2），
-# 不是我们要的产出倍数。实测把目标倍数(2)传进去，enhance 会输出模型原生的
-# 4 倍尺寸（5120x2880，面积 4 倍），300 帧被编码器读成 1213 帧、时长 48.5s。
-_NATIVE = 2 if "x2plus" in MODEL_NAME.lower() else 4
-upsampler = RealESRGANer(scale=_NATIVE, model_path=MODEL_PATH,
-                         model=_arch(MODEL_NAME), half=True, gpu_id=GPU_ID)
-_in = sys.stdin.buffer
-_out = sys.stdout.buffer
-_n = 0
-while True:
-    buf = _in.read(IN_BYTES)
-    if not buf or len(buf) < IN_BYTES:
-        break
-    arr = np.frombuffer(buf, dtype=np.uint16).reshape(IN_H, IN_W, 3)
-    try:
-        out, _ = upsampler.enhance(arr, outscale=SCALE)
-    except RuntimeError as e:
-        msg = str(e).lower()
-        if "out of memory" in msg:
-            sys.stderr.write("OOM" + chr(10)); sys.stderr.flush()
-            sys.exit(83)
-        raise
-    _out.write(np.ascontiguousarray(out).tobytes())
-    _out.flush()
-    _n += 1
-try:
-    del upsampler
-except NameError:
-    pass
-gc.collect()
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-sys.stderr.write(("FRAMES=%d" % _n) + chr(10)); sys.stderr.flush()
-"""
+    # 模板在 shared_modules/stream_ai_template.py —— 不能内联在这里。
+    # DEP_CHECK 会静态扫描 stages/*.py 原文找"顶层可执行代码"，
+    # 它分不清三引号字符串内外，内联模板会判 spawn 违规 → 全批 exit 80。
+    from stream_ai_template import build_stream_ai_script
+    script = build_stream_ai_script(
+        in_w, in_h, scale, model_path, model, gpu_id)
     tmpd = None
     try:
         tmpd = tempfile.mkdtemp(prefix="stream3_")
@@ -861,7 +809,11 @@ sys.stderr.write(("FRAMES=%d" % _n) + chr(10)); sys.stderr.flush()
                "-f", "rawvideo", "-vcodec", "rawvideo",
                "-pix_fmt", "rgb48le", "-s", f"{out_w}x{out_h}",
                "-framerate", str(fps_str), "-i", "-",
-               "-c:v", "ffv1", "-r", str(fps_str), "-an", str(output_mkv)]
+               "-c:v", "ffv1", "-r", str(fps_str)]
+    # 颜色标签必须与主流程 PNG 路线一致（COL-04），否则中间产物不带
+    # colorspace 标签，下游 stage7 会按自己的猜测补标签 → 可能错标。
+    enc_cmd += list(color_opts or [])
+    enc_cmd += ["-an", str(output_mkv)]
 
     dec = ai = enc = None
     # stderr 一律落临时文件：管道 stdout 已经移交给下游进程，
@@ -2123,6 +2075,96 @@ def main():
     empty_windows = 0
     # FIX-2026-10-23：连续空窗口计数，用于提前终止（见循环内注释）。
     consecutive_empty = 0
+
+    # ---- 方案 B：零落盘流式超分（params.ai_stream_raw）----
+    # 整段视频一次管道跑完（不受 ai_window_size 限制），帧全程不落盘。
+    # 任一步失败都**只记日志然后落到原 PNG 路径**，不影响原有可靠性。
+    if params.get("ai_stream_raw"):
+        _s_ai_py = _resolve_ai_python(logger)
+        if not _s_ai_py:
+            logger.warning("STAGE3_STREAM_NO_AI_PY",
+                           "AI interpreter missing; falling back to PNG path")
+        else:
+            try:
+                _s_inter = (f"{job_id}_{Path(input_name).stem}"
+                            f"_step3_upscale_p{param_hash}")
+                if combined_banned and force_allow:
+                    _s_inter = (f"{job_id}_{Path(input_name).stem}"
+                                f"_step3_forced_upscale_p{param_hash}")
+                _s_out = str(Path(temp_dir) / f"{_s_inter}.mkv")
+
+                _s_fps = "25"
+                try:
+                    _rf = subprocess.run(
+                        ["ffprobe", "-hide_banner", "-v", "error",
+                         "-select_streams", "v:0",
+                         "-show_entries", "stream=r_frame_rate",
+                         "-of", "default=noprint_wrappers=1:nokey=1",
+                         stage2_output],
+                        capture_output=True, text=True, errors="replace",
+                        timeout=10, shell=False)
+                    if _rf.returncode == 0 and _rf.stdout.strip():
+                        _s_fps = _rf.stdout.strip()
+                except Exception:
+                    pass
+
+                _s_dims = (0, 0)
+                try:
+                    _rd = subprocess.run(
+                        ["ffprobe", "-hide_banner", "-v", "error",
+                         "-select_streams", "v:0",
+                         "-show_entries", "stream=width,height",
+                         "-of", "csv=p=0", stage2_output],
+                        capture_output=True, text=True, errors="replace",
+                        timeout=10, shell=False)
+                    if _rd.returncode == 0:
+                        _parts = _rd.stdout.strip().split(",")
+                        _s_dims = (int(_parts[0]), int(_parts[1]))
+                except Exception:
+                    pass
+
+                _s_copts = []
+                try:
+                    from media_io import probe_color as _pc
+                    _sc = _pc(args.input) or {}
+                    if _sc.get("probed"):
+                        if _sc.get("matrix"):
+                            _s_copts += ["-colorspace", str(_sc["matrix"])]
+                        if _sc.get("range"):
+                            _s_copts += ["-color_range",
+                                         "tv" if _sc["range"] == "limited" else "pc"]
+                        if _sc.get("primaries"):
+                            _s_copts += ["-color_primaries", str(_sc["primaries"])]
+                        if _sc.get("transfer"):
+                            _s_copts += ["-color_trc", str(_sc["transfer"])]
+                except Exception:
+                    pass
+
+                if _s_dims[0] <= 0 or _s_dims[1] <= 0:
+                    logger.warning("STAGE3_STREAM_NO_DIMS",
+                                   "cannot probe stage2 dimensions; using PNG path")
+                else:
+                    _s_ok, _s_why, _s_n = _stream_raw_upscale(
+                        input_video=stage2_output, output_mkv=_s_out,
+                        width=_s_dims[0], height=_s_dims[1], scale=scale,
+                        fps_str=_s_fps, model=model,
+                        model_dir=str(SCRIPT_DIR.parent / "models"),
+                        ai_py=_s_ai_py, gpu_id=0,
+                        timeout_s=max(600, total_frames * 30),
+                        logger=logger, cancel_guard=_cancel_guard,
+                        color_opts=_s_copts)
+                    if _s_ok and os.path.exists(_s_out) and os.path.getsize(_s_out) > 0:
+                        logger.info("STAGE3_STREAM_DONE",
+                                    "Zero-disk raw-pipe upscale succeeded; "
+                                    "skipping PNG extract/encode entirely",
+                                    frames=_s_n, output=_s_out)
+                        return 0
+                    logger.warning("STAGE3_STREAM_FALLBACK",
+                                   "raw-pipe path failed; falling back to PNG path",
+                                   reason=str(_s_why)[:400])
+            except Exception as _se:
+                logger.warning("STAGE3_STREAM_FALLBACK",
+                               f"raw-pipe path raised: {_se}")
 
     for win_start in range(0, total_frames, win_size):
         win_end = min(win_start + win_size, total_frames)

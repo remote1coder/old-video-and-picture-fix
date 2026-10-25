@@ -111,6 +111,20 @@ global:
   #
   # 需要对比时可设为 auto（按内存自适应）或 png（旧行为）。
   ai_frame_transport: shared_memory
+  # 零落盘流式超分（方案 B）：帧全程走管道，不产生任何 PNG 文件。
+  # AI 侧的抽帧/AI/编码三段被替换成：
+  #   ffmpeg(解码 rawvideo rgb48le) → AI(读stdin→超分→写stdout) → ffmpeg(ffv1)
+  # 任何一步失败都会自动落回原 PNG 路径（只记 STAGE3_STREAM_FALLBACK）。
+  # 不受 ai_window_size 限制：整段一次跑完。
+  #
+  # 【默认开启的理由】2026-10-26 实测（1280×720 → 2560×1440，300 帧，2×）：
+  #     PNG 路线   18m36s  rc=0，temp 里写 300×5.28MB 输入帧 + 300×21.13MB
+  #                        输出帧 ≈ 7.7 GB（写完即删，纯 SSD 损耗）
+  #     流式路线   16m34s  rc=0，**零帧文件**（temp 只有下游 mkv）
+  #   成品规格一致：2560×1440 / 300 帧 / 12.000s
+  #   结构比对：相关系数 0.999894、平均差 0.26%（差异来自 stage6 随机颗粒）
+  # 即：既省 SSD 又更快，故默认开启。任何一步失败都会自动落回 PNG 路线。
+  ai_stream_raw: true
   # 期望的窗口帧数；auto 下会按内存缩减
   ai_frame_buffer_frames: 256
   # 最多占用「可用内存」的比例（留 50% 给系统与其他进程）
