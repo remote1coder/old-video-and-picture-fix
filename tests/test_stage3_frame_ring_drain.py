@@ -170,3 +170,36 @@ def test_ring_requires_slots_ge_frames():
         assert got == [3, 2, 3], f"覆盖行为变了：{got}"
     finally:
         ring.close()
+
+
+def test_shm_env_set_implies_drain_called():
+    """结构性不变量：设了 WB_FRAME_OUT_SHM_NAME 就必须调用 drain。
+
+    2026-10-25 的断链事故正是漏了这条：生产侧设了环境变量，AI 把结果
+    写进输出 ring，却没有代码去读 → 下游拿不到帧。
+    本测试用源码静态检查把这个配对钉住。
+    """
+    import io
+    src = io.open(s3.__file__, encoding="utf-8", errors="replace").read()
+    i_set = src.find('env["WB_FRAME_OUT_SHM_NAME"]')
+    i_drain = src.find("_drain_ring_to_pngs(")
+    assert i_set > 0, "找不到设置 WB_FRAME_OUT_SHM_NAME 的代码"
+    assert i_drain > 0, "找不到调用 _drain_ring_to_pngs 的代码"
+    # drain 的调用点必须在设置点之后（收集侧在生产侧之后）
+    assert i_drain > i_set, "drain 调用点在设置环境变量之前？顺序反了"
+    # drain 必须受"环境变量存在"保护
+    guard = src[i_drain - 400:i_drain]
+    assert "WB_FRAME_OUT_SHM_NAME" in guard, \
+        "drain 调用没有检查 WB_FRAME_OUT_SHM_NAME 是否存在"
+
+
+def test_shm_failure_clears_env_vars():
+    """结构性不变量：shm 建立失败时必须清掉所有 WB_FRAME_* 再回退 PNG。
+
+    否则残留的环境变量会让 AI 子进程尝试挂一个不存在的 ring。
+    """
+    import io
+    src = io.open(s3.__file__, encoding="utf-8", errors="replace").read()
+    assert 'if _k.startswith("WB_FRAME_")' in src, \
+        "缺少清理 WB_FRAME_* 的代码（失败回退会残留环境变量）"
+    assert "STAGE3_FRAME_RING_FALLBACK" in src, "缺少回退日志"
