@@ -545,77 +545,6 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 "    raise\n"
             )
         # FIX-R6-02: 用 AI 解释器（.venv_r4）而不是 sys.executable
-        # 3c-2 接线：窗口能整体放进 ring 才走共享内存，否则回退 PNG。
-        # 不做分块——分块会引入"生产者覆盖未读帧"的风险（见
-        # test_ring_requires_slots_ge_frames），而回退 PNG 至少是安全的。
-        _ring = None
-        _out_ring = None
-        _shm_meta = None
-        try:
-            import glob as _glob
-            import cv2 as _cv2
-            _pngs = sorted(_glob.glob(os.path.join(input_path, "*.png")))
-            _plan = _plan_frame_transport([(input_path, output_dir)],
-                                          params or {}, logger)
-            if (_plan and _plan.get("transport") == "shared_memory"
-                    and _pngs
-                    and len(_pngs) <= int(_plan["buffer_frames"])):
-                _probe = _cv2.imread(_pngs[0], _cv2.IMREAD_UNCHANGED)
-                _ph, _pw = int(_probe.shape[0]), int(_probe.shape[1])
-                _pc = 1 if _probe.ndim == 2 else int(_probe.shape[2])
-                _pdt = str(_probe.dtype)
-                _pfb = _pw * _ph * _pc * _probe.dtype.itemsize
-                _slots = len(_pngs)
-                _ring = FrameRing(name="wb_fr_%d" % os.getpid(),
-                                  frame_bytes=_pfb, slots=_slots)
-                _n, _w, _h, _c, _dt = _load_window_into_ring(
-                    input_path, _ring, _pfb, _slots, logger)
-                if _n == len(_pngs):
-                    _ow, _oh = _w * scale, _h * scale
-                    _ofb = _ow * _oh * _c * _probe.dtype.itemsize
-                    _out_ring = FrameRing(name="wb_fo_%d" % os.getpid(),
-                                          frame_bytes=_ofb, slots=_slots)
-                    _shm_meta = (_n, _w, _h, _c, _dt, _slots, _pfb,
-                                 _ofb, _ow, _oh)
-                    env["WB_FRAME_SHM_NAME"] = _ring.name
-                    env["WB_FRAME_SHM_SLOTS"] = str(_slots)
-                    env["WB_FRAME_BYTES"] = str(_pfb)
-                    env["WB_FRAME_COUNT"] = str(_n)
-                    env["WB_FRAME_W"] = str(_w)
-                    env["WB_FRAME_H"] = str(_h)
-                    env["WB_FRAME_C"] = str(_c)
-                    env["WB_FRAME_DTYPE"] = _dt
-                    env["WB_FRAME_OUT_SHM_NAME"] = _out_ring.name
-                    env["WB_FRAME_OUT_SLOTS"] = str(_slots)
-                    env["WB_FRAME_OUT_BYTES"] = str(_ofb)
-                    if logger:
-                        logger.info("STAGE3_FRAME_RING_ACTIVE",
-                                    "shared-memory frame transport active",
-                                    frames=_n, slots=_slots,
-                                    in_bytes=_pfb, out_bytes=_ofb)
-                else:
-                    _ring.close(); _ring = None
-                    if logger:
-                        logger.warning("STAGE3_FRAME_RING_FALLBACK",
-                                       "ring load incomplete, using PNG")
-            elif _plan and _plan.get("transport") == "shared_memory":
-                if logger:
-                    logger.info("STAGE3_FRAME_RING_SKIP",
-                                "window larger than ring budget, using PNG",
-                                frames=len(_pngs),
-                                budget=_plan.get("buffer_frames"))
-        except Exception as _re:
-            if logger:
-                logger.warning("STAGE3_FRAME_RING_FALLBACK",
-                               f"shm setup failed, using PNG: {_re}")
-            for _r in (_ring, _out_ring):
-                if _r is not None:
-                    try: _r.close()
-                    except Exception: pass
-            _ring = _out_ring = None
-            for _k in list(env):
-                if _k.startswith("WB_FRAME_"):
-                    env.pop(_k, None)
 
         cmd = [ai_py, script_path]
 
@@ -784,28 +713,7 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
         cmd = [ai_py, script_path]
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                             timeout=7200, shell=False, env=env)
-        # 3c-2 收集侧：只要设了 WB_FRAME_OUT_SHM_NAME 就**必须** drain，
-        # 否则下游拿不到帧（上一轮就是漏了这里导致断链，已回退重做）。
-        if (r.returncode == 0 and _shm_meta is not None
-                and env.get("WB_FRAME_OUT_SHM_NAME")):
-            (_n, _w, _h, _c, _dt, _slots, _pfb, _ofb, _ow, _oh) = _shm_meta
-            _got = _drain_ring_to_pngs(
-                env["WB_FRAME_OUT_SHM_NAME"], _slots, _ofb, _n,
-                output_dir, _ow, _oh, _c, _dt, logger)
-            if _got != _n:
-                if logger:
-                    logger.error("STAGE3_FRAME_RING_DRAIN_SHORT",
-                                 f"drained {_got}/{_n} frames")
-                return False
-            if logger:
-                logger.info("STAGE3_FRAME_RING_DRAINED",
-                            "drained shm output back to PNG", frames=_got)
-        # 无论走没走 shm，都要把 ring 放掉（Windows 上 unlink 是 no-op，
-        # 由 OS 在进程退出后回收，但 close 仍要调）
-        for _r in (_ring, _out_ring):
-            if _r is not None:
-                try: _r.close()
-                except Exception: pass
+
         try:
             Path(script_path).unlink(missing_ok=True)
         except Exception:
@@ -1154,6 +1062,77 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
         #
         # `-u` 很关键：子进程卡住时，缓冲的 stdout 会让诊断日志**空白**，
         # 看起来就像"什么都没发生"。无缓冲后至少能看到它停在哪一行。
+        # 3c-2 接线：窗口能整体放进 ring 才走共享内存，否则回退 PNG。
+        # 不做分块——分块会引入"生产者覆盖未读帧"的风险（见
+        # test_ring_requires_slots_ge_frames），而回退 PNG 至少是安全的。
+        _ring = None
+        _out_ring = None
+        _shm_meta = None
+        try:
+            import glob as _glob
+            import cv2 as _cv2
+            _pngs = sorted(_glob.glob(os.path.join(input_path, "*.png")))
+            _plan = _plan_frame_transport([(input_path, output_dir)],
+                                          params or {}, logger)
+            if (_plan and _plan.get("transport") == "shared_memory"
+                    and _pngs
+                    and len(_pngs) <= int(_plan["buffer_frames"])):
+                _probe = _cv2.imread(_pngs[0], _cv2.IMREAD_UNCHANGED)
+                _ph, _pw = int(_probe.shape[0]), int(_probe.shape[1])
+                _pc = 1 if _probe.ndim == 2 else int(_probe.shape[2])
+                _pdt = str(_probe.dtype)
+                _pfb = _pw * _ph * _pc * _probe.dtype.itemsize
+                _slots = len(_pngs)
+                _ring = FrameRing(name="wb_fr_%d" % os.getpid(),
+                                  frame_bytes=_pfb, slots=_slots)
+                _n, _w, _h, _c, _dt = _load_window_into_ring(
+                    input_path, _ring, _pfb, _slots, logger)
+                if _n == len(_pngs):
+                    _ow, _oh = _w * scale, _h * scale
+                    _ofb = _ow * _oh * _c * _probe.dtype.itemsize
+                    _out_ring = FrameRing(name="wb_fo_%d" % os.getpid(),
+                                          frame_bytes=_ofb, slots=_slots)
+                    _shm_meta = (_n, _w, _h, _c, _dt, _slots, _pfb,
+                                 _ofb, _ow, _oh)
+                    env["WB_FRAME_SHM_NAME"] = _ring.name
+                    env["WB_FRAME_SHM_SLOTS"] = str(_slots)
+                    env["WB_FRAME_BYTES"] = str(_pfb)
+                    env["WB_FRAME_COUNT"] = str(_n)
+                    env["WB_FRAME_W"] = str(_w)
+                    env["WB_FRAME_H"] = str(_h)
+                    env["WB_FRAME_C"] = str(_c)
+                    env["WB_FRAME_DTYPE"] = _dt
+                    env["WB_FRAME_OUT_SHM_NAME"] = _out_ring.name
+                    env["WB_FRAME_OUT_SLOTS"] = str(_slots)
+                    env["WB_FRAME_OUT_BYTES"] = str(_ofb)
+                    if logger:
+                        logger.info("STAGE3_FRAME_RING_ACTIVE",
+                                    "shared-memory frame transport active",
+                                    frames=_n, slots=_slots,
+                                    in_bytes=_pfb, out_bytes=_ofb)
+                else:
+                    _ring.close(); _ring = None
+                    if logger:
+                        logger.warning("STAGE3_FRAME_RING_FALLBACK",
+                                       "ring load incomplete, using PNG")
+            elif _plan and _plan.get("transport") == "shared_memory":
+                if logger:
+                    logger.info("STAGE3_FRAME_RING_SKIP",
+                                "window larger than ring budget, using PNG",
+                                frames=len(_pngs),
+                                budget=_plan.get("buffer_frames"))
+        except Exception as _re:
+            if logger:
+                logger.warning("STAGE3_FRAME_RING_FALLBACK",
+                               f"shm setup failed, using PNG: {_re}")
+            for _r in (_ring, _out_ring):
+                if _r is not None:
+                    try: _r.close()
+                    except Exception: pass
+            _ring = _out_ring = None
+            for _k in list(env):
+                if _k.startswith("WB_FRAME_"):
+                    env.pop(_k, None)
         cmd = [ai_py, "-u", script_path]
 
         # B9-后续（第七轮）：**批量路径原来固定 timeout=7200（两小时）**。
@@ -1248,6 +1227,28 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
             return False
         # FIX-R6-03: 失败必须留证据（同 run_realesrgan；原实现静默 False）
         if r.returncode == 83:
+            # 3c-2 收集侧：只要设了 WB_FRAME_OUT_SHM_NAME 就**必须** drain，
+            # 否则下游拿不到帧（上一轮就是漏了这里导致断链，已回退重做）。
+            if (r.returncode == 0 and _shm_meta is not None
+                    and env.get("WB_FRAME_OUT_SHM_NAME")):
+                (_n, _w, _h, _c, _dt, _slots, _pfb, _ofb, _ow, _oh) = _shm_meta
+                _got = _drain_ring_to_pngs(
+                    env["WB_FRAME_OUT_SHM_NAME"], _slots, _ofb, _n,
+                    output_dir, _ow, _oh, _c, _dt, logger)
+                if _got != _n:
+                    if logger:
+                        logger.error("STAGE3_FRAME_RING_DRAIN_SHORT",
+                                     f"drained {_got}/{_n} frames")
+                    return False
+                if logger:
+                    logger.info("STAGE3_FRAME_RING_DRAINED",
+                                "drained shm output back to PNG", frames=_got)
+            # 无论走没走 shm，都要把 ring 放掉（Windows 上 unlink 是 no-op，
+            # 由 OS 在进程退出后回收，但 close 仍要调）
+            for _r in (_ring, _out_ring):
+                if _r is not None:
+                    try: _r.close()
+                    except Exception: pass
             try:
                 Path(script_path).unlink(missing_ok=True)
             except Exception:
