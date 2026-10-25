@@ -779,8 +779,6 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
 
     in_w, in_h = int(width), int(height)
     out_w, out_h = in_w * int(scale), in_h * int(scale)
-    in_bytes = in_w * in_h * 3 * 2
-    out_bytes = out_w * out_h * 3 * 2
     model_path = str(Path(model_dir) / f"{model}.pth")
 
     # ---- AI 脚本：stdin 读帧 -> 超分 -> stdout 写帧 ----
@@ -842,9 +840,27 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                                    bufsize=10 ** 8)
         ai.stdout.close()           # 让 ai→enc 直接连通
 
-        enc.wait(timeout=timeout_s)
-        ai.wait(timeout=timeout_s)
-        dec.wait(timeout=timeout_s)
+        # 三个子进程都登记到取消守卫：Ctrl+C/取消时必须把它们一起杀掉，
+        # 否则守卫删掉的半截 mkv 会被孤儿进程重新写回来（RV-12 同族）。
+        _cg_mod = None
+        if cancel_guard is not None:
+            try:
+                import cancel_guard as _cg_mod  # noqa: F401
+                for _p in (dec, ai, enc):
+                    if _p is not None:
+                        _cg_mod.watch_process(_p)
+            except Exception:
+                _cg_mod = None
+        try:
+            enc.wait(timeout=timeout_s)
+            ai.wait(timeout=timeout_s)
+            dec.wait(timeout=timeout_s)
+        finally:
+            if _cg_mod is not None:
+                for _p in (dec, ai, enc):
+                    if _p is not None:
+                        try: _cg_mod.unwatch_process(_p)
+                        except Exception: pass
     except subprocess.TimeoutExpired:
         for p_ in (dec, ai, enc):
             if p_ is not None:
@@ -879,9 +895,17 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
         return False, (f"rc dec={dec.returncode} ai={ai.returncode} "
                        f"enc={enc.returncode} | ai_err={ai_txt[-500:]} "
                        f"| dec_err={dec_txt[-200:]} "
-                       f"| enc_err={enc_txt[-200:]}"), frames
+                       f"| enc_err={enc_txt[-200:]} "
+                       f"| script_kept_at={tmpd}"), frames
     if not os.path.exists(str(output_mkv)):
         return False, "encoder produced no output", frames
+    # 成功：清掉临时脚本与 stderr 文件。失败会提前 return，
+    # 那时**保留** tmpd 以便排查（项目约定：失败必须留证据）。
+    try:
+        import shutil as _sh
+        _sh.rmtree(tmpd, ignore_errors=True)
+    except Exception:
+        pass
     if logger:
         logger.info("STAGE3_STREAM_RAW_OK",
                     "Raw-pipe upscale finished with zero frame files on disk",
@@ -2144,6 +2168,14 @@ def main():
                     logger.warning("STAGE3_STREAM_NO_DIMS",
                                    "cannot probe stage2 dimensions; using PNG path")
                 else:
+                    # 与正常路径一致：编码前登记产物，取消时删掉半截 mkv，
+                    # 否则下游 exists()>0 的缓存检查会把它当成功产物复用。
+                    if _cancel_guard is not None:
+                        try:
+                            _cancel_guard.watch_outputs(
+                                _s_out, logger=logger, stage=3)
+                        except Exception:
+                            pass
                     _s_ok, _s_why, _s_n = _stream_raw_upscale(
                         input_video=stage2_output, output_mkv=_s_out,
                         width=_s_dims[0], height=_s_dims[1], scale=scale,
@@ -2154,6 +2186,11 @@ def main():
                         logger=logger, cancel_guard=_cancel_guard,
                         color_opts=_s_copts)
                     if _s_ok and os.path.exists(_s_out) and os.path.getsize(_s_out) > 0:
+                        if _cancel_guard is not None:
+                            try:
+                                _cancel_guard.release_outputs()
+                            except Exception:
+                                pass
                         logger.info("STAGE3_STREAM_DONE",
                                     "Zero-disk raw-pipe upscale succeeded; "
                                     "skipping PNG extract/encode entirely",
