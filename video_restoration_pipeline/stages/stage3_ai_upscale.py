@@ -818,7 +818,8 @@ def _load_window_into_ring(frames_dir, ring, frame_bytes, slots, logger=None):
     return len(pngs), w, h, c, dt
 
 
-def _plan_frame_transport(window_dirs, params, logger=None):
+def _plan_frame_transport(window_dirs, params, logger=None,
+                          window_frames=None):
     """探测首帧尺寸并按可用内存决定传输方式（3a：只记日志，不改变行为）。
 
     返回 plan dict（transport / buffer_frames / reason / ...）；
@@ -856,9 +857,13 @@ def _plan_frame_transport(window_dirs, params, logger=None):
             logger.warning("STAGE3_FRAME_TRANSPORT_PROBE_FAIL", str(_e))
         return None
 
-    plan = plan_transport(frame_bytes,
-                          int(params.get("ai_frame_buffer_frames", 256) or 256),
-                          params)
+    # window_frames 优先：ring 要装的是**这一窗口的全部帧**，
+    # 不能拿 ai_frame_buffer_frames（默认 256）当上限——否则窗口一大就
+    # 永远走不成共享内存。真正的上限由 plan_transport 按可用内存算。
+    _req = int(params.get("ai_frame_buffer_frames", 256) or 256)
+    if window_frames:
+        _req = max(_req, int(window_frames))
+    plan = plan_transport(frame_bytes, _req, params)
     if logger:
         logger.info("STAGE3_FRAME_TRANSPORT_PLAN",
                     f"frame transport decided: {plan['transport']}",
@@ -1078,7 +1083,8 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
             _shm_out = window_dirs[0][1] if len(window_dirs) == 1 else None
             _pngs = (sorted(_glob.glob(os.path.join(_shm_in, "*.png")))
                      if _shm_in else [])
-            _plan = (_plan_frame_transport(window_dirs, params or {}, logger)
+            _plan = (_plan_frame_transport(window_dirs, params or {}, logger,
+                                           window_frames=len(_pngs))
                      if _shm_in else None)
             if (_plan and _plan.get("transport") == "shared_memory"
                     and _pngs
