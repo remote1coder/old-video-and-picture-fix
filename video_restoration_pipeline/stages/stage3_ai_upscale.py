@@ -1071,9 +1071,15 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
         try:
             import glob as _glob
             import cv2 as _cv2
-            _pngs = sorted(_glob.glob(os.path.join(input_path, "*.png")))
-            _plan = _plan_frame_transport([(input_path, output_dir)],
-                                          params or {}, logger)
+            # batch 的变量是 window_dirs（[(frames_dir, out_dir), ...]），没有
+            # _shm_in / _shm_out。共享内存一次只装一个窗口，故**仅在单窗口
+            # 时启用**；多窗口回退 PNG（batch 一次加载模型跑多窗，本来也更划算）。
+            _shm_in = window_dirs[0][0] if len(window_dirs) == 1 else None
+            _shm_out = window_dirs[0][1] if len(window_dirs) == 1 else None
+            _pngs = (sorted(_glob.glob(os.path.join(_shm_in, "*.png")))
+                     if _shm_in else [])
+            _plan = (_plan_frame_transport(window_dirs, params or {}, logger)
+                     if _shm_in else None)
             if (_plan and _plan.get("transport") == "shared_memory"
                     and _pngs
                     and len(_pngs) <= int(_plan["buffer_frames"])):
@@ -1086,7 +1092,7 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 _ring = FrameRing(name="wb_fr_%d" % os.getpid(),
                                   frame_bytes=_pfb, slots=_slots)
                 _n, _w, _h, _c, _dt = _load_window_into_ring(
-                    input_path, _ring, _pfb, _slots, logger)
+                    _shm_in, _ring, _pfb, _slots, logger)
                 if _n == len(_pngs):
                     _ow, _oh = _w * scale, _h * scale
                     _ofb = _ow * _oh * _c * _probe.dtype.itemsize
@@ -1234,7 +1240,7 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 (_n, _w, _h, _c, _dt, _slots, _pfb, _ofb, _ow, _oh) = _shm_meta
                 _got = _drain_ring_to_pngs(
                     env["WB_FRAME_OUT_SHM_NAME"], _slots, _ofb, _n,
-                    output_dir, _ow, _oh, _c, _dt, logger)
+                    _shm_out, _ow, _oh, _c, _dt, logger)
                 if _got != _n:
                     if logger:
                         logger.error("STAGE3_FRAME_RING_DRAIN_SHORT",
