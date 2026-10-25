@@ -727,6 +727,95 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 
 # FIX-P8-9: Batch model loading for Python API path
 # ORIGINAL: Per-window model loading via run_realesrgan (slow for Python API)
+def _drain_ring_to_pngs(shm_name, slots, out_frame_bytes, count, out_dir,
+                        width, height, channels, dtype_name, logger=None):
+    """把 AI 写进输出 ring 的结果落回 PNG（下游 stage4 仍消费文件）。
+
+    这是共享内存传输的**结果收集侧**。与载入侧（_load_window_into_ring）
+    必须成对出现：只要设置了 WB_FRAME_OUT_SHM_NAME，就一定要调用本函数，
+    否则下游拿不到任何帧。
+
+    Returns:
+        落盘帧数；0 表示失败（调用方应回退到 PNG 模式重跑或报错）。
+    """
+    import cv2
+    import numpy as np
+    from multiprocessing import shared_memory
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        shm = shared_memory.SharedMemory(name=shm_name)
+    except Exception as _e:
+        if logger:
+            logger.error("STAGE3_FRAME_RING_DRAIN_ATTACH_FAIL", str(_e))
+        return 0
+    written = 0
+    try:
+        dt = np.dtype(dtype_name)
+        for i in range(count):
+            off = (i % slots) * out_frame_bytes
+            raw = bytes(shm.buf[off:off + out_frame_bytes])
+            arr = np.frombuffer(raw, dtype=dt)
+            if channels > 1:
+                arr = arr.reshape(height, width, channels)
+            else:
+                arr = arr.reshape(height, width)
+            if not cv2.imwrite(os.path.join(out_dir, "shm_%06d.png" % i), arr):
+                if logger:
+                    logger.error("STAGE3_FRAME_RING_DRAIN_WRITE_FAIL",
+                                 "frame %d" % i)
+                return 0
+            written += 1
+    except Exception as _e:
+        if logger:
+            logger.error("STAGE3_FRAME_RING_DRAIN_FAIL", str(_e))
+        return 0
+    finally:
+        try:
+            shm.close()
+        except Exception:
+            pass
+    return written
+
+
+def _load_window_into_ring(frames_dir, ring, frame_bytes, slots, logger=None):
+    """把一个窗口的 PNG 全部读入共享内存 ring（载入侧）。
+
+    Returns:
+        (帧数, 宽, 高, 通道, dtype名)；帧数 0 表示失败。
+    """
+    import glob
+    import cv2
+    import numpy as np
+    pngs = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
+    if not pngs:
+        return 0, 0, 0, 0, "uint8"
+    first = cv2.imread(pngs[0], cv2.IMREAD_UNCHANGED)
+    if first is None:
+        if logger:
+            logger.error("STAGE3_FRAME_RING_READ_FAIL", pngs[0])
+        return 0, 0, 0, 0, "uint8"
+    h, w = int(first.shape[0]), int(first.shape[1])
+    c = 1 if first.ndim == 2 else int(first.shape[2])
+    dt = str(first.dtype)
+    fb = w * h * c * first.dtype.itemsize
+    if fb != frame_bytes:
+        if logger:
+            logger.warning("STAGE3_FRAME_RING_SIZE_MISMATCH",
+                           f"probe {frame_bytes}B != actual {fb}B")
+        return 0, w, h, c, dt
+    for i, fp in enumerate(pngs):
+        arr = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+        if arr is None:
+            if logger:
+                logger.error("STAGE3_FRAME_RING_READ_FAIL", fp)
+            return 0, w, h, c, dt
+        # 不能把 bytes 直接赋值给 uint8 数组（numpy 会抛
+        # ValueError: invalid literal for int()），必须先 frombuffer
+        ring.slot(i)[:] = np.frombuffer(
+            np.ascontiguousarray(arr).tobytes(), dtype=np.uint8)
+    return len(pngs), w, h, c, dt
+
+
 def _plan_frame_transport(window_dirs, params, logger=None):
     """探测首帧尺寸并按可用内存决定传输方式（3a：只记日志，不改变行为）。
 

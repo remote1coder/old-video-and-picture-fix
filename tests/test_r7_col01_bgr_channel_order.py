@@ -63,8 +63,10 @@ def test_both_callsites_feed_bgr_to_enhance():
     两次调用都用 cv2 读写，且 **没有** 残留的 PIL-RGB 直传。
     """
     src = _stage3_src()
-    assert src.count("cv2.imread(fp, cv2.IMREAD_UNCHANGED)") == 2, \
-        "不是两个调用点都走 cv2 读帧（通道与位深会失控）"
+    # 2026-10-25：_load_window_into_ring 也走 cv2 读帧（载入共享内存 ring），
+    # 读帧点从 2 变 3。契约是"每个读帧点都用 cv2"，故断言下限。
+    assert src.count("cv2.imread(fp, cv2.IMREAD_UNCHANGED)") >= 2, \
+        "读帧点没用 cv2（通道与位深会失控）"
     # 2026-10-25：stage3 加了共享内存传输分支，其"无输出 ring"回退也走
     # cv2.imwrite，于是写回点从 2 变 3。真正的契约是"**每个**写回点都用 cv2
     # （保住通道与位深）"，所以断言下限而非写死的个数。
