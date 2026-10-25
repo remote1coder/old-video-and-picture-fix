@@ -87,7 +87,21 @@ global:
   #                放不下或窗口被压得过小则自动回退 PNG
   # shared_memory  强制共享内存（内存不足时窗口会被压小，日志会说明）
   # png            强制 PNG 文件中转（改动前的行为）
-  ai_frame_transport: auto
+  #
+  # 【默认值为什么是 png】2026-10-25 实测（VID_20200325_104441，
+  # 320×240 / 585 帧 / 2×，窗口 1024=单窗，同机同参数只改传输方式）：
+  #     png  8m07s  rc=0
+  #     shm  8m58s  rc=0   （日志确认 STAGE3_FRAME_RING_ACTIVE
+  #                         frames=585 slots=585，确实走了共享内存）
+  # 两者成品逐位一致（585 帧 / 19.315s / 640×480 / 11M），**正确性没问题**，
+  # 但共享内存**慢约 10%**。
+  #
+  # 原因：当前实现只改了 AI 侧，两端仍是 PNG 文件
+  #     PNG →[读PNG]→ ring →[AI]→ ring →[写PNG]→ PNG
+  # ring 是**多出来的一跳**，不是替换，所以只会更慢。
+  # 要拿到收益必须连抽帧侧一起改（raw 直接进 ring、ring 直送编码），
+  # 彻底去掉 PNG。在那之前默认走 png。
+  ai_frame_transport: png
   # 期望的窗口帧数；auto 下会按内存缩减
   ai_frame_buffer_frames: 256
   # 最多占用「可用内存」的比例（留 50% 给系统与其他进程）
