@@ -45,6 +45,15 @@ from typing import List, Tuple, Optional, Union
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
+# 3c：帧传输（共享内存 ring）。导入失败不能让 stage3 起不来——
+# 用守卫导入，wire 块会在用到时再检查一次。
+try:
+    from frame_transport import FrameRing, plan_transport  # noqa: F401
+except Exception:                                          # pragma: no cover
+    FrameRing = None
+    plan_transport = None
+
+
 from logger import get_logger  # noqa: E402
 
 try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
@@ -1087,7 +1096,7 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                                            window_frames=len(_pngs))
                      if _shm_in else None)
             if (_plan and _plan.get("transport") == "shared_memory"
-                    and _pngs
+                    and _pngs and FrameRing is not None
                     and len(_pngs) <= int(_plan["buffer_frames"])):
                 _probe = _cv2.imread(_pngs[0], _cv2.IMREAD_UNCHANGED)
                 _ph, _pw = int(_probe.shape[0]), int(_probe.shape[1])
