@@ -1786,7 +1786,46 @@ def main():
     #      并在产物 metadata 里标记 `timing_unexplained=true`，让人能发现；
     #   3. 时长信息缺失 → 标 `timing_unverified`，**不**宣称同步已验证。
     original_duration = params.get("duration", 0)
-    processed_duration = _get_stream_duration(input_source, "v")
+    # FIX-2026-10-25：必须测**最终成品**，不能测 input_source（step6 中间产物）。
+    # 实测踩到的误报：中间产物没有显式 fps，ffprobe 按默认 25fps 算出
+    # 23.400s（585/25），而成品是 19.315s、源 19.304s —— 于是
+    # `STAGE7_TIMING_UNEXPLAINED duration changed by 4096ms` 判成失败，
+    # 但成品其实完全正常（与 PNG 基线逐位一致）。
+    # 本处已在编码之后运行，output_path 可用，优先探它。
+    processed_duration = 0.0
+    _probe_target = None
+    if output_path and os.path.exists(str(output_path)):
+        _probe_target = str(output_path)
+    elif output_path:
+        # 成品此刻可能还是本次 attempt 独占的暂存名
+        # （`{stem}.attempt-<id>.mkv` / `.partial`，见上方 FIX 注释）。
+        # 探它——它才是"刚编码完、带正确 fps"的那份文件。
+        import glob as _g
+        _stem = Path(str(output_path)).name
+        _base = _stem
+        for _suf in (".mkv", ".mp4", ".mov"):
+            if _base.endswith(_suf):
+                _base = _base[: -len(_suf)]
+                break
+        _cands = [c for c in _g.glob(
+            str(Path(str(output_path)).parent / (_base + ".attempt-*")))
+            if os.path.getsize(c) > 0]
+        if _cands:
+            _cands.sort(key=os.path.getmtime)
+            _probe_target = _cands[-1]
+    if _probe_target:
+        processed_duration = _get_stream_duration(_probe_target, "v")
+    if processed_duration <= 0:
+        # 成品探不到（例如被重定向/尚未落盘）才退回中间产物，并留痕
+        processed_duration = _get_stream_duration(input_source, "v")
+        if processed_duration > 0 and logger:
+            logger.warning(
+                "STAGE7_TIMING_PROBE_FALLBACK_TO_SOURCE",
+                "Final output duration unavailable; probed the pre-encode "
+                "source instead. Its fps may be a container default (e.g. "
+                "25fps), so treat the timing delta with care.",
+                output_path=str(output_path))
+
     tempo_ratio = 1.0
     _timing_state = "verified"          # verified | adjusted | unverified | unexplained
     _declared_speed = params.get("expected_speed")
