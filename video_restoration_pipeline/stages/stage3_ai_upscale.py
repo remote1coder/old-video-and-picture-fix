@@ -738,6 +738,206 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 
 # FIX-P8-9: Batch model loading for Python API path
 # ORIGINAL: Per-window model loading via run_realesrgan (slow for Python API)
+def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
+                         fps_str, model, model_dir, ai_py, gpu_id=0,
+                         timeout_s=7200, logger=None, cancel_guard=None):
+    """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
+
+    为什么这样做
+    ------------
+    PNG 中转的代价实测很大：2560×1440 的 RGB48 单帧 PNG 约 21 MB，
+    一个 2612 帧素材**仅输出帧**就要写 53.9 GB，而且这些帧写完即删，
+    是纯粹的固态硬盘健康度损耗。官方 ffmpeg 示例也明确写：
+    先写 PNG 再喂 ffmpeg"很慢（编码+写+读+解码）且占大量空间"。
+
+    本函数把整段链条串成三个进程的管道，**帧永远不进磁盘**：
+        ffmpeg -i in -f rawvideo -pix_fmt rgb48le -            (stdout)
+              → python(读stdin→RealESRGAN→写stdout)            (stdin/stdout)
+              → ffmpeg -f rawvideo ... -i - -c:v ffv1 out.mkv  (stdin)
+    OS 负责背压，父进程不需要任何协调（没有双向管道 → 不会死锁）。
+
+    已验证（本地实测）
+    ------------------
+    - rgb48le 是合法 pix_fmt，16-bit RGB 小端
+    - ffv1 接受 rgb48le 输入（内部存 gbrp16le），解码回来样本值精确一致
+    - 解码侧 `stdout.read(w*h*3*2)` + np.frombuffer(uint16) 逐帧读取可行
+
+    注意
+    ----
+    AI 脚本的 stdout 必须是**纯二进制**，任何 print 都会污染数据流，
+    因此脚本内所有输出走 stderr。
+
+    Returns:
+        (ok: bool, reason: str, frames: int)
+    """
+    import subprocess
+    import tempfile
+
+    if not ai_py:
+        return False, "no AI interpreter", 0
+
+    in_w, in_h = int(width), int(height)
+    out_w, out_h = in_w * int(scale), in_h * int(scale)
+    in_bytes = in_w * in_h * 3 * 2
+    out_bytes = out_w * out_h * 3 * 2
+    model_path = str(Path(model_dir) / f"{model}.pth")
+
+    # ---- AI 脚本：stdin 读帧 -> 超分 -> stdout 写帧 ----
+    script = f"""
+import os, sys, gc, numpy as np, cv2
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from realesrgan import RealESRGANer
+
+IN_W, IN_H, SCALE = {in_w}, {in_h}, {int(scale)}
+IN_BYTES = IN_W * IN_H * 3 * 2
+MODEL_PATH = {model_path!r}
+MODEL_NAME = {model!r}
+GPU_ID = {int(gpu_id)}
+
+def _arch(name):
+    n = name.lower()
+    if "realesr-general" in n:
+        from basicsr.archs.srvgg_arch import SRVGGNetCompact
+        return SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
+                               num_conv=32, upscale=4, act_type="prelu")
+    if "x2plus" in n:
+        return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                       num_block=23, num_grow_ch=32, scale=2)
+    return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                   num_block=23, num_grow_ch=32, scale=4)
+
+# 关键：RealESRGANer 的 scale 必须是**模型原生倍数**（x4v3=4、x2plus=2），
+# 不是我们要的产出倍数。实测把目标倍数(2)传进去，enhance 会输出模型原生的
+# 4 倍尺寸（5120x2880，面积 4 倍），300 帧被编码器读成 1213 帧、时长 48.5s。
+_NATIVE = 2 if "x2plus" in MODEL_NAME.lower() else 4
+upsampler = RealESRGANer(scale=_NATIVE, model_path=MODEL_PATH,
+                         model=_arch(MODEL_NAME), half=True, gpu_id=GPU_ID)
+_in = sys.stdin.buffer
+_out = sys.stdout.buffer
+_n = 0
+while True:
+    buf = _in.read(IN_BYTES)
+    if not buf or len(buf) < IN_BYTES:
+        break
+    arr = np.frombuffer(buf, dtype=np.uint16).reshape(IN_H, IN_W, 3)
+    try:
+        out, _ = upsampler.enhance(arr, outscale=SCALE)
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "out of memory" in msg:
+            sys.stderr.write("OOM" + chr(10)); sys.stderr.flush()
+            sys.exit(83)
+        raise
+    _out.write(np.ascontiguousarray(out).tobytes())
+    _out.flush()
+    _n += 1
+try:
+    del upsampler
+except NameError:
+    pass
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+sys.stderr.write(("FRAMES=%d" % _n) + chr(10)); sys.stderr.flush()
+"""
+    tmpd = None
+    try:
+        tmpd = tempfile.mkdtemp(prefix="stream3_")
+        sp = os.path.join(tmpd, "ai_frame.py")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write(script)
+    except Exception as e:
+        return False, f"cannot write AI script: {e}", 0
+
+    dec_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin",
+               "-i", str(input_video),
+               "-f", "rawvideo", "-pix_fmt", "rgb48le", "-vsync", "0", "-"]
+    # 帧率必须用 `-framerate`（rawvideo 输入的专用选项）。
+    # 实测用 `-r 25` 放在 -i 之前，输出被写成 48.52s（≈6.18fps）而不是
+    # 300/25=12.0s —— 时间戳整个错掉。输出侧再加一个 `-r` 兜底。
+    enc_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y",
+               "-f", "rawvideo", "-vcodec", "rawvideo",
+               "-pix_fmt", "rgb48le", "-s", f"{out_w}x{out_h}",
+               "-framerate", str(fps_str), "-i", "-",
+               "-c:v", "ffv1", "-r", str(fps_str), "-an", str(output_mkv)]
+
+    dec = ai = enc = None
+    # stderr 一律落临时文件：管道 stdout 已经移交给下游进程，
+    # 再 communicate() 会 "read of closed file"；而 stderr=PIPE 又不读
+    # 会有缓冲区打满导致子进程阻塞的风险。落文件最稳。
+    err_paths = {}
+    for _tag in ("dec", "ai", "enc"):
+        err_paths[_tag] = os.path.join(tmpd, f"{_tag}.err")
+    try:
+        with open(err_paths["dec"], "wb") as _fe:
+            dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE,
+                                   stderr=_fe, stdin=subprocess.DEVNULL,
+                                   bufsize=10 ** 8)
+        env = os.environ.copy()
+        for k in list(env):
+            if k.upper().startswith(("PYTHONPATH", "PYTHONHOME")):
+                env.pop(k, None)
+        with open(err_paths["ai"], "wb") as _fa:
+            ai = subprocess.Popen([ai_py, sp], stdin=dec.stdout,
+                                  stdout=subprocess.PIPE, stderr=_fa,
+                                  env=env, bufsize=10 ** 8)
+        dec.stdout.close()          # 让 dec→ai 直接连通
+        with open(err_paths["enc"], "wb") as _fc:
+            enc = subprocess.Popen(enc_cmd, stdin=ai.stdout,
+                                   stdout=subprocess.DEVNULL, stderr=_fc,
+                                   bufsize=10 ** 8)
+        ai.stdout.close()           # 让 ai→enc 直接连通
+
+        enc.wait(timeout=timeout_s)
+        ai.wait(timeout=timeout_s)
+        dec.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        for p_ in (dec, ai, enc):
+            if p_ is not None:
+                try: p_.kill()
+                except Exception: pass
+        return False, f"streaming timeout after {timeout_s}s", 0
+    except Exception as e:
+        for p_ in (dec, ai, enc):
+            if p_ is not None:
+                try: p_.kill()
+                except Exception: pass
+        return False, f"streaming pipeline error: {e}", 0
+
+    def _read_err(tag):
+        try:
+            with open(err_paths[tag], "rb") as f:
+                return f.read().decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    dec_txt, ai_txt, enc_txt = _read_err("dec"), _read_err("ai"), _read_err("enc")
+    frames = 0
+    for ln in ai_txt.splitlines():
+        if ln.startswith("FRAMES="):
+            try: frames = int(ln.split("=", 1)[1])
+            except ValueError: pass
+    rc_ok = (dec.returncode == 0 and ai.returncode == 0 and enc.returncode == 0)
+    if ai.returncode == 83:
+        return False, "OOM in AI process (exit 83)", frames
+    if not rc_ok:
+        # 把三方的 stderr 尾巴都带上——否则"启动失败"会被误当成 OOM
+        return False, (f"rc dec={dec.returncode} ai={ai.returncode} "
+                       f"enc={enc.returncode} | ai_err={ai_txt[-500:]} "
+                       f"| dec_err={dec_txt[-200:]} "
+                       f"| enc_err={enc_txt[-200:]}"), frames
+    if not os.path.exists(str(output_mkv)):
+        return False, "encoder produced no output", frames
+    if logger:
+        logger.info("STAGE3_STREAM_RAW_OK",
+                    "Raw-pipe upscale finished with zero frame files on disk",
+                    frames=frames, in_px=f"{in_w}x{in_h}",
+                    out_px=f"{out_w}x{out_h}")
+    return True, "ok", frames
+
+
 def _clear_stale_frame_dirs(temp_dir, job_id, logger=None):
     """清掉**同一 job_id** 上次跑批残留在 temp 里的帧目录。
 
