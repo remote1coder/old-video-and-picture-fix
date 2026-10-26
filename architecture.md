@@ -48,6 +48,33 @@
 | 6 | `stages/stage6_grain_synthesis.py` | Film grain synthesis | face-restored → grain-added |
 | 7 | `stages/stage7_encode.py` | Final encoding | grain-added → final output |
 
+#### stage3 内部数据流：默认零落盘（`ai_stream_raw`）
+
+stage3 有两种内部通路，由 `ai_stream_raw` 选择：
+
+**默认 —— 三进程管道，帧不进磁盘：**
+
+```
+ffmpeg(-i stage2.mkv -f rawvideo -pix_fmt rgb48le -)   ← 解码
+      → python(读 stdin 帧 → RealESRGAN → 写 stdout)   ← 超分
+      → ffmpeg(-f rawvideo ... -i - -c:v ffv1 step3.mkv)  ← 编码
+```
+
+- OS 负责背压，父进程不参与协调；没有双向管道，不会死锁
+- **不受 `ai_window_size` 限制**，整段一次跑完
+- 失败自动落回下面的 PNG 通路（`STAGE3_STREAM_FALLBACK`）
+
+**回退 —— PNG 中转（`ai_stream_raw: false`）：**
+
+```
+stage2.mkv → ffmpeg 抽帧 frame_%08d.png → AI 读写 PNG → ffmpeg 编 step3.mkv
+```
+
+这条通路每个窗口会写「输入帧 + 输出帧」两批 PNG，2560×1440 时约 21 MB/帧，
+是纯粹的固态硬盘损耗。`ai_frame_transport`（`shared_memory` / `auto` / `png`）
+只影响 AI 侧用环还是用文件，**两端仍是 PNG，因此不省写入**。
+
+
 #### Photo Pipeline Stages
 | Stage | File | Purpose | Input → Output |
 |-------|------|---------|----------------|
