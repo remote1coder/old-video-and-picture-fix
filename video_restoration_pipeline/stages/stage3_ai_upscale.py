@@ -1082,7 +1082,7 @@ def _load_window_into_ring(frames_dir, ring, frame_bytes, slots, logger=None):
 
 
 def _plan_frame_transport(window_dirs, params, logger=None,
-                          window_frames=None):
+                          window_frames=None, scale=1):
     """探测首帧尺寸并按可用内存决定传输方式（3a：只记日志，不改变行为）。
 
     返回 plan dict（transport / buffer_frames / reason / ...）；
@@ -1126,7 +1126,9 @@ def _plan_frame_transport(window_dirs, params, logger=None,
     _req = int(params.get("ai_frame_buffer_frames", 256) or 256)
     if window_frames:
         _req = max(_req, int(window_frames))
-    plan = plan_transport(frame_bytes, _req, params)
+    # STR-06：ring 是「输入 + 输出」两份，预算必须按合计算。
+    plan = plan_transport(frame_bytes, _req, params,
+                          out_scale=int(scale) if scale else 1)
     if logger:
         logger.info("STAGE3_FRAME_TRANSPORT_PLAN",
                     f"frame transport decided: {plan['transport']}",
@@ -1158,7 +1160,8 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
     model_dir = SCRIPT_DIR.parent.resolve() / "models"
 
     # 3a：只探测并记录传输方式决策，暂不改变行为
-    _plan_frame_transport(window_dirs, params or {}, logger)
+    _plan_frame_transport(window_dirs, params or {}, logger,
+                          scale=scale)
 
     # FIX-R6-02: DAT 家族分流（DAT / DAT-2 / DAT-S / DAT-light）
     try:
@@ -1347,7 +1350,8 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
             _pngs = (sorted(_glob.glob(os.path.join(_shm_in, "*.png")))
                      if _shm_in else [])
             _plan = (_plan_frame_transport(window_dirs, params or {}, logger,
-                                           window_frames=len(_pngs))
+                                           window_frames=len(_pngs),
+                                           scale=scale)
                      if _shm_in else None)
             if (_plan and _plan.get("transport") == "shared_memory"
                     and _pngs and FrameRing is not None
