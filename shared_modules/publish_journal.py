@@ -162,6 +162,19 @@ def write_journal(journal_path: str, payload: Dict[str, Any]) -> bool:
         return False
 
 
+def journal_state(journal_path: str) -> str:
+    """journal 的三态：``"missing"`` / ``"valid"`` / ``"invalid"``。
+
+    PHOTO-03：`read_journal()` 对"不存在""读取失败""JSON 损坏"
+    "摘要不符"一律返回 None，调用方于是把**损坏的 journal** 当成
+    "没有旧事务"直接开始下一次发布 —— 这违反了"状态未知则保留现场"。
+    本函数把两者区分开：调用方对 ``invalid`` 应阻断并要求人工处理。
+    """
+    if not journal_path or not os.path.exists(journal_path):
+        return "missing"
+    return "valid" if read_journal(journal_path) is not None else "invalid"
+
+
 def read_journal(journal_path: str) -> Optional[Dict[str, Any]]:
     """读 journal；不存在/损坏/摘要不符都返回 None（不猜测修复）。"""
     try:
@@ -251,6 +264,23 @@ def validate_journal_paths(doc: Dict[str, Any],
             fields.extend([v for v in vals if isinstance(v, str)])
     if isinstance(doc.get("target"), str):
         fields.append(doc["target"])
+
+    # PHOTO-04：生产 journal 把 backup / staging 写在
+    # `records[target]` 里（stage6 写入、恢复/清理也从那里取），
+    # 只校验顶层键等于**没校验真正会被操作的路径**。
+    # 攻击者/误写只要把 records 里的 backup 指到授权根之外，
+    # 恢复时就会去读写那个路径。
+    _recs = doc.get("records")
+    if isinstance(_recs, dict):
+        for _t, _r in _recs.items():
+            if isinstance(_t, str):
+                fields.append(_t)
+            if not isinstance(_r, dict):
+                continue
+            for _k in ("backup", "staging", "path", "target"):
+                _v = _r.get(_k)
+                if isinstance(_v, str):
+                    fields.append(_v)
 
     for p in fields:
         if os.path.isabs(p) or p.startswith("..") or f"..{os.sep}" in p:

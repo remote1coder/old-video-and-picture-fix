@@ -264,6 +264,24 @@ def _recover_prior_publish(work_output_path: str,
       `needs_human`    状态无法判定，保留现场等人工（调用方应失败）
     """
     jp = journal_path_for(work_output_path)
+    # PHOTO-03：先分清"确实没有 journal"与"journal 坏了/被改过"。
+    # 后者状态未知，必须保留现场等人工，不能当成"没有旧事务"继续发布。
+    try:
+        from publish_journal import journal_state as _jstate
+        _st = _jstate(jp)
+    except Exception:
+        _st = "missing"
+    if _st == "invalid":
+        if logger:
+            logger.error(
+                "STAGE6_JOURNAL_INVALID",
+                "Publish journal exists but cannot be trusted (corrupt, "
+                "unreadable, or digest mismatch). Refusing to start a new "
+                "publish on top of an unknown previous state.",
+                journal=jp)
+        return {"status": "needs_human", "action": None,
+                "report": {"journal": jp, "state": "invalid",
+                           "reason": "journal unreadable or digest mismatch"}}
     doc = read_journal(jp)
     if doc is None:
         return {"status": "none", "action": None, "report": None}
@@ -1450,11 +1468,20 @@ def main():
         _entry = snapshot.get(_t) or {}
         _existed = os.path.exists(_t)
         _bk = _entry.get("backup")
+        # PHOTO-05：PREPARED 时就要记下**预期新代摘要**。
+        # 原实现只记 old_digest / backup_digest，new_digest 要等全部替换完
+        # （L1617）才写。于是"第一个目标替换后硬终止"时，已替换的文件
+        # 既不是 OLD 也不是 NEW → classify_recovery 判 UNKNOWN →
+        # 走人工处理，而不是按设计自动回滚。
+        # 暂存件此刻已经就绪，直接算它的摘要作为预期新代。
+        _stg = _entry.get("staging")
         _journal_records[_t] = {
             "existed": _existed,
             "old_digest": file_digest(_t) if _existed else None,
+            "new_digest": file_digest(_stg) if _stg else None,
             "backup": _bk,
             "backup_digest": file_digest(_bk) if _bk else None,
+            "staging": _stg,
             "state": _entry.get("state"),
         }
     _journal_path = journal_path_for(work_output_path)
