@@ -562,6 +562,47 @@ def _probe_packet_span(path: str, stream_type: str = "v") -> float:
     return end - start
 
 
+def _count_frames_quietly(path, logger=None):
+    """数视频帧数；失败返回 0（调用方按"未知"处理）。
+
+    只信 nb_frames / nb_read_frames 这类整数，不用 format=duration 反推——
+    后者在无显式 fps 的容器里会按默认 25fps 算，实测把 585 帧算成 23.4s。
+    """
+    if not path or not os.path.exists(str(path)):
+        return 0
+    try:
+        import subprocess as _sp
+        r = _sp.run(["ffprobe", "-hide_banner", "-v", "error",
+                     "-select_streams", "v:0",
+                     "-show_entries", "stream=nb_frames",
+                     "-of", "default=noprint_wrappers=1:nokey=1",
+                     str(path)],
+                    capture_output=True, text=True, errors="replace",
+                    timeout=60, shell=False)
+        if r.returncode == 0:
+            v = int(str(r.stdout.strip()).splitlines()[0])
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        r = _sp.run(["ffprobe", "-hide_banner", "-v", "error",
+                     "-count_frames", "-select_streams", "v:0",
+                     "-show_entries", "stream=nb_read_frames",
+                     "-of", "default=noprint_wrappers=1:nokey=1",
+                     str(path)],
+                    capture_output=True, text=True, errors="replace",
+                    timeout=300, shell=False)
+        if r.returncode == 0:
+            return int(str(r.stdout.strip()).splitlines()[0])
+    except Exception:
+        pass
+    if logger:
+        logger.warning("STAGE7_FRAME_COUNT_FAIL", str(path))
+    return 0
+
+
 def _get_stream_duration(path: str, stream_type: str = "v") -> float:
     """Get video or audio stream duration using ffprobe.
 
@@ -1786,45 +1827,47 @@ def main():
     #      并在产物 metadata 里标记 `timing_unexplained=true`，让人能发现；
     #   3. 时长信息缺失 → 标 `timing_unverified`，**不**宣称同步已验证。
     original_duration = params.get("duration", 0)
-    # FIX-2026-10-25：必须测**最终成品**，不能测 input_source（step6 中间产物）。
-    # 实测踩到的误报：中间产物没有显式 fps，ffprobe 按默认 25fps 算出
-    # 23.400s（585/25），而成品是 19.315s、源 19.304s —— 于是
-    # `STAGE7_TIMING_UNEXPLAINED duration changed by 4096ms` 判成失败，
-    # 但成品其实完全正常（与 PNG 基线逐位一致）。
-    # 本处已在编码之后运行，output_path 可用，优先探它。
+    # ---- 编码前的时长估计（GATE-05 修正）----
+    # 本段在 **ffmpeg 编码之前** 运行（真正的编码调用在下方约 L2091），
+    # 因此绝对不能去探 output_path 或 glob `{stem}.attempt-*`：
+    #   - 首次运行时成品不存在，只会静默退回 input_source
+    #   - 重跑/并发时会把**上一代成品或别人的 attempt** 当成自己的时长依据
+    # 上一版正是这么写的，注释却说"已在编码之后"，属于无效修复。
+    #
+    # 正确做法：用**帧数比例**推导，完全绕开容器 fps。
+    # step6 中间产物的 format=duration 不可靠（无显式 fps 时 ffprobe 按
+    # 默认 25fps 计算，实测把 585 帧算成 23.400s），但 nb_frames 是 mux 时
+    # 写死的整数，可信。于是：
+    #     processed_duration = original_duration * (处理帧数 / 源帧数)
     processed_duration = 0.0
-    _probe_target = None
-    if output_path and os.path.exists(str(output_path)):
-        _probe_target = str(output_path)
-    elif output_path:
-        # 成品此刻可能还是本次 attempt 独占的暂存名
-        # （`{stem}.attempt-<id>.mkv` / `.partial`，见上方 FIX 注释）。
-        # 探它——它才是"刚编码完、带正确 fps"的那份文件。
-        import glob as _g
-        _stem = Path(str(output_path)).name
-        _base = _stem
-        for _suf in (".mkv", ".mp4", ".mov"):
-            if _base.endswith(_suf):
-                _base = _base[: -len(_suf)]
-                break
-        _cands = [c for c in _g.glob(
-            str(Path(str(output_path)).parent / (_base + ".attempt-*")))
-            if os.path.getsize(c) > 0]
-        if _cands:
-            _cands.sort(key=os.path.getmtime)
-            _probe_target = _cands[-1]
-    if _probe_target:
-        processed_duration = _get_stream_duration(_probe_target, "v")
+    _src_frames = 0
+    try:
+        _sf = params.get("frame_count") or params.get("source_frames")
+        _src_frames = int(_sf) if _sf else 0
+    except (TypeError, ValueError):
+        _src_frames = 0
+    if _src_frames <= 0 and args is not None:
+        _src_frames = _count_frames_quietly(getattr(args, "input", ""), logger)
+    _proc_frames = _count_frames_quietly(input_source, logger)
+    if original_duration > 0 and _src_frames > 0 and _proc_frames > 0:
+        processed_duration = float(original_duration) * _proc_frames / _src_frames
+        if logger:
+            logger.info("STAGE7_TIMING_DURATION_FROM_FRAMES",
+                        "Pre-encode duration derived from frame counts "
+                        "(avoids the container default-fps trap and never "
+                        "reads a previous output)",
+                        src_frames=_src_frames, proc_frames=_proc_frames,
+                        original_duration=round(float(original_duration), 3),
+                        processed_duration=round(processed_duration, 3))
     if processed_duration <= 0:
-        # 成品探不到（例如被重定向/尚未落盘）才退回中间产物，并留痕
+        # 兜底：仍用流式探测，但明确标注它可能受容器默认 fps 影响
         processed_duration = _get_stream_duration(input_source, "v")
         if processed_duration > 0 and logger:
             logger.warning(
                 "STAGE7_TIMING_PROBE_FALLBACK_TO_SOURCE",
-                "Final output duration unavailable; probed the pre-encode "
-                "source instead. Its fps may be a container default (e.g. "
-                "25fps), so treat the timing delta with care.",
-                output_path=str(output_path))
+                "Frame counts unavailable; fell back to probing the "
+                "pre-encode source. Its fps may be a container default "
+                "(e.g. 25fps), so treat the timing delta with care.")
 
     tempo_ratio = 1.0
     _timing_state = "verified"          # verified | adjusted | unverified | unexplained
