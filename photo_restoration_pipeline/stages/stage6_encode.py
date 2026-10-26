@@ -1369,6 +1369,45 @@ def main():
     #
     # 放在这里（而不是进程启动时）的理由：此刻才确定这次事务要动哪些文件，
     # 可以用作 journal 路径归属校验的授权根目录。
+    # ---- PHOTO-01：发布锁必须在**恢复 / 备份 / journal 写入之前**获取 ----
+    #
+    # 原实现把锁放在"改任何目标之前"，但 `_recover_prior_publish`（会
+    # 恢复/清理文件）与 journal 写入都在它之前。两个任务写同一输出时，
+    # 后来的任务可在前一个持锁期间恢复/清理其事务，或用陈旧快照覆盖
+    # journal；后续提交段互斥保护不了**已经发生的**改动。
+    #
+    # 设计依据（联网核对）：崩溃恢复应是"每次启动的标准前导"，并且要在
+    # **单一 mutation lock 之内**执行；锁按确定顺序获取，用 try/finally
+    # 保证释放。
+    #
+    # 这里用可重入释放：本段到提交段之间有多处提前 return，每处都要先
+    # 释放，最后提交段结束时再释放一次（已释放则空操作）。
+    _lock_holder = {"cm": None}
+
+    def _rel_lock():
+        _cm = _lock_holder.get("cm")
+        if _cm is not None:
+            try:
+                _cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            _lock_holder["cm"] = None
+
+    try:
+        _lock_cm = acquire_target_locks(
+            commit_targets,
+            timeout=float(params.get("publish_lock_timeout", 60)),
+            logger=logger)
+        _lock_cm.__enter__()
+        _lock_holder["cm"] = _lock_cm
+    except TargetLockTimeout as _lt:
+        logger.error("STAGE6_PUBLISH_LOCK_TIMEOUT",
+                     "Could not acquire publish locks; nothing was modified",
+                     targets=_lt.targets, timeout=_lt.timeout)
+        _fail(logger, status_path, "publish_lock", str(_lt), paths=[],
+              preserve_valid_status=True)
+        return 82
+
     _prior = _recover_prior_publish(work_output_path, commit_targets, logger)
     if _prior.get("status") == "needs_human":
         # 状态无法判定 —— 不猜、不动，让人工介入。此时动任何文件都可能
@@ -1381,6 +1420,7 @@ def main():
               "unresolved prior publish transaction; inspect the journal "
               "and .pubbak manually",
               paths=[tmp_avif] + round_artifacts)
+        _rel_lock()
         return 82
     if _prior.get("status") == "rolled_back" and logger:
         logger.warning("STAGE6_PRIOR_PUBLISH_RECOVERED",
@@ -1421,6 +1461,7 @@ def main():
                 _fail(logger, status_path, "color_drift",
                       f"delta={_drift['delta']:.2f} > {_thr}",
                       paths=[tmp_avif, tmp_tiff] + round_artifacts)
+                _rel_lock()
                 return 86
             logger.warning("STAGE6_COLOR_DRIFT", _msg, **_fields)
         elif _drift["status"] == "ok":
@@ -1453,6 +1494,7 @@ def main():
                              if e.get("state") == BACKUP_FAILED])
         _fail(logger, status_path, "publish_backup",
               "incomplete backup; commit not started", paths=[])
+        _rel_lock()
         return 82
 
     # 持久 journal（第七轮）：备份已完整、即将改动目标 —— 此刻把"这次事务
@@ -1504,6 +1546,7 @@ def main():
         _fail(logger, status_path, "publish_journal",
               "journal not persisted; commit not started", paths=[],
               preserve_valid_status=True)
+        _rel_lock()
         return 82
     logger.info("STAGE6_JOURNAL_PREPARED",
                 "Publish journal persisted before touching any target",
@@ -1513,19 +1556,7 @@ def main():
     # PUB-04（第七轮）：提交段必须持有**全部目标路径的互斥锁**。
     # 逐路径加锁（不是集合摘要），任何重叠目标集合都会互斥；
     # 锁从"改任何目标之前"开始，覆盖备份、替换、侧车写入与回滚。
-    try:
-        _lock_cm = acquire_target_locks(
-            commit_targets,
-            timeout=float(params.get("publish_lock_timeout", 60)),
-            logger=logger)
-        _lock_cm.__enter__()
-    except TargetLockTimeout as _lt:
-        logger.error("STAGE6_PUBLISH_LOCK_TIMEOUT",
-                     "Could not acquire publish locks; nothing was modified",
-                     targets=_lt.targets, timeout=_lt.timeout)
-        _fail(logger, status_path, "publish_lock", str(_lt), paths=[],
-              preserve_valid_status=True)
-        return 82
+    # PUB-04 的锁已在**恢复之前**获取（见上方 PHOTO-01 段），此处不再重复。
 
     try:
         try:
@@ -1644,7 +1675,7 @@ def main():
         return 0
     finally:
         try:
-            _lock_cm.__exit__(None, None, None)
+            _rel_lock()
         except Exception:
             pass
 
