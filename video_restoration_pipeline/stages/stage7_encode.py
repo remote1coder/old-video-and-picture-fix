@@ -1058,7 +1058,8 @@ def _force_publish_enabled(params: dict, key: str) -> bool:
 
 
 def _fullchain_blockers(checks: dict, mode: str,
-                        sync_abs_rc: int = 0) -> List[str]:
+                        sync_abs_rc: int = 0,
+                        error: object = None) -> List[str]:
     """全链核对：按模式决定**哪些判据要拦**（纯函数，便于单测）。
 
     Args:
@@ -1077,10 +1078,31 @@ def _fullchain_blockers(checks: dict, mode: str,
     """
     m = (mode or "frames_only").strip().lower()
     blocked: List[str] = []
-    if (checks or {}).get("frames", {}).get("ok") is False:
+    ck = checks or {}
+
+    # ---- GATE-02：顶层错误必须拦，不能等同通过 ----
+    # 源不可读 / 探测失败时 verify_output 返回 ok=False 且 checks={}，
+    # 旧实现只查 frames.ok is False，于是"什么都没量到"反而放行。
+    if error:
+        blocked.append("ERROR")
+
+    # 一条判据都没产生 -> 视为未验收，而不是通过
+    if not ck:
+        if not error:
+            blocked.append("NO_CHECKS")
+        return blocked
+
+    # 各模式**必需**的判据必须存在且明确为 True；缺失即未验收。
+    # （frames_only 刻意允许时长差，所以不能拿顶层 ok 一刀切。）
+    if "frames" not in ck:
+        blocked.append("FRAMES_MISSING")
+    elif ck.get("frames", {}).get("ok") is False:
         blocked.append("FRAMES")
+
     if m in ("relative", "absolute"):
-        if (checks or {}).get("duration", {}).get("ok") is False:
+        if "duration" not in ck:
+            blocked.append("DURATION_MISSING")
+        elif ck.get("duration", {}).get("ok") is False:
             blocked.append("DURATION")
     if m == "absolute" and sync_abs_rc != 0:
         blocked.append("SYNC_ABSOLUTE")
@@ -2013,7 +2035,27 @@ def main():
         # `streams=[]`（静音视频），stage7 仍 rc=0。
         # 现在先核对源片本身：源片有声 → 直接从源片提取音轨；
         # 提取也失败 → 按 allow_silent_output 决定，默认**不允许**静默丢音轨。
-        source_has_audio = _source_has_audio_stream(args.input)
+        # ---- GATE-06：源侧音轨存在性必须用三态，不能二值 ----
+        # `_source_has_audio_stream` 在 ffprobe 出错/超时时统一返回 False，
+        # 于是"暂时探测不到"被写成"源片本来就没音轨"，直接加 `-an`
+        # 产出静音视频，而后续全链与机械核对都只看视频事实，发现不了。
+        # 改成三态：未知默认失败，只有明确 absent 才允许自然无声。
+        _src_presence = _probe_audio_presence(args.input)
+        if _src_presence == "unknown":
+            _allow_silent = params.get("allow_silent_output", False)
+            logger.error(
+                "STAGE7_SOURCE_AUDIO_UNKNOWN",
+                "Cannot determine whether the source has an audio track "
+                "(ffprobe failed / timed out). Refusing to silently drop "
+                "audio unless allow_silent_output is set.",
+                source=args.input, allow_silent_output=_allow_silent)
+            if not _allow_silent:
+                return 86
+            logger.warning("STAGE7_SOURCE_AUDIO_UNKNOWN_FORCED",
+                           "allow_silent_output=true; proceeding without "
+                           "audio. The output may be silent.",
+                           source=args.input)
+        source_has_audio = (_src_presence == "present")
         if source_has_audio:
             logger.warning("STAGE7_AUDIO_INTERMEDIATE_MISSING",
                            "No intermediate audio track in temp, but the "
@@ -2258,7 +2300,7 @@ def main():
                     if _fc_mode == "absolute":
                         _abs_rc = _validate_av_sync(_publish_tmp, logger,
                                                     params)
-                    _fc_blocked = _fullchain_blockers(_ck, _fc_mode, _abs_rc)
+                    _fc_blocked = _fullchain_blockers(_ck, _fc_mode, _abs_rc, error=(_fc or {}).get("error"))
                     logger.info("STAGE7_FULLCHAIN_VERIFY",
                                 "Full-chain verification (source vs output)",
                                 mode=_fc_mode,
@@ -2294,6 +2336,34 @@ def main():
             try:
                 with acquire_target_locks([output_path], timeout=30,
                                           logger=logger):
+                    # ---- GATE-01：阻断性检查必须在**发布之前**执行 ----
+                    # 原实现先 os.replace 覆盖正式路径，之后才做机械核对与
+                    # 帧序对齐。一旦新件帧序错位，旧成品已被换掉，失败的
+                    # 新件却占据正式路径 —— 失败即毁掉上一代有效成品。
+                    # 这里对 attempt 独占的暂存文件先核一遍；不过就不发布。
+                    try:
+                        from artifact_verify import (
+                            verify_output as _vo_pre,
+                            render_verdict as _rv_pre,
+                        )
+                        _pre = _vo_pre(input_source, _publish_tmp, {})
+                    except Exception as _pe:
+                        logger.error("STAGE7_PREPUBLISH_VERIFY_ERROR",
+                                     f"pre-publish check raised: {_pe}")
+                        return 86
+                    if not _pre.get("ok"):
+                        logger.error(
+                            "STAGE7_PREPUBLISH_VERIFY_FAIL",
+                            "Refusing to publish: the staged attempt failed "
+                            "the mechanical check. The existing output is "
+                            "left untouched.",
+                            attempt_id=_attempt_id,
+                            verdict=_rv_pre(_pre) if _pre else "")
+                        return 86
+                    logger.info("STAGE7_PREPUBLISH_VERIFY_OK",
+                                "Staged attempt passed the mechanical check; "
+                                "publishing now", attempt_id=_attempt_id)
+
                     if os.path.exists(output_path) and not _same_volume(
                             _publish_tmp, output_path):
                         # 跨盘：先完整复制到目标端，再删暂存
