@@ -87,10 +87,37 @@ def test_mode_is_case_insensitive(s7):
     assert s7._fullchain_blockers(_ck(duration=False), "RELATIVE") == ["DURATION"]
 
 
-def test_handles_missing_or_none_checks(s7):
-    """checks 缺失/为 None 时不炸，按"没核对到"处理（不拦）。"""
-    assert s7._fullchain_blockers({}, "frames_only") == []
-    assert s7._fullchain_blockers(None, "absolute") == []
+def test_missing_or_none_checks_block_instead_of_pass(s7):
+    """GATE-02：一条判据都没量到 = 未验收，必须拦，不能等同通过。
+
+    旧实现只查 `frames.ok is False`，于是源不可读（checks={}）时反而
+    放行并发布。这里把"不安全默认"反过来锁住。
+    """
+    assert s7._fullchain_blockers({}, "frames_only") == ["NO_CHECKS"]
+    assert s7._fullchain_blockers(None, "absolute") == ["NO_CHECKS"]
+
+
+def test_top_level_error_always_blocks(s7):
+    """顶层 error（源不可读等）在任何模式下都要拦。"""
+    for m in ("frames_only", "relative", "absolute"):
+        got = s7._fullchain_blockers({}, m, error="SOURCE_UNREADABLE")
+        assert got == ["ERROR"], (m, got)
+
+
+def test_required_check_missing_blocks(s7):
+    """必需判据缺失 = 未验收；存在且为 False = 明确失败。"""
+    # frames 存在且通过 -> 放行
+    assert s7._fullchain_blockers({"frames": {"ok": True}},
+                                  "frames_only") == []
+    # frames 缺失 -> 未验收
+    assert s7._fullchain_blockers({"duration": {"ok": True}},
+                                  "frames_only") == ["FRAMES_MISSING"]
+    # frames 明确失败
+    assert s7._fullchain_blockers({"frames": {"ok": False}},
+                                  "frames_only") == ["FRAMES"]
+    # relative 档还要求 duration 存在
+    assert s7._fullchain_blockers({"frames": {"ok": True}},
+                                  "relative") == ["DURATION_MISSING"]
 
 
 def test_multiple_blockers_accumulate(s7):
