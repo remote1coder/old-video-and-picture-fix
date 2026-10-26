@@ -1135,6 +1135,32 @@ def _measure_av_drift(path: str) -> Optional[float]:
         return None
 
 
+def _measure_av_drift_vec(path: str):
+    """返回音画漂移的**三个分量** (start, end, span)，测不出返回 None。
+
+    GATE-04：不能先用 `max(..., key=abs)` 压成一个标量再相减。
+    反例（秒）：源 视频[0,10] 音频[0,10.5] → 分量 (0, 0.5, 0.5) → 压成 0.5
+               成品 视频[0,10] 音频[0.5,10.5] → 分量 (0.5, 0.5, 0) → 压成 0.5
+    两个标量相减 = 0 → 判"同步"，但音频实际比源**新增了 500ms 延迟**。
+    必须先逐分量相减，再取最大的那个差值。
+    """
+    try:
+        if _probe_audio_presence(path) != "present":
+            return None
+        v_start = _probe_stream_start(path, "v")
+        a_start = _probe_stream_start(path, "a")
+        v_span = _get_stream_duration(path, "v")
+        a_span = _get_stream_duration(path, "a")
+        if v_start is None or a_start is None or not v_span or not a_span:
+            return None
+        v_start += _probe_encoder_priming(path, "v")
+        a_start += _probe_encoder_priming(path, "a")
+        v_end, a_end = v_start + v_span, a_start + a_span
+        return (a_start - v_start, a_end - v_end, a_span - v_span)
+    except Exception:
+        return None
+
+
 def _validate_av_sync(muxed_path: str, logger,
                       params: Optional[dict] = None,
                       reference_path: Optional[str] = None) -> int:
@@ -1238,21 +1264,28 @@ def _validate_av_sync(muxed_path: str, logger,
     # 正确判据：| 成品漂移 − 源片漂移 |。
     #   源片自带 500ms → 成品 500ms → 差 0 → 通过（内容原样保留）
     #   流程额外引入 1000ms → 差 1000 → 拦下（这才是真问题）
-    _ref_drift = None
+    # GATE-04：参考漂移要用**向量**，不能用压扁后的标量。
+    _ref_vec = None
     if reference_path:
         try:
-            _ref = _measure_av_drift(reference_path)
-            if _ref is not None:
-                _ref_drift = _ref
+            _ref_vec = _measure_av_drift_vec(reference_path)
         except Exception:
-            _ref_drift = None
+            _ref_vec = None
 
-    if _ref_drift is not None:
-        # 有基准：比"变化量"。方向按变化量的符号定。
-        _signed = _signed - _ref_drift
+    if _ref_vec is not None:
+        # 逐分量相减（start / end / span 各自比），再取最大的那个差值。
+        # 这样"某一项新增了 500ms"不会被另一项抵消掉。
+        _out_vec = (start_signed, end_signed, dur_signed)
+        _deltas = [o - r for o, r in zip(_out_vec, _ref_vec)]
+        _name, _signed = max(
+            zip(("start", "end", "dur"), _deltas),
+            key=lambda x: abs(x[1]))
         diff_ms = abs(_signed) * 1000
         audio_lags = _signed > 0
-        _basis = f"vs source drift {_ref_drift * 1000:.0f}ms"
+        _basis = ("vs source drift per-component "
+                  f"start/delta={_deltas[0] * 1000:.0f}ms "
+                  f"end/delta={_deltas[1] * 1000:.0f}ms "
+                  f"span/delta={_deltas[2] * 1000:.0f}ms")
     else:
         # 无基准（源片测不出/未提供）：退回绝对阈值
         diff_ms = abs(_signed) * 1000
