@@ -21,6 +21,13 @@ This project provides two restoration pipelines:
 Both pipelines follow a multi-stage architecture that preserves original
 quality while applying modern restoration techniques.
 
+Video upscaling runs as a **zero-disk pipeline**: decoded frames are streamed
+from `ffmpeg` into the AI process over stdin/stdout and straight into the
+encoder, so no intermediate frame images are written to disk. This avoids
+tens of gigabytes of throwaway writes per clip (a 2612-frame 1440p upscale would
+otherwise write ~54 GB of temporary PNGs) and is faster than the PNG route.
+If any stage fails, it falls back to the PNG path automatically.
+
 ### Quick Start
 
 #### Prerequisites
@@ -345,6 +352,11 @@ internal working documents and are **not distributed with the repository**:
 - **照片修复流水线** — 扫描件与数码照片
 
 两条链都采用多阶段架构，在应用现代修复技术的同时尽量保留原始质量。
+
+视频超分默认走**零落盘管道**：解码后的帧通过 stdin/stdout 直接从 `ffmpeg`
+流进 AI 进程、再直接送进编码器，中间不写任何帧图片。这样每个素材可省掉
+数十 GB 的临时写入（2612 帧的 1440p 超分原本要写约 54 GB 临时 PNG），
+而且比 PNG 路线更快。任何一步失败都会自动回退到 PNG 路线。
 
 ### 快速开始
 
