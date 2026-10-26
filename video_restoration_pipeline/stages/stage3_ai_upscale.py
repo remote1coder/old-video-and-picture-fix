@@ -2103,7 +2103,16 @@ def main():
     # ---- 方案 B：零落盘流式超分（params.ai_stream_raw）----
     # 整段视频一次管道跑完（不受 ai_window_size 限制），帧全程不落盘。
     # 任一步失败都**只记日志然后落到原 PNG 路径**，不影响原有可靠性。
-    if params.get("ai_stream_raw"):
+    # STR-05：流式成功会提前 return 0，从而绕过后面的 lanczos_target
+    # 二次缩放、位深核对、强制超分对比图与执行指纹写入。在共用收尾抽出之前，
+    # 凡是需要这些后处理的配置就**不走流式**，保证两条路径语义一致。
+    _s_lanczos = params.get("lanczos_target", "auto")
+    if _s_lanczos not in (None, "", "auto"):
+        logger.info("STAGE3_STREAM_SKIP_LANCZOS",
+                    "lanczos_target is set; the streaming path would bypass "
+                    "secondary scaling, so use the PNG path instead",
+                    lanczos_target=str(_s_lanczos))
+    elif params.get("ai_stream_raw"):
         _s_ai_py = _resolve_ai_python(logger)
         if not _s_ai_py:
             logger.warning("STAGE3_STREAM_NO_AI_PY",
