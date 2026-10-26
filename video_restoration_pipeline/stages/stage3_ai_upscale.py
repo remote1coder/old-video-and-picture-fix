@@ -914,6 +914,39 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     return True, "ok", frames
 
 
+def _is_vfr(pts_map, tol: float = 0.01) -> bool:
+    """由逐帧 PTS 判断是否变帧率（相邻间隔不一致）。
+
+    STR-04：流式路径用 rawvideo 传帧，不携带逐帧 PTS，编码端只能固定
+    `-framerate` + `-r`，VFR 素材的间隔会被压成 CFR —— 帧数不变但
+    时序已变。在支持逐帧 PTS 之前，VFR 必须显式回退 PNG 路径
+    （该路径用 concat 的每帧 duration 保留时序）。
+
+    Args:
+        pts_map: `{frame_index: pts_seconds}`。
+        tol: 相对容差，默认 1%（覆盖浮点/时间基抖动）。
+
+    Returns:
+        True = 判定为 VFR；数据不足或无法判定时返回 False（交给调用方
+        按"未知"处理，不要因此误伤正常素材）。
+    """
+    if not pts_map or len(pts_map) < 3:
+        return False
+    try:
+        ts = sorted(float(v) for v in pts_map.values() if v is not None)
+    except (TypeError, ValueError):
+        return False
+    if len(ts) < 3:
+        return False
+    d = [b - a for a, b in zip(ts, ts[1:]) if b > a]
+    if len(d) < 2:
+        return False
+    med = sorted(d)[len(d) // 2]
+    if med <= 0:
+        return False
+    return (max(d) - min(d)) / med > tol
+
+
 def _clear_stale_frame_dirs(temp_dir, job_id, logger=None):
     """清掉**同一 job_id** 上次跑批残留在 temp 里的帧目录。
 
@@ -2112,6 +2145,14 @@ def main():
                     "lanczos_target is set; the streaming path would bypass "
                     "secondary scaling, so use the PNG path instead",
                     lanczos_target=str(_s_lanczos))
+    elif _is_vfr(all_pts_map):
+        # STR-04：VFR 素材走流式会把间隔压成 CFR，时序被改变。
+        # 逐帧 PTS 传输尚未实现，这里显式回退 PNG 路径保留时序。
+        logger.info("STAGE3_STREAM_SKIP_VFR",
+                    "Variable frame rate detected; the streaming path would "
+                    "flatten frame intervals to CFR, so use the PNG path "
+                    "(which preserves per-frame durations)",
+                    frames=len(all_pts_map or {}))
     elif params.get("ai_stream_raw"):
         _s_ai_py = _resolve_ai_python(logger)
         if not _s_ai_py:
