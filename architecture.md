@@ -60,7 +60,9 @@ ffmpeg(-i stage2.mkv -f rawvideo -pix_fmt rgb48le -)   ← 解码
       → ffmpeg(-f rawvideo ... -i - -c:v ffv1 step3.mkv)  ← 编码
 ```
 
-- OS 负责背压，父进程不参与协调；没有双向管道，不会死锁
+- OS 负责背压，父进程不参与协调；没有双向管道，避免了
+  stderr=PIPE 未排空这一类阻塞（但仍需各自验证背压/短读/
+  EOF 传播/超时/取消）
 - **不受 `ai_window_size` 限制**，整段一次跑完
 - 失败自动落回下面的 PNG 通路（`STAGE3_STREAM_FALLBACK`）
 
