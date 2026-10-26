@@ -1337,17 +1337,24 @@ def _validate_av_sync(muxed_path: str, logger,
                        f"({'audio lags' if audio_lags else 'audio leads'}; "
                        f"basis: {_basis})", **_detail())
         return 0  # Continue but warn
-    elif diff_ms > 0:
-        logger.warning("STAGE7_SYNC_WARN",
-                       f"AV sync difference {diff_ms:.0f}ms exceeds 300ms threshold, "
-                       "sync processing recommended", **_detail())
-        return 0  # Continue but warn
     elif diff_ms > 100:
         # FIX-R7-S7-11: >100ms must be WARNING per v7.32 §3.10.9.
+        # 本分支原先被上面的 `diff_ms > 0` 遮蔽成死代码：任何正差值都先
+        # 命中 >0，于是 5ms 也会写"exceeds 300ms threshold"（硬编码，
+        # 与实际值无关），而真正的 >100ms 告警永远不触发。
+        # 现在按「fail → warn 阈值 → 100ms」从高到低排列，不再有遮蔽。
         logger.warning("STAGE7_SYNC_WARN_100",
                        f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
                        **_detail())
         return 0  # Continue
+    elif diff_ms > 0:
+        # 剩余区间：0 < diff <= 100ms。如实报出实际值与告警线，
+        # 不要再写死一个和本分支对不上的阈值。
+        logger.info("STAGE7_SYNC_MINOR",
+                    f"AV sync difference {diff_ms:.0f}ms is within the "
+                    f"100ms noise floor (warn threshold {warn_ms:.0f}ms)",
+                    **_detail())
+        return 0
 
     logger.info("STAGE7_SYNC_OK",
                 f"AV sync within tolerance ({diff_ms:.0f}ms)", **_detail())

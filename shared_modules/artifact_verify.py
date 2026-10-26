@@ -147,6 +147,15 @@ def probe_media_facts(path: str) -> Dict[str, Any]:
     stats_all = stats.get("all") or {}
     facts["mean"] = stats_all.get("mean")
     facts["std"] = stats_all.get("std")
+
+    # GATE-02 补漏：原先只有"文件不存在"才设 error。ffprobe 超时 /
+    # 非零退出 / 输出解析失败时，facts 会**全是 None 但 error 仍为 None**，
+    # 于是 verify_output 里所有判据都变成 ok=None，最终可能 ok=True ——
+    # "什么都没量到"反而通过。
+    # 这里只兜最保守的一档：连尺寸都拿不到，说明探测彻底失败。
+    # （照片是单帧、frames 可能合法地为 None，所以不能拿 frames 判。）
+    if facts.get("width") is None and facts.get("height") is None:
+        facts["error"] = facts.get("error") or "probe produced no usable facts"
     return facts
 
 
@@ -324,13 +333,18 @@ def verify_output(source_path: str, output_path: str,
     #
     # 核对是发布前的最后一道防线，它自己绝不能在"没核对"时报通过。
     if not src["exists"] or src.get("error"):
+        # GATE-02：这条是**提前 return**，必须同样带上顶层 error /
+        # hard_error，否则 stage7 的 _fullchain_blockers 收不到信号，
+        # 在 frames_only 模式下仍会放行（它只看 checks 与 error）。
         return {"ok": False,
                 "issues": [{"level": "error",
                             "code": "SOURCE_UNREADABLE",
                             "message": f"源不可读（{src.get('error') or 'file not found'}）："
                                        f"帧数/时长/首末帧/黑图全部无法核对，"
                                        f"拒绝判为通过"}],
-                "source": src, "output": out, "checks": {}}
+                "source": src, "output": out, "checks": {},
+                "error": "SOURCE_UNREADABLE",
+                "hard_error": "SOURCE_UNREADABLE"}
 
     # 1) 时长 —— **按帧粒度判断，不用固定百分比**
     #
@@ -473,11 +487,30 @@ def verify_output(source_path: str, output_path: str,
                                       f"接近纯色（mean={o_mean}）—— "
                                       "内容丢失"})
 
+    # GATE-02 补漏：探测失败本身必须是 error，而不是"所有判据都 None"。
+    # 源/成品任一侧拿不到可用事实，就不能声称核对通过。
+    _probe_err = src.get("error") or out.get("error")
+    if _probe_err:
+        issues.append({"level": "error", "code": "PROBE_UNUSABLE",
+                       "message": f"媒体事实探测失败：{_probe_err}"})
+
     errors = [i for i in issues if i["level"] == "error"]
     if strict:
         errors += [i for i in issues if i["level"] == "warning"]
+
+    # 硬错误（内容丢失 / 探测失败）与模式无关，都要拦：
+    # 全链门按模式只放宽"时长"，不该放宽"黑图"这类跨模式硬错误。
+    _hard = ""
+    for _i in errors:
+        if _i.get("code") in ("BLANK_FRAMES", "SOURCE_UNREADABLE",
+                              "PROBE_UNUSABLE"):
+            _hard = _i["code"]
+            break
+
     return {"ok": not errors, "issues": issues, "source": src,
-            "output": out, "checks": checks}
+            "output": out, "checks": checks,
+            "error": _probe_err or _hard or None,
+            "hard_error": _hard or None}
 
 
 def render_verdict(result: Dict[str, Any]) -> str:
