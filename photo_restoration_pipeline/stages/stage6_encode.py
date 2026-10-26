@@ -309,8 +309,37 @@ def _recover_prior_publish(work_output_path: str,
     for t in (doc.get("targets") or []):
         r = (doc.get("records") or {}).get(t) or {}
         bk = r.get("backup")
+        bk_digest = r.get("backup_digest")
         if bk and os.path.exists(bk):
-            snapshot[t] = {"state": BACKUP_OK, "backup": bk}
+            # PHOTO-02：只检查"存在"不够。
+            # 备份可能在异常后被截断/损坏，而 journal 里明明记了
+            # backup_digest 却从不核对 —— 于是会用坏备份去覆盖
+            # **仍然完好的旧成品**，比不恢复更糟。
+            _usable = True
+            _why = None
+            if bk_digest:
+                try:
+                    from publish_journal import file_digest as _fd
+                    _actual = _fd(bk)
+                    if _actual != bk_digest:
+                        _usable = False
+                        _why = ("backup digest mismatch: "
+                                f"on-disk={_actual} expected={bk_digest}")
+                except Exception as _de:
+                    _usable = False
+                    _why = f"cannot verify backup digest: {_de}"
+            if _usable:
+                snapshot[t] = {"state": BACKUP_OK, "backup": bk}
+            else:
+                snapshot[t] = {"state": BACKUP_FAILED, "backup": bk,
+                               "reason": _why}
+                if logger:
+                    logger.error(
+                        "STAGE6_BACKUP_DIGEST_MISMATCH",
+                        "Backup exists but its digest does not match the "
+                        "journal; refusing to restore from it (would "
+                        "overwrite a possibly-good old output)",
+                        target=t, backup=bk, reason=_why)
         elif r.get("existed") is False:
             snapshot[t] = {"state": BACKUP_ABSENT, "backup": None}
         else:
