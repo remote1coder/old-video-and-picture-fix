@@ -2317,14 +2317,22 @@ def main():
             if params.get("full_chain_verify", True):
                 _fc_mode = str(params.get("full_chain_verify_mode",
                                           "frames_only")).strip().lower()
+                _fc_pending = None
                 try:
                     from artifact_verify import verify_output as _fc_verify
                     _fc = _fc_verify(args.input, _publish_tmp, params)
                     try:
                         import json as _fcj
-                        with open(str(output_path) + ".fullchain.json",
-                                  "w", encoding="utf-8") as _f:
+                        # GATE-03：先写 **attempt 专属**路径。
+                        # 直接覆盖正式 `<output>.fullchain.json` 会让
+                        # 「新尝试失败」也把报告留在上一代成品旁边，
+                        # 并发 attempt 还会互相覆盖报告。发布成功后再转正。
+                        _fc_final = str(output_path) + ".fullchain.json"
+                        _fc_tmp = (str(output_path)
+                                   + f".fullchain.{_attempt_id}.json")
+                        with open(_fc_tmp, "w", encoding="utf-8") as _f:
                             _fcj.dump(_fc, _f, ensure_ascii=False, indent=2)
+                        _fc_pending = (_fc_tmp, _fc_final)
                     except Exception:
                         pass
                     _ck = (_fc or {}).get("checks") or {}
@@ -2408,6 +2416,17 @@ def main():
                                 "Attempt staged file promoted to the final "
                                 "path after validation",
                                 output=output_path, attempt_id=_attempt_id)
+                    # GATE-03：只有发布成功，本次 attempt 的全链报告才转正
+                    # 为正式 sidecar。失败时不覆盖上一代的报告。
+                    if _fc_pending:
+                        try:
+                            import shutil as _sh2
+                            _sh2.move(_fc_pending[0], _fc_pending[1])
+                            _fc_pending = None
+                        except Exception as _fe:
+                            logger.warning(
+                                "STAGE7_FULLCHAIN_SIDECAR_PROMOTE_FAIL",
+                                str(_fe))
             except TargetLockTimeout as _lt:
                 logger.error("STAGE7_PUBLISH_LOCK_TIMEOUT",
                              "Another attempt holds the target lock; this "
@@ -2487,6 +2506,17 @@ def main():
                                        skipped=_align.get("skipped"))
                 except Exception as _ae:
                     logger.warning("STAGE7_ALIGN_ERROR", str(_ae))
+
+                # GATE-03：对齐判定可能刚把 _ver["ok"] 改成 False，
+                # 必须**用最终结论重写** sidecar。否则磁盘上的
+                # .verify.json 仍是 ok=True，而日志和返回码却是失败，
+                # 报告与成品对不上代。
+                try:
+                    import json as _json2
+                    with open(_side, "w", encoding="utf-8") as _f2:
+                        _json2.dump(_ver, _f2, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
 
                 if _ver.get("ok"):
                     logger.info("STAGE7_VERIFY_OK",

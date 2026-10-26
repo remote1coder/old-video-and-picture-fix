@@ -90,13 +90,21 @@ def _cfg(params: Optional[dict], key: str, default: float,
 
 def plan_transport(frame_bytes: int,
                    requested_frames: int = DEFAULT_BUFFER_FRAMES,
-                   params: Optional[dict] = None) -> Dict[str, Any]:
+                   params: Optional[dict] = None,
+                   out_scale: int = 1) -> Dict[str, Any]:
     """决定这一轮用共享内存还是 PNG，以及缓冲区放多少帧。
 
     Args:
         frame_bytes: 单帧字节数（如 RGB48 的 w*h*3*2）。必须 > 0。
         requested_frames: 期望的窗口帧数（来自 config / CLI）。
         params: 合并后的参数字典（含 ai_frame_* 键）。
+        out_scale: 超分倍数（相对输入的边长倍数）。
+
+            STR-06：调用方实际会创建**两份** ring —— 输入 ring 与输出 ring。
+            输出帧面积是输入的 out_scale² 倍，所以每帧真实占用是
+            frame_bytes × (1 + out_scale²)：2× 时 5 倍、4× 时 17 倍。
+            旧实现只按 frame_bytes 算预算，于是"输入 ring 落在预算内"
+            的表象下，两份 ring 合计可能远超预留内存底线。
 
     Returns:
         dict，至少含：
@@ -156,7 +164,16 @@ def plan_transport(frame_bytes: int,
     if floor_budget < budget:
         budget = max(0, floor_budget)
 
-    fits = budget // frame_bytes if frame_bytes else 0
+    # STR-06：按「输入 ring + 输出 ring」合计预算。
+    # out_scale<=1 时退化为只有输入 ring（保持旧行为，便于单测对照）。
+    try:
+        _os = int(out_scale)
+    except (TypeError, ValueError):
+        _os = 1
+    if _os < 1:
+        _os = 1
+    per_frame = frame_bytes * (1 + _os * _os) if _os > 1 else frame_bytes
+    fits = budget // per_frame if per_frame else 0
     effective = min(req, fits)
 
     if effective < min_frames:
