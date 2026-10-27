@@ -106,3 +106,26 @@ def test_sync_log_grading_has_no_shadowed_branch():
     iminor = text.find("STAGE7_SYNC_MINOR")
     assert i100 != -1 and iminor != -1, "两个分支都应存在"
     assert i100 < iminor, ">100ms 分支必须在剩余区间之前，否则又会被遮蔽"
+
+
+def test_verifier_exception_blocks_instead_of_passing():
+    """校验器自己抛异常时必须阻断发布，不能只记 warning（fail-open）。
+
+    另外 `_fc_blocked` 必须在 try 之前初始化：否则异常跳到 except 后，
+    后面的 `if _fc_blocked:` 会 NameError，把"校验异常"升级成整个 stage 崩溃。
+    """
+    src = os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                       "stage7_encode.py")
+    text = open(src, encoding="utf-8", errors="replace").read()
+
+    i_init = text.find("_fc_blocked = []")
+    i_try = text.find("from artifact_verify import verify_output as _fc_verify")
+    assert i_init != -1 and i_try != -1
+    assert i_init < i_try, "_fc_blocked 必须在校验 try 之前初始化"
+
+    # 异常分支必须赋值阻断项，且用 error 级
+    i_exc = text.find("STAGE7_FULLCHAIN_VERIFY_ERROR")
+    assert i_exc != -1, "异常分支应使用 ERROR 级事件"
+    window = text[i_exc:i_exc + 500]
+    assert '_fc_blocked = ["VERIFY_ERROR"]' in window, \
+        "校验器异常必须标记为阻断项"

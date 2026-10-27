@@ -315,10 +315,15 @@ def verify_output(source_path: str, output_path: str,
     checks: Dict[str, Any] = {}
 
     if not out["exists"]:
-        return {"ok": False, "issues": [{"level": "error",
-                                         "code": "OUTPUT_MISSING",
-                                         "message": "成品不存在"}],
-                "source": src, "output": out, "checks": {}}
+        # 与 SOURCE_UNREADABLE 同理：这是提前 return，不经过尾部汇总，
+        # 必须自带顶层 error / hard_error，否则全链门收不到信号。
+        return {"ok": False,
+                "issues": [{"level": "error",
+                            "code": "OUTPUT_MISSING",
+                            "message": "成品不存在"}],
+                "source": src, "output": out, "checks": {},
+                "error": "OUTPUT_MISSING",
+                "hard_error": "OUTPUT_MISSING"}
 
     # FIX-2026-10-22：源不可读时必须**明确失败**，不能静默放行。
     #
