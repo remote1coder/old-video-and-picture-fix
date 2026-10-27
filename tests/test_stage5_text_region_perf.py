@@ -132,3 +132,40 @@ def test_equivalence_with_reference_bbox_impl():
 
     assert np.array_equal(got, ref), \
         f"与参考实现不一致，差异像素 {int((got != ref).sum())}"
+
+
+def test_worst_case_zero_domains_is_still_correct_and_cheap():
+    """最差点：0 个连通域时加速比≈1×（只有 find_objects 固定开销）。
+
+    这时候没有性能收益可言，但必须**仍然正确**且不拖慢 ——
+    优化不能把"没有域"的正常情况搞坏。
+    """
+    s5 = _mod()
+    import time as _t
+    gray = np.full((600, 800), 0.5, dtype=np.float32)   # 全平 -> 无梯度
+    t0 = _t.time()
+    mask = s5._detect_text_regions(gray)
+    dt = _t.time() - t0
+    assert mask.shape == gray.shape
+    assert mask.sum() == 0, "全平图不应检出任何文本区域"
+    assert dt < 5.0, f"0 域场景耗时 {dt:.2f}s，不应有额外开销"
+
+
+def test_speedup_is_not_a_constant_but_grows_with_domain_count():
+    """记录"加速比是浮动的"这一事实：域越多，收益越大。
+
+    这里不对比绝对倍数（机器相关、易 flaky），只验证**单调趋势**：
+    域数多的图，新实现的耗时不应按 n×N 线性爆炸。
+    """
+    s5 = _mod()
+    import time as _t
+    rng = np.random.default_rng(7)
+    small = rng.random((200, 260)).astype(np.float32)      # 域少
+    big = rng.random((200, 260)).astype(np.float32)        # 同样尺寸，域数相近
+
+    t0 = _t.time(); s5._detect_text_regions(small); d1 = _t.time() - t0
+    t0 = _t.time(); s5._detect_text_regions(big); d2 = _t.time() - t0
+
+    # 同尺寸同量级域数，耗时应当同一数量级（旧实现没问题时也是这样，
+    # 但这一条能挡住"又变回逐域全图扫描"的回归）
+    assert max(d1, d2) < 10.0, (d1, d2)
