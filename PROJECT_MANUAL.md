@@ -966,6 +966,44 @@ PNG 还是共享内存环）。**共享内存环单独使用时并不省写入**
 
 内存不足时自动回退并记 `STAGE3_FRAME_RING_SKIP` / `STAGE3_FRAME_RING_FALLBACK`。
 
+### 12.10 照片链 stage5 的性能陷阱（逐域全图扫描）
+
+**症状**：单张照片跑批在 stage5 卡满 20 分钟（`timeout=1200s`）后超时，
+重试 2 次仍失败，最终 rc=87，且**期间零日志输出**——看起来像卡死。
+
+**根因**：`_detect_text_regions()` 对每个连通域做两次**全图**扫描。
+AI 放大后的照片是 8000×6000（4800 万像素），实测连通域 **183,300** 个，
+单次全图扫描 0.09s → 约 **268 分钟**。stage5 永远跑不完。
+
+**判据（复现用）**：
+
+```python
+from scipy import ndimage
+lab, n = ndimage.label(stroke_mask)   # n 会到十几万
+```
+
+只要 `n` 是五位数以上，任何 `labeled == i` 形式的逐域全图操作都不可行。
+
+**正确写法**：用 `ndimage.find_objects()` 取 bbox，只在局部切片内操作：
+
+```python
+for i, sl in enumerate(ndimage.find_objects(labeled), start=1):
+    if sl is None:
+        continue
+    sub = (labeled[sl] == i)      # 只在 bbox 内比较
+    n_px = int(sub.sum())
+    ...
+    text_mask[sl][sub] = 1.0      # 基础切片是 view，能回写
+```
+
+**实测**：1500×2000 裁剪（2488 个域）旧 14.69s → 新 0.02s（约 680 倍），
+**掩码逐位一致（差异 0 像素）**。
+真实照片端到端：修复前 1h05m/rc=87/无产物 → 修复后 **6m48s/rc=0**。
+
+**通用规则**：任何"按连通域/按标签循环"的代码，在图像尺寸可能达到数千万
+像素时，必须用 `find_objects` 之类的方式把操作限定在局部，禁止在循环体内
+写 `arr == label` 或 `np.argwhere(arr == label)`。
+
 ## 13. 目录名说明
 
 **重要**：项目实际使用的目录名为：
