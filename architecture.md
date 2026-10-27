@@ -305,9 +305,21 @@ Returns exit code 80 if any required dependency is missing.
     声音滞后：warn 185ms / fail 400ms
     声音超前：warn  90ms / fail 200ms
 
-若提供了 `reference_path`（原始素材），判据改为
-`| 成品漂移 − 源片漂移 |` —— 源片自带的漂移不算流程的问题。
-实测 204 个真实素材：绝对阈值误杀率 31%，相对判据 1.5%。
+若提供了 `reference_path`（原始素材），判据改为"比变化量" ——
+源片自带的漂移不算流程的问题。实测 204 个真实素材：绝对阈值误杀率 31%，
+相对判据 1.5%。
+
+**关键：必须逐分量相减，不能先压成标量再相减。**
+`_measure_av_drift()` 会把 (start, end, span) 三项用 `max(..., key=abs)`
+压成一个带符号标量；若拿"成品标量 − 源片标量"，会**抵消新增错位**：
+
+    源   视频[0,10] 音频[0,10.5]   → 分量 (0, 0.5, 0.5) → 压成 0.5
+    成品 视频[0,10] 音频[0.5,10.5] → 分量 (0.5, 0.5, 0) → 压成 0.5
+    两标量相减 = 0 → 判"同步"，但音频实际新增了 500ms 延迟
+
+所以另设 `_measure_av_drift_vec()` 返回三元组，参考侧用向量，
+相对分支**逐分量相减后再取最大差值**，任一分量新增错位都能被抓到。
+日志 `_basis` 会列出三个分量各自的 delta，便于定位是哪一项漂了。
 
 四个阈值均可在 config 中调整（设非正数退回默认，**不允许关闭判定**）。
 
@@ -340,6 +352,45 @@ Returns exit code 80 if any required dependency is missing.
 `--all-low-confidence` 批量）。确认时：清 `needs_confirmation`、
 把 confidence 至少抬到 0.80、并把 `SKIP` 复位为 `PENDING`
 （否则 scan 标的 SKIP 原样保留，批次会 "Processing 0 video jobs"）。
+
+### 11.4 通过条件：**明确 True 才算通过**（fail-open 防治）
+
+这一族缺陷出现过 6 次，形式高度一致：**"量不出来"被当成"通过"**。
+定四条硬规则：
+
+| 形式 | 例子 | 规则 |
+|---|---|---|
+| 提前 return 不经过尾部汇总 | `SOURCE_UNREADABLE` / `OUTPUT_MISSING` 曾不带 `error` | 校验函数的**每个** return 都要带统一阻断字段 |
+| 只拦 `is False`，漏 `is None` | `frames.ok is None`（无法推算允许帧数）曾放行 | 通过条件写 `ok is True`，**不要写** `ok is not False` |
+| 只 warning 不阻断 | 校验器自身抛异常 → 记条 warning 继续发布 | 校验器异常属于"未验收"，必须阻断（`VERIFY_ERROR`） |
+| 变量未初始化 | `_fc_blocked` 在 try 外没赋值 → 异常后 NameError | try 之后要读的变量，必须在 try **之前**初始化 |
+
+对应实现：
+- `artifact_verify.verify_output()` 顶层输出 `ok` / `error` / `hard_error`；
+  `BLANK_FRAMES`、`SOURCE_UNREADABLE`、`OUTPUT_MISSING`、`PROBE_UNUSABLE`
+  标为**跨模式硬错误**（模式只放宽时长，不放宽黑图/不可读）
+- `stage7_encode._fullchain_blockers()` 对必需判据要求明确 True，
+  否则记 `*_UNVERIFIED`
+- `checks` 为空记 `NO_CHECKS`，顶层 `error` 记 `ERROR`
+
+### 11.5 发布顺序：阻断性检查必须在**覆盖成品之前**
+
+stage7 的发布顺序固定为：
+
+```
+持有目标锁
+  → 对 attempt 暂存件跑机械核对（PREPUBLISH_VERIFY_OK / _FAIL / _ERROR）
+  → 不过就 return 86，正式路径一个字节都不动
+  → 通过才 os.replace 发布
+  → 全链核对 + 帧序对齐 → 用最终结论重写 <output>.verify.json
+  → 全链报告从 attempt 专属路径"转正"为 <output>.fullchain.json
+```
+
+早期实现先 `os.replace` 再核对，一旦新件帧序错位，**旧成品已被换掉**，
+失败的新件却占据正式路径。同理，全链报告若直接写正式路径，新尝试失败时
+也会把报告留在上一代成品旁边。
+
+---
 
 ## 12. 已知架构级限制（当前）
 
