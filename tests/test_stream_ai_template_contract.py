@@ -37,6 +37,9 @@ def _fake_pkg(tmp_path):
     pkg = tmp_path / "fakepkg"
     pkg.mkdir()
     (pkg / "torch.py").write_text(
+        "import contextlib\n"
+        "def no_grad():\n"
+        "    return contextlib.nullcontext()\n"
         "def __getattr__(name):\n"
         "    if name == 'cuda':\n"
         "        class _C:\n"
@@ -113,12 +116,16 @@ def _fake_pkg(tmp_path):
                 self.process()
 
             def post_process(self):
+                # 真实 RealESRGANer 返回 NCHW 张量，squeeze 后是 **CHW**。
+                # 设 FAKE_CHW=1 时模拟这个形状 —— 这是本轮真机挂掉的那个坑。
+                if os.environ.get('FAKE_CHW') == '1':
+                    return np.transpose(self.output, (2, 0, 1))
                 return self.output
     """), encoding="utf-8")
     return str(pkg)
 
 
-def _run_script(tmp_path, in_frames):
+def _run_script(tmp_path, in_frames, chw=False):
     pkg = _fake_pkg(tmp_path)
     script = build_stream_ai_script(
         IN_W, IN_H, SCALE, "dummy.pth", "realesr-general-x4v3", 0)
@@ -128,6 +135,8 @@ def _run_script(tmp_path, in_frames):
     env = dict(os.environ)
     env["PYTHONPATH"] = pkg + os.pathsep + env.get("PYTHONPATH", "")
     env["FAKE_IN"] = str(rec)
+    if chw:
+        env["FAKE_CHW"] = "1"
     p = subprocess.run([sys.executable, str(sp)],
                        input=b"".join(in_frames),
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -223,6 +232,25 @@ def test_output_is_written_as_rgb(tmp_path):
     import numpy as np
     out = np.frombuffer(p.stdout, dtype=np.uint16).reshape(
         IN_H * SCALE, IN_W * SCALE, 3)
+    assert int(out[0, 0, 0]) == 65535, f"R={out[0,0,0]}"
+    assert abs(int(out[0, 0, 1]) - 32768) <= 1, f"G={out[0,0,1]}"
+    assert int(out[0, 0, 2]) == 0, f"B={out[0,0,2]}"
+
+
+def test_chw_model_output_is_transposed_to_hwc(tmp_path):
+    """模型返回 **CHW**（真实 torch 张量 squeeze 后的形状）时也必须正确。
+
+    真机教训：`_to_numpy` 原先把 squeeze 后的 CHW 直接当 HWC 用，
+    于是 `out[:, :, ::-1]` 翻的是**宽度轴**，随后的 cv2.resize 因维度
+    对不上抛 cv2.error，整条流式路径回退到 PNG。单测桩返回 HWC 时看不出来。
+    """
+    p, _ = _run_script(tmp_path, [_frame()], chw=True)
+    assert p.returncode == 0, p.stderr.decode("utf-8", "replace")[:400]
+    assert len(p.stdout) == OUT_BYTES
+    import numpy as np
+    out = np.frombuffer(p.stdout, dtype=np.uint16).reshape(
+        IN_H * SCALE, IN_W * SCALE, 3)
+    # 替身图案 R=1.0/G=0.5/B=0.0（RGB）→ 写出仍应是 RGB 顺序
     assert int(out[0, 0, 0]) == 65535, f"R={out[0,0,0]}"
     assert abs(int(out[0, 0, 1]) - 32768) <= 1, f"G={out[0,0,1]}"
     assert int(out[0, 0, 2]) == 0, f"B={out[0,0,2]}"

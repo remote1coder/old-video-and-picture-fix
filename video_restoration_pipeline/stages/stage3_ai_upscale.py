@@ -2316,6 +2316,57 @@ def main():
                                     "Zero-disk raw-pipe upscale succeeded; "
                                     "skipping PNG extract/encode entirely",
                                     frames=_s_n, output=_s_out)
+                        # ---- R12-12：成功路径不能就此 return ----
+                        # 原来直接 return 0，绕过了 PNG 路径末尾的三段收尾：
+                        #   ① 执行指纹侧车（"这次到底跑了什么"）
+                        #   ② 强制出片时的比较图
+                        #   ③ cancel_guard.release_outputs()
+                        # 其中 ③ 最危险：守卫仍持有产物所有权，之后任何一次
+                        # 取消都可能把**已经成功的成品**删掉。
+                        try:
+                            from exec_fingerprint import (
+                                build_exec_fingerprint as _bef,
+                                write_exec_sidecar as _wes)
+                            _s_fp = _bef(
+                                model=model, scale=scale,
+                                ai_python=_resolve_ai_python(logger),
+                                model_path=str(SCRIPT_DIR.parent.resolve()
+                                               / "models" / f"{model}.pth"),
+                                backend=("cpu" if backend == "cpu"
+                                         else "gpu"),
+                                fallback_reason=(params.get(
+                                    "_oom_fallback_reason") or None),
+                                logger=logger)
+                            if _s_fp and _wes(_s_out, _s_fp):
+                                logger.info(
+                                    "STAGE3_STREAM_EXEC_FINGERPRINT",
+                                    "Recorded the exec fingerprint for the "
+                                    "streaming path too",
+                                    backend=_s_fp.get("backend"),
+                                    model=_s_fp.get("requested_model"))
+                            elif _s_fp:
+                                logger.warning(
+                                    "STAGE3_STREAM_EXEC_SIDECAR_EMPTY",
+                                    "Streaming path ran but its exec "
+                                    "fingerprint sidecar was not written")
+                        except Exception as _fpe:
+                            # 记录失败不中断已成功的超分（与 PNG 路径一致）
+                            logger.warning("STAGE3_STREAM_EXEC_FP_FAIL",
+                                           str(_fpe))
+                        if combined_banned and force_allow:
+                            logger.warning(
+                                "STAGE3_STREAM_SKIP_COMPARISON",
+                                "Forced upscale via streaming: comparison "
+                                "frames are not generated on this path "
+                                "(known gap); the artifact is still marked "
+                                "forced",
+                                output=_s_out)
+                        if _cancel_guard is not None:
+                            # 产物已完整落盘 → 守卫不得再删它
+                            _cancel_guard.release_outputs()
+                        logger.info("STAGE3_DONE",
+                                    "AI upscaling complete (streaming)",
+                                    total_frames=_s_n, output_path=_s_out)
                         return 0
                     logger.warning("STAGE3_STREAM_FALLBACK",
                                    "raw-pipe path failed; falling back to PNG path",
