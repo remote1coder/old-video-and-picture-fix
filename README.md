@@ -295,10 +295,21 @@ force-publish override:
 | Full-chain | **original input vs output** | `allow_verify_fail_publish` |
 | Mechanical | step 6 artifact vs output | `allow_verify_fail_publish` |
 
-A/V drift is judged **relative to the source** (`|output drift − source drift|`)
-rather than against a fixed threshold — measured on 204 real phone clips,
-a fixed threshold misjudged **31%** of them (the drift is inherent to old
-sources), while the relative criterion dropped that to **1.5%**.
+A/V drift is judged **relative to the source** rather than against a fixed
+threshold — measured on 204 real phone clips, a fixed threshold misjudged
+**31%** of them (the drift is inherent to old sources), while the relative
+criterion dropped that to **1.5%**.
+
+The comparison is **per component** (start / end / span are differenced
+individually, then the worst one is taken). Differencing the two
+`max(|·|)`-collapsed scalars would cancel a newly introduced shift:
+source audio 500 ms long and output audio shifted 500 ms later both collapse
+to the same scalar, so the subtraction reports "in sync".
+
+A check only **passes when it is explicitly `True`**. `ok: null` (could not be
+measured) is treated as **not verified** and blocks publishing, as does an
+exception thrown by the verifier itself. Hard errors — blank frames,
+unreadable source, missing output — block in every mode.
 
 `full_chain_verify_mode` selects how strict the full-chain gate is:
 `frames_only` (default, lowest false positives) / `relative` / `absolute`.
@@ -613,7 +624,14 @@ PIL ImageCms，而 Pillow 的 CMS 只支持 8-bit；置 `true` 会在这种降�
 | 全链核对 | **原始素材 vs 成品** | `allow_verify_fail_publish` |
 | 机械核对 | step6 产物 vs 成品 | `allow_verify_fail_publish` |
 
-音画漂移按**相对源片**判定（`|成品漂移 − 源片漂移|`），不用固定阈值 ——
+音画漂移按**相对源片**判定，不用固定阈值 —— 且必须是**逐分量**相减
+（start / end / span 各自比，再取最大差值）。若先把两个"绝对值最大的标量"
+相减，会抵消新增错位：源音频长 500ms、成品音频整体后移 500ms，两者压成
+同一个标量，相减得 0 反而判"同步"。
+核对结论**只有明确为 `True` 才算通过**：`ok: null`（量不出来）视为
+未验收并阻断发布；校验器自身抛异常同样阻断。黑图、源不可读、成品缺失
+属于跨模式硬错误，任何档位都拦。
+
 实测 204 个真实手机素材，固定阈值误杀 **31%**（漂移是老素材自带的），
 改用相对判据后降到 **1.5%**。
 

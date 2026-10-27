@@ -1050,6 +1050,41 @@ for i, sl in enumerate(ndimage.find_objects(labeled), start=1):
 输出目录最终只剩 avif、tif、journal、status、encode_contract 及各自的
 0 字节 `.lock`（锁文件本身，正常保留）。
 
+### 12.12 照片链发布事务：顺序与不变量
+
+照片链 stage6 发布是**跨多文件事务**，正确性依赖以下固定顺序。
+任何一步挪位都会破坏某个不变量，历史上都真出过问题。
+
+```
+① acquire_target_locks(全部目标)        ← 锁必须在最前
+② _recover_prior_publish()               ← 恢复上一个未了结事务
+③ 备份旧代到 <out>.<attempt>.pubbak/     ← 并核对 backup_digest
+④ write_journal(phase=PREPARED)          ← 含 old_digest / new_digest
+⑤ os.replace 逐个目标
+⑥ write_journal(phase=COMMITTED)         ← 含各目标最终 new_digest
+⑦ _purge_publish_residue(keep_journal)   ← 删备份，留 journal
+```
+
+**各步为什么必须在这个位置**
+
+| 步 | 不变量 | 曾被违反的后果 |
+|---|---|---|
+| ① 锁在恢复之前 | 恢复也在加锁范围内 | 后到的任务能在前一个持锁期间恢复/清理它的事务，或用陈旧快照覆盖 journal |
+| ③ 核 `backup_digest` | 只用摘要一致的备份恢复 | 备份被截断仍判 OK → **用坏备份覆盖仍然完好的旧成品** |
+| ④ 记 `new_digest` | PREPARED 就有预期新代摘要 | 第一个目标替换后硬终止 → 文件既非旧代也非新代 → 判 UNKNOWN，无法自动回滚 |
+| ⑦ 成功也清理 | 输出目录只有成品与侧车 | `purge` 原先只在两条异常路径调用，正常跑完**恒留 238 MB 上一代备份** |
+
+**journal 三态**：`journal_state()` → `missing` / `valid` / `invalid`。
+`invalid`（损坏 / 摘要不符 / 读不出）必须返回 `needs_human`，
+**不能**当成"没有旧事务"继续发布 —— "状态未知则保留现场"。
+
+**路径校验必须覆盖 `records` 里的嵌套路径**：生产 journal 把
+`backup` / `staging` 写在 `records[target]` 下，只校验顶层
+`targets` / `backups` / `staging` 等于绕过了**真正会被操作的路径**。
+
+**清理只用 `os.rmdir`（仅空目录成功）+ 逐个 `os.remove`，禁止 `rmtree`。**
+目录里若有 journal 没记录到的文件，整目录保留不动 —— 不猜、不盲删。
+
 ## 13. 目录名说明
 
 **重要**：项目实际使用的目录名为：
