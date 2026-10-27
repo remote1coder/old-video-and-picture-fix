@@ -118,10 +118,18 @@ def test_verifier_exception_blocks_instead_of_passing():
                        "stage7_encode.py")
     text = open(src, encoding="utf-8", errors="replace").read()
 
-    i_init = text.find("_fc_blocked = []")
+    # R12-06 之后，_fc_blocked / _fc_pending 都在**开关判断之外**初始化，
+    # 位置更靠前；这里只要求它出现在校验 try 之前。
+    i_init = text.find("_fc_blocked: List[str] = []")
     i_try = text.find("from artifact_verify import verify_output as _fc_verify")
     assert i_init != -1 and i_try != -1
     assert i_init < i_try, "_fc_blocked 必须在校验 try 之前初始化"
+    # R12-06：_fc_pending 也必须在开关之外初始化，否则关闭全链检查后
+    # 发布段那句 `if _fc_pending:` 会 UnboundLocalError。
+    i_pending = text.find("_fc_pending = None")
+    i_gate = text.find('if _fc_enabled:')
+    assert i_pending != -1 and i_gate != -1
+    assert i_pending < i_gate, "_fc_pending 必须在 if _fc_enabled 之前初始化"
 
     # 异常分支必须赋值阻断项，且用 error 级
     i_exc = text.find("STAGE7_FULLCHAIN_VERIFY_ERROR")

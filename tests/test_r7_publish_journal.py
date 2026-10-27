@@ -206,11 +206,35 @@ def test_stage6_writes_journal_before_touching_targets():
     assert i_prep < i_replace, "journal 写在了改动目标之后"
 
 
-def test_stage6_journal_records_old_digest_and_backup():
-    """记录里必须含旧摘要与备份摘要（恢复判断依赖它们）。"""
-    import os as _os
-    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-    src = open(_os.path.join(root, "photo_restoration_pipeline", "stages",
-                             "stage6_encode.py"), encoding="utf-8").read()
-    assert '"old_digest": file_digest(_t) if _existed else None' in src
-    assert '"backup_digest": file_digest(_bk) if _bk else None' in src
+def test_stage6_journal_records_old_digest_and_backup(tmp_path):
+    """记录里必须含旧摘要与备份摘要（恢复判断依赖它们）。
+
+    直接调生产函数 `_build_journal_records()`，用真实文件，
+    不再靠搜源码字符串。
+    """
+    import sys as _sys
+    _root = tmp_path
+    tgt = _root / "out.avif"
+    tgt.write_bytes(b"OLD-GEN")
+    bk = _root / "0_out.avif"
+    bk.write_bytes(b"OLD-GEN")
+    stg = _root / "out.avif.partial"
+    stg.write_bytes(b"NEW-GEN")
+
+    for cand in (os.path.join(os.path.dirname(os.path.dirname(
+                     os.path.abspath(__file__))),
+                     "photo_restoration_pipeline", "stages"),):
+        if cand not in _sys.path:
+            _sys.path.insert(0, cand)
+    import stage6_encode as s6
+
+    recs = s6._build_journal_records(
+        [str(tgt)],
+        {str(tgt): {"state": s6.BACKUP_OK, "backup": str(bk)}},
+        {str(tgt): str(stg)},
+        {str(tgt): s6.file_digest(str(stg))})
+
+    r = recs[str(tgt)]
+    assert r["old_digest"] == s6.file_digest(str(tgt))
+    assert r["backup_digest"] == s6.file_digest(str(bk))
+    assert r["new_digest"] == s6.file_digest(str(stg))

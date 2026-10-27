@@ -1164,10 +1164,20 @@ def _measure_av_drift_vec(path: str):
         a_span = _get_stream_duration(path, "a")
         if v_start is None or a_start is None or not v_span or not a_span:
             return None
-        v_start += _probe_encoder_priming(path, "v")
-        a_start += _probe_encoder_priming(path, "a")
-        v_end, a_end = v_start + v_span, a_start + a_span
-        return (a_start - v_start, a_end - v_end, a_span - v_span)
+        # R12-08：口径必须与 `_validate_av_sync` 主路径**完全一致** ——
+        #   start 用 content_start（raw_start + priming，priming 会被播放器丢弃）
+        #   end   用 raw_end（raw_start + span）
+        # 原实现先把 priming 加进 start，再用它拼 end，末端被整体平移；
+        # 主路径用的是 raw_end，于是同一个文件也会算出一个并不存在的末端差。
+        _pv = _probe_encoder_priming(path, "v")
+        _pa = _probe_encoder_priming(path, "a")
+        v_content = v_start + _pv
+        a_content = a_start + _pa
+        v_raw_end = v_start + v_span
+        a_raw_end = a_start + a_span
+        return (a_content - v_content,
+                a_raw_end - v_raw_end,
+                a_span - v_span)
     except Exception:
         return None
 
@@ -1315,10 +1325,6 @@ def _validate_av_sync(muxed_path: str, logger,
             v = default
         return v if v > 0 else default   # 非正数退回默认，不允许关闭判定
 
-    fail_ms = (_ms("sync_fail_ms_lag", 400.0) if audio_lags
-               else _ms("sync_fail_ms_lead", 200.0))
-    warn_ms = (_ms("sync_warn_ms_lag", 185.0) if audio_lags
-               else _ms("sync_warn_ms_lead", 90.0))
     # 兼容既有 _detail() 与日志里用到的三个分量（保持绝对值语义）
     start_diff, end_diff, dur_diff = (
         abs(start_signed), abs(end_signed), abs(dur_signed))
@@ -1332,39 +1338,88 @@ def _validate_av_sync(muxed_path: str, logger,
                     duration_drift_ms=dur_diff * 1000,
                     encoder_priming_ms=priming_ms)
 
-    if diff_ms > fail_ms:
+    # ---- R12-08：逐分量按**自己的符号**套对应阈值，再取最高严重等级 ----
+    #
+    # 旧实现先把三个分量压成"绝对值最大的那一个"，再用它一项的符号决定
+    # 唯一一组阈值（超前 200 / 滞后 400）。可复算反例：
+    #   源   视频/音频都是 [0,10]
+    #   成品 视频 [0,10]，音频 [-0.25,10.05]
+    #   相对分量：起点 -250ms / 终点 +50ms / 跨度 +300ms
+    # 起点声音超前 250ms 已超 200ms 失败线，但"最大绝对值"是 +300ms，
+    # 于是套了 400ms 的滞后线 → 只警告、返回 0，**漏判**。
+    #
+    # 正确做法：每个分量各自判，合并最高等级。200/400ms 是本项目策略
+    # 取值，不是 ITU 标准原值。
+    _comp_ms = [
+        ("start", start_signed * 1000.0),
+        ("end", end_signed * 1000.0),
+        ("span", dur_signed * 1000.0),
+    ]
+    if _ref_vec is not None:
+        _comp_ms = [
+            ("start", (start_signed - _ref_vec[0]) * 1000.0),
+            ("end", (end_signed - _ref_vec[1]) * 1000.0),
+            ("span", (dur_signed - _ref_vec[2]) * 1000.0),
+        ]
+
+    # level: 3=fail, 2=warn, 1=warn(>100ms), 0=minor
+    _worst = {"level": 0, "name": None, "mag": 0.0, "thr": None, "lag": None}
+    for _nm, _mag in _comp_ms:
+        _lag = _mag > 0
+        _f = _ms("sync_fail_ms_lag" if _lag else "sync_fail_ms_lead",
+                 400.0 if _lag else 200.0)
+        _w = _ms("sync_warn_ms_lag" if _lag else "sync_warn_ms_lead",
+                 185.0 if _lag else 90.0)
+        _a = abs(_mag)
+        if _a > _f:
+            _lv, _thr = 3, _f
+        elif _a > _w:
+            _lv, _thr = 2, _w
+        elif _a > 100.0:
+            _lv, _thr = 1, 100.0
+        else:
+            _lv, _thr = 0, _w
+        if _lv > _worst["level"] or (
+                _lv == _worst["level"] and _a > _worst["mag"]):
+            _worst = {"level": _lv, "name": _nm, "mag": _a,
+                      "thr": _thr, "lag": _lag}
+
+    diff_ms = max(abs(m) for _n, m in _comp_ms)
+    _comp_txt = " / ".join(f"{n} {m:+.0f}ms" for n, m in _comp_ms)
+    _dir_txt = ("audio lags" if _worst["lag"] else "audio leads")
+    _worst_txt = (f"worst: {_worst['name']} {_worst['mag']:.0f}ms "
+                  f"({_dir_txt}, threshold {_worst['thr']:.0f}ms)")
+
+    if _worst["level"] == 3:
         logger.error("STAGE7_SYNC_FAIL",
-                     f"AV sync difference {diff_ms:.0f}ms exceeds "
-                     f"{fail_ms:.0f}ms threshold "
-                     f"({'audio lags' if audio_lags else 'audio leads'}; "
-                     f"basis: {_basis}) "
-                     f"(start {start_diff * 1000:.0f}ms / end {end_diff * 1000:.0f}ms "
-                     f"/ drift {dur_diff * 1000:.0f}ms)", **_detail())
+                     f"AV sync failed on {_worst['name']} component: "
+                     f"{_worst['mag']:.0f}ms exceeds "
+                     f"{_worst['thr']:.0f}ms ({_dir_txt}; basis: {_basis}) "
+                     f"[{_comp_txt}]",
+                     per_component=_comp_ms, **_detail())
         return 86
-    elif diff_ms > warn_ms:
+    if _worst["level"] == 2:
         logger.warning("STAGE7_SYNC_WARN",
-                       f"AV sync difference {diff_ms:.0f}ms exceeds "
-                       f"{warn_ms:.0f}ms "
-                       f"({'audio lags' if audio_lags else 'audio leads'}; "
-                       f"basis: {_basis})", **_detail())
-        return 0  # Continue but warn
-    elif diff_ms > 100:
+                       f"AV sync warning on {_worst['name']} component: "
+                       f"{_worst['mag']:.0f}ms exceeds "
+                       f"{_worst['thr']:.0f}ms ({_dir_txt}; basis: {_basis}) "
+                       f"[{_comp_txt}]",
+                       per_component=_comp_ms, **_detail())
+        return 0
+    if _worst["level"] == 1:
         # FIX-R7-S7-11: >100ms must be WARNING per v7.32 §3.10.9.
-        # 本分支原先被上面的 `diff_ms > 0` 遮蔽成死代码：任何正差值都先
-        # 命中 >0，于是 5ms 也会写"exceeds 300ms threshold"（硬编码，
-        # 与实际值无关），而真正的 >100ms 告警永远不触发。
-        # 现在按「fail → warn 阈值 → 100ms」从高到低排列，不再有遮蔽。
         logger.warning("STAGE7_SYNC_WARN_100",
-                       f"AV sync difference {diff_ms:.0f}ms exceeds 100ms threshold",
-                       **_detail())
-        return 0  # Continue
-    elif diff_ms > 0:
-        # 剩余区间：0 < diff <= 100ms。如实报出实际值与告警线，
-        # 不要再写死一个和本分支对不上的阈值。
+                       f"AV sync {_worst['name']} component "
+                       f"{_worst['mag']:.0f}ms exceeds 100ms threshold "
+                       f"[{_comp_txt}]",
+                       per_component=_comp_ms, **_detail())
+        return 0
+
+    if diff_ms > 0:
         logger.info("STAGE7_SYNC_MINOR",
-                    f"AV sync difference {diff_ms:.0f}ms is within the "
-                    f"100ms noise floor (warn threshold {warn_ms:.0f}ms)",
-                    **_detail())
+                    f"AV sync within the 100ms noise floor ({diff_ms:.0f}ms) "
+                    f"[{_comp_txt}]",
+                    per_component=_comp_ms, **_detail())
         return 0
 
     logger.info("STAGE7_SYNC_OK",
@@ -2331,15 +2386,34 @@ def main():
             #
             # 帧数判据之所以安全：`expected_frame_counts()` 已覆盖
             # IVTC(5→4)、QTGMC divisor=1(翻倍)、divisor=2(不变) 三种合法变化。
+            # R12-06：这些状态必须在**开关判断之外**初始化。
+            # 原来 _fc_pending 写在 `if full_chain_verify:` 里面 —— 用户关掉
+            # 全链检查后，发布段之后那句 `if _fc_pending:` 会抛
+            # UnboundLocalError，此时媒体**已经被 os.replace 覆盖**，
+            # 于是"换了文件却报发布失败"。
             _fc_blocked: List[str] = []
-            if params.get("full_chain_verify", True):
-                _fc_mode = str(params.get("full_chain_verify_mode",
-                                          "frames_only")).strip().lower()
-                _fc_pending = None
-                # 必须先初始化：下面 try 里任何一步抛异常都会跳到 except，
-                # 若此时 _fc_blocked 还没赋值，后面的 `if _fc_blocked:`
-                # 会直接 NameError（把"校验异常"变成整个 stage 崩溃）。
-                _fc_blocked = []
+            _fc_pending = None
+            _fc_mode = str(params.get("full_chain_verify_mode",
+                                      "frames_only")).strip().lower()
+            _fc_enabled = bool(params.get("full_chain_verify", True))
+            # 注意：_ver 要到后面的 verify_output() 才创建，这里不能写 _ver，
+            # 否则 UnboundLocalError。先攒在 _prechecks 里，等 _ver 建好再合并。
+            _prechecks: Dict[str, Any] = {}
+            if not _fc_enabled:
+                # 明确记录"本次未执行全链核对"，不能让它看起来像通过。
+                _prechecks["fullchain_verify"] = {
+                    "executed": False,
+                    "reason": "full_chain_verify disabled by config",
+                }
+                logger.warning("STAGE7_FULLCHAIN_DISABLED",
+                               "full_chain_verify is disabled; this run "
+                               "publishes WITHOUT the full-chain check. The "
+                               "artifact must be reported as unverified.",
+                               attempt_id=_attempt_id)
+            if _fc_enabled:
+                # try 里任何一步抛异常都会跳到 except；若那时 _fc_blocked
+                # 还没赋值，后面的 `if _fc_blocked:` 会 NameError
+                # （把"校验异常"变成整个 stage 崩溃）。故此处再确保一次。
                 try:
                     from artifact_verify import verify_output as _fc_verify
                     _fc = _fc_verify(args.input, _publish_tmp, params)
@@ -2419,25 +2493,98 @@ def main():
                                      f"pre-publish check raised: {_pe}")
                         return 86
                     if not _pre.get("ok"):
+                        # R12-15：这道门也要尊重用户的强制开关，但**不能一律放行**。
+                        # 分清两类：
+                        #   * 硬错误（源不可读 / 成品缺失 / 探测不可用）——
+                        #     属于"事实未知或根本没法量"，强制发布等于蒙，
+                        #     任何开关都不放行；
+                        #   * 普通质量失败（帧数/亮度等判据为 False）——
+                        #     用户可以显式承担风险，与全链门/机械门一致。
+                        _hard = (_pre.get("hard_error") or "").strip()
+                        if _hard:
+                            logger.error(
+                                "STAGE7_PREPUBLISH_HARD_ERROR",
+                                "Refusing to publish: the staged attempt hit a "
+                                "hard error (unreadable / missing / unmeasurable)"
+                                " which cannot be force-published. The existing "
+                                "output is left untouched.",
+                                attempt_id=_attempt_id, hard_error=_hard,
+                                verdict=_rv_pre(_pre) if _pre else "")
+                            _discard_attempt_tmp(_publish_tmp, logger)
+                            return 86
+                        _force_pre = _force_publish_enabled(
+                            params, "allow_verify_fail_publish")
+                        if not _force_pre:
+                            logger.error(
+                                "STAGE7_PREPUBLISH_VERIFY_FAIL",
+                                "Refusing to publish: the staged attempt failed "
+                                "the mechanical check. The existing output is "
+                                "left untouched. Set "
+                                "allow_verify_fail_publish=true to force.",
+                                attempt_id=_attempt_id,
+                                verdict=_rv_pre(_pre) if _pre else "")
+                            return 86
+                        # 强制放行：必须留痕，且**不得**写成"已验证"。
+                        _prechecks["prepublish_forced"] = {
+                            "forced": True,
+                            "reason": "allow_verify_fail_publish",
+                            "verdict": _rv_pre(_pre) if _pre else "",
+                        }
                         logger.error(
-                            "STAGE7_PREPUBLISH_VERIFY_FAIL",
-                            "Refusing to publish: the staged attempt failed "
-                            "the mechanical check. The existing output is "
-                            "left untouched.",
+                            "STAGE7_PREPUBLISH_FORCE_PUBLISHED",
+                            "Pre-publish check FAILED but "
+                            "allow_verify_fail_publish is on: publishing "
+                            "anyway. The artifact is NOT verified.",
                             attempt_id=_attempt_id,
                             verdict=_rv_pre(_pre) if _pre else "")
+                    # R12-04：帧序检查也必须**在覆盖之前**完成。
+                    # 原来它只对已发布的正式路径执行 —— 一旦错序，旧成品
+                    # 已被 os.replace 换掉，再返回 86 也救不回来。
+                    # 这里对 attempt 暂存件核一次，不过就不发布。
+                    try:
+                        from artifact_verify import (
+                            verify_frame_alignment as _vfa_pre,
+                            render_alignment as _ra_pre,
+                        )
+                        _align_pre = _vfa_pre(
+                            input_source, _publish_tmp, samples=4)
+                    except Exception as _ae:
+                        logger.error("STAGE7_PREPUBLISH_ALIGN_ERROR",
+                                     f"pre-publish alignment raised: {_ae}")
                         return 86
+                    if _align_pre.get("ok") is False:
+                        logger.error(
+                            "STAGE7_PREPUBLISH_ALIGN_FAIL",
+                            "Refusing to publish: the staged attempt has "
+                            "shifted frame order. The existing output is "
+                            "left untouched.",
+                            attempt_id=_attempt_id,
+                            verdict=_ra_pre(_align_pre))
+                        _discard_attempt_tmp(_publish_tmp, logger)
+                        return 86
+                    _prechecks["alignment_precheck"] = {
+                        "ok": _align_pre.get("ok"),
+                        "flipped": _align_pre.get("flipped"),
+                        "checked": len(_align_pre.get("points") or []),
+                    }
+
                     logger.info("STAGE7_PREPUBLISH_VERIFY_OK",
-                                "Staged attempt passed the mechanical check; "
-                                "publishing now", attempt_id=_attempt_id)
+                                "Staged attempt passed the mechanical check "
+                                "and frame-order check; publishing now",
+                                attempt_id=_attempt_id)
 
                     if os.path.exists(output_path) and not _same_volume(
                             _publish_tmp, output_path):
                         # 跨盘：先完整复制到目标端，再删暂存
                         shutil.copy2(_publish_tmp, output_path)
                         os.unlink(_publish_tmp)
+                        _published_by_copy = True
                     else:
+                        # 同一卷 os.replace：只是改名，**字节必然与暂存件一致**，
+                        # 发布前的帧序/机械核对已经覆盖过，无需再做一次
+                        # 全量解码审计（12 秒片子约 5 分钟，长片不可接受）。
                         os.replace(_publish_tmp, output_path)
+                        _published_by_copy = False
                     logger.info("STAGE7_PUBLISHED",
                                 "Attempt staged file promoted to the final "
                                 "path after validation",
@@ -2488,6 +2635,9 @@ def main():
             try:
                 from artifact_verify import verify_output, render_verdict
                 _ver = verify_output(input_source, output_path, {})
+                # 把发布前完成的检查结果并进最终报告（R12-06 / R12-04）。
+                if _prechecks:
+                    _ver.setdefault("prechecks", {}).update(_prechecks)
                 _side = str(output_path) + ".verify.json"
                 try:
                     import json as _json
@@ -2507,21 +2657,39 @@ def main():
                 try:
                     from artifact_verify import (verify_frame_alignment,
                                                  render_alignment)
-                    _align = verify_frame_alignment(
-                        input_source, output_path, samples=4)
+                    # R12-04：这里是**发布后的审计读回**，不再改变本次结论。
+                    # 阻断判定已在上面的发布前门完成（对暂存件）；发布之后
+                    # 才发现的错序无法回救旧成品，再改 _ver["ok"] 只会让
+                    # "文件已换掉、报告说失败"变成不一致状态。
+                    #
+                    # 只有**跨卷复制**发布才需要读回：同卷 os.replace 是改名，
+                    # 字节与暂存件完全相同，发布前已经核过，重复全量解码
+                    # 只是白烧时间。
+                    _align = (
+                        verify_frame_alignment(input_source, output_path,
+                                               samples=4)
+                        if _published_by_copy else
+                        {"ok": True, "skipped": "same-volume rename",
+                         "flipped": 0, "points": []})
+                    _ver["alignment_postaudit"] = {
+                        "ok": _align.get("ok"),
+                        "flipped": _align.get("flipped"),
+                        "checked": len(_align.get("points") or []),
+                    }
                     if _align.get("ok") is True:
                         logger.info("STAGE7_ALIGN_OK",
                                     "Frame order verified on sampled points",
                                     flipped=_align.get("flipped"),
                                     checked=len(_align.get("points") or []))
                     elif _align.get("ok") is False:
-                        logger.error("STAGE7_ALIGN_FAIL",
-                                     "Frame order looks shifted between "
-                                     "stage7 input and output",
+                        logger.error("STAGE7_ALIGN_POSTAUDIT_MISMATCH",
+                                     "Post-publish audit sees shifted frame "
+                                     "order; the pre-publish check passed, so "
+                                     "this indicates a copy/encode fault. "
+                                     "Artifact is already live.",
                                      verdict=render_alignment(_align))
-                        _ver["ok"] = False
                         _ver.setdefault("issues", []).append({
-                            "level": "error",
+                            "level": "warning",
                             "code": "FRAME_ORDER_SHIFTED",
                             "message": _align.get("note") or "帧序错位",
                         })
@@ -2533,10 +2701,10 @@ def main():
                 except Exception as _ae:
                     logger.warning("STAGE7_ALIGN_ERROR", str(_ae))
 
-                # GATE-03：对齐判定可能刚把 _ver["ok"] 改成 False，
-                # 必须**用最终结论重写** sidecar。否则磁盘上的
-                # .verify.json 仍是 ok=True，而日志和返回码却是失败，
-                # 报告与成品对不上代。
+                # GATE-03 / R12-04：sidecar 必须写**最终**结论。
+                # 对齐已改为"发布前阻断 + 发布后仅审计"，所以它不会再
+                # 把 _ver["ok"] 改 False；但 _ver 仍可能被预检查标记，
+                # 这里统一在写盘前落定，避免磁盘与实际结论不一致。
                 try:
                     import json as _json2
                     with open(_side, "w", encoding="utf-8") as _f2:

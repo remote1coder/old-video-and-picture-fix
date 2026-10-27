@@ -947,6 +947,37 @@ def _is_vfr(pts_map, tol: float = 0.01) -> bool:
     return (max(d) - min(d)) / med > tol
 
 
+def _classify_timeline(pts_map) -> str:
+    """把逐帧 PTS 分成三态：``"cfr"`` / ``"vfr"`` / ``"unknown"``。
+
+    R12-10：`_is_vfr()` 对"数据不足/不可用"返回 False，调用方于是把
+    **未知当成 CFR** 放进了不携带 PTS 的流式路径。PTS 读不出来不等于
+    固定帧率 —— 这是"量不出来当通过"的又一个变体。
+
+    只有时间轴完整、合法、且间隔一致时才返回 ``"cfr"``。
+    """
+    if not pts_map or len(pts_map) < 3:
+        return "unknown"
+    import math
+    try:
+        # 必须按**帧号顺序**取时间戳；先 sorted() 会把"非单调"这个
+        # 危险信号抹平（0, .04, .02, .06 排完就变单调了）。
+        _pairs = sorted((float(k), float(v)) for k, v in pts_map.items()
+                        if v is not None)
+    except (TypeError, ValueError):
+        return "unknown"
+    ts = [v for _k, v in _pairs]
+    if len(ts) < 3 or not all(math.isfinite(v) for v in ts):
+        return "unknown"
+    d = [b - a for a, b in zip(ts, ts[1:])]
+    if any(x <= 0 for x in d):
+        return "unknown"          # 非单调 → 时间轴不可信
+    med = sorted(d)[len(d) // 2]
+    if med <= 0:
+        return "unknown"
+    return "vfr" if (max(d) - min(d)) / med > 0.01 else "cfr"
+
+
 def _clear_stale_frame_dirs(temp_dir, job_id, logger=None):
     """清掉**同一 job_id** 上次跑批残留在 temp 里的帧目录。
 
@@ -2105,7 +2136,11 @@ def main():
         "-of", "default=noprint_wrappers=1:nokey=1",
         stage2_output,
     ]
-    actual_fps = 30.0
+    # R12-10：帧率探测失败**不能静默用默认值**。
+    # 真实 30fps 的素材若按 25fps 编码，帧数完全正确但时长变了 20%，
+    # 任何"帧数一致"的核对都发现不了。
+    actual_fps = None
+    _fps_ok = False
     try:
         r = subprocess.run(fps_cmd, capture_output=True, text=True, errors="replace",
                           timeout=10, shell=False)
@@ -2113,11 +2148,37 @@ def main():
             fps_str_val = r.stdout.strip()
             if "/" in fps_str_val:
                 num, den = fps_str_val.split("/")
-                actual_fps = int(num) / int(den)
+                _v = int(num) / int(den)
             else:
-                actual_fps = float(fps_str_val)
+                _v = float(fps_str_val)
+            if _v and _v > 0:
+                actual_fps = _v
+                _fps_ok = True
     except Exception:
         pass
+    if not _fps_ok:
+        # 有完整 PTS 时可以从帧间隔反推，这不算"猜"；
+        # 否则记为假设值并明确留痕，同时禁止走流式路径。
+        _tl_probe = _classify_timeline(all_pts_map)
+        if _tl_probe != "unknown":
+            _ts = sorted(float(v) for v in all_pts_map.values())
+            _d = [b - a for a, b in zip(_ts, _ts[1:]) if b > a]
+            if _d:
+                _med = sorted(_d)[len(_d) // 2]
+                if _med > 0:
+                    actual_fps = 1.0 / _med
+                    _fps_ok = True
+                    logger.info("STAGE3_FPS_FROM_PTS",
+                                "r_frame_rate probe failed; derived fps from "
+                                "frame intervals instead",
+                                derived_fps=round(actual_fps, 4))
+        if not _fps_ok:
+            actual_fps = 25.0
+            logger.error("STAGE3_FPS_ASSUMED",
+                         "Could not determine the frame rate from ffprobe or "
+                         "PTS; falling back to 25 fps. Timing is NOT verified "
+                         "for this run, and the streaming path is disabled.",
+                         assumed_fps=actual_fps)
 
     # FIX-N8-2: Query all PTS once before window loop (not per-window)
     # ORIGINAL: extract_frames_with_pts called ffprobe for every window
@@ -2149,14 +2210,20 @@ def main():
                     "lanczos_target is set; the streaming path would bypass "
                     "secondary scaling, so use the PNG path instead",
                     lanczos_target=str(_s_lanczos))
-    elif _is_vfr(all_pts_map):
-        # STR-04：VFR 素材走流式会把间隔压成 CFR，时序被改变。
-        # 逐帧 PTS 传输尚未实现，这里显式回退 PNG 路径保留时序。
-        logger.info("STAGE3_STREAM_SKIP_VFR",
-                    "Variable frame rate detected; the streaming path would "
-                    "flatten frame intervals to CFR, so use the PNG path "
-                    "(which preserves per-frame durations)",
-                    frames=len(all_pts_map or {}))
+    elif _classify_timeline(all_pts_map) != "cfr":
+        # STR-04 / R12-10：只有**确认是 CFR** 才允许走不携带 PTS 的流式路径。
+        # VFR 会被压成 CFR；UNKNOWN（PTS 读不出/非单调/不足）同样不能
+        # 冒充 CFR —— 否则"量不出来"又变成了"按固定帧率处理"。
+        _tl = _classify_timeline(all_pts_map)
+        logger.info("STAGE3_STREAM_SKIP_TIMELINE",
+                    "Timeline is not confirmed CFR; the streaming path would "
+                    "encode at a fixed frame rate and change the timing, so "
+                    "use the PNG path instead",
+                    timeline=_tl, frames=len(all_pts_map or {}))
+    elif not _fps_ok:
+        logger.info("STAGE3_STREAM_SKIP_FPS_UNKNOWN",
+                    "Frame rate could not be determined; rawvideo would need a "
+                    "guessed -framerate, so use the PNG path instead")
     elif params.get("ai_stream_raw"):
         _s_ai_py = _resolve_ai_python(logger)
         if not _s_ai_py:

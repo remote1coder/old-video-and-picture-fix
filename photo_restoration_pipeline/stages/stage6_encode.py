@@ -158,6 +158,85 @@ def _run_encoder(cmd: List[str], timeout: int, logger=None) -> Tuple[bool, str, 
             cancel_guard.unwatch_process(proc)
 
 
+def _build_journal_records(commit_targets: List[str],
+                           snapshot: Dict[str, Dict[str, Optional[str]]],
+                           staging_map: Dict[str, str],
+                           new_digest_map: Dict[str, Optional[str]],
+                           ) -> Dict[str, Dict[str, Any]]:
+    """构造 PREPARED 的 records —— **生产路径与测试共用这一份**。
+
+    R12-01：new_digest 必须来自**真实存在的暂存件**。曾经的写法是从
+    snapshot 里取 `staging` 字段，而 `_snapshot_for_rollback()` 只返回
+    state/backup，于是字段存在、值恒为 None —— 半提交后已替换的文件
+    既非旧代也非新代，恢复只能判 UNKNOWN。
+
+    Args:
+        commit_targets: 本次事务要发布的全部目标。
+        snapshot: 备份快照（提供 backup / state）。
+        staging_map: 目标 → 暂存件路径。
+        new_digest_map: 目标 → 预期新代摘要（WSL 回拷目标沿用 work_* 的）。
+
+    Returns:
+        `{目标: record}`；`new_digest` 直接取自 new_digest_map。
+    """
+    records: Dict[str, Dict[str, Any]] = {}
+    for t in commit_targets:
+        entry = snapshot.get(t) or {}
+        existed = os.path.exists(t)
+        bk = entry.get("backup")
+        records[t] = {
+            "existed": existed,
+            "old_digest": file_digest(t) if existed else None,
+            "new_digest": new_digest_map.get(t),
+            "backup": bk,
+            "backup_digest": file_digest(bk) if bk else None,
+            "staging": staging_map.get(t),
+            "state": entry.get("state"),
+        }
+    return records
+
+
+def _verify_new_digest(path: str,
+                       expected: Dict[str, Optional[str]]) -> None:
+    """R12-01：替换完成后立刻核对该目标是否真的变成**预期的新代**。
+
+    暂存件与 journal 摘要保证"重启时能认出新代"，这里保证"本次替换
+    确实落地了预期字节" —— 硬链接/占位文件/异常写入都会在这里暴露，
+    而不是等到下次启动才发现摘要对不上。
+    """
+    want = expected.get(path)
+    if not want:
+        return
+    got = file_digest(path)
+    if got != want:
+        raise PublishAbort(
+            "digest_mismatch",
+            f"published artifact does not match its staged digest: {path} "
+            f"(on-disk={got} expected={want})")
+
+
+def _write_json_staging(path: str, payload: Dict[str, Any]) -> bool:
+    """把 JSON **写成指定的暂存文件**（不做 replace）。
+
+    R12-01：contract / status 原先在提交段直接用 `_write_json_sidecar()`
+    写正式路径，于是 PREPARED 阶段它们**还没有文件**，`new_digest` 只能是
+    None —— 半提交后已替换的文件既非旧代也非新代，恢复只能判 UNKNOWN。
+    这里提前序列化到独立暂存件，提交段只做 os.replace。
+    """
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        return False
+
+
 def _write_json_sidecar(path: str, payload: Dict[str, Any]) -> bool:
     """Atomically write a JSON sidecar (temp + replace)."""
     tmp = f"{path}.tmp"
@@ -210,7 +289,8 @@ def _snapshot_for_rollback(paths: List[str], backup_dir: str,
     snapshot: Dict[str, Dict[str, Optional[str]]] = {}
     for idx, path in enumerate([p for p in paths if p]):
         if not os.path.isfile(path):
-            snapshot[path] = {"state": BACKUP_ABSENT, "backup": None}
+            snapshot[path] = {"state": BACKUP_ABSENT, "backup": None,
+                              "old_digest": None, "backup_digest": None}
             continue
         try:
             os.makedirs(backup_dir, exist_ok=True)
@@ -222,9 +302,20 @@ def _snapshot_for_rollback(paths: List[str], backup_dir: str,
             # 提交阶段虽然主要用 os.replace 换 inode，但无法强制所有调用方
             # 都这样做，备份必须自己站得住。
             shutil.copyfile(path, backup)
-            snapshot[path] = {"state": BACKUP_OK, "backup": backup}
+            # R12-02：同时记下"旧代摘要"和"备份实际摘要"。
+            # 回滚时两者都要核 —— 只有摘要同时等于 old_digest 与
+            # backup_digest 的备份才允许覆盖目标，否则坏备份会盖掉好文件。
+            # 备份是 copyfile 出来的，正常情况下两者相同；分开记录是为了
+            # 在"备份后被外部改动"时能发现。
+            snapshot[path] = {
+                "state": BACKUP_OK,
+                "backup": backup,
+                "old_digest": file_digest(path),
+                "backup_digest": file_digest(backup),
+            }
         except OSError as e:
-            snapshot[path] = {"state": BACKUP_FAILED, "backup": None}
+            snapshot[path] = {"state": BACKUP_FAILED, "backup": None,
+                              "old_digest": None, "backup_digest": None}
             if logger:
                 logger.error("STAGE6_ROLLBACK_BACKUP_FAIL",
                              f"Cannot back up {path} before publishing: {e}. "
@@ -269,8 +360,16 @@ def _recover_prior_publish(work_output_path: str,
     try:
         from publish_journal import journal_state as _jstate
         _st = _jstate(jp)
-    except Exception:
-        _st = "missing"
+    except Exception as _je:
+        # R12 边界：**异常代表"不知道"，不能等同于"不存在"**。
+        # 原实现把异常降成 missing，等于在"读不出来"时当成"没有旧事务"
+        # 直接开始新发布 —— 与"状态未知则保留现场"相反。
+        _st = "invalid"
+        if logger:
+            logger.error("STAGE6_JOURNAL_STATE_ERROR",
+                         "Could not determine the state of the publish "
+                         "journal; treating it as invalid (unknown is not "
+                         "the same as absent)", journal=jp, error=str(_je))
     if _st == "invalid":
         if logger:
             logger.error(
@@ -346,10 +445,17 @@ def _recover_prior_publish(work_output_path: str,
                 except Exception as _de:
                     _usable = False
                     _why = f"cannot verify backup digest: {_de}"
+            # R12-02：把 journal 里的两个摘要一并带进 snapshot，
+            # 让 _rollback_publish() 能"先全组预检、再动手"。
+            _old_d = r.get("old_digest")
             if _usable:
-                snapshot[t] = {"state": BACKUP_OK, "backup": bk}
+                snapshot[t] = {"state": BACKUP_OK, "backup": bk,
+                               "old_digest": _old_d,
+                               "backup_digest": bk_digest}
             else:
                 snapshot[t] = {"state": BACKUP_FAILED, "backup": bk,
+                               "old_digest": _old_d,
+                               "backup_digest": bk_digest,
                                "reason": _why}
                 if logger:
                     logger.error(
@@ -359,17 +465,31 @@ def _recover_prior_publish(work_output_path: str,
                         "overwrite a possibly-good old output)",
                         target=t, backup=bk, reason=_why)
         elif r.get("existed") is False:
-            snapshot[t] = {"state": BACKUP_ABSENT, "backup": None}
+            snapshot[t] = {"state": BACKUP_ABSENT, "backup": None,
+                           "old_digest": None, "backup_digest": None}
         else:
-            snapshot[t] = {"state": BACKUP_FAILED, "backup": None}
+            snapshot[t] = {"state": BACKUP_FAILED, "backup": None,
+                           "old_digest": r.get("old_digest"),
+                           "backup_digest": None}
     rb = _rollback_publish(snapshot, logger)
     if not rb.get("fully_restored"):
         if logger:
-            logger.error("STAGE6_PRIOR_PUBLISH_ROLLBACK_FAILED",
-                         "Could not fully restore the previous generation "
-                         "from journal backups; leaving everything untouched",
-                         failed=rb.get("failed"),
-                         impossible=rb.get("impossible"))
+            # R12-02：预检失败 = **一个字节都没动**；执行阶段失败 = 动过。
+            # 原先无条件写 "leaving everything untouched"，预检通过但执行
+            # 中途失败时这句话是假的，会误导人工判断。
+            _untouched = bool(rb.get("precheck_failed"))
+            logger.error(
+                "STAGE6_PRIOR_PUBLISH_ROLLBACK_FAILED",
+                ("Rollback aborted at precheck: nothing was modified. "
+                 "Inspect the journal and .pubbak manually."
+                 if _untouched else
+                 "Rollback started but did not fully restore the previous "
+                 "generation; some targets may have been modified."),
+                precheck_failed=_untouched,
+                restored=rb.get("restored"),
+                skipped=rb.get("skipped"),
+                failed=rb.get("failed"),
+                impossible=rb.get("impossible"))
         return {"status": "needs_human", "action": None,
                 "report": {"rollback": rb}}
     _purge_publish_residue(jp, rep, logger)
@@ -389,22 +509,34 @@ def _purge_publish_residue(journal_path: str, report: Dict[str, Any],
             留着。它同时是输出目录里的审计文件，且下次启动要靠它识别
             "上次已完整提交"，删掉会让下次重复发布。
     """
-    removed: List[str] = []
-    for t, info in (report.get("targets") or {}).items():
+    # R12 边界：返回**可核验的结果**，不要"吞掉 OSError 再报已清理"。
+    # 外层会据 removed/failed/kept 如实汇报；保留未知非空目录是合理的
+    # （里面可能有 journal 没记录到的文件，不猜、不盲删）。
+    result: Dict[str, Any] = {"removed": [], "failed": [], "kept": []}
+    removed, failed = result["removed"], result["failed"]
+
+    for _t, info in (report.get("targets") or {}).items():
         bk = info.get("backup")
-        if bk and os.path.isfile(bk):
-            try:
-                os.remove(bk)
-                removed.append(bk)
-            except OSError:
-                pass
+        if not bk:
+            continue
+        if not os.path.isfile(bk):
+            continue
+        try:
+            os.remove(bk)
+            removed.append(bk)
+        except OSError as e:
+            failed.append({"path": bk, "error": str(e)})
+
     if not keep_journal:
         try:
             if os.path.exists(journal_path):
                 os.remove(journal_path)
                 removed.append(journal_path)
-        except OSError:
-            pass
+        except OSError as e:
+            failed.append({"path": journal_path, "error": str(e)})
+    else:
+        result["kept"].append(journal_path)
+
     # 备份文件都删掉后，`.pubbak` 目录通常是空的 —— 顺手移除。
     # 用 rmdir 而不是 rmtree：**只有目录为空才会成功**，万一里面还有
     # journal 没记录到的文件（不该有，但不猜），就留着不动。
@@ -413,107 +545,171 @@ def _purge_publish_residue(journal_path: str, report: Dict[str, Any],
                         for info in (report.get("targets") or {}).values())
               if b}:
         try:
-            if os.path.isdir(d) and not os.listdir(d):
-                os.rmdir(d)
-                removed.append(d)
-        except OSError:
-            pass
-    if removed and logger:
-        logger.info("STAGE6_PRIOR_PUBLISH_RESIDUE_PURGED",
-                    "Removed journal and backups of a concluded transaction",
-                    removed=removed)
+            if not os.path.isdir(d):
+                continue
+            if os.listdir(d):
+                result["kept"].append(d)     # 非空：明确记录"故意保留"
+                continue
+            os.rmdir(d)
+            removed.append(d)
+        except OSError as e:
+            failed.append({"path": d, "error": str(e)})
+
+    if logger:
+        if failed:
+            logger.error("STAGE6_PUBLISH_RESIDUE_PURGE_PARTIAL",
+                         "Some publish residue could NOT be removed; the "
+                         "output directory still contains leftovers",
+                         removed=removed, failed=failed, kept=result["kept"])
+        elif removed:
+            logger.info("STAGE6_PRIOR_PUBLISH_RESIDUE_PURGED",
+                        "Removed journal and backups of a concluded transaction",
+                        removed=removed, kept=result["kept"])
+    return result
 
 
 def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
                       logger=None) -> Dict[str, Any]:
-    """R3-03 / PUB-02（第七轮）：把每个目标路径恢复成提交前的内容。
+    """把每个目标路径恢复成提交前的内容。
 
-    返回**可直接核验的逐文件结果**（旧实现返回 None，调用方无法知道
-    部分恢复失败，却仍打印"Previous generation restored"）：
+    **R12-02：先形成全组计划并全部校验通过，才开始改动任何文件。**
 
-    ```
-    {
-      "restored":  [path, ...],       # 从备份拷回成功
-      "removed":   [path, ...],       # 本次新建、已正确删除
-      "failed":    [{"path","error"}],# 恢复动作本身失败
-      "impossible":[path, ...],       # 备份失败/缺失，未改动（没得恢复）
-      "fully_restored": bool,         # = not failed and not impossible
-    }
-    ```
+    旧实现逐目标独立恢复，有两个真实后果：
+    - 一份备份校验失败时，其他目标**已经被改掉**、好备份**已被消耗**，
+      然后才返回 needs_human —— 日志里"leaving everything untouched"不成立；
+    - 备份本身不核摘要，坏备份能覆盖仍然完好的目标却报
+      `fully_restored=True`。
 
-    * ``backed_up``  → 从备份拷回；
-    * ``absent``     → 删除本次新建的文件；
-    * ``backup_failed`` → **不动**（没有备份可恢复，删掉就等于销毁旧产物），
-      记 `STAGE6_RESTORE_IMPOSSIBLE`，绝不声称"完整旧代已恢复"。
+    Args:
+        snapshot: ``{目标路径: {"state", "backup", "old_digest", "backup_digest"}}``。
+            后两项可选；提供时用于"已是旧代则跳过"与"备份摘要必须匹配"。
+
+    Returns:
+        dict：`restored` / `removed` / `failed` / `impossible` /
+        `skipped` / `fully_restored` / `precheck_failed`。
+        `precheck_failed=True` 表示**没有改动任何文件**，调用方应保留现场。
     """
     result: Dict[str, Any] = {"restored": [], "removed": [], "failed": [],
-                              "impossible": [], "fully_restored": False}
+                              "impossible": [], "skipped": [],
+                              "fully_restored": False,
+                              "precheck_failed": False}
+
+    # ---------- 阶段一：全组预检（只读，不改任何东西）----------
+    plan: List[Dict[str, Any]] = []
     for path, entry in snapshot.items():
         state = entry.get("state")
         backup = entry.get("backup")
-        try:
-            if state == BACKUP_OK and backup and os.path.isfile(backup):
-                # R3-03 / B14：优先 `os.replace` —— 单次系统调用、原子，
-                # 比 copyfile 的失败面小得多。取消处理器里做文件 I/O 有额外
-                # 风险（Windows 实测会再抛 KeyboardInterrupt），
-                # 越少的系统调用越好；跨卷失败时再退回复制。
-                try:
-                    os.replace(backup, path)
-                    result["restored"].append(path)
-                    continue
-                except OSError:
-                    pass
-                shutil.copyfile(backup, path)
-                result["restored"].append(path)
-            elif state == BACKUP_ABSENT and os.path.exists(path):
-                os.remove(path)
-                result["removed"].append(path)
-            elif state == BACKUP_FAILED:
+        old_digest = entry.get("old_digest")
+        bk_digest = entry.get("backup_digest")
+        cur = file_digest(path)
+
+        # 已经是旧代 → 无需任何动作（这也解决"回滚消耗了备份、但目标是
+        # 完整旧代时仍要求备份"导致的重复恢复死结）。
+        if old_digest and cur == old_digest:
+            result["skipped"].append(path)
+            continue
+
+        if state == BACKUP_OK and backup and os.path.isfile(backup):
+            actual = file_digest(backup)
+            # 备份必须同时满足"记录里的摘要"和"旧代摘要"才可用。
+            if bk_digest and actual != bk_digest:
                 result["impossible"].append(path)
-            elif state == BACKUP_OK:
-                # PUB-02（测试抓到的真实漏洞）：snapshot 声明"备份已成功"，
-                # 但备份文件此刻不可用（被外部删除 / 损坏 / 被清理）。
-                # 旧实现的三个分支都不匹配 → **静默跳过该目标** →
-                # fully_restored 仍为 True，等于假报"完整恢复"。
-                # 这里必须显式记为失败，阻止假报成功。
                 result["failed"].append({
                     "path": path,
-                    "error": "declared backup is missing or unreadable",
-                })
-                if logger:
-                    logger.error("STAGE6_ROLLBACK_BACKUP_MISSING",
-                                 f"Snapshot claims a backup for {path} but it "
-                                 "is not readable; cannot restore this target",
-                                 path=path, backup=backup)
+                    "error": "backup digest mismatch "
+                             f"(on-disk={actual} expected={bk_digest})"})
+                continue
+            if old_digest and actual != old_digest:
+                result["impossible"].append(path)
+                result["failed"].append({
+                    "path": path,
+                    "error": "backup content is not the recorded old "
+                             f"generation (on-disk={actual} old={old_digest})"})
+                continue
+            plan.append({"path": path, "action": "restore", "backup": backup})
+        elif state == BACKUP_ABSENT and cur is not None:
+            plan.append({"path": path, "action": "remove"})
+        elif state == BACKUP_ABSENT:
+            result["skipped"].append(path)      # 本来就不该存在，且确实不在
+        elif state == BACKUP_OK:
+            result["impossible"].append(path)
+            result["failed"].append({
+                "path": path,
+                "error": "declared backup is missing or unreadable"})
+            if logger:
+                logger.error("STAGE6_ROLLBACK_BACKUP_MISSING",
+                             f"Snapshot claims a backup for {path} but it is "
+                             "not readable; cannot restore this target",
+                             path=path, backup=backup)
+        elif state == BACKUP_FAILED:
+            result["impossible"].append(path)
+        else:
+            result["impossible"].append(path)
+
+    # 任一目标无法满足 → 一个字节都不动，保留现场交人工。
+    if result["failed"] or result["impossible"]:
+        result["precheck_failed"] = True
+        result["fully_restored"] = False
+        if logger:
+            logger.error("STAGE6_ROLLBACK_PRECHECK_FAILED",
+                         "Rollback aborted BEFORE touching anything: some "
+                         "targets cannot be restored to the recorded old "
+                         "generation. Files and backups left as-is.",
+                         impossible=result["impossible"],
+                         failed=result["failed"])
+        return result
+
+    # ---------- 阶段二：执行（此时已确认每一步都可行）----------
+    for step in plan:
+        path = step["path"]
+        try:
+            if step["action"] == "restore":
+                backup = step["backup"]
+                try:
+                    # 复制而不是 replace：备份在整组确认完成前保持可重试，
+                    # 中途再崩一次仍能继续。
+                    shutil.copyfile(backup, path)
+                except OSError:
+                    shutil.copyfile(backup, path)
+                if not _verify_restored(path, step, snapshot):
+                    result["failed"].append({
+                        "path": path,
+                        "error": "restored content does not match old_digest"})
+                    continue
+                result["restored"].append(path)
+            else:
+                if os.path.exists(path):
+                    os.remove(path)
+                result["removed"].append(path)
         except OSError as e:
-            # PUB-02：不再静默吞掉 —— 记录到结构化结果，由调用方决定
-            # 是否进入 RECOVERY_REQUIRED，绝不假报"已完整恢复"。
             result["failed"].append({"path": path, "error": str(e)})
             if logger:
                 logger.error("STAGE6_ROLLBACK_FAIL",
                              f"Could not restore {path}: {e}", path=path)
 
-    result["fully_restored"] = (not result["failed"]
-                               and not result["impossible"])
-    if result["impossible"] and logger:
-        logger.error("STAGE6_RESTORE_IMPOSSIBLE",
-                     f"{len(result['impossible'])} path(s) had no usable backup "
-                     "and were left untouched; the previous generation could NOT "
-                     "be fully restored — do not report a clean rollback",
-                     impossible_paths=result["impossible"])
-    if logger:
+    result["fully_restored"] = not result["failed"]
+    if result["fully_restored"] and logger:
+        # 整组确认完成 → 备份才可安全丢弃（下次启动会因"已是旧代"直接跳过，
+        # 即使备份已被消耗也不会卡住）。
         logger.info("STAGE6_ROLLBACK_RESULT",
                     f"restored={len(result['restored'])} "
                     f"removed={len(result['removed'])} "
-                    f"failed={len(result['failed'])} "
-                    f"impossible={len(result['impossible'])}",
-                    fully_restored=result["fully_restored"])
+                    f"skipped={len(result['skipped'])} "
+                    "fully_restored=True")
+    elif logger:
+        logger.error("STAGE6_ROLLBACK_INCOMPLETE",
+                     "Rollback did not fully restore the previous generation",
+                     failed=result["failed"])
     return result
-    if logger:
-        logger.info("STAGE6_PUBLISH_ROLLBACK",
-                    f"Rollback finished: {restored} restored, "
-                    f"{impossible} impossible")
 
+
+def _verify_restored(path: str, step: Dict[str, Any],
+                     snapshot: Dict[str, Dict[str, Optional[str]]]) -> bool:
+    """恢复后核对：目标内容必须等于记录的旧代摘要（无记录则视为通过）。"""
+    want = (snapshot.get(path) or {}).get("old_digest")
+    if not want:
+        return True
+    return file_digest(path) == want
 
 def _fail(logger, status_path: str, operation: str, reason: str,
           paths: Optional[List[str]] = None,
@@ -1414,162 +1610,227 @@ def main():
               preserve_valid_status=True)
         return 82
 
-    _prior = _recover_prior_publish(work_output_path, commit_targets, logger)
-    if _prior.get("status") == "needs_human":
-        # 状态无法判定 —— 不猜、不动，让人工介入。此时动任何文件都可能
-        # 把一次可恢复的残留变成不可恢复的损失。
-        logger.error("STAGE6_PRIOR_PUBLISH_UNRESOLVED",
-                     "A previous publish transaction could not be resolved "
-                     "automatically; refusing to start a new one",
-                     report=_prior.get("report"))
-        _fail(logger, status_path, "prior_publish_recovery",
-              "unresolved prior publish transaction; inspect the journal "
-              "and .pubbak manually",
-              paths=[tmp_avif] + round_artifacts)
-        _rel_lock()
-        return 82
-    if _prior.get("status") == "rolled_back" and logger:
-        logger.warning("STAGE6_PRIOR_PUBLISH_RECOVERED",
-                       "Rolled a previous uncommitted publish back to the "
-                       "old generation before starting this one",
-                       report=_prior.get("report"))
-
-    # --- FIX-2026-10-20（G6 实跑的教训）：发布前的色彩保真守卫 -----------
-    #
-    # 为什么加：8-bit 输入的照片链曾长期产出**纯黑成品**而 rc=0 —— 契约、
-    # CICP、avifdec 头部核验全部正常，只有像素是黑的。那次是靠人工拿
-    # avifdec 解出来算 mean 才发现的。这里把这一步变成例行守卫，让
-    # "整体崩坏"（黑/白/内容丢失）不可能再带着 rc=0 流出去。
-    #
-    # 判据与视频链 stage7 **同一份实现**（shared_modules/color_probe.py），
-    # 这里只决定"超了阈值要不要失败"。阈值默认 60.0，实测标定：
-    #   纯黑成品 delta≈116 → 拦；ProPhoto→sRGB delta≈26.7 → 放行；
-    #   普通 sRGB 正常处理 delta≈1 → 放行。
-    # 即它专门抓"整体崩坏"，不抓细微色偏（后者需针对素材标定更严的值）。
+    # R12 边界：锁已经拿到手，**从这一刻到提交段结束都由 finally 兜住**。
+    # 原实现最外层 finally 只围住提交段，恢复 / 取摘要 / 写 PREPARED
+    # 这些已加锁步骤抛异常时不会释放锁（进程内被捕获时尤其明显）。
+    # 这里给前导段补一个兜底：释放后原样重抛，不改变异常语义。
     try:
-        from color_probe import (COLOR_DRIFT_DEFAULT_THRESHOLD,
-                                 check_color_drift)
-        _thr = float(params.get("color_drift_threshold",
-                                COLOR_DRIFT_DEFAULT_THRESHOLD))
-        _enforce = bool(params.get("color_drift_enforce", False))
-        _drift = check_color_drift(args.input, tmp_avif, threshold=_thr,
-                                   enforce=_enforce, logger=logger)
-        _fields = {k: v for k, v in _drift.items() if k != "status"}
-        if _drift["status"] == "drift":
-            _msg = ("Colour drift between original input and encoded output "
-                    "exceeds threshold")
-            if _enforce:
-                logger.error("STAGE6_COLOR_DRIFT", _msg, **_fields)
-                # tmp_avif / tmp_tiff 是本次 attempt 的暂存，round_artifacts 是
-                # 本轮其余临时产物，都要丢掉，否则 .partial 会留在 output 目录。
-                # 既有成品一个字节都不动（PUB-01 语义），与视频链 stage7 的
-                # _discard_attempt_tmp 对称。tmp_tiff 未写时为 ""，_fail 会跳过。
-                _fail(logger, status_path, "color_drift",
-                      f"delta={_drift['delta']:.2f} > {_thr}",
-                      paths=[tmp_avif, tmp_tiff] + round_artifacts)
-                _rel_lock()
-                return 86
-            logger.warning("STAGE6_COLOR_DRIFT", _msg, **_fields)
-        elif _drift["status"] == "ok":
-            logger.info("STAGE6_COLOR_OK",
-                        "Colour distribution within threshold", **_fields)
-        else:
-            # 探测失败 → 如实记"未校验"，不假装通过，也不阻断。
-            logger.warning("STAGE6_COLOR_SKIPPED",
-                           "Could not probe RGB means on one side; colour "
-                           "fidelity left unchecked")
-    except Exception as _ce:
-        logger.warning("STAGE6_COLOR_DRIFT_ERROR", str(_ce))
+        _prior = _recover_prior_publish(work_output_path, commit_targets, logger)
+        if _prior.get("status") == "needs_human":
+            # 状态无法判定 —— 不猜、不动，让人工介入。此时动任何文件都可能
+            # 把一次可恢复的残留变成不可恢复的损失。
+            logger.error("STAGE6_PRIOR_PUBLISH_UNRESOLVED",
+                         "A previous publish transaction could not be resolved "
+                         "automatically; refusing to start a new one",
+                         report=_prior.get("report"))
+            _fail(logger, status_path, "prior_publish_recovery",
+                  "unresolved prior publish transaction; inspect the journal "
+                  "and .pubbak manually",
+                  # R12-03：旧成品与它的 status 一个字节都没动，属于"旧代仍有效"。
+                  # 覆盖固定 status 会把好产物标成 FAILED，还会毁掉一条本可用于
+                  # 恢复的摘要证据。诊断写到 attempt 级侧车。
+                  paths=[tmp_avif] + round_artifacts,
+                  preserve_valid_status=True)
+            _rel_lock()
+            return 82
+        if _prior.get("status") == "rolled_back" and logger:
+            logger.warning("STAGE6_PRIOR_PUBLISH_RECOVERED",
+                           "Rolled a previous uncommitted publish back to the "
+                           "old generation before starting this one",
+                           report=_prior.get("report"))
 
-    # FIX-A3：同 tmp_avif，备份目录也带 job 维度（见上方说明）。
-    backup_dir = f"{work_output_path}{_iso}.pubbak"
-    snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
-    # R3-03 / B14：进入发布临界区前把"成套回滚"挂到取消路径上。
-    # 取消处理器最后是 os._exit，普通 try/finally 根本跑不到，
-    # 所以必须注册为取消钩子；提交成功后由 release_outputs() 清除。
-    if cancel_guard is not None:
-        cancel_guard.add_cancel_hook(
-            lambda: _rollback_publish(snapshot, logger))
-    # R3-03 / B03：任一目标备份失败 → **在改动任何旧产物之前停止**。
-    if _snapshot_has_failure(snapshot):
-        logger.error("STAGE6_PUBLISH_BACKUP_INCOMPLETE",
-                     "Cannot back up every artifact of the current generation; "
-                     "refusing to start the commit (a later failure could "
-                     "destroy the previous generation)",
-                     failed=[p for p, e in snapshot.items()
-                             if e.get("state") == BACKUP_FAILED])
-        _fail(logger, status_path, "publish_backup",
-              "incomplete backup; commit not started", paths=[])
-        _rel_lock()
-        return 82
+        # --- FIX-2026-10-20（G6 实跑的教训）：发布前的色彩保真守卫 -----------
+        #
+        # 为什么加：8-bit 输入的照片链曾长期产出**纯黑成品**而 rc=0 —— 契约、
+        # CICP、avifdec 头部核验全部正常，只有像素是黑的。那次是靠人工拿
+        # avifdec 解出来算 mean 才发现的。这里把这一步变成例行守卫，让
+        # "整体崩坏"（黑/白/内容丢失）不可能再带着 rc=0 流出去。
+        #
+        # 判据与视频链 stage7 **同一份实现**（shared_modules/color_probe.py），
+        # 这里只决定"超了阈值要不要失败"。阈值默认 60.0，实测标定：
+        #   纯黑成品 delta≈116 → 拦；ProPhoto→sRGB delta≈26.7 → 放行；
+        #   普通 sRGB 正常处理 delta≈1 → 放行。
+        # 即它专门抓"整体崩坏"，不抓细微色偏（后者需针对素材标定更严的值）。
+        try:
+            from color_probe import (COLOR_DRIFT_DEFAULT_THRESHOLD,
+                                     check_color_drift)
+            _thr = float(params.get("color_drift_threshold",
+                                    COLOR_DRIFT_DEFAULT_THRESHOLD))
+            _enforce = bool(params.get("color_drift_enforce", False))
+            _drift = check_color_drift(args.input, tmp_avif, threshold=_thr,
+                                       enforce=_enforce, logger=logger)
+            _fields = {k: v for k, v in _drift.items() if k != "status"}
+            if _drift["status"] == "drift":
+                _msg = ("Colour drift between original input and encoded output "
+                        "exceeds threshold")
+                if _enforce:
+                    logger.error("STAGE6_COLOR_DRIFT", _msg, **_fields)
+                    # tmp_avif / tmp_tiff 是本次 attempt 的暂存，round_artifacts 是
+                    # 本轮其余临时产物，都要丢掉，否则 .partial 会留在 output 目录。
+                    # 既有成品一个字节都不动（PUB-01 语义），与视频链 stage7 的
+                    # _discard_attempt_tmp 对称。tmp_tiff 未写时为 ""，_fail 会跳过。
+                    _fail(logger, status_path, "color_drift",
+                          f"delta={_drift['delta']:.2f} > {_thr}",
+                          # R12-03：色彩守卫在提交前拒绝 → 旧代完好。
+                          paths=[tmp_avif, tmp_tiff] + round_artifacts,
+                          preserve_valid_status=True)
+                    _rel_lock()
+                    return 86
+                logger.warning("STAGE6_COLOR_DRIFT", _msg, **_fields)
+            elif _drift["status"] == "ok":
+                logger.info("STAGE6_COLOR_OK",
+                            "Colour distribution within threshold", **_fields)
+            else:
+                # 探测失败 → 如实记"未校验"，不假装通过，也不阻断。
+                logger.warning("STAGE6_COLOR_SKIPPED",
+                               "Could not probe RGB means on one side; colour "
+                               "fidelity left unchecked")
+        except Exception as _ce:
+            logger.warning("STAGE6_COLOR_DRIFT_ERROR", str(_ce))
 
-    # 持久 journal（第七轮）：备份已完整、即将改动目标 —— 此刻把"这次事务
-    # 要动哪些文件、旧内容是什么、备份在哪"落盘。
-    #
-    # 为什么必须落盘：进程被硬终止后，内存 snapshot 与取消钩子都没了，
-    # 只剩一堆 `.pubbak`。没有 journal 时，谁也说不清这些备份属于哪次
-    # 事务、事务走到哪一步、还完不完整 —— 只能靠"发现备份 + 摘要不符"
-    # 去**猜**，而那可能是一次早已成功的旧尝试。
-    _journal_targets = list(commit_targets)
-    _journal_records: Dict[str, Any] = {}
-    for _t in _journal_targets:
-        _entry = snapshot.get(_t) or {}
-        _existed = os.path.exists(_t)
-        _bk = _entry.get("backup")
-        # PHOTO-05：PREPARED 时就要记下**预期新代摘要**。
-        # 原实现只记 old_digest / backup_digest，new_digest 要等全部替换完
-        # （L1617）才写。于是"第一个目标替换后硬终止"时，已替换的文件
-        # 既不是 OLD 也不是 NEW → classify_recovery 判 UNKNOWN →
-        # 走人工处理，而不是按设计自动回滚。
-        # 暂存件此刻已经就绪，直接算它的摘要作为预期新代。
-        _stg = _entry.get("staging")
-        _journal_records[_t] = {
-            "existed": _existed,
-            "old_digest": file_digest(_t) if _existed else None,
-            "new_digest": file_digest(_stg) if _stg else None,
-            "backup": _bk,
-            "backup_digest": file_digest(_bk) if _bk else None,
-            "staging": _stg,
-            "state": _entry.get("state"),
+        # FIX-A3：同 tmp_avif，备份目录也带 job 维度（见上方说明）。
+        backup_dir = f"{work_output_path}{_iso}.pubbak"
+        snapshot = _snapshot_for_rollback(commit_targets, backup_dir, logger)
+        # R3-03 / B14：进入发布临界区前把"成套回滚"挂到取消路径上。
+        # 取消处理器最后是 os._exit，普通 try/finally 根本跑不到，
+        # 所以必须注册为取消钩子；提交成功后由 release_outputs() 清除。
+        if cancel_guard is not None:
+            cancel_guard.add_cancel_hook(
+                lambda: _rollback_publish(snapshot, logger))
+        # R3-03 / B03：任一目标备份失败 → **在改动任何旧产物之前停止**。
+        if _snapshot_has_failure(snapshot):
+            logger.error("STAGE6_PUBLISH_BACKUP_INCOMPLETE",
+                         "Cannot back up every artifact of the current generation; "
+                         "refusing to start the commit (a later failure could "
+                         "destroy the previous generation)",
+                         failed=[p for p, e in snapshot.items()
+                                 if e.get("state") == BACKUP_FAILED])
+            _fail(logger, status_path, "publish_backup",
+                  "incomplete backup; commit not started", paths=[],
+                  # R12-03：备份失败 → 还没动任何目标 → 旧代仍有效。
+                  preserve_valid_status=True)
+            _rel_lock()
+            return 82
+
+        # ---- R12-01：PREPARED 必须握有**真实存在**的新产物摘要 ----
+        #
+        # 原实现只把 AVIF/TIFF 的 .partial 当暂存件，contract / status 直到
+        # 提交段才直接写正式路径 → PREPARED 时它们没有文件可测，new_digest
+        # 恒为 None。后果：替换了 AVIF、还没替换侧车时硬终止，新 AVIF 既不
+        # 匹配 old_digest 也没有可匹配的 new_digest → 判 UNKNOWN → 无法自动
+        # 回滚（正是本轮报告 R12-01 指出的断点）。
+        #
+        # 现在：四个目标都先准备**独立暂存件**，取到摘要再写 PREPARED；
+        # 任一必要暂存件写不出或摘要取不到，就**在改动任何目标之前停止**。
+        _staging_map: Dict[str, str] = {work_output_path: tmp_avif}
+        if tiff_info.get("written") and tmp_tiff:
+            _staging_map[work_tiff_path] = tmp_tiff
+
+        _contract_stg = f"{contract_path}{_iso}.partial"
+        _status_stg = f"{status_path}{_iso}.partial"
+        _status_payload = {
+            "status": "SUCCESS",
+            "stage": 6,
+            "skipped_operations": _color_skipped(color),
+            "output_path": publish_output_path,
+            "published": True,
         }
-    _journal_path = journal_path_for(work_output_path)
-    _journal_base = {
-        "schema": JOURNAL_SCHEMA,
-        "job_id": params.get("job_id") or "",
-        "attempt_id": f"{os.getpid()}-{int(time.time() * 1000)}",
-        "stage": 6,
-        "targets": _journal_targets,
-        "records": _journal_records,
-        "roots": [os.path.dirname(os.path.abspath(_t)) for _t in _journal_targets],
-    }
-    if not write_journal(_journal_path,
-                         dict(_journal_base, phase=PHASE_PREPARED)):
-        # journal 写不下去 → **不改任何目标**（否则硬终止后无法判断状态）
-        logger.error("STAGE6_JOURNAL_WRITE_FAIL",
-                     "Cannot persist the publish journal; refusing to modify "
-                     "any target (a crash would leave an unidentifiable state)",
-                     journal=_journal_path)
-        _fail(logger, status_path, "publish_journal",
-              "journal not persisted; commit not started", paths=[],
-              preserve_valid_status=True)
-        _rel_lock()
-        return 82
-    logger.info("STAGE6_JOURNAL_PREPARED",
-                "Publish journal persisted before touching any target",
-                journal=_journal_path,
-                attempt_id=_journal_base["attempt_id"])
+        # contract 的 published 标志在提交段才会被占位；其内容其余部分此刻已定型，
+        # 先按"将要发布"序列化，保证暂存件内容与最终正式文件逐字节一致。
+        contract["published"] = True
+        _stg_ok = (_write_json_staging(_contract_stg, contract)
+                   and _write_json_staging(_status_stg, _status_payload))
+        if not _stg_ok:
+            logger.error("STAGE6_STAGING_PREPARE_FAIL",
+                         "Cannot materialise the contract / status staging files; "
+                         "refusing to start the commit (a crash mid-publish would "
+                         "leave files that cannot be identified as new or old)")
+            _fail(logger, status_path, "publish_staging",
+                  "staging sidecars not prepared; commit not started", paths=[],
+                  preserve_valid_status=True)
+            _rel_lock()
+            return 82
+        _staging_map[contract_path] = _contract_stg
+        _staging_map[status_path] = _status_stg
 
-    # PUB-04（第七轮）：提交段必须持有**全部目标路径的互斥锁**。
-    # 逐路径加锁（不是集合摘要），任何重叠目标集合都会互斥；
-    # 锁从"改任何目标之前"开始，覆盖备份、替换、侧车写入与回滚。
-    # PUB-04 的锁已在**恢复之前**获取（见上方 PHOTO-01 段），此处不再重复。
+        # 每个目标的**预期新代摘要**。WSL 回拷目标没有自己的暂存件，
+        # 其内容就是对应 work_* 暂存件的副本，故沿用同一摘要。
+        _new_digest_map: Dict[str, Optional[str]] = {}
+        for _t, _s in _staging_map.items():
+            _new_digest_map[_t] = file_digest(_s)
+        if original_output_path:
+            _new_digest_map[publish_output_path] = _new_digest_map.get(
+                work_output_path)
+            if tiff_info.get("written") and work_tiff_path:
+                _new_digest_map[publish_tiff_path] = _new_digest_map.get(
+                    work_tiff_path)
+
+        _missing = [t for t in commit_targets if not _new_digest_map.get(t)]
+        if _missing:
+            logger.error("STAGE6_NEW_DIGEST_UNAVAILABLE",
+                         "Cannot compute the expected digest of the new "
+                         "generation for every target; refusing to commit",
+                         missing=_missing)
+            _fail(logger, status_path, "publish_staging",
+                  "expected new digests unavailable; commit not started", paths=[],
+                  preserve_valid_status=True)
+            _rel_lock()
+            return 82
+
+        # 持久 journal（第七轮）：备份已完整、即将改动目标 —— 此刻把"这次事务
+        # 要动哪些文件、旧内容是什么、备份在哪"落盘。
+        #
+        # 为什么必须落盘：进程被硬终止后，内存 snapshot 与取消钩子都没了，
+        # 只剩一堆 `.pubbak`。没有 journal 时，谁也说不清这些备份属于哪次
+        # 事务、事务走到哪一步、还完不完整 —— 只能靠"发现备份 + 摘要不符"
+        # 去**猜**，而那可能是一次早已成功的旧尝试。
+        _journal_targets = list(commit_targets)
+        _journal_records = _build_journal_records(
+            _journal_targets, snapshot, _staging_map, _new_digest_map)
+        _journal_path = journal_path_for(work_output_path)
+        _journal_base = {
+            "schema": JOURNAL_SCHEMA,
+            "job_id": params.get("job_id") or "",
+            "attempt_id": f"{os.getpid()}-{int(time.time() * 1000)}",
+            "stage": 6,
+            "targets": _journal_targets,
+            "records": _journal_records,
+            "roots": [os.path.dirname(os.path.abspath(_t)) for _t in _journal_targets],
+        }
+        if not write_journal(_journal_path,
+                             dict(_journal_base, phase=PHASE_PREPARED)):
+            # journal 写不下去 → **不改任何目标**（否则硬终止后无法判断状态）
+            logger.error("STAGE6_JOURNAL_WRITE_FAIL",
+                         "Cannot persist the publish journal; refusing to modify "
+                         "any target (a crash would leave an unidentifiable state)",
+                         journal=_journal_path)
+            _fail(logger, status_path, "publish_journal",
+                  "journal not persisted; commit not started", paths=[],
+                  preserve_valid_status=True)
+            _rel_lock()
+            return 82
+        logger.info("STAGE6_JOURNAL_PREPARED",
+                    "Publish journal persisted before touching any target",
+                    journal=_journal_path,
+                    attempt_id=_journal_base["attempt_id"])
+
+        # PUB-04（第七轮）：提交段必须持有**全部目标路径的互斥锁**。
+        # 逐路径加锁（不是集合摘要），任何重叠目标集合都会互斥；
+        # 锁从"改任何目标之前"开始，覆盖备份、替换、侧车写入与回滚。
+        # PUB-04 的锁已在**恢复之前**获取（见上方 PHOTO-01 段），此处不再重复。
+
+    except BaseException:
+        _rel_lock()
+        raise
 
     try:
         try:
             os.replace(tmp_avif, work_output_path)
+            _verify_new_digest(work_output_path, _new_digest_map)
             contract["published"] = True
             if tiff_info.get("written") and tmp_tiff:
                 os.replace(tmp_tiff, work_tiff_path)
+                _verify_new_digest(work_tiff_path, _new_digest_map)
                 tiff_info["master_path"] = work_tiff_path
             if original_output_path:
                 # RV-13: 源路径一律用工作路径（work_*）
@@ -1585,19 +1846,19 @@ def main():
                             f"copy back failed: {work_tiff_path}")
                     logger.info("STAGE6_WSL_COPYBACK_TIFF",
                                 f"Copied master back to {publish_tiff_path}")
-            # 契约与状态必须**写成功**才算提交完成（A12：侧车写失败仍 rc=0 是错的）
-            if not _write_json_sidecar(contract_path, contract):
-                raise PublishAbort("contract",
-                                   "could not write the encode contract sidecar")
-            if not _write_json_sidecar(status_path, {
-                "status": "SUCCESS",
-                "stage": 6,
-                "skipped_operations": _color_skipped(color),
-                "output_path": publish_output_path,
-                "published": True,
-            }):
-                raise PublishAbort("status",
-                                   "could not write the SUCCESS status sidecar")
+            # R12-01：侧车也**只做 replace**，内容早在 PREPARED 之前就已
+            # 序列化到暂存件（摘要已进 journal）。这样"已替换的文件"永远
+            # 能被认成新代，不会退化成 UNKNOWN。
+            for _tgt, _stg, _label in (
+                    (contract_path, _contract_stg, "contract"),
+                    (status_path, _status_stg, "status")):
+                try:
+                    os.replace(_stg, _tgt)
+                except OSError as _se:
+                    raise PublishAbort(_label,
+                                       f"could not publish the {_label} "
+                                       f"sidecar: {_se}")
+                _verify_new_digest(_tgt, _new_digest_map)
         except PublishAbort as abort:
             logger.error("STAGE6_PUBLISH_ABORT",
                          f"Publish aborted at {abort.operation}: {abort.reason}; "
