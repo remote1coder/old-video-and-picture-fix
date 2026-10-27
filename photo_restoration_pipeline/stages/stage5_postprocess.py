@@ -195,21 +195,37 @@ def _detect_text_regions(gray: np.ndarray, min_aspect_ratio: float = 2.0) -> np.
         labeled, num_features = ndimage.label(stroke_mask)
         text_mask = np.zeros_like(gray, dtype=np.float32)
 
-        for i in range(1, num_features + 1):
-            coords = np.argwhere(labeled == i)
-            if len(coords) < 20:  # Too small
+        # ---- 性能修复（2026-10-27，实测 20 分钟超时的根因）----
+        # 原实现每个连通域都做两次**全图**扫描：
+        #     coords = np.argwhere(labeled == i)   # O(全图)
+        #     text_mask[labeled == i] = 1.0        # 又一次 O(全图)
+        # 实测：AI 放大后的 8000×6000 照片有 **183,300** 个连通域，
+        # 单次全图扫描 0.09s → 光这两行就约 268 分钟。
+        # stage5 的超时是 1200s，于是**永远跑不完**，且中途没有任何
+        # 进度日志（20 分钟零输出，看起来像"卡死"其实是算不完）。
+        #
+        # 改用 ndimage.find_objects 取每个连通域的 bounding box，
+        # 只在 bbox 的局部切片内比较/写入 —— 复杂度从
+        # O(域数 × 全图像素) 降到 O(全图像素 + Σ bbox 面积)。
+        slices = ndimage.find_objects(labeled)
+        for i, sl in enumerate(slices, start=1):
+            if sl is None:
                 continue
-            y_min, x_min = coords.min(axis=0)
-            y_max, x_max = coords.max(axis=0)
-            h = y_max - y_min + 1
-            w = x_max - x_min + 1
-            if w == 0:
+            # 只在 bbox 内比较，避免全图扫描
+            sub = (labeled[sl] == i)
+            n_px = int(sub.sum())
+            if n_px < 20:  # Too small
+                continue
+            h = sl[0].stop - sl[0].start
+            w = sl[1].stop - sl[1].start
+            if w == 0 or h == 0:
                 continue
             aspect = max(h, w) / min(h, w)
-            density = len(coords) / (h * w)
+            density = n_px / (h * w)
             # Text-like: high aspect ratio, moderate density
             if aspect >= min_aspect_ratio and 0.1 <= density <= 0.8:
-                text_mask[labeled == i] = 1.0
+                # 基础切片返回的是 view，按 sub 掩码写入会回写到 text_mask
+                text_mask[sl][sub] = 1.0
 
         # Dilate slightly to cover character bodies
         text_mask = ndimage.binary_dilation(text_mask, iterations=2).astype(
