@@ -2656,15 +2656,13 @@ def main():
                        "intermediate will have no colour tags "
                        "(downstream must not assume BT.601/709)")
 
-    is_vfr = False
-    if len(all_pts) >= 3:
-        intervals = [all_pts[i + 1] - all_pts[i]
-                     for i in range(len(all_pts) - 1)]
-        if intervals:
-            avg_interval = sum(intervals) / len(intervals)
-            max_deviation = max(abs(iv - avg_interval) for iv in intervals)
-            # If max deviation > 10% of average, treat as VFR
-            is_vfr = max_deviation > avg_interval * 0.1
+    # R12-11：这里必须与**前面的流式门控共用同一个分类器**。
+    # 原实现是另一套规则（最大偏差 > 平均间隔的 10%），比前门的
+    # "相对偏差 > 1%" 宽得多 —— 40ms/42ms 交替的素材前门判 VFR、
+    # 到这里又被判回 CFR，前段的"保时序"要求等于被撤销。
+    _tl_encode = _classify_timeline(
+        {i: t for i, t in enumerate(all_pts)} if all_pts else {})
+    is_vfr = (_tl_encode == "vfr")
 
     # 诊断：60 帧进、59 帧出的问题就出在这条分岔上。先把它记清楚，
     # 不要再靠猜。

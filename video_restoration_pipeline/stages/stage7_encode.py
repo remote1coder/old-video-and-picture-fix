@@ -1977,16 +1977,40 @@ def main():
     if _src_frames <= 0 and args is not None:
         _src_frames = _count_frames_quietly(getattr(args, "input", ""), logger)
     _proc_frames = _count_frames_quietly(input_source, logger)
-    if original_duration > 0 and _src_frames > 0 and _proc_frames > 0:
-        processed_duration = float(original_duration) * _proc_frames / _src_frames
+    # R12-07：**先实测，再估算。**
+    #
+    # 帧数比例 `orig * proc/src` 只在"帧间隔恒定"时成立。反例：
+    #   同 250 帧、上游明确 2 倍速 → 应有 5s，比例仍给 10s；
+    #   250 帧→500 帧且帧率同步翻倍 → 应仍 10s，比例给 20s。
+    # 也就是说它能排除"读了旧成品"的污染，但**不能当作一般时序证据**。
+    #
+    # 优先用中间产物自己的 packet 时间戳（真实时间轴，能反映变速/倍帧）；
+    # 只有测不出时才退回比例，并且**明确标成估计**，不冒充已验证。
+    _timing_basis = "packet-span"
+    _measured_span = _probe_packet_span(input_source, "v")
+    if _measured_span > 0:
+        processed_duration = float(_measured_span)
         if logger:
-            logger.info("STAGE7_TIMING_DURATION_FROM_FRAMES",
-                        "Pre-encode duration derived from frame counts "
-                        "(avoids the container default-fps trap and never "
-                        "reads a previous output)",
-                        src_frames=_src_frames, proc_frames=_proc_frames,
-                        original_duration=round(float(original_duration), 3),
+            logger.info("STAGE7_TIMING_DURATION_FROM_PTS",
+                        "Pre-encode duration measured from the intermediate's "
+                        "own packet timestamps (reflects speed changes and "
+                        "frame interpolation)",
                         processed_duration=round(processed_duration, 3))
+    elif original_duration > 0 and _src_frames > 0 and _proc_frames > 0:
+        processed_duration = float(original_duration) * _proc_frames / _src_frames
+        _timing_basis = "frame-ratio (estimated)"
+        if logger:
+            logger.error("STAGE7_TIMING_DURATION_ESTIMATED",
+                         "Packet timestamps unavailable; duration is only "
+                         "ESTIMATED from the frame-count ratio. This assumes a "
+                         "constant frame interval and is WRONG for speed "
+                         "changes or frame interpolation. Timing is NOT "
+                         "verified for this run.",
+                         src_frames=_src_frames, proc_frames=_proc_frames,
+                         original_duration=round(float(original_duration), 3),
+                         processed_duration=round(processed_duration, 3))
+    else:
+        _timing_basis = "unknown"
     if processed_duration <= 0:
         # 兜底：仍用流式探测，但明确标注它可能受容器默认 fps 影响
         processed_duration = _get_stream_duration(input_source, "v")
