@@ -35,7 +35,12 @@ def s7():
     return _load_stage7()
 
 
-def _ck(frames=None, duration=None):
+def _ck(frames=True, duration=True):
+    """构造 checks。默认 True（"不关心=通过"），要测失败/未验收就显式传值。
+
+    注意：`ok=None` 的语义是**未验收**（如"无法推算允许帧数"），
+    与"没提供该判据"不同 —— 前者必须拦，见 test_unverified_blocks_*。
+    """
     return {"frames": {"ok": frames}, "duration": {"ok": duration}}
 
 
@@ -102,6 +107,23 @@ def test_top_level_error_always_blocks(s7):
     for m in ("frames_only", "relative", "absolute"):
         got = s7._fullchain_blockers({}, m, error="SOURCE_UNREADABLE")
         assert got == ["ERROR"], (m, got)
+
+
+def test_unverified_ok_none_blocks(s7):
+    """`ok=None`（量不出来）也是未验收，必须拦。
+
+    artifact_verify 在"无法推算允许帧数"时会产出
+    `{"frames": {"ok": None, "note": "无法推算允许帧数，未校验"}}`。
+    旧逻辑只拦 `ok is False`，于是这种情况静默通过 ——
+    "量不出来"变成了"通过"。
+    """
+    assert s7._fullchain_blockers(_ck(frames=None), "frames_only") == \
+        ["FRAMES_UNVERIFIED"]
+    assert s7._fullchain_blockers(_ck(frames=True, duration=None),
+                                  "relative") == ["DURATION_UNVERIFIED"]
+    # 明确 False 仍报具体失败码，不降级成 UNVERIFIED
+    assert s7._fullchain_blockers(_ck(frames=False),
+                                  "frames_only") == ["FRAMES"]
 
 
 def test_required_check_missing_blocks(s7):

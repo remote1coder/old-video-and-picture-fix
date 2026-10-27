@@ -1094,16 +1094,27 @@ def _fullchain_blockers(checks: dict, mode: str,
 
     # 各模式**必需**的判据必须存在且明确为 True；缺失即未验收。
     # （frames_only 刻意允许时长差，所以不能拿顶层 ok 一刀切。）
+    # 必需判据必须**明确为 True**。
+    # 注意 `ok is None` 的情形（如"无法推算允许帧数，未校验"）也是未验收，
+    # 不能只拦 `is False` —— 那会让"量不出来"悄悄变成"通过"。
     if "frames" not in ck:
         blocked.append("FRAMES_MISSING")
-    elif ck.get("frames", {}).get("ok") is False:
-        blocked.append("FRAMES")
+    else:
+        _fok = ck.get("frames", {}).get("ok")
+        if _fok is False:
+            blocked.append("FRAMES")
+        elif _fok is not True:
+            blocked.append("FRAMES_UNVERIFIED")
 
     if m in ("relative", "absolute"):
         if "duration" not in ck:
             blocked.append("DURATION_MISSING")
-        elif ck.get("duration", {}).get("ok") is False:
-            blocked.append("DURATION")
+        else:
+            _dok = ck.get("duration", {}).get("ok")
+            if _dok is False:
+                blocked.append("DURATION")
+            elif _dok is not True:
+                blocked.append("DURATION_UNVERIFIED")
     if m == "absolute" and sync_abs_rc != 0:
         blocked.append("SYNC_ABSOLUTE")
     return blocked
@@ -2325,6 +2336,10 @@ def main():
                 _fc_mode = str(params.get("full_chain_verify_mode",
                                           "frames_only")).strip().lower()
                 _fc_pending = None
+                # 必须先初始化：下面 try 里任何一步抛异常都会跳到 except，
+                # 若此时 _fc_blocked 还没赋值，后面的 `if _fc_blocked:`
+                # 会直接 NameError（把"校验异常"变成整个 stage 崩溃）。
+                _fc_blocked = []
                 try:
                     from artifact_verify import verify_output as _fc_verify
                     _fc = _fc_verify(args.input, _publish_tmp, params)
@@ -2355,8 +2370,12 @@ def main():
                                 blocked=_fc_blocked or None,
                                 checks=_ck)
                 except Exception as _fc_exc:
-                    logger.warning("STAGE7_FULLCHAIN_VERIFY_FAIL",
-                                   f"Full-chain verify raised: {_fc_exc}")
+                    # 校验器自己崩了 ≠ 校验通过。原先只记 warning，
+                    # 于是"没校验成"照样发布（fail-open）。
+                    # 这里标记为阻断项；强制出片开关仍可越过。
+                    logger.error("STAGE7_FULLCHAIN_VERIFY_ERROR",
+                                 f"Full-chain verify raised: {_fc_exc}")
+                    _fc_blocked = ["VERIFY_ERROR"]
 
             if _fc_blocked:
                 # 与音画同步一致：加**强制出片**逃生门。
