@@ -1963,7 +1963,11 @@ def test_r303_backup_failure_does_not_destroy_previous_generation(tmp_path,
     s6._rollback_publish(snapshot, log)
     assert final.exists(), "备份失败后回滚把旧产物删除了（R3-03 的核心危害）"
     assert final.read_bytes() == b"OLD-VALID"
-    assert "STAGE6_RESTORE_IMPOSSIBLE" in log.events, \
+    # R12-02 之后，这类"备份不可用"会在**预检阶段**就整体阻断（更好：
+    # 不是恢复一半才失败）。事件名随之变为 PRECHECK_FAILED；
+    # 旧的 RESTORE_IMPOSSIBLE 语义仍保留给"预检通过但执行失败"。
+    assert ("STAGE6_ROLLBACK_PRECHECK_FAILED" in log.events
+            or "STAGE6_RESTORE_IMPOSSIBLE" in log.events), \
         "回滚失败却仍然声称已恢复"
 
 

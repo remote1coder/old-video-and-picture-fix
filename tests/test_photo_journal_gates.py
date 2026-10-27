@@ -141,10 +141,24 @@ def test_classify_without_new_digest_is_unknown(tmp_path):
     assert rep["targets"][str(t)]["state"] == "UNKNOWN", rep
 
 
-def test_stage6_records_new_digest_at_prepare():
-    """源码护栏：PREPARED 的 records 必须含 new_digest（不能又退回只记旧代）。"""
-    src = os.path.join(_ROOT, "photo_restoration_pipeline", "stages",
-                       "stage6_encode.py")
-    text = open(src, encoding="utf-8", errors="replace").read()
-    assert '"new_digest": file_digest(_stg)' in text, \
+def test_stage6_records_new_digest_at_prepare(tmp_path):
+    """PREPARED 的 records 必须含**真实** new_digest（不能又退回只记旧代）。
+
+    R12-01 之后，记录构造收敛到生产函数 `_build_journal_records()`；
+    这里直接调它并用真实暂存件，而不是搜源码字符串。
+    """
+    import stage6_encode as s6
+
+    tgt = tmp_path / "out.avif"
+    tgt.write_bytes(b"OLD")
+    stg = tmp_path / "out.avif.partial"
+    stg.write_bytes(b"NEW")
+    stg_map = {str(tgt): str(stg)}
+    nd = {str(tgt): s6.file_digest(str(stg))}
+
+    recs = s6._build_journal_records(
+        [str(tgt)], {str(tgt): {"state": s6.BACKUP_ABSENT, "backup": None}},
+        stg_map, nd)
+    assert recs[str(tgt)]["new_digest"] == nd[str(tgt)], \
         "PREPARED 阶段应记录预期新代摘要（取自 staging）"
+    assert recs[str(tgt)]["staging"] == str(stg)

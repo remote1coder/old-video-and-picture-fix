@@ -92,3 +92,39 @@ def test_real_cfr_clip_is_not_flagged():
             except OSError:
                 pass
         os.rmdir(d)
+
+
+# ------------------- R12-10：三态时间轴（CFR / VFR / UNKNOWN）-------------------
+
+def test_classify_timeline_three_states():
+    """只有**确认是 CFR** 才允许走不携带 PTS 的路径。
+
+    旧 `_is_vfr()` 对"数据不足/不可用"返回 False，调用方把它当成 CFR ——
+    PTS 读不出来不等于固定帧率，这是"量不出来当通过"的又一个变体。
+    """
+    # CFR：均匀间隔
+    assert s3._classify_timeline({i: i * 0.04 for i in range(60)}) == "cfr"
+    # VFR：40ms / 42ms 交替（相对偏差 4.8% > 1%）
+    ts, t = {}, 0.0
+    for i in range(60):
+        ts[i] = t
+        t += 0.040 if i % 2 == 0 else 0.042
+    assert s3._classify_timeline(ts) == "vfr"
+    # UNKNOWN：数据不足
+    assert s3._classify_timeline({}) == "unknown"
+    assert s3._classify_timeline({0: 0.0, 1: 0.04}) == "unknown"
+    assert s3._classify_timeline(None) == "unknown"
+
+
+def test_classify_timeline_rejects_bad_pts():
+    """非单调 / 非有限值的时间轴不可信 → UNKNOWN（不能当 CFR）。"""
+    assert s3._classify_timeline({0: 0.0, 1: 0.04, 2: 0.02, 3: 0.06}) == "unknown"
+    assert s3._classify_timeline({0: 0.0, 1: float("nan"), 2: 0.08}) == "unknown"
+    assert s3._classify_timeline({0: 0.0, 1: 0.04, 2: 0.08, 3: 0.08}) == "unknown"
+
+
+def test_classify_is_stricter_than_is_vfr():
+    """UNKNOWN 判据必须比 `_is_vfr` 严 —— 后者对未知返回 False。"""
+    unknown_pts = {0: 0.0, 1: 0.04}          # 只有 2 帧
+    assert s3._is_vfr(unknown_pts) is False   # 旧判据：不是 VFR
+    assert s3._classify_timeline(unknown_pts) == "unknown"   # 新判据：也不是 CFR

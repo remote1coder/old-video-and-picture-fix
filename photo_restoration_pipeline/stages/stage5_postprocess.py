@@ -174,6 +174,47 @@ def _resize_array_high_depth(arr: "np.ndarray", target_w: int, target_h: int):
     return None, "no high-depth resampler available (cv2 and scipy missing)"
 
 
+def _box_to_pixel_bounds(box, w_img: int, h_img: int):
+    """把检测框规范化成**整数半开区间**并裁到图像内。
+
+    R12-13：stage4 保存的是 **float** 坐标（facexlib 原样输出），stage5
+    直接 `max(0, fx)` / `min(w, fx + fw)` 得到的仍是 float，
+    `img[y1:y2, x1:x2]` 立刻抛 TypeError。项目内三次照片成功日志都在同一行
+    记录了这个错误 —— 人像颜色匹配因此从未真正跑过。
+
+    契约：
+    - 非有限值（NaN/Inf）或非数值 → 返回 None，由调用方降级；
+    - 起点 **floor**、终点 **ceil**（半开区间，保证不丢边缘像素）；
+    - 裁到 ``[0, w]`` / ``[0, h]``；退化为空框时返回 None。
+
+    Args:
+        box: ``(x, y, w, h)``，允许 float。
+        w_img/h_img: 图像宽高（像素）。
+
+    Returns:
+        ``(x1, y1, x2, y2)`` 全为 `int`，且 ``x2 > x1 and y2 > y1``；
+        不合法时返回 ``None``。
+    """
+    import math
+
+    try:
+        fx, fy, fw, fh = (float(v) for v in box[:4])
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (fx, fy, fw, fh)):
+        return None
+    if fw <= 0 or fh <= 0:
+        return None
+
+    x1 = max(0, int(math.floor(fx)))
+    y1 = max(0, int(math.floor(fy)))
+    x2 = min(int(w_img), int(math.ceil(fx + fw)))
+    y2 = min(int(h_img), int(math.ceil(fy + fh)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
 def _detect_text_regions(gray: np.ndarray, min_aspect_ratio: float = 2.0) -> np.ndarray:
     """Detect text-like regions using stroke width approximation.
 
@@ -428,38 +469,59 @@ def _chin_y_from_landmarks_photo(landmarks, face_box) -> int:
 
 
 def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
-    """Sample hand skin-tone pixels below the face (photo pipeline, RGB float32).
+    """在脸部下方采样手部肤色像素。
 
-    FIX-H-12-06: Per v7.32 §3.10.7, color matching should reference hand ROI in
-    addition to neck. Hands are not directly detected (no hand model); sample
-    skin-tone pixels in the region below the face box. img_arr is RGB float32
-    in [0,255]. Returns N×3 float32 array (possibly empty).
+    **R12-14：输入/输出统一为 0–1**（与 stage5 的调用方一致）。
+
+    原实现把 docstring 写成 "RGB float32 in [0,255]"，阈值也用 0–255 的
+    `r>95 / g>40 / b>20`；但唯一的调用方传进来的是**归一化到 0–1** 的图
+    （`_arr / _scale_max`）。0–1 的像素永远不可能 > 95，于是手部参考**恒为空**，
+    这条采样从来没生效过 —— 修正浮点框之后这个缺陷依然存在。
+
+    Args:
+        img_arr: RGB float32，范围 **0–1**。
+        face_box: `(x, y, w, h)`，允许 float（stage4 原样输出 facexlib 坐标）。
+
+    Returns:
+        N×3 float32（同样 0–1），可能为空。
     """
+    empty = np.empty((0, 3), dtype=np.float32)
     try:
         if img_arr is None or img_arr.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
+            return empty
         h, w = img_arr.shape[:2]
-        fx, fy, fw, fh = (int(face_box[0]), int(face_box[1]),
-                          int(face_box[2]), int(face_box[3]))
-        x1 = max(0, fx - fw // 2)
-        x2 = min(w, fx + fw + fw // 2)
-        y1 = min(h, fy + fh + fh // 4)
-        y2 = min(h, y1 + fh * 2)
+        pb = _box_to_pixel_bounds(face_box, w, h)
+        if pb is None:
+            return empty
+        bx1, by1, bx2, by2 = pb
+        bw = bx2 - bx1
+        bh = by2 - by1
+
+        # 脸部下方：略宽于脸、向下延伸两倍脸高
+        x1 = max(0, bx1 - bw // 2)
+        x2 = min(w, bx2 + bw // 2)
+        y1 = min(h, by2 + bh // 4)
+        y2 = min(h, y1 + bh * 2)
         if y2 <= y1 or x2 <= x1:
-            return np.empty((0, 3), dtype=np.float32)
+            return empty
         region = img_arr[y1:y2, x1:x2]
         if region.size == 0:
-            return np.empty((0, 3), dtype=np.float32)
+            return empty
+
         r = region[:, :, 0]
         g = region[:, :, 1]
         b = region[:, :, 2]
         mx = np.maximum(np.maximum(r, g), b)
         mn = np.minimum(np.minimum(r, g), b)
-        skin_mask = (r > 95) & (g > 40) & (b > 20) & (mx - mn > 15) & (np.abs(r - g) > 15)
+        # 阈值原为 0–255 域（95 / 40 / 20 / 15 / 15），此处按 0–1 域等比缩放。
+        # 这是项目启发式，不是普适肤色判据。
+        _s = 1.0 / 255.0
+        skin_mask = ((r > 95 * _s) & (g > 40 * _s) & (b > 20 * _s)
+                     & ((mx - mn) > 15 * _s)
+                     & (np.abs(r - g) > 15 * _s))
         return region[skin_mask]
     except Exception:
-        return np.empty((0, 3), dtype=np.float32)
-
+        return empty
 
 def _carry_icc_to_output(output_path: str, icc: Optional[bytes],
                          logger=None) -> bool:
@@ -658,14 +720,21 @@ def _match_portrait_color(image_path: str, face_boxes: list,
         face_mask = np.zeros((h_img, w_img), dtype=np.float32)
         corrected = img_arr.copy()
 
-        for box_idx, (fx, fy, fw, fh) in enumerate(face_boxes):
-            # Clamp box to image bounds
-            x1 = max(0, fx)
-            y1 = max(0, fy)
-            x2 = min(w_img, fx + fw)
-            y2 = min(h_img, fy + fh)
-            if x2 <= x1 or y2 <= y1:
+        for box_idx, _box in enumerate(face_boxes):
+            # R12-13：框可能是 float（stage4 原样保存 facexlib 输出），
+            # 必须规范成整数半开区间才能做切片。非法框 → 跳过并记录，
+            # 不静默吞掉。
+            _pb = _box_to_pixel_bounds(_box, w_img, h_img)
+            if _pb is None:
+                if logger:
+                    logger.warning(
+                        "STAGE5_FACE_BOX_INVALID",
+                        "Skipping a face box that is not a usable pixel "
+                        "region (non-finite, empty, or fully outside)",
+                        box=_box, image_size=[w_img, h_img])
                 continue
+            x1, y1, x2, y2 = _pb
+            fx, fy, fw, fh = (float(v) for v in _box[:4])
 
             # Estimate neck region: directly below face,
             # same width, 0.4x face height.
@@ -675,8 +744,9 @@ def _match_portrait_color(image_path: str, face_boxes: list,
             _lm = (landmarks[box_idx]
                    if landmarks and box_idx < len(landmarks) else None)
             _chin = _chin_y_from_landmarks_photo(_lm, (fx, fy, fw, fh))
-            ny1 = max(y2, _chin) if _chin > 0 else y2
-            ny2 = min(h_img, ny1 + int(fh * 0.4))
+            # _chin 来自关键点推算，可能是 float —— 切片端点必须整数。
+            ny1 = int(max(y2, _chin)) if _chin > 0 else int(y2)
+            ny2 = min(int(h_img), int(ny1) + int(fh * 0.4))
             nx1 = x1
             nx2 = x2
             if ny2 <= ny1:
