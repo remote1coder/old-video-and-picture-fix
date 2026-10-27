@@ -378,11 +378,16 @@ def _recover_prior_publish(work_output_path: str,
 
 
 def _purge_publish_residue(journal_path: str, report: Dict[str, Any],
-                           logger=None) -> None:
+                           logger=None, keep_journal: bool = False) -> None:
     """删掉一次已了结事务留下的 journal 与 `.pubbak` 备份。
 
     只删 journal 里**记录过**的备份路径，不做目录遍历猜测
     （`publish_journal` 的 docstring 专门批评过"发现备份就回滚"是猜测）。
+
+    Args:
+        keep_journal: 成功提交后清理时置 True —— 备份删掉，但 journal
+            留着。它同时是输出目录里的审计文件，且下次启动要靠它识别
+            "上次已完整提交"，删掉会让下次重复发布。
     """
     removed: List[str] = []
     for t, info in (report.get("targets") or {}).items():
@@ -393,12 +398,13 @@ def _purge_publish_residue(journal_path: str, report: Dict[str, Any],
                 removed.append(bk)
             except OSError:
                 pass
-    try:
-        if os.path.exists(journal_path):
-            os.remove(journal_path)
-            removed.append(journal_path)
-    except OSError:
-        pass
+    if not keep_journal:
+        try:
+            if os.path.exists(journal_path):
+                os.remove(journal_path)
+                removed.append(journal_path)
+        except OSError:
+            pass
     # 备份文件都删掉后，`.pubbak` 目录通常是空的 —— 顺手移除。
     # 用 rmdir 而不是 rmtree：**只有目录为空才会成功**，万一里面还有
     # journal 没记录到的文件（不该有，但不猜），就留着不动。
@@ -1670,6 +1676,26 @@ def main():
                          "publish as uncommitted and re-publish",
                          journal=_journal_path)
             return 82
+
+        # ---- 成功提交后清理 `.pubbak` 备份（2026-10-27 实测缺陷）----
+        # 原实现：COMMITTED 之后直接 return 0，**从不删备份**。
+        # 清理只发生在两条「异常恢复」路径（上次已提交 / 回滚成功），
+        # 于是正常跑完一遍输出目录里恒留一份完整上一代备份 ——
+        # 实测单张照片 238 MB（avif+tif+两个侧车）。
+        # 这里删备份但**保留 journal**：它既是输出目录里的审计文件，
+        # 也是下次启动识别 ALREADY_COMMITTED 的依据。
+        try:
+            _purge_report = {"targets": {
+                _t: {"backup": _r.get("backup")}
+                for _t, _r in _done_records.items()}}
+            _purge_publish_residue(_journal_path, _purge_report,
+                                   logger, keep_journal=True)
+            logger.info("STAGE6_PUBLISH_RESIDUE_PURGED",
+                        "Removed the .pubbak backups of the previous "
+                        "generation after a successful commit "
+                        "(journal kept for audit and next-run detection)")
+        except Exception as _pe:
+            logger.warning("STAGE6_PUBLISH_RESIDUE_PURGE_FAIL", str(_pe))
 
         logger.info("STAGE6_DONE", "Photo encoding complete", output=publish_output_path)
         return 0
