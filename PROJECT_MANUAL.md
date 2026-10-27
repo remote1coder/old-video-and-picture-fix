@@ -1004,6 +1004,31 @@ for i, sl in enumerate(ndimage.find_objects(labeled), start=1):
 像素时，必须用 `find_objects` 之类的方式把操作限定在局部，禁止在循环体内
 写 `arr == label` 或 `np.argwhere(arr == label)`。
 
+### 12.11 照片链发布后的 `.pubbak` 备份清理
+
+**症状**：照片正常跑完后，输出目录里留着一个 `<输出名>.<attempt>.pubbak`
+备份目录，装着上一代的完整文件（avif + tif + encode_contract + status），
+实测单张 **238 MB**。
+
+**根因**：`_purge_publish_residue()` 只在两条**异常恢复**路径被调用
+（上次已完整提交 / 回滚成功）；成功提交写完 `PHASE_COMMITTED` 后
+直接 `return 0`，**从不清理**。稳态下恒留一份上一代备份。
+
+**修法**：成功路径也清理，但 `keep_journal=True`：
+
+| 对象 | 处置 | 理由 |
+|---|---|---|
+| `.pubbak` 里的备份文件 | 删 | 省 238 MB，目录干净 |
+| `*.journal.json` | **留** | 同时是审计文件；下次启动靠它识别 `ALREADY_COMMITTED`，删了会重复发布 |
+
+**注意**：清理只用 `os.rmdir`（仅空目录成功）+ 逐个 `os.remove`，
+**不用 `rmtree`**。目录里若有 journal 没记录到的文件，整目录保留不动
+—— 不猜、不盲删。
+
+**验证**：跑前 `.pubbak` 1 个 / 238M → 跑后 0 个，rc=0。
+输出目录最终只剩 avif、tif、journal、status、encode_contract 及各自的
+0 字节 `.lock`（锁文件本身，正常保留）。
+
 ## 13. 目录名说明
 
 **重要**：项目实际使用的目录名为：
