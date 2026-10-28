@@ -1326,7 +1326,8 @@ def _measure_av_drift_vec(path: str):
 
 def _validate_av_sync(muxed_path: str, logger,
                       params: Optional[dict] = None,
-                      reference_path: Optional[str] = None) -> int:
+                      reference_path: Optional[str] = None,
+                      out_check: Optional[dict] = None) -> int:
     """Validate A/V sync on the final muxed output file.
 
     Per v6.3 §3.10.9 / v7.32 §3.10.9:
@@ -1392,6 +1393,14 @@ def _validate_av_sync(muxed_path: str, logger,
                      "to claim the output is in sync (not a pass)",
                      video_interval=intervals.get("v"),
                      audio_interval=intervals.get("a"))
+        # R13-07：**测量不可用 ≠ 质量超限**。前者是 UNVERIFIED，
+        # 不能和"确实漂移了"共用同一个结论。
+        if out_check is not None:
+            from check_result import CheckResult, UNVERIFIED
+            out_check["sync"] = CheckResult(
+                "sync", UNVERIFIED,
+                reason="stream intervals unmeasurable",
+                method="_validate_av_sync").as_dict()
         return 86
 
     v = intervals["v"]
@@ -1537,6 +1546,20 @@ def _validate_av_sync(muxed_path: str, logger,
     # 无漂移时不谈方向（原来的三元式会把 None 当 False，写出"audio leads"）
     _dir_txt = ("no drift" if _worst["name"] == "none"
                 else ("audio lags" if _worst["lag"] else "audio leads"))
+
+    from check_result import CheckResult as _CRs, PASS as _P_, FAIL as _F_
+    if out_check is not None:
+        if _worst["level"] >= 2:
+            out_check["sync"] = _CRs(
+                "sync", _F_,
+                reason=(f"{_worst['name']} {_worst['mag']:.0f}ms exceeds "
+                        f"{_worst['thr']:.0f}ms"),
+                method="_validate_av_sync",
+                evidence={"per_component": _comp_ms}).as_dict()
+        else:
+            out_check["sync"] = _CRs(
+                "sync", _P_, method="_validate_av_sync",
+                evidence={"per_component": _comp_ms}).as_dict()
 
     if _worst["level"] == 3:
         logger.error("STAGE7_SYNC_FAIL",
@@ -2393,8 +2416,12 @@ def main():
         if r.returncode == 0 and Path(_publish_tmp).exists() and Path(_publish_tmp).stat().st_size > 0:
             # FIX-P7-4: Validate A/V sync on final muxed output (not separate files)
             if has_audio:
+                # R13-07：把同步结论也收进统一四态（测量不可用 → UNVERIFIED，
+                # 与"确实漂移"分开）。先收到局部字典，稍后并入 _checks。
+                _sync_checks: Dict[str, Any] = {}
                 sync_result = _validate_av_sync(_publish_tmp, logger, params,
-                            reference_path=args.input)
+                            reference_path=args.input,
+                            out_check=_sync_checks)
                 if sync_result != 0:
                     # FIX-2026-10-24：加**强制出片**逃生门。
                     #
@@ -2504,6 +2531,11 @@ def main():
             _prechecks: Dict[str, Any] = {}
             # R13-07：统一四态结论（PASS/FAIL/UNVERIFIED/NOT_APPLICABLE）
             _checks: Dict[str, Any] = {}
+            # 同步门的结论在更早的分支里产生，这里并进来
+            try:
+                _checks.update(_sync_checks or {})
+            except NameError:
+                pass
             # R12-05：媒体换了但报告没跟上 → 这一代不完整，不能报成功
             _generation_incomplete = False
             if not _fc_enabled:
