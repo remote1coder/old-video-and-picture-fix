@@ -98,13 +98,59 @@ def test_hand_roi_samples_normalised_image():
 
 
 def test_hand_roi_rejects_wrong_domain():
-    """反例：把 0–255 的图直接传进来 → 阈值不匹配 → 采不到。
+    """把 0–255 的图传进来 → **必须被显式拒绝**，不是"碰巧采不到"。
 
-    这条锁住"域必须一致"这个契约：证明上面的用例不是因为阈值宽松才通过。
+    R13-09：本条原名与断言相反（名字说 reject，断言却是 `shape[0] > 0`）。
+    那等于把"契约错误"记成"这张图没有手"。现在函数入口有 `_is_unit_range()`
+    边界检查，传错域直接返回空并留痕，与"没有肤色像素"可区分。
+
+    注意：这说明的是**输入契约被强制**，不是"R12-14 原缺陷仍在"。
     """
-    img255 = _skin_image()
-    got = s5._hand_skin_roi_photo(img255, (40.0, 20.0, 60.0, 60.0))
-    assert got.shape[0] > 0, "0–255 域下 r>95 等阈值本来就该命中"
+    img255 = _skin_image()          # 0–255 域
+    assert s5._is_unit_range(img255) is False, "0–255 不应被判为单位区间"
+
+    log = _Log()
+    got = s5._hand_skin_roi_photo(img255, (40.0, 20.0, 60.0, 60.0),
+                                  logger=log)
+    assert got.shape[0] == 0, "错误数值域必须被拒绝"
+    assert log.has("STAGE5_HAND_ROI_DOMAIN_INVALID"), \
+        "拒绝时要留痕，不能静默返回空"
+
+
+def test_is_unit_range_accepts_valid_domains():
+    """[0,1] 的合法输入（含端点）必须通过；越界/NaN 必须拒绝。"""
+    import numpy as np
+    assert s5._is_unit_range(np.zeros((4, 4, 3), dtype=np.float32)) is True
+    assert s5._is_unit_range(np.ones((4, 4, 3), dtype=np.float32)) is True
+    assert s5._is_unit_range(
+        np.full((4, 4, 3), 0.5, dtype=np.float32)) is True
+    assert s5._is_unit_range(
+        np.full((4, 4, 3), 1.5, dtype=np.float32)) is False
+    assert s5._is_unit_range(
+        np.full((4, 4, 3), -0.1, dtype=np.float32)) is False
+    bad = np.zeros((4, 4, 3), dtype=np.float32)
+    bad[0, 0, 0] = float("nan")
+    assert s5._is_unit_range(bad) is False
+
+
+class _Log:
+    def __init__(self):
+        self.events = []
+
+    def _r(self, ev):
+        self.events.append(ev)
+
+    def info(self, ev, msg="", **k):
+        self._r(ev)
+
+    def warning(self, ev, msg="", **k):
+        self._r(ev)
+
+    def error(self, ev, msg="", **k):
+        self._r(ev)
+
+    def has(self, ev):
+        return ev in self.events
 
 
 def test_hand_roi_empty_when_no_skin():

@@ -468,7 +468,28 @@ def _chin_y_from_landmarks_photo(landmarks, face_box) -> int:
         return -1
 
 
-def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
+def _is_unit_range(arr) -> bool:
+    """数组是否落在 **[0, 1]**（含端点，带浮点容差）。
+
+    R13-09：`_hand_skin_roi_photo()` 的契约是 RGB **0–1**。它的阈值
+    （`r>95/255` 等）只在 0–1 域有意义；把 0–255 的图传进来会静默
+    采不到样本，把契约错误伪装成"这张图没有手"。
+    这里做显式边界检查，让调用方能区分"没有肤色像素"与"传错了域"。
+
+    NaN/Inf 视为不合法。
+    """
+    try:
+        if arr is None or getattr(arr, "size", 0) == 0:
+            return False
+        if not np.isfinite(arr).all():
+            return False
+        return float(arr.min()) >= -1e-6 and float(arr.max()) <= 1.0 + 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple,
+                         logger=None) -> np.ndarray:
     """在脸部下方采样手部肤色像素。
 
     **R12-14：输入/输出统一为 0–1**（与 stage5 的调用方一致）。
@@ -488,6 +509,18 @@ def _hand_skin_roi_photo(img_arr: np.ndarray, face_box: tuple) -> np.ndarray:
     empty = np.empty((0, 3), dtype=np.float32)
     try:
         if img_arr is None or img_arr.size == 0:
+            return empty
+        # R13-09：先校验数值域。传进来的若是 0–255，阈值不可能命中，
+        # 结果会变成"这张图没有手"——把契约错误伪装成正常降级。
+        if not _is_unit_range(img_arr):
+            if logger:
+                logger.warning(
+                    "STAGE5_HAND_ROI_DOMAIN_INVALID",
+                    "Hand-skin sampling expects RGB in [0,1] but received a "
+                    "different range; skipped instead of silently returning "
+                    "an empty sample set",
+                    observed_min=float(np.nanmin(img_arr)),
+                    observed_max=float(np.nanmax(img_arr)))
             return empty
         h, w = img_arr.shape[:2]
         pb = _box_to_pixel_bounds(face_box, w, h)
@@ -759,7 +792,8 @@ def _match_portrait_color(image_path: str, face_boxes: list,
 
             # FIX-H-12-06: sample hand skin-tone below the face and fold into
             # the neck reference so the match target reflects body skin.
-            hand_skin = _hand_skin_roi_photo(img_arr, (fx, fy, fw, fh))
+            hand_skin = _hand_skin_roi_photo(img_arr, (fx, fy, fw, fh),
+                                             logger=logger)
 
             # Convert to LAB using OpenCV
             # FIX-M12-11: Do LAB conversion on float32 (not uint8) to avoid

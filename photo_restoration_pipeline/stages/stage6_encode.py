@@ -417,8 +417,20 @@ def _recover_prior_publish(work_output_path: str,
 
     if rec.startswith("ALREADY_COMMITTED"):
         # 上次已完整提交。清掉这次事务的 journal 与备份残留即可。
-        _purge_publish_residue(jp, rep, logger)
-        return {"status": "already_new", "action": "purged", "report": rep}
+        _cl = _purge_publish_residue(jp, rep, logger)
+        # R13-08：**必须看返回值**。提交成功与"清理完成"是两件事，
+        # 清理失败既不推翻已提交的媒体，也不能被写成"已清理"。
+        if _cl.get("failed"):
+            logger.warning(
+                "STAGE6_PUBLISH_RESIDUE_PURGE_PENDING",
+                "Commit is complete but some residue could not be removed; "
+                "it stays on disk as cleanup_pending",
+                removed=_cl.get("removed"), failed=_cl.get("failed"),
+                kept=_cl.get("kept"))
+        return {"status": "already_new",
+                "action": ("purged" if not _cl.get("failed")
+                           else "purged_with_pending_cleanup"),
+                "cleanup": _cl, "report": rep}
 
     # ROLLBACK_SAFE（全是旧代，恢复是 no-op）与 MIXED（混合代，必须恢复）
     # 都走同一条路：按 journal 记录的备份把每个目标恢复成旧代。
@@ -492,8 +504,20 @@ def _recover_prior_publish(work_output_path: str,
                 impossible=rb.get("impossible"))
         return {"status": "needs_human", "action": None,
                 "report": {"rollback": rb}}
-    _purge_publish_residue(jp, rep, logger)
-    return {"status": "rolled_back", "action": "rolled_back",
+    _cl = _purge_publish_residue(jp, rep, logger)
+    # R13-08：**必须看返回值**。提交成功与"清理完成"是两件事，
+    # 清理失败既不推翻已提交的媒体，也不能被写成"已清理"。
+    if _cl.get("failed"):
+        logger.warning(
+            "STAGE6_PUBLISH_RESIDUE_PURGE_PENDING",
+            "Commit is complete but some residue could not be removed; "
+            "it stays on disk as cleanup_pending",
+            removed=_cl.get("removed"), failed=_cl.get("failed"),
+            kept=_cl.get("kept"))
+    return {"status": "rolled_back",
+            "action": ("rolled_back" if not _cl.get("failed")
+                       else "rolled_back_with_pending_cleanup"),
+            "cleanup": _cl,
             "report": {"recovery": rep, "rollback": rb}}
 
 
@@ -1949,12 +1973,25 @@ def main():
             _purge_report = {"targets": {
                 _t: {"backup": _r.get("backup")}
                 for _t, _r in _done_records.items()}}
-            _purge_publish_residue(_journal_path, _purge_report,
-                                   logger, keep_journal=True)
-            logger.info("STAGE6_PUBLISH_RESIDUE_PURGED",
-                        "Removed the .pubbak backups of the previous "
-                        "generation after a successful commit "
-                        "(journal kept for audit and next-run detection)")
+            _cl = _purge_publish_residue(_journal_path, _purge_report,
+                                         logger, keep_journal=True)
+            # R13-08：原实现丢弃返回值、无条件写"已清理"。
+            # 提交成功 ≠ 清理完成；失败要单独记 cleanup_pending。
+            if _cl.get("failed"):
+                logger.warning(
+                    "STAGE6_PUBLISH_RESIDUE_PURGE_PENDING",
+                    "Commit is complete but some .pubbak residue could not be "
+                    "removed; it stays on disk as cleanup_pending",
+                    removed=_cl.get("removed"),
+                    failed=_cl.get("failed"),
+                    kept=_cl.get("kept"))
+            else:
+                logger.info("STAGE6_PUBLISH_RESIDUE_PURGED",
+                            "Removed the .pubbak backups of the previous "
+                            "generation after a successful commit "
+                            "(journal kept for audit and next-run detection)",
+                            removed=_cl.get("removed"),
+                            kept=_cl.get("kept"))
         except Exception as _pe:
             logger.warning("STAGE6_PUBLISH_RESIDUE_PURGE_FAIL", str(_pe))
 
