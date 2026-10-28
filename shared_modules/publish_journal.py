@@ -40,8 +40,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import (Any, Dict, Iterable, List, Optional, Sequence, Tuple)
 
 __all__ = [
     "JOURNAL_SCHEMA",
@@ -89,6 +90,44 @@ def file_digest(path: str, chunk: int = 1 << 20) -> Optional[str]:
         return h.hexdigest()
     except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
         return None
+
+
+def file_state(path: str, chunk: int = 1 << 20) -> Tuple[str, Optional[str]]:
+    """把"文件在不在"分成 **PRESENT / ABSENT / ERROR** 三态。
+
+    R13-06：`file_digest()` 对"不存在""权限不足""I/O 错误""是目录"
+    **一律返回 None**，调用方无法区分：
+
+    - "旧代本来就没有这个文件"（ABSENT，正常）
+    - "文件就在那儿但读不出来"（ERROR，状态未知，必须保留现场）
+
+    混为一谈会让回滚在"读不出摘要"时跳过校验并报"已恢复"。
+
+    Returns:
+        ``(state, digest)``：
+        ``("PRESENT", sha256)`` 存在且可读；
+        ``("ABSENT", None)``    确实不存在；
+        ``("ERROR", None)``     存在但不可用（权限 / I/O / 非普通文件）。
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "ABSENT", None
+    except OSError:
+        return "ERROR", None
+    if not stat.S_ISREG(st.st_mode):
+        return "ERROR", None          # 目录/设备/管道：不是可发布产物
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                b = fh.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+        return "PRESENT", h.hexdigest()
+    except OSError:
+        return "ERROR", None
 
 
 def journal_path_for(target: str) -> str:
@@ -319,14 +358,32 @@ def classify_recovery(doc: Dict[str, Any]) -> Dict[str, Any]:
 
     for t in targets:
         rec = records.get(t) or {}
-        cur = file_digest(t)
+        # R13-06：用三态而不是"摘要为 None 就当作不存在"。
+        # 文件存在但读不出来（权限 / I/O / 是目录）属于**状态未知**，
+        # 必须走 UNKNOWN 保留现场，不能冒充 ABSENT。
+        _fstate, cur = file_state(t)
         old = rec.get("old_digest")
         new = rec.get("new_digest")
-        if cur is not None and new is not None and cur == new:
+        if _fstate == "ERROR":
+            state = "UNKNOWN"
+            report["has_unknown"] = True
+            report["all_old"] = False
+            report["all_new"] = False
+        elif cur is not None and new is not None and cur == new:
             state = "NEW"
             report["all_old"] = False
         elif cur is None and rec.get("existed") is False:
-            state = "ABSENT_OK"      # 本来就该不存在
+            # R13-05：**"旧代本来就不存在"只满足旧代，不满足新代。**
+            #
+            # 原实现这个分支两个标志都不动，于是"首次发布只替换了 AVIF、
+            # 其余目标本来就该被新建但还没建"被算成 all_new=True →
+            # 推荐 ALREADY_COMMITTED → journal 被清掉，半成品当成完整代。
+            #
+            # 新代要求这个目标**被创建**（new_digest 非空），现在它不在，
+            # 所以 NEW 侧不成立。将来若要支持"删除目标"，应写显式操作类型，
+            # 不能靠 None 猜。
+            state = "ABSENT_OK"      # 对**旧代**是正确的"不存在"
+            report["all_new"] = False
         elif cur is not None and old is not None and cur == old:
             state = "OLD"
             report["all_new"] = False
@@ -337,6 +394,7 @@ def classify_recovery(doc: Dict[str, Any]) -> Dict[str, Any]:
             report["all_new"] = False
         report["targets"][t] = {
             "state": state,
+            "file_state": _fstate,
             "current_digest": cur,
             "old_digest": old,
             "new_digest": new,

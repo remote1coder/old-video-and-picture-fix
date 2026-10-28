@@ -90,3 +90,38 @@ def test_precommit_rejections_use_preserve():
         window = text[i:i + 700]
         assert "preserve_valid_status=True" in window, \
             f"{op} 的拒绝分支缺少 preserve_valid_status=True"
+
+
+def test_all_precommit_fail_branches_preserve():
+    """R13-04：**所有**提交前失败都不得覆写旧代正式 status。
+
+    R12-03 只改了 4 个分支（needs_human / 颜色 / 备份 / staging），
+    审核又指出必需 TIFF、配置、编码、空产物、头验证这些提交前失败
+    仍在用默认 `_fail` —— 旧媒体还在，正式 status 却被写成新尝试的 FAILED，
+    而且写入发生在目标锁之外。
+
+    这里守调用形态：提交前的每个 `_fail(logger, status_path, ...)` 都必须带
+    `preserve_valid_status=True`；提交后的（回滚/恢复）不需要，它们由
+    `recovery_required` 或 rollback_detail 表达。
+    """
+    src = os.path.join(_ROOT, "photo_restoration_pipeline", "stages",
+                       "stage6_encode.py")
+    lines = open(src, encoding="utf-8", errors="replace").read().splitlines()
+
+    # 提交段起点：第一次出现 acquire_target_locks 的那一行
+    lock_line = next((i for i, l in enumerate(lines)
+                      if "_lock_cm = acquire_target_locks(" in l), None)
+    assert lock_line is not None, "找不到目标锁获取点"
+
+    offenders = []
+    for i, line in enumerate(lines):
+        if "_fail(logger, status_path" not in line:
+            continue
+        if line.lstrip().startswith("def "):
+            continue                     # 跳过函数定义本身
+        if i > lock_line:
+            continue                     # 提交后的分支另算
+        window = "\n".join(lines[i:i + 10])
+        if "preserve_valid_status=True" not in window:
+            offenders.append((i + 1, line.strip()[:60]))
+    assert not offenders, f"提交前 _fail 缺少 preserve_valid_status：{offenders}"
