@@ -635,6 +635,26 @@ def _decide_timing(original_duration: float, processed_duration: float,
     return tempo_ratio, state
 
 
+def _sha256_file(path: str, chunk: int = 1 << 20) -> Optional[str]:
+    """文件的 SHA-256；读不出来返回 None。
+
+    R12-05：跨卷发布要"复制到目标卷私有暂存 → 核对内容 → 再改名"，
+    而核对不能用大小代替内容（等长替换骗得过大小）。
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                b = fh.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def _probe_packet_span(path: str, stream_type: str = "v") -> float:
     """用 packet 时间戳求流跨度（NEW-RV-07）。
 
@@ -2482,6 +2502,8 @@ def main():
             # 注意：_ver 要到后面的 verify_output() 才创建，这里不能写 _ver，
             # 否则 UnboundLocalError。先攒在 _prechecks 里，等 _ver 建好再合并。
             _prechecks: Dict[str, Any] = {}
+            # R12-05：媒体换了但报告没跟上 → 这一代不完整，不能报成功
+            _generation_incomplete = False
             if not _fc_enabled:
                 # 明确记录"本次未执行全链核对"，不能让它看起来像通过。
                 _prechecks["fullchain_verify"] = {
@@ -2658,8 +2680,42 @@ def main():
 
                     if os.path.exists(output_path) and not _same_volume(
                             _publish_tmp, output_path):
-                        # 跨盘：先完整复制到目标端，再删暂存
-                        shutil.copy2(_publish_tmp, output_path)
+                        # R12-05：跨卷**不能直接 copy2 到正式路径**。
+                        # 原实现直接覆盖正式文件 —— 复制中断会留下截断的
+                        # 成品，把上一代有效产物一起毁掉。
+                        # 正确顺序：复制到**目标卷的私有暂存件** → 核对内容
+                        # → 再 os.replace 改名。失败时正式路径一个字节没动。
+                        _xvol_tmp = os.path.join(
+                            os.path.dirname(output_path) or ".",
+                            f"{os.path.basename(output_path)}"
+                            f".xvol-{_attempt_id}.partial")
+                        _src_digest = _sha256_file(_publish_tmp)
+                        try:
+                            shutil.copy2(_publish_tmp, _xvol_tmp)
+                            _dst_digest = _sha256_file(_xvol_tmp)
+                            if (_src_digest is None
+                                    or _dst_digest is None
+                                    or _src_digest != _dst_digest):
+                                raise OSError(
+                                    "cross-volume copy does not match the "
+                                    "staged candidate "
+                                    f"(src={_src_digest} dst={_dst_digest})")
+                            os.replace(_xvol_tmp, output_path)
+                        except OSError as _xe:
+                            # 正式路径未被触碰：清掉目标卷暂存件后如实失败
+                            try:
+                                if os.path.exists(_xvol_tmp):
+                                    os.remove(_xvol_tmp)
+                            except OSError:
+                                pass
+                            logger.error(
+                                "STAGE7_XVOL_PUBLISH_FAIL",
+                                "Cross-volume publish failed; the existing "
+                                "output is untouched (the copy goes to a "
+                                "private staging file on the target volume "
+                                "first)", attempt_id=_attempt_id, error=str(_xe))
+                            _discard_attempt_tmp(_publish_tmp, logger)
+                            return 82
                         os.unlink(_publish_tmp)
                         _published_by_copy = True
                     else:
@@ -2680,9 +2736,19 @@ def main():
                             _sh2.move(_fc_pending[0], _fc_pending[1])
                             _fc_pending = None
                         except Exception as _fe:
-                            logger.warning(
+                            # R12-05：报告转正失败**不是 warning 级别**。
+                            # 媒体已经换掉、报告却没跟上 = 这一代不完整，
+                            # 原先只记一条 warning 然后照常 return 0，
+                            # 于是"新媒体配旧报告"被当成成功发布。
+                            logger.error(
                                 "STAGE7_FULLCHAIN_SIDECAR_PROMOTE_FAIL",
-                                str(_fe))
+                                "Media was promoted but its full-chain report "
+                                "could not be; this generation is INCOMPLETE "
+                                "(media new, report stale/missing). Marking "
+                                "the run as a publish failure so it is not "
+                                "reported as a clean generation.",
+                                attempt_id=_attempt_id, error=str(_fe))
+                            _generation_incomplete = True
             except TargetLockTimeout as _lt:
                 logger.error("STAGE7_PUBLISH_LOCK_TIMEOUT",
                              "Another attempt holds the target lock; this "
@@ -2834,14 +2900,32 @@ def main():
                             _cancel_guard.release_outputs()
                         return 86
             except Exception as _ve:
-                # 核对器自身出问题不应把一次成功的编码判死，但要留痕
-                logger.warning("STAGE7_VERIFY_ERROR", str(_ve))
+                # R12-05 / R13-07：核对器自身出问题**不是**"通过"。
+                # 阻断判定已在发布前完成，所以这里不推翻已发布的媒体；
+                # 但必须记成 ERROR 并让结论显式变为"未验证"，
+                # 不能只留一条 warning 就当作正常结束。
+                logger.error("STAGE7_VERIFY_ERROR",
+                             "The post-publish verifier raised; this "
+                             "generation's verification result is UNKNOWN "
+                             "(not a pass)", error=str(_ve))
+                _prechecks["postverify_error"] = str(_ve)
 
-            logger.info("STAGE7_DONE", "Encoding complete", output=output_path)
-            # NEW-V-06: 产物已完整落盘（含 WSL 回拷），取消守卫不再有权
-            # 删它（RV-12：发布是不可逆的成功事件）。
             if _cancel_guard is not None:
+                # NEW-V-06: 产物已完整落盘（含 WSL 回拷），取消守卫不再有权
+                # 删它（RV-12：发布是不可逆的成功事件）。
                 _cancel_guard.release_outputs()
+            if _generation_incomplete:
+                # R12-05：媒体已换、报告未就位 —— 这一代不完整。
+                # 产物仍留在正式路径（有价值），但**不能报成功**。
+                logger.error(
+                    "STAGE7_GENERATION_INCOMPLETE",
+                    "The media file is live but this generation is incomplete "
+                    "(a required report could not be promoted). Exiting "
+                    "non-zero so callers do not treat it as a clean publish; "
+                    "inspect the sidecars before relying on the artifact.",
+                    output=output_path)
+                return 82
+            logger.info("STAGE7_DONE", "Encoding complete", output=output_path)
             return 0
         else:
             logger.error("STAGE7_FAILED", f"Encoding failed: {r.stderr[:300]}")
