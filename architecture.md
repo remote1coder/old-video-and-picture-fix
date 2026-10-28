@@ -467,7 +467,34 @@ stage7 的发布顺序固定为：
   质量失败可强制，但**结论仍是 FAIL**，只加 `forced` 标记。
 
 已接入：机械门、帧序门、同步门。
-未接入：全链门、颜色门（仍用各自的 `blocked` 列表）。
+未接入：全链门、颜色门（仍用各自的词表，见下）。
+
+#### ⚠️ 当前存在的不一致（未解决，优先处理）
+
+五道门现在**各有自己的词表**：
+
+| 门 | 位置 | 返回形态 | 词表 |
+|---|---|---|---|
+| 机械 | `stage7:2595` | `verify_output()` 的 `ok` | `True/False/None` |
+| 帧序 | `stage7:2655` | `ok` | `True/False/None` → 已转四态 |
+| 同步 | `stage7:1327` | `int` 退出码 | `0/86` → 已转四态 |
+| 全链 | `stage7:1202` | `List[str]` | `ERROR`/`NO_CHECKS`/`FRAMES`/`FRAMES_UNVERIFIED`/`DURATION`/`DURATION_UNVERIFIED`/`SYNC_ABSOLUTE` |
+| 颜色 | `color_probe:192` | `dict` | `"ok"`/`"drift"`/`"skipped"` |
+
+**更麻烦的是政策方向相反**：
+
+```
+全链门：FRAMES_UNVERIFIED  →  blocked  →  阻断发布（除非 force）
+帧序门：UNVERIFIED         →  warning   →  放行，只标 verified=false
+```
+
+同一个概念、同一个 `stage7`，**一个拦一个放**。
+这是第十三轮"只接了 3 道门"造成的新问题，不是原有分裂。
+
+**修复方向**：`_fullchain_blockers() -> List[str]` 改为 `-> List[CheckResult]`；
+颜色门加适配（`ok→PASS`、`drift→FAIL`、`skipped→UNVERIFIED`）；
+最后统一"未验证是否阻断"为一条 policy（建议：默认放行 + `verified=false`，
+与帧序门一致，因为"方法无判别力"不等于缺陷）。
 
 ---
 
