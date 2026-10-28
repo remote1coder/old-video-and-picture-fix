@@ -947,14 +947,37 @@ def _is_vfr(pts_map, tol: float = 0.01) -> bool:
     return (max(d) - min(d)) / med > tol
 
 
-def _classify_timeline(pts_map) -> str:
+def _fps_rational_str(fps: float) -> str:
+    """把浮点帧率还原成 ``num/den`` 形式（不提前四舍五入）。
+
+    R13-02 要求保留有理数：30000/1001 若写成 29.97，28800 秒的片子会
+    累积约 0.4 秒误差。ffmpeg 的 ``-framerate`` 接受 ``num/den``。
+    """
+    from fractions import Fraction
+    fr = Fraction(float(fps)).limit_denominator(1001)
+    return "%d/%d" % (fr.numerator, fr.denominator)
+
+
+def _classify_timeline(pts_map, expected_frames: int = None) -> str:
     """把逐帧 PTS 分成三态：``"cfr"`` / ``"vfr"`` / ``"unknown"``。
 
     R12-10：`_is_vfr()` 对"数据不足/不可用"返回 False，调用方于是把
     **未知当成 CFR** 放进了不携带 PTS 的流式路径。PTS 读不出来不等于
     固定帧率 —— 这是"量不出来当通过"的又一个变体。
 
-    只有时间轴完整、合法、且间隔一致时才返回 ``"cfr"``。
+    **只有时间轴完整、合法、且间隔一致时才返回 ``"cfr"``。**
+
+    R13-02：新增**覆盖度**检查。原实现只看"已采到的那些帧是否等间隔"，
+    于是"只采到 0/2/4 号帧"这种规则但缺帧的子集也会被判 CFR ——
+    缺的帧在 concat 时被静默补成均匀间隔，等于凭缺失数据宣布"时序完好"。
+
+    Args:
+        pts_map: ``{帧号: pts_秒}``。
+        expected_frames: 该流应有的帧数。给了就要求帧号**恰好是 0..N-1**；
+            没给则要求至少从 0 开始连续（无法证明完整时不给 CFR）。
+
+    Returns:
+        ``"cfr"`` / ``"vfr"`` / ``"unknown"``。
     """
     if not pts_map or len(pts_map) < 3:
         return "unknown"
@@ -969,6 +992,17 @@ def _classify_timeline(pts_map) -> str:
     ts = [v for _k, v in _pairs]
     if len(ts) < 3 or not all(math.isfinite(v) for v in ts):
         return "unknown"
+
+    # ---- 覆盖度：帧号必须完整 ----
+    _idx = [int(k) for k, _v in _pairs]
+    if expected_frames is not None and int(expected_frames) > 0:
+        _exp = int(expected_frames)
+        if len(_idx) != _exp or _idx != list(range(_exp)):
+            return "unknown"        # 缺帧/多帧 → 时间轴不完整
+    else:
+        # 拿不到应有帧数时，至少要求从 0 开始连续；否则无法证明覆盖完整
+        if _idx != list(range(len(_idx))):
+            return "unknown"
     d = [b - a for a, b in zip(ts, ts[1:])]
     if any(x <= 0 for x in d):
         return "unknown"          # 非单调 → 时间轴不可信
@@ -1591,6 +1625,7 @@ def _query_all_pts(video_path: str, logger=None) -> dict:
     Returns {frame_index: pts_seconds}.
     """
     pts_map: dict = {}
+    _bad_pts = 0
     try:
         pts_cmd = [
             "ffprobe", "-hide_banner", "-v", "error",
@@ -1612,12 +1647,24 @@ def _query_all_pts(video_path: str, logger=None) -> dict:
                 if pts_str:
                     try:
                         pts_map[i] = float(pts_str)
-                    except ValueError:
-                        pts_map[i] = i / 25.0
+                    except (TypeError, ValueError):
+                        # R13-02：**不再用 i/25 伪造时间戳**。
+                        # 原实现把"解析失败"变成"规则 25fps 的实测值"，
+                        # 于是全部 N/A 的素材会被判成 CFR，进而按 25fps
+                        # 编码 —— 帧数对、时长错，任何帧数核对都发现不了。
+                        # 这里只跳过该帧，缺失由覆盖度检查暴露。
+                        _bad_pts += 1
     except Exception:
         if logger:
             logger.warning("STAGE3_PTS_QUERY_FAIL",
-                           "Failed to query PTS, using frame-index fallback")
+                           "Failed to query per-frame PTS; the timeline will "
+                           "be reported as unknown rather than guessed")
+        return pts_map
+    if _bad_pts and logger:
+        logger.warning("STAGE3_PTS_PARTIAL",
+                       "Some frames had an unparseable PTS; they are left "
+                       "absent so the coverage check can reject CFR",
+                       bad_frames=_bad_pts, usable=len(pts_map))
     return pts_map
 
 
@@ -1675,10 +1722,9 @@ def extract_frames_with_pts(video_path: str, output_dir: str,
     for i, fp in enumerate(frame_files):
         # Map window-local index to global index
         global_idx = win_start + i
-        if pts_map:
-            pts = pts_map.get(global_idx, global_idx / 25.0)
-        else:
-            pts = global_idx / 25.0
+        # R13-02：缺失帧不再用 `global_idx / 25.0` 顶替。
+        # None 表示"这一帧没有可信时间戳"，由调用方决定能否保住时序。
+        pts = pts_map.get(global_idx) if pts_map else None
         frames.append((str(fp), pts))
 
     return frames
@@ -2136,11 +2182,20 @@ def main():
         "-of", "default=noprint_wrappers=1:nokey=1",
         stage2_output,
     ]
+    # R13-02：**先采集、再决策**。
+    # 原顺序是"先做 fps 决策，后采 PTS"，而 fps 失败时的回退分支要读
+    # `all_pts_map` —— 于是 fps 探测一失败就先抛 UnboundLocalError，
+    # 根本走不到 PTS 反推（这个顺序问题是 R12-10 引入的）。
+    # FIX-N8-2: Query all PTS once before window loop (not per-window)
+    all_pts_map = _query_all_pts(stage2_output, logger)
+
     # R12-10：帧率探测失败**不能静默用默认值**。
     # 真实 30fps 的素材若按 25fps 编码，帧数完全正确但时长变了 20%，
     # 任何"帧数一致"的核对都发现不了。
     actual_fps = None
     _fps_ok = False
+    _fps_raw_str = None      # 首次探测到的**原始有理数**（如 "30000/1001"）
+    _fps_source = None       # probe | pts-derived | user-assumed
     try:
         r = subprocess.run(fps_cmd, capture_output=True, text=True, errors="replace",
                           timeout=10, shell=False)
@@ -2154,12 +2209,15 @@ def main():
             if _v and _v > 0:
                 actual_fps = _v
                 _fps_ok = True
+                _fps_raw_str = fps_str_val
+                _fps_source = "probe"
     except Exception:
         pass
     if not _fps_ok:
         # 有完整 PTS 时可以从帧间隔反推，这不算"猜"；
         # 否则记为假设值并明确留痕，同时禁止走流式路径。
-        _tl_probe = _classify_timeline(all_pts_map)
+        # 只有**覆盖完整**的时间轴才允许用来反推帧率
+        _tl_probe = _classify_timeline(all_pts_map, total_frames)
         if _tl_probe != "unknown":
             _ts = sorted(float(v) for v in all_pts_map.values())
             _d = [b - a for a, b in zip(_ts, _ts[1:]) if b > a]
@@ -2168,21 +2226,43 @@ def main():
                 if _med > 0:
                     actual_fps = 1.0 / _med
                     _fps_ok = True
+                    _fps_source = "pts-derived"
                     logger.info("STAGE3_FPS_FROM_PTS",
                                 "r_frame_rate probe failed; derived fps from "
                                 "frame intervals instead",
                                 derived_fps=round(actual_fps, 4))
         if not _fps_ok:
-            actual_fps = 25.0
-            logger.error("STAGE3_FPS_ASSUMED",
-                         "Could not determine the frame rate from ffprobe or "
-                         "PTS; falling back to 25 fps. Timing is NOT verified "
-                         "for this run, and the streaming path is disabled.",
-                         assumed_fps=actual_fps)
-
-    # FIX-N8-2: Query all PTS once before window loop (not per-window)
-    # ORIGINAL: extract_frames_with_pts called ffprobe for every window
-    all_pts_map = _query_all_pts(stage2_output, logger)
+            # R13-02：**不再假设 25fps**。
+            # 依据执行指令："缺少构造时间轴所必需的信息时，自动模式停止
+            # 时间相关处理并说明所缺条件；明确保留人工指定 fps 的入口，
+            # 记录 explicit_assumption / UNVERIFIED"。
+            _manual_fps = params.get("original_fps") or params.get("fps")
+            try:
+                _manual_fps = float(_manual_fps) if _manual_fps else 0.0
+            except (TypeError, ValueError):
+                _manual_fps = 0.0
+            if _manual_fps > 0:
+                actual_fps = _manual_fps
+                _fps_ok = True
+                _fps_source = "user-assumed"
+                _fps_raw_str = _fps_rational_str(_manual_fps)
+                logger.warning(
+                    "STAGE3_FPS_EXPLICIT_ASSUMPTION",
+                    "Frame rate could not be measured; using the value the "
+                    "user specified. This is an EXPLICIT ASSUMPTION, not a "
+                    "probe result — timing is UNVERIFIED for this run.",
+                    assumed_fps=actual_fps, source=_fps_source)
+            else:
+                logger.error(
+                    "STAGE3_FPS_UNAVAILABLE",
+                    "Cannot determine the frame rate from ffprobe or PTS, and "
+                    "no explicit fps was provided. Refusing to guess (25 fps "
+                    "would silently change the duration). Provide "
+                    "`original_fps` / `fps` to proceed with a stated "
+                    "assumption, or supply a source whose PTS is readable.",
+                    pts_usable=len(all_pts_map or {}),
+                    expected_frames=total_frames)
+                return 86
 
     # FIX-P8-9: Collect window dirs for batch processing
     # ORIGINAL: Per-window run_realesrgan (model loaded per window)
@@ -2210,11 +2290,11 @@ def main():
                     "lanczos_target is set; the streaming path would bypass "
                     "secondary scaling, so use the PNG path instead",
                     lanczos_target=str(_s_lanczos))
-    elif _classify_timeline(all_pts_map) != "cfr":
+    elif _classify_timeline(all_pts_map, total_frames) != "cfr":
         # STR-04 / R12-10：只有**确认是 CFR** 才允许走不携带 PTS 的流式路径。
         # VFR 会被压成 CFR；UNKNOWN（PTS 读不出/非单调/不足）同样不能
         # 冒充 CFR —— 否则"量不出来"又变成了"按固定帧率处理"。
-        _tl = _classify_timeline(all_pts_map)
+        _tl = _classify_timeline(all_pts_map, total_frames)
         logger.info("STAGE3_STREAM_SKIP_TIMELINE",
                     "Timeline is not confirmed CFR; the streaming path would "
                     "encode at a fixed frame rate and change the timing, so "
@@ -2238,20 +2318,19 @@ def main():
                                 f"_step3_forced_upscale_p{param_hash}")
                 _s_out = str(Path(temp_dir) / f"{_s_inter}.mkv")
 
-                _s_fps = "25"
-                try:
-                    _rf = subprocess.run(
-                        ["ffprobe", "-hide_banner", "-v", "error",
-                         "-select_streams", "v:0",
-                         "-show_entries", "stream=r_frame_rate",
-                         "-of", "default=noprint_wrappers=1:nokey=1",
-                         stage2_output],
-                        capture_output=True, text=True, errors="replace",
-                        timeout=10, shell=False)
-                    if _rf.returncode == 0 and _rf.stdout.strip():
-                        _s_fps = _rf.stdout.strip()
-                except Exception:
-                    pass
+                # R13-02：**不能在这里第二次猜 fps**。
+                # 原实现重新 probe 一次、失败就用 "25"；于是首次成功得到
+                # 30000/1001、第二次失败时，同一批帧会按 25fps 编码 ——
+                # 帧数对、时长错，任何帧数核对都发现不了。
+                # 复用首次决策；只有真没有时才报错，不再默认 25。
+                if _fps_ok and actual_fps:
+                    _s_fps = (_fps_raw_str or _fps_rational_str(actual_fps))
+                else:
+                    logger.error(
+                        "STAGE3_STREAM_NO_TIMEBASE",
+                        "Cannot start the raw-pipe path without a frame rate; "
+                        "refusing to guess one (timing would silently change)")
+                    return 86
 
                 _s_dims = (0, 0)
                 try:
@@ -2635,7 +2714,15 @@ def main():
         "-of", "default=noprint_wrappers=1:nokey=1",
         stage2_output,
     ]
-    fps_str = "25"
+    # R13-02：同上，复用首次决策；不再重新 probe 后默认 25
+    if _fps_ok and actual_fps:
+        fps_str = (_fps_raw_str or _fps_rational_str(actual_fps))
+    else:
+        logger.error(
+            "STAGE3_ENCODE_NO_TIMEBASE",
+            "Cannot encode without a frame rate; refusing to guess one "
+            "(25 fps would silently change the duration)")
+        return 86
     try:
         r = subprocess.run(fps_cmd, capture_output=True, text=True, errors="replace",
                           timeout=10, shell=False)
@@ -2711,8 +2798,11 @@ def main():
     # 原实现是另一套规则（最大偏差 > 平均间隔的 10%），比前门的
     # "相对偏差 > 1%" 宽得多 —— 40ms/42ms 交替的素材前门判 VFR、
     # 到这里又被判回 CFR，前段的"保时序"要求等于被撤销。
+    # R13-02：传入应有帧数，缺帧/多帧一律不当 CFR/VFR 处理
     _tl_encode = _classify_timeline(
-        {i: t for i, t in enumerate(all_pts)} if all_pts else {})
+        {i: t for i, t in enumerate(all_pts)
+         if t is not None} if all_pts else {},
+        total_frames)
     is_vfr = (_tl_encode == "vfr")
 
     # 诊断：60 帧进、59 帧出的问题就出在这条分岔上。先把它记清楚，
@@ -2739,10 +2829,27 @@ def main():
         with open(concat_path, "w") as f:
             f.write("ffconcat version 1.0\n")
             for i, pts in enumerate(all_pts):
+                if pts is None:
+                    # 理论上到不了：is_vfr 已要求覆盖完整。留断言式保护，
+                    # 避免以后放宽分类器时静默算出负/零时长。
+                    raise ValueError(
+                        "VFR concat requested but frame %d has no PTS" % i)
                 if i < len(all_pts) - 1:
                     duration = all_pts[i + 1] - pts
-                else:
+                elif _fps_ok and actual_fps:
+                    # 末帧：优先用**已确认**的帧率
                     duration = 1.0 / actual_fps
+                elif i > 0:
+                    # 帧率未知时，用前一个间隔（来自真实 PTS，不是猜的）
+                    duration = pts - all_pts[i - 1]
+                else:
+                    raise ValueError(
+                        "cannot determine the last frame duration: fps "
+                        "unknown and no previous interval")
+                if not (duration > 0):
+                    raise ValueError(
+                        "non-positive frame duration at %d: %r"
+                        % (i, duration))
                 frame_file = Path(output_dir) / f"frame_{i:08d}.png"
                 f.write(f"file '{frame_file}'\n")
                 f.write(f"duration {duration:.6f}\n")

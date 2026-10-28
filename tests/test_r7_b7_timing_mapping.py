@@ -58,18 +58,20 @@ def test_source_no_longer_uses_bare_duration_diff():
 
 
 def test_declared_mapping_is_required_for_tempo():
-    """源码结构：tempo 只在显式声明分支里被赋值。"""
-    src = open(s7.__file__, encoding="utf-8").read()
-    # 找 tempo_ratio 被赋值的位置，应全部落在声明分支或初值
-    lines = src.splitlines()
-    assigns = [i for i, l in enumerate(lines)
-               if l.strip().startswith("tempo_ratio =")]
-    assert assigns, "没找到 tempo_ratio 赋值"
-    for i in assigns:
-        ctx = "\n".join(lines[max(0, i - 12):i + 1])
-        assert ("_declared_tempo" in ctx or "_declared_speed" in ctx
-                or "tempo_ratio = 1.0" in lines[i]), (
-            f"第 {i+1} 行的 tempo_ratio 赋值不在「显式声明」分支内：\n{ctx[-200:]}")
+    """只有**实测且显式声明**时才改音频 tempo。
+
+    原来是源码结构断言（依赖 `_declared_tempo` 这个局部变量名）；
+    R13-03 把决策逻辑抽成 `_decide_timing()` 纯函数之后，名不副实了。
+    改成直接调用生产函数验证行为 —— 更强，也不再绑实现细节。
+    """
+    # 未声明 + 时长变了 → 不许改音频
+    assert s7._decide_timing(10.0, 7.0, "packet-span", None, None) ==         (1.0, "unexplained")
+    # 声明且实测吻合 → 允许
+    ratio, state = s7._decide_timing(10.0, 5.0, "packet-span", 2.0, None)
+    assert state == "adjusted" and abs(ratio - 2.0) < 1e-9
+    # 声明吻合但时间轴是**估算** → 不许改音频（R13-03）
+    assert s7._decide_timing(10.0, 5.0, "frame-ratio (estimated)",
+                             2.0, None) == (1.0, "unverified")
 
 
 def test_timing_state_is_written_into_metadata():
