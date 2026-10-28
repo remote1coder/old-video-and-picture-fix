@@ -625,7 +625,21 @@ def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
         backup = entry.get("backup")
         old_digest = entry.get("old_digest")
         bk_digest = entry.get("backup_digest")
-        cur = file_digest(path)
+        # R13-06：当前文件存在但读不出来（权限 / I/O / 是目录）属于
+        # **状态未知**——不能当成"它已经是旧代"跳过，也不能盲目覆盖。
+        try:
+            from publish_journal import file_state as _fs
+            _cur_st, cur = _fs(path)
+        except Exception:
+            _cur_st, cur = ("PRESENT" if os.path.exists(path) else "ABSENT",
+                            file_digest(path))
+        if _cur_st == "ERROR":
+            result["impossible"].append(path)
+            result["failed"].append({
+                "path": path,
+                "error": "current file exists but is unreadable; "
+                         "state is unknown, refusing to modify it"})
+            continue
 
         # 已经是旧代 → 无需任何动作（这也解决"回滚消耗了备份、但目标是
         # 完整旧代时仍要求备份"导致的重复恢复死结）。
@@ -1448,7 +1462,11 @@ def main():
                          "written", error=tiff_info.get("error"))
             _fail(logger, status_path, "tiff_master",
                   tiff_info.get("error") or "archival TIFF master missing",
-                  paths=[tmp_avif] + round_artifacts)
+                  paths=[tmp_avif] + round_artifacts,
+                  # R13-04：本次是**提交前**失败，旧代媒体一个字节都没动。
+                  # 默认 _fail 会把正式 status 覆写成 FAILED —— 那会把一份
+                  # 仍然有效的旧成品标成失败，还可能毁掉恢复用的摘要证据。
+                  preserve_valid_status=True)
             return 86
 
     # --- FIX-V01: 命令构造（不支持的组合在启动前失败）---
@@ -1462,7 +1480,11 @@ def main():
     except media_io.UnsupportedAvifConfig as e:
         logger.error("STAGE6_AVIF_CONFIG_UNSUPPORTED", str(e))
         _fail(logger, status_path, "avif_config", str(e),
-              paths=[tmp_avif] + round_artifacts)
+              paths=[tmp_avif] + round_artifacts,
+                  # R13-04：本次是**提交前**失败，旧代媒体一个字节都没动。
+                  # 默认 _fail 会把正式 status 覆写成 FAILED —— 那会把一份
+                  # 仍然有效的旧成品标成失败，还可能毁掉恢复用的摘要证据。
+                  preserve_valid_status=True)
         return 86
 
     # 实际编码契约：记录"实际会编出什么"，而不是"用户想要什么"
@@ -1502,7 +1524,11 @@ def main():
         # 不能让"半截 AVIF"或"上一轮成品"被当成这次的成功结果。
         _fail(logger, status_path, "avif_encode",
               f"avifenc exited {rc}: {stderr[:500]}",
-              paths=[tmp_avif] + round_artifacts)
+              paths=[tmp_avif] + round_artifacts,
+                  # R13-04：本次是**提交前**失败，旧代媒体一个字节都没动。
+                  # 默认 _fail 会把正式 status 覆写成 FAILED —— 那会把一份
+                  # 仍然有效的旧成品标成失败，还可能毁掉恢复用的摘要证据。
+                  preserve_valid_status=True)
         return 84
     if not os.path.exists(tmp_avif) or os.path.getsize(tmp_avif) == 0:
         # 退出码 0 也不代表成功：必须验证产物本身
@@ -1511,7 +1537,11 @@ def main():
                      output=tmp_avif)
         _fail(logger, status_path, "avif_encode",
               "encoder produced an empty/missing file",
-              paths=[tmp_avif] + round_artifacts)
+              paths=[tmp_avif] + round_artifacts,
+                  # R13-04：本次是**提交前**失败，旧代媒体一个字节都没动。
+                  # 默认 _fail 会把正式 status 覆写成 FAILED —— 那会把一份
+                  # 仍然有效的旧成品标成失败，还可能毁掉恢复用的摘要证据。
+                  preserve_valid_status=True)
         return 84
 
     # --- R2-13: 发布前读回真实文件头，核对色彩标签 -----------------------
@@ -1540,7 +1570,11 @@ def main():
             _fail(logger, status_path, "header_verification_unknown",
                   "the encoded header could not be read back; strict mode "
                   "refuses to publish an unverified product",
-                  paths=[tmp_avif])
+                  paths=[tmp_avif],
+                  # R13-04：本次是**提交前**失败，旧代媒体一个字节都没动。
+                  # 默认 _fail 会把正式 status 覆写成 FAILED —— 那会把一份
+                  # 仍然有效的旧成品标成失败，还可能毁掉恢复用的摘要证据。
+                  preserve_valid_status=True)
             return 86
     if actual:
         contract["actual_header"] = actual
@@ -1564,7 +1598,11 @@ def main():
                 _fail(logger, status_path, "header_verification",
                       f"encoded header matrix {actual_matrix} != contract "
                       f"{declared_matrix}",
-                      paths=[tmp_avif] + round_artifacts)
+                      paths=[tmp_avif] + round_artifacts,
+                  # R13-04：本次是**提交前**失败，旧代媒体一个字节都没动。
+                  # 默认 _fail 会把正式 status 覆写成 FAILED —— 那会把一份
+                  # 仍然有效的旧成品标成失败，还可能毁掉恢复用的摘要证据。
+                  preserve_valid_status=True)
                 return 86
 
     # --- R2-01: 成套提交（备份旧代 → 逐个提交 → 任一步失败整批回滚）---
