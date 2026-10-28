@@ -2502,6 +2502,8 @@ def main():
             # 注意：_ver 要到后面的 verify_output() 才创建，这里不能写 _ver，
             # 否则 UnboundLocalError。先攒在 _prechecks 里，等 _ver 建好再合并。
             _prechecks: Dict[str, Any] = {}
+            # R13-07：统一四态结论（PASS/FAIL/UNVERIFIED/NOT_APPLICABLE）
+            _checks: Dict[str, Any] = {}
             # R12-05：媒体换了但报告没跟上 → 这一代不完整，不能报成功
             _generation_incomplete = False
             if not _fc_enabled:
@@ -2579,104 +2581,288 @@ def main():
 
             # 否则两个 attempt（同 job 重试，或不同 job 撞同一 -o）
             # 会互相覆盖，且失败方回滚时可能删掉对方刚发布的结果。
+            # ==== R12-05：候选件与报告在**锁外**准备完成 ====
+            # 审核 §D2 要求："编码和耗时核对只读本 attempt 私有候选件，
+            # 锁外完成"；"报告绑定候选媒体摘要和 generation ID，
+            # 提交前全部序列化"。
+            #
+            # 原实现把机械核对放在锁内、把 verify 报告放在**锁外对正式
+            # 路径**重新生成 —— A 释放锁后 B 替换了媒体，A 的后置核对
+            # 就会读到 B 的文件、却写着 A 的结论。
+            # 现在核对对象固定为本 attempt 独占的 `_publish_tmp`，
+            # 报告也绑定它的摘要，锁内只做"身份复核 + 两个 rename"。
+            # ---- GATE-01：阻断性检查必须在**发布之前**执行 ----
+            # 原实现先 os.replace 覆盖正式路径，之后才做机械核对与
+            # 帧序对齐。一旦新件帧序错位，旧成品已被换掉，失败的
+            # 新件却占据正式路径 —— 失败即毁掉上一代有效成品。
+            # 这里对 attempt 独占的暂存文件先核一遍；不过就不发布。
+            try:
+                from artifact_verify import (
+                    verify_output as _vo_pre,
+                    render_verdict as _rv_pre,
+                )
+                _pre = _vo_pre(input_source, _publish_tmp, {})
+            except Exception as _pe:
+                logger.error("STAGE7_PREPUBLISH_VERIFY_ERROR",
+                             f"pre-publish check raised: {_pe}")
+                return 86
+            if not _pre.get("ok"):
+                # R12-15：这道门也要尊重用户的强制开关，但**不能一律放行**。
+                # 分清两类：
+                #   * 硬错误（源不可读 / 成品缺失 / 探测不可用）——
+                #     属于"事实未知或根本没法量"，强制发布等于蒙，
+                #     任何开关都不放行；
+                #   * 普通质量失败（帧数/亮度等判据为 False）——
+                #     用户可以显式承担风险，与全链门/机械门一致。
+                _hard = (_pre.get("hard_error") or "").strip()
+                if _hard:
+                    logger.error(
+                        "STAGE7_PREPUBLISH_HARD_ERROR",
+                        "Refusing to publish: the staged attempt hit a "
+                        "hard error (unreadable / missing / unmeasurable)"
+                        " which cannot be force-published. The existing "
+                        "output is left untouched.",
+                        attempt_id=_attempt_id, hard_error=_hard,
+                        verdict=_rv_pre(_pre) if _pre else "")
+                    _discard_attempt_tmp(_publish_tmp, logger)
+                    return 86
+                _force_pre = _force_publish_enabled(
+                    params, "allow_verify_fail_publish")
+                if not _force_pre:
+                    logger.error(
+                        "STAGE7_PREPUBLISH_VERIFY_FAIL",
+                        "Refusing to publish: the staged attempt failed "
+                        "the mechanical check. The existing output is "
+                        "left untouched. Set "
+                        "allow_verify_fail_publish=true to force.",
+                        attempt_id=_attempt_id,
+                        verdict=_rv_pre(_pre) if _pre else "")
+                    return 86
+                # 强制放行：必须留痕，且**不得**写成"已验证"。
+                _prechecks["prepublish_forced"] = {
+                    "forced": True,
+                    "reason": "allow_verify_fail_publish",
+                    "verdict": _rv_pre(_pre) if _pre else "",
+                }
+                logger.error(
+                    "STAGE7_PREPUBLISH_FORCE_PUBLISHED",
+                    "Pre-publish check FAILED but "
+                    "allow_verify_fail_publish is on: publishing "
+                    "anyway. The artifact is NOT verified.",
+                    attempt_id=_attempt_id,
+                    verdict=_rv_pre(_pre) if _pre else "")
+            # R12-04：帧序检查也必须**在覆盖之前**完成。
+            # 原来它只对已发布的正式路径执行 —— 一旦错序，旧成品
+            # 已被 os.replace 换掉，再返回 86 也救不回来。
+            # 这里对 attempt 暂存件核一次，不过就不发布。
+            # R13-07：机械门也落成四态（硬错误与可强制的质量失败分开）
+            try:
+                from check_result import (
+                    CheckResult as _CRm, PASS as _P, FAIL as _F)
+                _mech_ok = bool(_pre.get("ok"))
+                _mech_hard = bool((_pre.get("hard_error") or "").strip())
+                _checks["mechanical"] = _CRm(
+                    "mechanical", _P if _mech_ok else _F,
+                    reason="" if _mech_ok else (_pre.get("hard_error")
+                                                or "mechanical check failed"),
+                    method="artifact_verify.verify_output",
+                    hard_error=(not _mech_ok) and _mech_hard,
+                    forced=(not _mech_ok) and _force_publish_enabled(
+                        params, "allow_verify_fail_publish"),
+                    force_key=("allow_verify_fail_publish"
+                               if not _mech_ok else None),
+                ).as_dict()
+            except Exception:
+                pass
+
+            try:
+                from artifact_verify import (
+                    verify_frame_alignment as _vfa_pre,
+                    render_alignment as _ra_pre,
+                )
+                _align_pre = _vfa_pre(
+                    input_source, _publish_tmp, samples=4)
+            except Exception as _ae:
+                logger.error("STAGE7_PREPUBLISH_ALIGN_ERROR",
+                             f"pre-publish alignment raised: {_ae}")
+                return 86
+            # R13-07：帧序结论必须落到**四态**，不能用一个 ok 值糊过去。
+            from check_result import (
+                CheckResult as _CR, PASS as _CR_PASS, FAIL as _CR_FAIL,
+                UNVERIFIED as _CR_UNV)
+            _align_ok = _align_pre.get("ok")
+            if _align_ok is False:
+                _fc_align = _CR("frame_order", _CR_FAIL,
+                                reason="sampled frames indicate shifted order",
+                                method="artifact_verify.verify_frame_alignment",
+                                evidence={"flipped": _align_pre.get("flipped"),
+                                          "checked": len(_align_pre.get("points")
+                                                         or [])})
+            elif _align_ok is None:
+                # 方法无判别力（例如静态画面）**不等于错乱**，也**不等于通过**。
+                _fc_align = _CR(
+                    "frame_order", _CR_UNV,
+                    reason=(_align_pre.get("error")
+                            or _align_pre.get("skipped")
+                            or "the alignment method produced no verdict"),
+                    method="artifact_verify.verify_frame_alignment",
+                    evidence={"checked": len(_align_pre.get("points") or [])})
+            else:
+                _fc_align = _CR(
+                    "frame_order", _CR_PASS,
+                    method="artifact_verify.verify_frame_alignment",
+                    evidence={"flipped": _align_pre.get("flipped"),
+                              "checked": len(_align_pre.get("points") or [])})
+            _checks["frame_order"] = _fc_align.as_dict()
+            _prechecks["alignment_precheck"] = {
+                "ok": _align_ok,
+                "flipped": _align_pre.get("flipped"),
+                "checked": len(_align_pre.get("points") or []),
+                "status": _fc_align.status,
+            }
+
+            # 只有 FAIL 阻断；UNVERIFIED（方法无判别力）只记录、不判死。
+            if _fc_align.status == _CR_UNV:
+                logger.warning(
+                    "STAGE7_PREPUBLISH_ALIGN_UNVERIFIED",
+                    "Frame-order check produced no verdict (method "
+                    "limitation). Publishing without that evidence; the "
+                    "artifact is reported as UNVERIFIED, not as verified.",
+                    attempt_id=_attempt_id, reason=_fc_align.reason)
+            if _fc_align.status == _CR_FAIL:
+                # 与机械门用**同一把**钥匙，避免"硬错误从一个入口被强制、
+                # 从另一个入口却绕不过去"的不一致。
+                _align_force = _force_publish_enabled(
+                    params, "allow_verify_fail_publish")
+                if _align_force and _fc_align.is_forceable:
+                    _fc_align.forced = True
+                    _fc_align.force_key = "allow_verify_fail_publish"
+                    _checks["frame_order"] = _fc_align.as_dict()
+                    logger.error(
+                        "STAGE7_PREPUBLISH_ALIGN_FORCED",
+                        "Frame-order check did NOT pass, but "
+                        "allow_verify_fail_publish is on: publishing anyway. "
+                        "The artifact is NOT verified.",
+                        attempt_id=_attempt_id, status=_fc_align.status,
+                        verdict=(_ra_pre(_align_pre)
+                                 if _align_ok is False else None))
+                else:
+                    logger.error(
+                        "STAGE7_PREPUBLISH_ALIGN_BLOCKED",
+                        "Refusing to publish: the frame-order check did not "
+                        "pass and cannot be forced. The existing output is "
+                        "left untouched.",
+                        attempt_id=_attempt_id, status=_fc_align.status,
+                        reason=_fc_align.reason,
+                        verdict=(_ra_pre(_align_pre)
+                                 if _align_ok is False else None))
+                    _discard_attempt_tmp(_publish_tmp, logger)
+                    return 86
+
+            logger.info("STAGE7_PREPUBLISH_VERIFY_OK",
+                        "Staged attempt passed the mechanical check "
+                        "and frame-order check; publishing now",
+                        attempt_id=_attempt_id)
+
+            # ---- R12-05：冻结候选身份，并把 verify 报告**写出来** ----
+            # 报告绑定 attempt_id 与候选媒体的 SHA-256：读方据此能证明
+            # "这份报告描述的就是这份字节"，而不是"某个时刻的正式路径"。
+            _cand_digest = _sha256_file(_publish_tmp)
+            if _cand_digest is None:
+                logger.error(
+                    "STAGE7_CANDIDATE_UNREADABLE",
+                    "Cannot read the staged candidate to bind its identity; "
+                    "refusing to publish (the previous generation is intact)",
+                    attempt_id=_attempt_id, candidate=_publish_tmp)
+                _discard_attempt_tmp(_publish_tmp, logger)
+                return 86
+            try:
+                _cand_stat = os.stat(_publish_tmp)
+            except OSError as _se:
+                logger.error("STAGE7_CANDIDATE_UNREADABLE", str(_se),
+                             attempt_id=_attempt_id)
+                _discard_attempt_tmp(_publish_tmp, logger)
+                return 86
+
+            _ver_doc = dict(_pre)
+            if _prechecks:
+                _ver_doc.setdefault("prechecks", {}).update(_prechecks)
+            _ver_doc["attempt_id"] = _attempt_id
+            _ver_doc["checks"] = _checks
+            # 汇总：只有全部 PASS（或不需要检查）才算 verified
+            try:
+                from check_result import (
+                    CheckResult as _CRr, publish_decision as _pd)
+                _rows = [_CRr(d["name"], d["status"],
+                              hard_error=bool(d.get("hard_error")),
+                              forced=bool(d.get("forced")))
+                         for d in _checks.values()]
+                _dec = _pd(_rows, force_enabled=_force_publish_enabled(
+                    params, "allow_verify_fail_publish"))
+                _ver_doc["publish_decision"] = _dec
+            except Exception as _de:
+                _ver_doc["publish_decision"] = {"error": str(_de)}
+            _ver_doc["media_sha256"] = _cand_digest
+            _ver_doc["media_bytes"] = _cand_stat.st_size
+            _ver_doc["report_scope"] = (
+                "measured on the attempt's private candidate before publish; "
+                "the published file is the same bytes")
+
+            _side_tmp = f"{output_path}.verify.{_attempt_id}.json"
+            try:
+                import json as _jsonw
+                with open(_side_tmp, "w", encoding="utf-8") as _fw:
+                    _jsonw.dump(_ver_doc, _fw, ensure_ascii=False, indent=2)
+            except OSError as _we:
+                # 必需报告写不出来 = 这一代没准备好，不能开始提交
+                logger.error(
+                    "STAGE7_VERIFY_REPORT_UNWRITABLE",
+                    "Cannot write this attempt's verify report; the generation "
+                    "is not ready to publish. Nothing was promoted.",
+                    attempt_id=_attempt_id, error=str(_we))
+                try:
+                    if os.path.exists(_side_tmp):
+                        os.remove(_side_tmp)
+                except OSError:
+                    pass
+                _discard_attempt_tmp(_publish_tmp, logger)
+                return 82
             try:
                 with acquire_target_locks([output_path], timeout=30,
                                           logger=logger):
-                    # ---- GATE-01：阻断性检查必须在**发布之前**执行 ----
-                    # 原实现先 os.replace 覆盖正式路径，之后才做机械核对与
-                    # 帧序对齐。一旦新件帧序错位，旧成品已被换掉，失败的
-                    # 新件却占据正式路径 —— 失败即毁掉上一代有效成品。
-                    # 这里对 attempt 独占的暂存文件先核一遍；不过就不发布。
-                    try:
-                        from artifact_verify import (
-                            verify_output as _vo_pre,
-                            render_verdict as _rv_pre,
-                        )
-                        _pre = _vo_pre(input_source, _publish_tmp, {})
-                    except Exception as _pe:
-                        logger.error("STAGE7_PREPUBLISH_VERIFY_ERROR",
-                                     f"pre-publish check raised: {_pe}")
-                        return 86
-                    if not _pre.get("ok"):
-                        # R12-15：这道门也要尊重用户的强制开关，但**不能一律放行**。
-                        # 分清两类：
-                        #   * 硬错误（源不可读 / 成品缺失 / 探测不可用）——
-                        #     属于"事实未知或根本没法量"，强制发布等于蒙，
-                        #     任何开关都不放行；
-                        #   * 普通质量失败（帧数/亮度等判据为 False）——
-                        #     用户可以显式承担风险，与全链门/机械门一致。
-                        _hard = (_pre.get("hard_error") or "").strip()
-                        if _hard:
-                            logger.error(
-                                "STAGE7_PREPUBLISH_HARD_ERROR",
-                                "Refusing to publish: the staged attempt hit a "
-                                "hard error (unreadable / missing / unmeasurable)"
-                                " which cannot be force-published. The existing "
-                                "output is left untouched.",
-                                attempt_id=_attempt_id, hard_error=_hard,
-                                verdict=_rv_pre(_pre) if _pre else "")
-                            _discard_attempt_tmp(_publish_tmp, logger)
-                            return 86
-                        _force_pre = _force_publish_enabled(
-                            params, "allow_verify_fail_publish")
-                        if not _force_pre:
-                            logger.error(
-                                "STAGE7_PREPUBLISH_VERIFY_FAIL",
-                                "Refusing to publish: the staged attempt failed "
-                                "the mechanical check. The existing output is "
-                                "left untouched. Set "
-                                "allow_verify_fail_publish=true to force.",
-                                attempt_id=_attempt_id,
-                                verdict=_rv_pre(_pre) if _pre else "")
-                            return 86
-                        # 强制放行：必须留痕，且**不得**写成"已验证"。
-                        _prechecks["prepublish_forced"] = {
-                            "forced": True,
-                            "reason": "allow_verify_fail_publish",
-                            "verdict": _rv_pre(_pre) if _pre else "",
-                        }
-                        logger.error(
-                            "STAGE7_PREPUBLISH_FORCE_PUBLISHED",
-                            "Pre-publish check FAILED but "
-                            "allow_verify_fail_publish is on: publishing "
-                            "anyway. The artifact is NOT verified.",
-                            attempt_id=_attempt_id,
-                            verdict=_rv_pre(_pre) if _pre else "")
-                    # R12-04：帧序检查也必须**在覆盖之前**完成。
-                    # 原来它只对已发布的正式路径执行 —— 一旦错序，旧成品
-                    # 已被 os.replace 换掉，再返回 86 也救不回来。
-                    # 这里对 attempt 暂存件核一次，不过就不发布。
-                    try:
-                        from artifact_verify import (
-                            verify_frame_alignment as _vfa_pre,
-                            render_alignment as _ra_pre,
-                        )
-                        _align_pre = _vfa_pre(
-                            input_source, _publish_tmp, samples=4)
-                    except Exception as _ae:
-                        logger.error("STAGE7_PREPUBLISH_ALIGN_ERROR",
-                                     f"pre-publish alignment raised: {_ae}")
-                        return 86
-                    if _align_pre.get("ok") is False:
-                        logger.error(
-                            "STAGE7_PREPUBLISH_ALIGN_FAIL",
-                            "Refusing to publish: the staged attempt has "
-                            "shifted frame order. The existing output is "
-                            "left untouched.",
-                            attempt_id=_attempt_id,
-                            verdict=_ra_pre(_align_pre))
-                        _discard_attempt_tmp(_publish_tmp, logger)
-                        return 86
-                    _prechecks["alignment_precheck"] = {
-                        "ok": _align_pre.get("ok"),
-                        "flipped": _align_pre.get("flipped"),
-                        "checked": len(_align_pre.get("points") or []),
-                    }
 
-                    logger.info("STAGE7_PREPUBLISH_VERIFY_OK",
-                                "Staged attempt passed the mechanical check "
-                                "and frame-order check; publishing now",
-                                attempt_id=_attempt_id)
+
+                    # ---- R12-05：锁内只做**身份复核**，不重新解码 ----
+                    # 候选件由本 attempt 独占（文件名含 attempt_id，
+                    # 且所有写入者已关闭），所以不需要在锁内重算摘要
+                    # ——那会让长片每次取锁都全量 hash 一遍。
+                    # 这里核对 (设备号, inode, 大小, mtime) 是否与锁外
+                    # 冻结时一致：变了说明有人动过这份候选，立即拒绝。
+                    try:
+                        _now_stat = os.stat(_publish_tmp)
+                    except OSError as _oe:
+                        logger.error(
+                            "STAGE7_CANDIDATE_VANISHED",
+                            "The staged candidate disappeared before publish",
+                            attempt_id=_attempt_id, error=str(_oe))
+                        return 86
+                    _id_now = (getattr(_now_stat, "st_dev", 0),
+                               getattr(_now_stat, "st_ino", 0),
+                               _now_stat.st_size,
+                               _now_stat.st_mtime_ns)
+                    _id_then = (getattr(_cand_stat, "st_dev", 0),
+                                getattr(_cand_stat, "st_ino", 0),
+                                _cand_stat.st_size,
+                                _cand_stat.st_mtime_ns)
+                    if _id_now != _id_then:
+                        logger.error(
+                            "STAGE7_CANDIDATE_CHANGED",
+                            "The staged candidate changed after it was "
+                            "verified; refusing to publish a file whose "
+                            "identity no longer matches the report",
+                            attempt_id=_attempt_id,
+                            identity_before=_id_then, identity_now=_id_now)
+                        return 86
 
                     if os.path.exists(output_path) and not _same_volume(
                             _publish_tmp, output_path):
@@ -2730,6 +2916,21 @@ def main():
                                 output=output_path, attempt_id=_attempt_id)
                     # GATE-03：只有发布成功，本次 attempt 的全链报告才转正
                     # 为正式 sidecar。失败时不覆盖上一代的报告。
+                    # R12-05：verify 报告与媒体一起转正；转不过去就是
+                    # 本代不完整（媒体已换、报告没跟上），不能报成功。
+                    if _side_tmp:
+                        try:
+                            os.replace(_side_tmp,
+                                       f"{output_path}.verify.json")
+                            _side_tmp = None
+                        except OSError as _ve2:
+                            logger.error(
+                                "STAGE7_VERIFY_SIDECAR_PROMOTE_FAIL",
+                                "Media was promoted but its verify report "
+                                "could not be; this generation is INCOMPLETE.",
+                                attempt_id=_attempt_id, error=str(_ve2))
+                            _generation_incomplete = True
+
                     if _fc_pending:
                         try:
                             import shutil as _sh2
@@ -2773,142 +2974,30 @@ def main():
                                 f"Failed to copy {output_path} back to {original_output_path}")
                     return 82
             
-            # 产物核对（第七轮）：stage7 只做编码，**不改帧数**。
-            # 对比 stage7 的输入（stage6 产物）与最终成品：
-            # 帧数必须精确相等，时长 ±3%，首末帧画面应高度接近
-            # （同分辨率同内容，只差一次编码）。
-            #
-            # 之所以核对的是"输入 vs 成品"而不是"源片 vs 成品"：
-            # stage7 的责任边界就是编码这一步。全链丢帧由
-            # `artifact_verify.verify_output(源, 成品)` 这个独立入口查。
-            try:
-                from artifact_verify import verify_output, render_verdict
-                _ver = verify_output(input_source, output_path, {})
-                # 把发布前完成的检查结果并进最终报告（R12-06 / R12-04）。
-                if _prechecks:
-                    _ver.setdefault("prechecks", {}).update(_prechecks)
-                _side = str(output_path) + ".verify.json"
-                try:
-                    import json as _json
-                    with open(_side, "w", encoding="utf-8") as _f:
-                        _json.dump(_ver, _f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
-                # 逐帧对齐（第七轮）：**只在帧序不变的两端可靠**。
-                #
-                # stage7 是纯编码，输入（step6 产物）与输出（成品）的
-                # 帧序严格一一对应。实测：对应帧相关系数 1.0000，
-                # 邻居帧 0.65-0.96，判别力极强。
-                #
-                # **不要**把这个结果拿去推"源片 vs 全链成品"—— 中间有
-                # QTGMC 去隔行，输出第 k 帧不等于源第 k 帧时刻，
-                # 那种比法会给出 8/8 全 flipped 的假警报。
-                try:
-                    from artifact_verify import (verify_frame_alignment,
-                                                 render_alignment)
-                    # R12-04：这里是**发布后的审计读回**，不再改变本次结论。
-                    # 阻断判定已在上面的发布前门完成（对暂存件）；发布之后
-                    # 才发现的错序无法回救旧成品，再改 _ver["ok"] 只会让
-                    # "文件已换掉、报告说失败"变成不一致状态。
-                    #
-                    # 只有**跨卷复制**发布才需要读回：同卷 os.replace 是改名，
-                    # 字节与暂存件完全相同，发布前已经核过，重复全量解码
-                    # 只是白烧时间。
-                    _align = (
-                        verify_frame_alignment(input_source, output_path,
-                                               samples=4)
-                        if _published_by_copy else
-                        {"ok": True, "skipped": "same-volume rename",
-                         "flipped": 0, "points": []})
-                    _ver["alignment_postaudit"] = {
-                        "ok": _align.get("ok"),
-                        "flipped": _align.get("flipped"),
-                        "checked": len(_align.get("points") or []),
-                    }
-                    if _align.get("ok") is True:
-                        logger.info("STAGE7_ALIGN_OK",
-                                    "Frame order verified on sampled points",
-                                    flipped=_align.get("flipped"),
-                                    checked=len(_align.get("points") or []))
-                    elif _align.get("ok") is False:
-                        logger.error("STAGE7_ALIGN_POSTAUDIT_MISMATCH",
-                                     "Post-publish audit sees shifted frame "
-                                     "order; the pre-publish check passed, so "
-                                     "this indicates a copy/encode fault. "
-                                     "Artifact is already live.",
-                                     verdict=render_alignment(_align))
-                        _ver.setdefault("issues", []).append({
-                            "level": "warning",
-                            "code": "FRAME_ORDER_SHIFTED",
-                            "message": _align.get("note") or "帧序错位",
-                        })
-                    else:
-                        # 采样点判别力不足 —— 如实记"未校验"，不假装通过
-                        logger.warning("STAGE7_ALIGN_SKIPPED",
-                                       _align.get("error") or "无法判定",
-                                       skipped=_align.get("skipped"))
-                except Exception as _ae:
-                    logger.warning("STAGE7_ALIGN_ERROR", str(_ae))
-
-                # GATE-03 / R12-04：sidecar 必须写**最终**结论。
-                # 对齐已改为"发布前阻断 + 发布后仅审计"，所以它不会再
-                # 把 _ver["ok"] 改 False；但 _ver 仍可能被预检查标记，
-                # 这里统一在写盘前落定，避免磁盘与实际结论不一致。
-                try:
-                    import json as _json2
-                    with open(_side, "w", encoding="utf-8") as _f2:
-                        _json2.dump(_ver, _f2, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
-
-                if _ver.get("ok"):
-                    logger.info("STAGE7_VERIFY_OK",
-                                "Output passed the mechanical check "
-                                "(frame count / duration / first-last frame "
-                                "/ frame order)", sidecar=_side)
-                else:
-                    logger.error("STAGE7_VERIFY_FAIL",
-                                 "Output failed the mechanical check",
-                                 sidecar=_side,
-                                 verdict=render_verdict(_ver))
-                    # FIX-2026-10-24：这道门原本**没有强制开关**，无条件
-                    # return 86。于是"用户能强制跑通整个流程"这个要求
-                    # 只满足了两道门（音画同步、全链核对），第三道绕不过去。
-                    #
-                    # 实测（2026-10-24，VID_20150614_145458）：
-                    #   帧数 292→292 完全正确，但时长 15.163→15.723
-                    #   （+3.7%）触发 DURATION_MISMATCH → 作业判 86，
-                    #   成品其实已经落盘且可用。
-                    #
-                    # 现在与另两道门统一：allow_verify_fail_publish 为真时
-                    # 保留成品并按成功返回，但记 ERROR 且 verdict 留在
-                    # .verify.json 里 —— **不等于验过**。
-                    _mforce = _force_publish_enabled(
-                            params, "allow_verify_fail_publish")
-                    if _mforce:
-                        logger.error(
-                            "STAGE7_VERIFY_FAIL_FORCE_ACCEPTED",
-                            "Mechanical check FAILED but "
-                            "allow_verify_fail_publish is on: keeping the "
-                            "artifact and treating the run as SUCCESS. "
-                            "The artifact is NOT verified.",
-                            sidecar=_side, verdict=render_verdict(_ver))
-                    else:
-                        # 核对失败不清成品（它可能仍有价值），但必须让 main
-                        # 知道这次运行不算成功 —— 退出码 86 = 验证失败。
-                        if _cancel_guard is not None:
-                            _cancel_guard.release_outputs()
-                        return 86
-            except Exception as _ve:
-                # R12-05 / R13-07：核对器自身出问题**不是**"通过"。
-                # 阻断判定已在发布前完成，所以这里不推翻已发布的媒体；
-                # 但必须记成 ERROR 并让结论显式变为"未验证"，
-                # 不能只留一条 warning 就当作正常结束。
-                logger.error("STAGE7_VERIFY_ERROR",
-                             "The post-publish verifier raised; this "
-                             "generation's verification result is UNKNOWN "
-                             "(not a pass)", error=str(_ve))
-                _prechecks["postverify_error"] = str(_ve)
+            # ==== R12-05：核对早已在锁外对**候选件**完成 ====
+            # 原来这里会再对正式路径跑一次 `verify_output` 并重写 sidecar：
+            #   ① 多花一次全量解码（12 秒片子约 5 分钟，长片不可接受）；
+            #   ② A 释放锁后 B 可能已替换媒体，A 的结论会落在 B 的文件上。
+            # 现在核对对象固定为 `_publish_tmp`，报告已随媒体一起转正，
+            # 这里只如实汇报那份**已冻结**的结论。
+            from artifact_verify import render_verdict as _render_verdict
+            _ver = _ver_doc
+            _side = f"{output_path}.verify.json"
+            if _ver.get("ok"):
+                logger.info("STAGE7_VERIFY_OK",
+                            "Candidate passed the mechanical check BEFORE "
+                            "publish (frame count / duration / first-last "
+                            "frame / frame order); the published file is the "
+                            "same bytes", sidecar=_side,
+                            media_sha256=_cand_digest)
+            else:
+                # 走到这里只可能是 allow_verify_fail_publish 强制放行过
+                logger.error(
+                    "STAGE7_VERIFY_FAIL",
+                    "The published candidate FAILED the mechanical check and "
+                    "was only published because allow_verify_fail_publish is "
+                    "on. This artifact is NOT verified.",
+                    sidecar=_side, verdict=_render_verdict(_ver))
 
             if _cancel_guard is not None:
                 # NEW-V-06: 产物已完整落盘（含 WSL 回拷），取消守卫不再有权
