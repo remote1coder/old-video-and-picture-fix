@@ -722,9 +722,16 @@ def test_rv12_failed_encode_leaves_no_partial_and_records_failed(tmp_path,
     assert rc == 84
     assert not final.exists(), "失败后最终路径上仍留有半成品（RV-12 未修复）"
     assert not (out / "clip_restored.avif.partial").exists()
+    # R13-04：**提交前失败不再覆写正式 status**。
+    # 正式 generation 状态只由 publisher 在事务内更新；一次失败尝试的诊断
+    # 写到 attempt 专属侧车，调度器读那一份即可。
     status_file = out / "clip_restored.avif.status.json"
-    assert status_file.exists(), "失败没有留下 FAILED 记录"
-    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert not status_file.exists(), \
+        "失败尝试不应创建/覆写正式 status（会污染旧代的有效状态）"
+
+    attempts = sorted(out.glob("clip_restored.avif.status.json.attempt-*.json"))
+    assert attempts, "失败没有留下 attempt 级 FAILED 记录"
+    status = json.loads(attempts[-1].read_text(encoding="utf-8"))
     assert status["status"] == "FAILED"
     assert status["failed_operation"] == "avif_encode"
     # 同一提交集合：母版也不能留下"半个提交"
