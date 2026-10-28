@@ -1363,7 +1363,13 @@ def _validate_av_sync(muxed_path: str, logger,
         ]
 
     # level: 3=fail, 2=warn, 1=warn(>100ms), 0=minor
-    _worst = {"level": 0, "name": None, "mag": 0.0, "thr": None, "lag": None}
+    # R13-01：初值必须是**合法 winner**。
+    # 原来 thr/lag/name 都是 None，而更新条件是"等级更高 或 同等级且幅值更大"——
+    # 三个分量都恰好为 0 时两个条件都不成立，_worst 永远不被更新，
+    # thr 保持 None，随后 `f"{None:.0f}"` 直接抛 TypeError → 整阶段返回 82。
+    # 而"三分量全零"正是**最正常的情况**（源片与成品都没漂）。
+    _worst = {"level": 0, "name": "none", "mag": 0.0,
+              "thr": 0.0, "lag": False}
     for _nm, _mag in _comp_ms:
         _lag = _mag > 0
         _f = _ms("sync_fail_ms_lag" if _lag else "sync_fail_ms_lead",
@@ -1386,9 +1392,9 @@ def _validate_av_sync(muxed_path: str, logger,
 
     diff_ms = max(abs(m) for _n, m in _comp_ms)
     _comp_txt = " / ".join(f"{n} {m:+.0f}ms" for n, m in _comp_ms)
-    _dir_txt = ("audio lags" if _worst["lag"] else "audio leads")
-    _worst_txt = (f"worst: {_worst['name']} {_worst['mag']:.0f}ms "
-                  f"({_dir_txt}, threshold {_worst['thr']:.0f}ms)")
+    # 无漂移时不谈方向（原来的三元式会把 None 当 False，写出"audio leads"）
+    _dir_txt = ("no drift" if _worst["name"] == "none"
+                else ("audio lags" if _worst["lag"] else "audio leads"))
 
     if _worst["level"] == 3:
         logger.error("STAGE7_SYNC_FAIL",

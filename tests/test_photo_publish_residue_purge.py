@@ -109,3 +109,44 @@ def test_success_path_calls_purge():
     assert i_purge < i_done, \
         "成功路径的清理必须在 STAGE6_DONE 之前"
     assert "keep_journal=True" in text, "成功路径清理必须保留 journal"
+
+
+def test_purge_reports_failed_instead_of_swallowing(tmp_path):
+    """R13-08：删除失败必须如实报告，不能"吞掉 OSError 当已清理"。
+
+    在 Windows 上持有一个打开的文件句柄即可让 os.remove 失败，
+    这是真实失败路径，不是桩。
+    """
+    import os
+    bk = tmp_path / "0_out.avif"
+    bk.write_bytes(b"x")
+    jp = tmp_path / "j.json"
+    jp.write_text("{}", encoding="utf-8")
+    report = {"targets": {"out.avif": {"backup": str(bk)}}}
+
+    fh = open(str(bk), "rb")          # 占住句柄
+    try:
+        r = s6._purge_publish_residue(str(jp), report, None, keep_journal=True)
+        assert r["failed"], "删除失败必须出现在 failed 里"
+        assert any(str(bk) in str(f.get("path")) for f in r["failed"]), r
+        assert str(bk) not in r["removed"], "失败的文件不能同时算已删"
+    finally:
+        fh.close()
+
+
+def test_success_path_branches_on_purge_result():
+    """R13-08：成功提交后的清理必须**读返回值**，不能无条件写"已清理"。
+
+    这条守调用形态；真实失败返回由上面的行为用例证明。
+    """
+    import os
+    src = os.path.join(_ROOT if "_ROOT" in globals() else
+                       os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "photo_restoration_pipeline", "stages",
+                       "stage6_encode.py")
+    text = open(src, encoding="utf-8", errors="replace").read()
+    assert 'STAGE6_PUBLISH_RESIDUE_PURGE_PENDING' in text, \
+        "清理失败要有独立事件，不能只写 PURGED"
+    # 三处调用都必须把返回值接住
+    assert text.count("_cl = _purge_publish_residue(") >= 3, \
+        "三处 purge 调用都要接返回值"
