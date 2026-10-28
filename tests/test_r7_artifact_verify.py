@@ -275,7 +275,12 @@ def test_stage7_runs_the_check_and_fails_with_86():
     assert "STAGE7_VERIFY_FAIL" in src
     assert "return 86" in src, "核对失败必须让运行不算成功"
     # 核对器自身异常不能把成功编码判死
-    assert "STAGE7_VERIFY_ERROR" in src
+    # R12-05：核对已前移到**发布前**（对候选件），异常分支随之改名。
+    # 行为比原来更严：原实现是发布后核对、异常只 warning 且成品已落盘；
+    # 现在是发布前核对、异常直接 return 86 且正式路径一个字节没动。
+    assert ("STAGE7_PREPUBLISH_VERIFY_ERROR" in src
+            or "STAGE7_VERIFY_ERROR" in src), \
+        "核对器异常必须有明确分支，不能静默通过"
 
 
 # ---------------------------------------------------------------------------

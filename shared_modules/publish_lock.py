@@ -170,15 +170,26 @@ def acquire_target_locks(targets: Iterable[Optional[str]],
     try:
         for target in ordered:
             lp = lock_path_for(target)
-            try:
-                os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
-                fh = open(lp, "a+b")
-            except OSError as exc:
-                if logger:
-                    logger.error("PUBLISH_LOCK_OPEN_FAIL",
-                                 f"cannot open lock file {lp}: {exc}",
-                                 path=lp)
-                raise
+            # 并发创建锁文件本身有竞态：两个进程同时 open("a+b") 同一个
+            # 不存在的文件时，Windows 上可能抛 PermissionError/EACCES
+            # （另一进程正在 create）。那不是"没有权限"，重试即可。
+            # 原实现对 OSError 直接 raise，于是并发场景会**偶发**失败。
+            _open_deadline = time.monotonic() + max(0.0, float(timeout))
+            while True:
+                try:
+                    os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
+                    fh = open(lp, "a+b")
+                    break
+                except OSError as exc:
+                    if (time.monotonic() >= _open_deadline
+                            or getattr(exc, "errno", None) not in
+                            (errno.EACCES, errno.EAGAIN, 13, 11)):
+                        if logger:
+                            logger.error("PUBLISH_LOCK_OPEN_FAIL",
+                                         f"cannot open lock file {lp}: {exc}",
+                                         path=lp)
+                        raise
+                    time.sleep(poll_interval)
             got = False
             while True:
                 if _try_lock(fh):
