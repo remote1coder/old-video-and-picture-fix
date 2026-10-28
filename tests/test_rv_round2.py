@@ -657,6 +657,41 @@ def test_rv11_face_metadata_changes_the_cache_identity(tmp_path):
 # RV-12 · 产物事务发布（编码器替身：写半截 + 失败）
 # ---------------------------------------------------------------------------
 
+class _SubprocessShim:
+    """把 stage6 看到的 `subprocess` 换成"只有 Popen 是假的"。
+
+    原来直接 `monkeypatch.setattr(s6.subprocess, "Popen", ...)` ——
+    但 `s6.subprocess` 就是**全局 subprocess 模块**，于是该测试期间
+    任何 `subprocess.run()`（内部是 `with Popen(...) as p:`）都会拿到
+    假 Popen 并抛 "does not support the context manager protocol"。
+    这会让测试结果依赖**前面跑过哪些测试**（全量跑时失败、单跑通过）。
+
+    这里只替换 stage6 这一侧的引用，`run()` 也走同一个替身，
+    不再污染进程全局。
+    """
+
+    def __init__(self, real, fake_popen):
+        self._real = real
+        self.Popen = fake_popen
+
+    def run(self, cmd, **kw):
+        p = self.Popen(cmd, **kw)
+        out, err = p.communicate()
+
+        class _Completed:
+            pass
+
+        r = _Completed()
+        r.returncode = p.returncode
+        r.stdout = out
+        r.stderr = err
+        r.args = cmd
+        return r
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 class _FakeProc:
     """编码器替身：把"写了一半再返回失败"做成确定性行为。"""
 
@@ -664,6 +699,19 @@ class _FakeProc:
         self.cmd = cmd
         self.returncode = returncode
         self._write = write_bytes
+        self.stdout = None
+        self.stderr = None
+
+    # `subprocess.run()` 内部是 `with Popen(...) as process:` ——
+    # 桩缺上下文管理器协议时，只要被测代码走了 run() 而不是直接 Popen，
+    # 就会抛 "does not support the context manager protocol"。
+    # 这是桩不完整，不是产品缺陷；补齐后两条路径都能被替身覆盖。
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.wait()
+        return False
 
     def communicate(self, timeout=None):
         if self._write:
@@ -702,7 +750,8 @@ def _run_stage6(tmp_path, monkeypatch, fake_cls, extra_params=None):
     monkeypatch.setattr(s6.media_io, "detect_avifenc_capability",
                         lambda *a, **k: media_io.AvifencCapability(
                             available=True, version=(1, 4, 2)))
-    monkeypatch.setattr(s6.subprocess, "Popen", fake_cls)
+    # 只替换 stage6 看到的 subprocess，不动进程全局模块（见 _SubprocessShim）
+    monkeypatch.setattr(s6, "subprocess", _SubprocessShim(subprocess, fake_cls))
     argv = [sys.argv[0], "--input", str(temp / "clip.tif"),
             "--job-id", "job001", "--params", json.dumps(params)]
     monkeypatch.setattr(sys, "argv", argv)
