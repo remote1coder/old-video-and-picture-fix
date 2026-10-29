@@ -961,7 +961,7 @@ def resume_artifact_matches(final_path: str, job: Dict[str, Any],
 
 
 def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
-                      args) -> List[str]:
+                      args, plan=None) -> List[str]:
     """FIX-V03: locate the stage7 final output.
 
     Stage7 writes to ``output_dir`` (stage7_encode.py:517-521), NOT to temp, so
@@ -975,16 +975,39 @@ def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
     """
     import glob
     candidates: List[str] = []
-    explicit = job.get("output_path") or ""
-    if explicit and os.path.exists(explicit):
-        candidates.append(explicit)
     output_dir = ""
     if isinstance(args, dict):
         output_dir = args.get("output") or ""
+        _relocate = args.get("relocate_output")
     else:
         output_dir = getattr(args, "output", "") or ""
+        _relocate = getattr(args, "relocate_output", None)
     if not output_dir:
         output_dir = config.get("global", {}).get("output_dir", "./output")
+
+    # ---- R15-02：**权威目标优先** ----
+    # 原来这里只看 job.output_path，完全不理会 relocate 的结果 ——
+    # 于是执行写到 B、完成标记却写到 A（给旧媒体写本次完成记录）。
+    # 现在先按与执行方**同一套**逻辑算出权威路径并优先使用它。
+    try:
+        from run_plan import resolve_final_media_path as _rfmp
+    except ImportError:                      # pragma: no cover - 部署异常
+        _rfmp = None
+    _auth = None
+    if plan is not None:
+        _auth = plan.get("output_path") if hasattr(plan, "get") else None
+    elif _rfmp is not None:
+        try:
+            _auth, _ = _rfmp(job, output_dir=output_dir,
+                             relocate_output=_relocate)
+        except Exception:
+            _auth = None
+    if _auth and os.path.exists(_auth):
+        candidates.append(_auth)
+
+    explicit = job.get("output_path") or ""
+    if explicit and os.path.exists(explicit) and explicit not in candidates:
+        candidates.append(explicit)
     stem = _safe_input_stem(job.get("input_path", ""))
     job_id = str(job.get("job_id", "") or "")
     # RV-09: 同名不同 job 的候选：{stem}_{job_id}_restored.* 由
@@ -1042,14 +1065,64 @@ def _ensure_unique_final_outputs(jobs: List[Dict[str, Any]],
             seen[default_path] = str(job.get("job_id", ""))
 
 
+class _BufferedLog:
+    """预检阶段的日志缓冲：只进内存 + stderr，**不落盘**。
+
+    R15-03：`process_job` 原来在预检之前就 `logger.info("JOB_START", ...)`，
+    而 StructuredLogger 会创建日志目录 —— 一个路径越界的 job 仍然会在
+    授权根之外造出目录。这里把"计划阶段"的所有日志先接住，
+    等路径校验通过、真正建好 job logger 之后再回放进去。
+    """
+
+    def __init__(self, stream=None):
+        self.records = []
+        self._stream = stream
+
+    def _add(self, level, event, msg="", **kw):
+        self.records.append((level, event, msg, kw))
+        if self._stream is not None:
+            try:
+                self._stream.write(
+                    "[preflight %s] %s: %s\n" % (level, event, msg))
+            except Exception:
+                pass
+
+    def info(self, event, msg="", **kw):
+        self._add("info", event, msg, **kw)
+
+    def warning(self, event, msg="", **kw):
+        self._add("warning", event, msg, **kw)
+
+    def error(self, event, msg="", **kw):
+        self._add("error", event, msg, **kw)
+
+    def debug(self, event, msg="", **kw):
+        self._add("debug", event, msg, **kw)
+
+    def flush_into(self, target):
+        """把缓冲的记录回放到真实 logger（顺序不变）。"""
+        if target is None:
+            return
+        for level, event, msg, kw in self.records:
+            fn = getattr(target, level, None) or getattr(target, "info", None)
+            try:
+                fn(event, msg, **kw)
+            except Exception:
+                pass
+
+
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 args, logger) -> Tuple[int, str]:
     """Process a single job through all stages. Returns (exit_code, stderr)."""
     job_id = job["job_id"]
     input_path = job["input_path"]
 
-    logger.info("JOB_START", f"Starting job {job_id}",
-                job_id=job_id, input_path=input_path)
+    # R15-03：计划阶段**零落盘**。所有日志先进缓冲（同时打 stderr），
+    # 路径校验通过、job logger 建好之后再回放 —— 这样"越界路径的 job
+    # 在授权根外造出日志目录"就不可能发生。
+    _pre_log = _BufferedLog(sys.stderr)
+    _pre_log.info("JOB_START", f"Starting job {job_id}",
+                  job_id=job_id, input_path=input_path)
 
     # BUG-042 fix: normalize args to dict early so all downstream code uses dict API
     if not isinstance(args, dict):
@@ -1091,7 +1164,7 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         cli_overrides["force_allow_banned_upscale"] = True
 
     # Merge params
-    params = merge_params(job, config, cli_overrides, logger)
+    params = merge_params(job, config, cli_overrides, _pre_log)
     params["output_path"] = job.get("output_path", "")
 
     # ---- R14-06：有效路径预检，必须先于**首次落盘** ----
@@ -1101,8 +1174,21 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # 后续 stage 只消费这一份（不在 stage 内重新决定位置）。
     try:
         from run_plan import resolve_run_plan as _resolve_run_plan
-    except ImportError:                     # pragma: no cover - 部署异常
+    except ImportError as _rpe:             # pragma: no cover - 部署异常
         _resolve_run_plan = None
+        # R15-03：用户已经要求限制写根时，模块缺失**必须失败** ——
+        # 否则"以为受限"的运行会悄悄回到无限制行为。
+        if args.get("allow_write_root") or config.get("allowed_write_roots"):
+            sys.stderr.write(
+                "[run-plan] FATAL: write roots were requested but "
+                "shared_modules/run_plan.py could not be imported "
+                f"({_rpe}). Refusing to run without path validation.\n")
+            _pre_log.error(
+                "RUNPLAN_MODULE_MISSING",
+                "Write roots were requested but the run-plan module is "
+                "unavailable; refusing to run without path validation.",
+                error=str(_rpe))
+            return 82, "run-plan module missing while write roots requested"
 
     if _resolve_run_plan is not None:
         _roots = (args.get("allow_write_root")
@@ -1111,11 +1197,11 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             job, params, write_roots=_roots,
             relocate_output=args.get("relocate_output"))
         for _w in _plan.warnings:
-            logger.warning("RUNPLAN_WARN", _w, job_id=job_id)
+            _pre_log.warning("RUNPLAN_WARN", _w, job_id=job_id)
         if not _plan.ok:
             for _e in _plan.errors:
-                logger.error("RUNPLAN_BLOCKED", _e, job_id=job_id)
-            logger.error(
+                _pre_log.error("RUNPLAN_BLOCKED", _e, job_id=job_id)
+            _pre_log.error(
                 "RUNPLAN_ABORT",
                 "Refusing to start: the effective run plan has blocking "
                 "path problems. Nothing has been written for this job. "
@@ -1131,7 +1217,9 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         if _plan.get("log_dir"):
             params["log_dir"] = _plan.get("log_dir")
         params["_run_plan"] = _plan.as_dict()
-        logger.info(
+        # R15-02：完成标记必须消费**同一个**计划对象，不能靠重新读正式路径
+        params["_run_plan_obj"] = _plan
+        _pre_log.info(
             "RUNPLAN_OK", "effective run plan resolved",
             job_id=job_id,
             output=params.get("output_path"),
@@ -1156,8 +1244,47 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     if not check_wsl_space(params, logger=logger, job=job):
         return 87, "Insufficient disk space"
 
+    # ---- R15-03：重定向之后必须**再核一次** ----
+    # `checkpoint.check_wsl_space()` 会改写 params["temp_dir"] /
+    # params["output_dir"]（WSL 重定向、空间不足回退）。校验完再换位置，
+    # 等于校验没做。这里对**实际生效**的那份路径重新校验；
+    # 越界就停，不让"验证过又偷偷换目录"发生。
+    if _resolve_run_plan is not None and _roots:
+        try:
+            from run_plan import path_key as _pkey
+        except ImportError:                 # pragma: no cover
+            _pkey = None
+        _plan2 = _resolve_run_plan(job, params, write_roots=_roots,
+                                   relocate_output=args.get("relocate_output"))
+        if not _plan2.ok:
+            for _e in _plan2.errors:
+                logger.error("RUNPLAN_BLOCKED_AFTER_REDIRECT", _e,
+                             job_id=job_id)
+            logger.error(
+                "RUNPLAN_ABORT_AFTER_REDIRECT",
+                "WSL/disk fallback moved a write path outside the authorised "
+                "roots; refusing to continue.", job_id=job_id)
+            return 82, "run-plan invalid after redirect"
+        if _pkey is not None:
+            _old_tmp = _pkey(_plan.get("temp_dir"))
+            _new_tmp = _pkey(_plan2.get("temp_dir"))
+            if _old_tmp != _new_tmp:
+                logger.warning(
+                    "RUNPLAN_TEMP_REDIRECTED",
+                    "The WSL/disk fallback redirected temp_dir; the new "
+                    "location was re-validated against the authorised roots",
+                    job_id=job_id,
+                    before=_plan.get("temp_dir"),
+                    after=_plan2.get("temp_dir"))
+        params["_run_plan_obj"] = _plan2
+        params["_run_plan"] = _plan2.as_dict()
+
     log_dir = params.get("log_dir", "./logs")
     job_logger = get_logger(log_dir=log_dir, job_id=job_id)
+    # R15-03：路径已校验、logger 已建好 —— 现在才把计划阶段的记录回放。
+    # 顺序不变（JOB_START 仍是最早一条），但此前一个字都没写盘。
+    _pre_log.flush_into(logger)
+    _pre_log.flush_into(job_logger)
 
     # Determine stage order
     stages = [
@@ -1565,7 +1692,8 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # RV-09: 成功后写下"这个产物是用哪个输入/哪套参数做出来的"，
     # 否则下一次运行没有任何依据判断能否复用。
     try:
-        finals = find_final_output(job, config, args)
+        finals = find_final_output(job, config, args,
+                                   plan=params.get("_run_plan_obj"))
         for cand in finals:
             if os.path.exists(cand) and os.path.getsize(cand) > 0:
                 write_completion_marker(cand, job, config, job_logger)

@@ -210,6 +210,7 @@ _WRITE_KEYS = (
     "journal_path",
     "temp_dir",
     "log_dir",
+    "log_file",
     "wsl_copyback_path",
 )
 _READ_KEYS = ("input_path",)
@@ -224,6 +225,43 @@ def _derive_sidecars(output_path: str) -> Dict[str, str]:
         "contract_path": output_path + ".contract.json",
         "journal_path": output_path + ".journal.json",
     }
+
+
+def resolve_final_media_path(job: Dict[str, Any],
+                             output_dir: Optional[str] = None,
+                             relocate_output: Optional[str] = None
+                             ) -> Tuple[Optional[str], str]:
+    """决定**最终媒体**路径（单一权威，供执行/发现/标记共用）。
+
+    R15-02：`find_final_output()` 原来自己优先读 `job.output_path`，
+    完全不看 relocate 的结果 —— 于是"执行写到 B、完成标记写在 A"。
+    把这段逻辑抽出来，两个消费者都调它，就不会再分叉。
+
+    Args:
+        job: manifest 里的 job。
+        output_dir: CLI/配置给的输出**目录**（仅在 job 没有显式目标时使用）。
+        relocate_output: 显式重定位目录；给定时媒体落到这里，保留 basename。
+
+    Returns:
+        ``(raw_path, source)``；无法确定时 ``(None, SOURCE_DEFAULT)``。
+    """
+    job_out = job.get("output_path") or ""
+    if relocate_output:
+        basename = (os.path.basename(str(job_out).replace("\\", "/"))
+                    if job_out else f"{job.get('job_id', 'job')}_restored.mkv")
+        return os.path.join(relocate_output, basename), SOURCE_CLI_RELOCATE
+    if job_out:
+        return str(job_out), SOURCE_JOB
+    if output_dir:
+        # **必须与写入方一致**：stage7 的兜底是
+        #   output_dir / f"{Path(input_name).stem}_restored.mkv"
+        # 用 job_id 拼一个不同的名字会让"执行写 A、发现找 B"（R15-02）。
+        stem = os.path.splitext(
+            os.path.basename(str(job.get("input_path") or "")))[0]
+        if not stem:
+            stem = str(job.get("job_id") or "job")
+        return os.path.join(str(output_dir), f"{stem}_restored.mkv"), SOURCE_CLI
+    return None, SOURCE_DEFAULT
 
 
 def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
@@ -250,27 +288,16 @@ def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
     roots = [r for r in (write_roots or []) if r]
 
     # ---- 最终媒体路径 ----
-    job_out = job.get("output_path") or ""
     out_dir = params.get("output_dir") or params.get("output_dir_default") or ""
-
-    if relocate_output:
-        # 显式重定位：用原 basename 落到新目录，来源记为 cli:relocate
-        basename = os.path.basename(str(job_out).replace("\\", "/")) if job_out \
-            else f"{job.get('job_id', 'job')}_restored.mkv"
-        out_raw = os.path.join(relocate_output, basename)
-        out_source = SOURCE_CLI_RELOCATE
-    elif job_out:
-        out_raw, out_source = str(job_out), SOURCE_JOB
-    elif out_dir:
-        # 没有 job 级输出时才用目录 + 约定名
-        name = f"{job.get('job_id', 'job')}_restored.mkv"
-        out_raw = os.path.join(str(out_dir), name)
-        out_source = SOURCE_CLI if params.get("_output_from_cli") else SOURCE_CONFIG
-    else:
+    out_raw, out_source = resolve_final_media_path(
+        job, output_dir=out_dir, relocate_output=relocate_output)
+    if not out_raw:
         out_raw, out_source = "", SOURCE_DEFAULT
         errors.append(
             "输出路径无法确定：既没有 job.output_path，也没有可用的 "
             "output_dir。请在 manifest 或 CLI 中明确指定。")
+    elif out_source == SOURCE_CLI and not params.get("_output_from_cli"):
+        out_source = SOURCE_CONFIG
 
     out_res = resolve_path(out_raw) if out_raw else None
     paths: Dict[str, PathValue] = {
@@ -303,17 +330,49 @@ def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
                                   resolve_path(tmp_raw) if tmp_raw else None,
                                   tmp_source, True)
 
-    # ---- 日志目录 ----
-    log_raw, log_source = _pick([
-        (SOURCE_JOB, job.get("log_path")),
-        (SOURCE_CLI, params.get("log_dir")),
-        (SOURCE_CONFIG, params.get("log_dir_default")),
-    ])
-    if not log_raw:
-        log_raw, log_source = "./logs", SOURCE_DEFAULT
+    # ---- 日志 ----
+    # R15-01：`job.log_path` 是**文件**，不是目录。
+    # `main.py:366` 已经把它转成父目录写进 `params["log_dir"]`，
+    # 并且尊重 CLI 覆盖。这里**不再**用原始文件路径覆盖那个结果——
+    # 否则 logger 会拿一个 `.log` 当目录去 mkdir：
+    #   文件已存在 → 启动失败；不存在 → 造出一个叫 xxx.log 的目录。
+    log_dir_raw = params.get("log_dir") or ""
+    if not log_dir_raw:
+        log_dir_raw = "./logs"
         warnings.append("日志目录未指定，将使用默认 ./logs")
-    paths["log_dir"] = PathValue("log_dir", log_raw, resolve_path(log_raw),
-                                 log_source, True)
+    log_file_raw = job.get("log_path") or ""
+
+    # 来源只做**归因说明**，不改变取值优先级
+    if log_file_raw and os.path.dirname(os.path.abspath(log_file_raw)) and \
+            not params.get("_log_dir_from_cli") and \
+            path_key(os.path.dirname(os.path.abspath(log_file_raw))) == \
+            path_key(log_dir_raw):
+        log_dir_source = SOURCE_JOB
+    elif params.get("log_dir"):
+        log_dir_source = (SOURCE_CLI if params.get("_log_dir_from_cli")
+                          else SOURCE_CONFIG)
+    else:
+        log_dir_source = SOURCE_DEFAULT
+
+    paths["log_dir"] = PathValue("log_dir", log_dir_raw,
+                                 resolve_path(log_dir_raw),
+                                 log_dir_source, True)
+    if log_file_raw:
+        paths["log_file"] = PathValue("log_file", log_file_raw,
+                                      resolve_path(log_file_raw),
+                                      log_dir_source, True)
+    # 类型自检：目录位置若以 .log 结尾、或文件位置的父目录与 log_dir 不符，
+        # 都说明上游把两者搞混了。
+    if os.path.splitext(log_dir_raw)[1].lower() in (".log", ".jsonl"):
+        errors.append(
+            f"log_dir 指向的是文件而不是目录：{log_dir_raw}。"
+            "job.log_path 是文件路径，其父目录才是日志目录。")
+    if log_file_raw:
+        _lf_parent = os.path.dirname(os.path.abspath(log_file_raw))
+        if path_key(_lf_parent) != path_key(log_dir_raw):
+            warnings.append(
+                f"log_file 的父目录（{_lf_parent}）与 log_dir"
+                f"（{log_dir_raw}）不一致；以 log_dir 为准创建目录。")
 
     # ---- WSL 最终回拷目标（仅重定向时存在）----
     wsl_target = job.get("original_output_path") or params.get("wsl_original_output")
@@ -363,8 +422,18 @@ def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
                    errors, warnings)
 
 
+#: 可以**多 job 共享**的容器目录。共享它们不是冲突。
+_SHARED_CONTAINER_KEYS = ("temp_dir", "log_dir")
+
+
 def detect_cross_job_conflicts(plans: Iterable[RunPlan]) -> List[str]:
     """多个 job 的目标集合是否互相踩到（侧车碰撞、媒体同名等）。
+
+    **共享目录不算冲突**（R15-03）：两个 job 用同一个 `temp_dir` 或
+    `log_dir` 是完全正常的 —— 里面有各自的 `job_id` 前缀文件名。
+    真正危险的是**文件级**重合：同一个媒体、同一份侧车。
+
+    另外检查"一个 job 的输出覆盖另一个 job 的输入"。
 
     Returns:
         冲突描述列表；空表示无冲突。
@@ -374,11 +443,29 @@ def detect_cross_job_conflicts(plans: Iterable[RunPlan]) -> List[str]:
         for key, pv in plan.paths.items():
             if not pv.is_write or not pv.resolved:
                 continue
+            if key in _SHARED_CONTAINER_KEYS:
+                continue                     # 容器目录可共享
             owners.setdefault(path_key(pv.resolved) or pv.resolved,
                               []).append(f"{plan.job_id}:{key}")
 
     conflicts: List[str] = []
     for path, who in owners.items():
         if len(who) > 1:
-            conflicts.append(f"路径被多个目标占用：{path} ← {', '.join(who)}")
+            conflicts.append(f"文件路径被多个目标占用：{path} ← {', '.join(who)}")
+
+    # 输出覆盖别人的输入
+    for plan in plans:
+        for other in plans:
+            if other is plan:
+                continue
+            _in = other.get("input_path")
+            if not _in:
+                continue
+            _in_key = path_key(_in)
+            for key, pv in plan.paths.items():
+                if not pv.is_write or not pv.resolved or key in _SHARED_CONTAINER_KEYS:
+                    continue
+                if path_key(pv.resolved) == _in_key:
+                    conflicts.append(
+                        f"{plan.job_id}:{key} 会覆盖 {other.job_id} 的输入：{_in}")
     return conflicts
