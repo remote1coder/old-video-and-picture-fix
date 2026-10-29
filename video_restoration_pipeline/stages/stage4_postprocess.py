@@ -295,6 +295,13 @@ def main():
         # FIX-R6-04: 多输入滤镜图用 -filter_complex + 显式 -map
         "-filter_complex", filter_chain,
         "-map", "[vout]",
+        # ---- R15-04：**必须 passthrough** ----
+        # stage3 的 VFR 路径用 concat + 逐帧 duration 保留原始时间戳，
+        # 但它写出的 MKV 把 `r_frame_rate` 标成了 25/1（帧数正确、标签错）。
+        # 这里如果沿用默认 `-vsync cfr`，ffmpeg 会按 25fps 重新定时，
+        # **丢掉放不下的帧**：真机实测 458 → 381（-16.8%），
+        # 受控复现 120 → 102（-15%）。加 passthrough 后帧数 120 → 120。
+        "-fps_mode", "passthrough",
         "-c:v", "ffv1",
         "-pix_fmt", pix_fmt,
         "-an",
@@ -313,6 +320,26 @@ def main():
                                timeout=3600, shell=False)
         if (r.returncode == 0 and Path(output_path).exists()
                 and Path(output_path).stat().st_size > 0):
+            # ---- R15-04：帧数守恒自查 ----
+            # 这一步以前**没有任何自检**：VFR 输入被重定时成 CFR、
+            # 丢掉 16.8% 的帧，直到 stage7 的全链门才暴露 —— 那时整条
+            # 链路已经跑完。这里提前判，失败就停。
+            try:
+                from frame_conservation import check_conservation
+                _ok, _rep = check_conservation(
+                    stage3_output, output_path, "stage4", logger)
+                if not _ok:
+                    logger.error(
+                        "STAGE4_FRAME_CONSERVATION_BROKEN",
+                        "Post-processing changed the frame count/timing; "
+                        "refusing to hand this intermediate downstream.",
+                        reasons=_rep.get("reasons"))
+                    return 86
+            except ImportError:            # pragma: no cover - 部署异常
+                logger.warning("STAGE4_CONSERVATION_SKIP",
+                               "frame_conservation module missing; the "
+                               "check was NOT performed")
+
             logger.info("STAGE4_DONE", "Post-processing complete",
                         output=output_path)
             # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。

@@ -2293,6 +2293,10 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
             "-i", input_source,
             "-ss", str(ss_time),
             "-t", str(duration),
+            # R15-04：抽帧必须一帧一张。默认 `-vsync cfr` 会对 VFR 源
+            # 按声明的 r_frame_rate 重新定时，**丢掉放不下的帧** ——
+            # 真机实测 458 帧的素材抽出 381 张。
+            "-fps_mode", "passthrough",
             os.path.join(face_frames_dir,
                          f"face_{start_frame:06d}_%04d.png")
         ]
@@ -2330,6 +2334,8 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     extract_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-i", input_source,
+        # R15-04：同上 —— 抽帧要一帧一张，不能让 vsync 丢帧
+        "-fps_mode", "passthrough",
         os.path.join(all_frames_dir, "frame_%08d.png")
     ]
     try:
