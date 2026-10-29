@@ -2936,8 +2936,34 @@ def main():
             try:
                 from timeline_plan import (
                     read_plan as _read_tl,
-                    claim_source_verified as _claim_src)
+                    claim_source_verified as _claim_src,
+                    build_transform_verdict as _build_tv)
                 _tl_plan = _read_tl(temp_dir, job_id)
+
+                # ---- 结论 ②：用户请求的变换是否真的执行了 ----
+                # 以前这里只声明了 `transform_applied_verified: None` 却从没人填，
+                # 读报告的人会以为"这项没意义"，实际是"没人写"。现在必须产出裁定。
+                _tv = _build_tv(
+                    declared_speed=params.get("expected_speed"),
+                    declared_tempo=params.get("expected_tempo"),
+                    original_duration=original_duration,
+                    processed_duration=processed_duration,
+                    timing_state=_timing_state,
+                    tempo_applied=tempo_ratio)
+                if _tv["status"] == "FAIL":
+                    logger.error(
+                        "STAGE7_TRANSFORM_NOT_APPLIED",
+                        "The requested speed/tempo change does not match what "
+                        "was actually produced.", verdict=_tv)
+                elif _tv["status"] == "UNVERIFIED":
+                    logger.warning(
+                        "STAGE7_TRANSFORM_UNVERIFIED",
+                        "A transform was requested but cannot be confirmed.",
+                        verdict=_tv)
+                elif _tv["requested"]:
+                    logger.info("STAGE7_TRANSFORM_VERIFIED",
+                                "The requested transform matches the output",
+                                verdict=_tv)
                 if isinstance(_tl_plan, dict):
                     _src_verified = bool(_tl_plan.get("source_verified"))
                     _out_measured = (_timing_basis == "packet-span")
@@ -2956,6 +2982,8 @@ def main():
                         # 唯一判定入口：③（输出可测）不能把 ① 洗成已验证
                         "source_timing_claimed_verified": _claim_src(
                             _tl_plan, _timing_state),
+                        # 结论 ②：变换是否执行（总会给出裁定，不会是 None）
+                        "transform_applied_verified": _tv,
                     }
                     if not _src_verified:
                         logger.warning(
@@ -2985,6 +3013,41 @@ def main():
             try:
                 from check_result import (
                     CheckResult as _CRr, publish_decision as _pd)
+                # ---- 结论②也进决策门 ----
+                # 声明了 expected_speed=2x 但链路没兑现，却照样报
+                # `verified=true` —— 那是**报告在说谎**。所以把它当一项检查：
+                #   FAIL       → 阻断（可用 allow_verify_fail_publish 强制）
+                #   UNVERIFIED → 不阻断，但 verified 必须为 false
+                #   PASS / NOT_APPLICABLE → 不拖累 verified（没要求变换不该扣分）
+                try:
+                    _tvs = _tv.get("status")
+                except NameError:
+                    _tvs = None
+                    logger.error(
+                        "STAGE7_TRANSFORM_VERDICT_MISSING",
+                        "The transform verdict was not built; refusing to "
+                        "claim the requested transform was applied.",
+                        job_id=job_id)
+                    _checks["transform"] = {
+                        "name": "transform", "status": "UNVERIFIED",
+                        "reason": "transform verdict was never built",
+                        "method": "timeline_plan.build_transform_verdict",
+                        "severity": "error"}
+                else:
+                    if _tvs in ("PASS", "FAIL", "UNVERIFIED"):
+                        _checks["transform"] = {
+                            "name": "transform",
+                            "status": _tvs,
+                            "reason": _tv.get("reason") or "",
+                            "method": "timeline_plan.build_transform_verdict",
+                            "severity": ("error" if _tvs == "FAIL"
+                                         else ("warning" if _tvs == "UNVERIFIED"
+                                               else "info")),
+                            "force_key": ("allow_verify_fail_publish"
+                                          if _tvs == "FAIL" else None),
+                            "evidence": _tv,
+                        }
+
                 _rows = []
                 for _d in _checks.values():
                     # 必须把 severity / force_key / reason 原样带过去，
