@@ -344,3 +344,68 @@ def test_success_with_keep_backups(tmp_path):
                       decision={"publish": True}, keep_backups=True)
     assert res.ok is True
     assert any(".pubbak" in n for n in os.listdir(_backup_dir(tmp_path)))
+
+
+# ---------------------------------------------------------------- WSL 回拷
+
+def test_wsl_copyback_commits_media_and_reports_together(tmp_path):
+    """WSL 最终路径也走同一事务：媒体 + 报告一起，不能只拷媒体。
+
+    原来 `wsl_copy_back()` 只拷媒体、用共享 `<original>.tmp`；报告留在
+    重定向区。现在 stage7 先在**目标侧 attempt 私有暂存**复制，再调用
+    同一个 `publish()` —— 本条验证该协议本身。
+    """
+    redirect_dir = tmp_path / "redirected"
+    wsl_dir = tmp_path / "wsl_original"
+    wsl_dir.mkdir()
+
+    # 重定向区已发布的成果
+    media = _write(redirect_dir / "clip_restored.mkv", b"NEW-MEDIA")
+    verify = _write(redirect_dir / "clip_restored.mkv.verify.json",
+                    b'{"gen":"NEW-verify"}')
+    full = _write(redirect_dir / "clip_restored.mkv.fullchain.json",
+                  b'{"gen":"NEW-fullchain"}')
+
+    # 目标侧私有暂存（模拟 stage7 的 copyfile）
+    import shutil
+    stage_dir = wsl_dir
+    m_s = str(stage_dir / "clip_restored.mkv.wsl-att9.mkv")
+    v_s = str(stage_dir / "clip_restored.mkv.verify.json.wsl-att9")
+    f_s = str(stage_dir / "clip_restored.mkv.fullchain.json.wsl-att9")
+    shutil.copyfile(media, m_s)
+    shutil.copyfile(verify, v_s)
+    shutil.copyfile(full, f_s)
+
+    tgt_m = str(wsl_dir / "clip_restored.mkv")
+    tgt_v = str(wsl_dir / "clip_restored.mkv.verify.json")
+    tgt_f = str(wsl_dir / "clip_restored.mkv.fullchain.json")
+
+    res = pub.publish(
+        [pub.Artifact("media", m_s, tgt_m),
+         pub.Artifact("verify", v_s, tgt_v),
+         pub.Artifact("fullchain", f_s, tgt_f)],
+        journal_path=str(wsl_dir / "clip_restored.mkv.journal.json"),
+        backup_dir=str(tmp_path / "wsl_backup"),
+        attempt_id="att9", decision={"publish": True})
+
+    assert res.ok is True, res.as_dict()
+    assert _read(tgt_m) == b"NEW-MEDIA"
+    assert _read(tgt_v) == b'{"gen":"NEW-verify"}', "报告必须一起过去"
+    assert _read(tgt_f) == b'{"gen":"NEW-fullchain"}'
+
+
+def test_wsl_staging_is_attempt_private_not_shared_tmp(tmp_path):
+    """暂存名必须带 attempt，不能是共享的 `<original>.tmp`。"""
+    import inspect
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage7_encode.py"),
+               encoding="utf-8", errors="replace").read()
+    assert ".wsl-{_attempt_id}" in src, "WSL 暂存必须带 attempt 标识"
+    # 只在**非注释行**里查调用（注释里提到旧函数名是正常的）
+    code = [ln for ln in src.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    assert not any("wsl_copy_back(" in ln for ln in code), \
+        "不得再调用只拷媒体、使用共享 .tmp 的旧实现"
+    assert "import" not in "".join(
+        ln for ln in code if "wsl_copy_back" in ln), \
+        "也不得再导入它"

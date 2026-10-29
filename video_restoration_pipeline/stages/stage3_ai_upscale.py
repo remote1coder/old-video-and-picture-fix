@@ -3029,6 +3029,35 @@ def main():
         except Exception:
             pass
 
+    # ---- R14-05：把**时间轴结论**交给下游（job 级侧车）----
+    # 审核要求"跨阶段保存至少三个不同结论"：
+    #   ① 源时间轴是否已验证；② 用户请求的变换是否执行；③ 输出是否测得。
+    # stage3 只能确定 ① 和 ②；③ 由 stage7 在成品上测。
+    # 写在 temp_dir 里（job 级），因为 stage7 的输入是 stage6 的产物，
+    # 拿不到 stage3 产物旁的侧车。
+    try:
+        from timeline_plan import (
+            build_plan as _build_tl, write_plan as _write_tl)
+        _tl_doc = _build_tl(
+            job_id, _tl_encode, fps_value=fps_str, fps_source=_fps_source,
+            pts_usable=len(all_pts_map or {}), expected_frames=total_frames,
+            assumptions=(["fps came from a spec, not from measurement"]
+                         if _fps_source in ("user-assumed", "manifest-assumed")
+                         else []))
+        _tl_path = _write_tl(temp_dir, _tl_doc)
+        if _tl_path:
+            logger.info("STAGE3_TIMELINE_PLAN",
+                        "Timeline conclusions recorded for downstream stages",
+                        path=_tl_path,
+                        source_timeline=_tl_doc["source_timeline"],
+                        source_verified=_tl_doc["source_verified"],
+                        fps_source=_fps_source)
+        else:
+            logger.warning("STAGE3_TIMELINE_PLAN_FAIL",
+                           "Could not write the timeline plan sidecar")
+    except Exception as _tle:
+        logger.warning("STAGE3_TIMELINE_PLAN_FAIL", str(_tle))
+
     # ID-07：执行指纹落到产物旁边（与身份侧车并列，互不覆盖）
     if _exec_fp:
         try:

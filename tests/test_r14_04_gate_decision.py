@@ -210,3 +210,68 @@ def test_all_pass_with_warning_stays_verified():
     assert d["publish"] is True
     assert d["verified"] is True
     assert d["warnings"] == ["sync"]
+
+
+# ---------------------------------------------------------------- 完整结果集
+
+def test_disabled_fullchain_is_not_applicable_not_missing():
+    """禁用的必需检查要有**明确表示**，不能从汇总里消失。"""
+    rs = [cr.CheckResult("mechanical", cr.PASS),
+          cr.CheckResult("sync", cr.PASS),
+          cr.CheckResult("frame_order", cr.PASS),
+          cr.CheckResult("fullchain", cr.NOT_APPLICABLE,
+                         reason="full_chain_verify is disabled")]
+    d = cr.publish_decision(rs)
+    assert d["publish"] is True
+    assert d["verified"] is True, "禁用的是可选检查，不该拖垮 verified"
+
+
+def test_fullchain_verifier_crash_is_unverified_not_pass():
+    """校验器崩了 → UNVERIFIED，不是通过。"""
+    r = cr.CheckResult("fullchain", cr.UNVERIFIED,
+                       reason="the full-chain verifier raised",
+                       severity="error")
+    d = cr.publish_decision([r])
+    assert d["verified"] is False
+
+
+def test_fullchain_fail_uses_the_verify_force_key():
+    """全链 FAIL 走 `allow_verify_fail_publish`（与机械门同一把钥匙）。"""
+    r = cr.CheckResult("fullchain", cr.FAIL, reason="blocked: DURATION",
+                       severity="error", force_key="allow_verify_fail_publish")
+    assert cr.publish_decision([r])["publish"] is False
+    assert cr.publish_decision(
+        [r], enabled_forces={"allow_sync_fail_publish"})["publish"] is False
+    d = cr.publish_decision(
+        [r], enabled_forces={"allow_verify_fail_publish"})
+    assert d["publish"] is True and d["forced"] is True
+
+
+def test_color_without_enforce_is_pass_plus_warning():
+    """颜色飘移但未开 enforce → PASS+warning（记录，不阻断）。"""
+    r = cr.CheckResult("color", cr.PASS, severity="warning",
+                       reason="delta 3.2 > threshold 3.0 (enforce off)")
+    d = cr.publish_decision([r])
+    assert d["publish"] is True
+    assert "color" in d["warnings"]
+
+
+def test_color_probe_failure_is_unverified():
+    """颜色探不出 → UNVERIFIED。"""
+    r = cr.CheckResult("color", cr.UNVERIFIED,
+                       reason="RGB means could not be probed")
+    assert cr.publish_decision([r])["verified"] is False
+
+
+def test_stage7_records_color_and_fullchain():
+    """source guard：stage7 必须把颜色与全链写进 `_checks`。
+
+    行为由上面的四态用例证明；这里守"有没有真的接进去"。
+    """
+    src = os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                       "stage7_encode.py")
+    text = open(src, encoding="utf-8", errors="replace").read()
+    assert '_checks["fullchain"]' in text, "全链结论未进结果集"
+    assert '_color_checks["color"]' in text, "颜色结论未进结果集"
+    assert "_checks.update(_color_checks or {})" in text, \
+        "颜色结论没有并入 _checks"

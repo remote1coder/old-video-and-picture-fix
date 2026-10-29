@@ -29,7 +29,9 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
 
 from logger import get_logger  # noqa: E402
-from checkpoint import (wsl_redirect_path, wsl_copy_back,
+# R14-01：WSL 回拷改走 publisher 事务，不再调用 wsl_copy_back
+# （它用共享的 `<original>.tmp`，并发时会互相踩，且只拷媒体）。
+from checkpoint import (wsl_redirect_path,
                         select_media_candidates)  # noqa: E402
 # PUB-04（第七轮）：发布目标互斥锁（逐路径加锁，非集合摘要）
 # R14-01：目标锁与事务提交已收进 shared_modules/publisher.py，
@@ -2489,11 +2491,50 @@ def main():
                 _thr = float(params.get("color_drift_threshold",
                                         COLOR_DRIFT_DEFAULT_THRESHOLD))
                 _enforce = bool(params.get("color_drift_enforce", False))
+                # 颜色结论先存局部，等 _checks 建好后合并（同 _sync_checks）
+                _color_checks: Dict[str, Any] = {}
                 _drift = check_color_drift(args.input, _publish_tmp,
                                            threshold=_thr, enforce=_enforce,
                                            logger=logger)
                 _fields = {k: v for k, v in _drift.items()
                            if k != "status"}
+                # R14-04：颜色结论也进**统一结果集**（原来只是日志）。
+                try:
+                    from check_result import (
+                        CheckResult as _CRc, PASS as _Pc, FAIL as _Fc,
+                        UNVERIFIED as _Uc)
+                    _cst = _drift.get("status")
+                    if _cst == "drift":
+                        _ccheck = _CRc(
+                            "color",
+                            (_Fc if _enforce else _Pc),
+                            reason=(f"max channel delta {_drift.get('delta')} "
+                                    f"> threshold {_drift.get('threshold')}"
+                                    + ("" if _enforce else
+                                       " (enforce off: recorded, not blocking)")),
+                            method="color_probe.check_color_drift",
+                            severity=("error" if _enforce else "warning"),
+                            force_key=("allow_verify_fail_publish"
+                                       if _enforce else None),
+                            evidence={"src_mean": _drift.get("src_mean"),
+                                      "out_mean": _drift.get("out_mean"),
+                                      "delta": _drift.get("delta")})
+                    elif _cst == "ok":
+                        _ccheck = _CRc("color", _Pc,
+                                       method="color_probe.check_color_drift",
+                                       evidence={"delta": _drift.get("delta")})
+                    else:
+                        _ccheck = _CRc("color", _Uc,
+                                       reason="RGB means could not be probed",
+                                       method="color_probe.check_color_drift",
+                                       severity="warning")
+                    _color_checks["color"] = _ccheck.as_dict()
+                except Exception as _cce:
+                    _color_checks["color"] = {"name": "color",
+                                              "status": "UNVERIFIED",
+                                              "reason": f"checker error: {_cce}",
+                                              "severity": "warning"}
+
                 if _drift["status"] == "drift":
                     _msg = ("Colour drift between original input and "
                             "encoded output exceeds threshold")
@@ -2553,9 +2594,13 @@ def main():
             _prechecks: Dict[str, Any] = {}
             # R13-07：统一四态结论（PASS/FAIL/UNVERIFIED/NOT_APPLICABLE）
             _checks: Dict[str, Any] = {}
-            # 同步门的结论在更早的分支里产生，这里并进来
+            # 同步 / 颜色门的结论在更早的分支里产生，这里并进来
             try:
                 _checks.update(_sync_checks or {})
+            except NameError:
+                pass
+            try:
+                _checks.update(_color_checks or {})
             except NameError:
                 pass
             # R12-05：媒体换了但报告没跟上 → 这一代不完整，不能报成功
@@ -2611,6 +2656,46 @@ def main():
                     logger.error("STAGE7_FULLCHAIN_VERIFY_ERROR",
                                  f"Full-chain verify raised: {_fc_exc}")
                     _fc_blocked = ["VERIFY_ERROR"]
+
+            # R14-04：全链结论进**统一结果集**。
+            # 禁用的必需检查也必须有明确表示，不能从汇总里消失。
+            try:
+                from check_result import (
+                    CheckResult as _CRf, PASS as _Pf, FAIL as _Ff,
+                    UNVERIFIED as _Uf, NOT_APPLICABLE as _NAf)
+                if not _fc_enabled:
+                    _fcheck = _CRf(
+                        "fullchain", _NAf,
+                        reason="full_chain_verify is disabled in this run",
+                        method="artifact_verify.verify_output")
+                elif "VERIFY_ERROR" in (_fc_blocked or []):
+                    _fcheck = _CRf(
+                        "fullchain", _Uf,
+                        reason="the full-chain verifier raised",
+                        method="artifact_verify.verify_output",
+                        severity="error")
+                elif _fc_blocked:
+                    _fcheck = _CRf(
+                        "fullchain", _Ff,
+                        reason="blocked: " + ",".join(_fc_blocked),
+                        method="artifact_verify.verify_output",
+                        severity="error",
+                        force_key="allow_verify_fail_publish",
+                        forced=_force_publish_enabled(
+                            params, "allow_verify_fail_publish"),
+                        evidence={"mode": _fc_mode,
+                                  "blocked": list(_fc_blocked)})
+                else:
+                    _fcheck = _CRf(
+                        "fullchain", _Pf,
+                        method="artifact_verify.verify_output",
+                        evidence={"mode": _fc_mode})
+                _checks["fullchain"] = _fcheck.as_dict()
+            except Exception as _fce:
+                _checks["fullchain"] = {"name": "fullchain",
+                                        "status": "UNVERIFIED",
+                                        "reason": f"check builder error: {_fce}",
+                                        "severity": "error"}
 
             if _fc_blocked:
                 # 与音画同步一致：加**强制出片**逃生门。
@@ -2842,6 +2927,57 @@ def main():
             if _prechecks:
                 _ver_doc.setdefault("prechecks", {}).update(_prechecks)
             _ver_doc["attempt_id"] = _attempt_id
+
+            # ---- R14-05：消费 stage3 的时间轴计划，分开三个结论 ----
+            # ① 源时间轴是否已验证（stage3 判定）
+            # ② 用户请求的变换是否执行（stage3 记录声明 + stage7 的 atempo 决策）
+            # ③ 输出时间轴是否测得（本 stage 的 timing_basis）
+            # **关键**：源未被验证时，不能因为"输出能测"就宣称源时序已验证。
+            try:
+                from timeline_plan import (
+                    read_plan as _read_tl,
+                    claim_source_verified as _claim_src)
+                _tl_plan = _read_tl(temp_dir, job_id)
+                if isinstance(_tl_plan, dict):
+                    _src_verified = bool(_tl_plan.get("source_verified"))
+                    _out_measured = (_timing_basis == "packet-span")
+                    _ver_doc["timeline"] = {
+                        "source_timeline": _tl_plan.get("source_timeline"),
+                        "source_verified": _src_verified,
+                        "manual_interpretation":
+                            _tl_plan.get("manual_interpretation"),
+                        "assumptions": _tl_plan.get("assumptions") or [],
+                        "fps": _tl_plan.get("fps"),
+                        "pts_coverage": _tl_plan.get("pts_coverage"),
+                        "output_measured": _out_measured,
+                        "timing_state": _timing_state,
+                        "timing_basis": _timing_basis,
+                        # 只有"源已验证"且"本次判定为 verified"才敢说源时序成立
+                        # 唯一判定入口：③（输出可测）不能把 ① 洗成已验证
+                        "source_timing_claimed_verified": _claim_src(
+                            _tl_plan, _timing_state),
+                    }
+                    if not _src_verified:
+                        logger.warning(
+                            "STAGE7_SOURCE_TIMELINE_NOT_VERIFIED",
+                            "The source timeline was never established upstream;"
+                            " this run's timing conclusions describe the OUTPUT "
+                            "only and must not be read as source verification.",
+                            job_id=job_id,
+                            source_timeline=_tl_plan.get("source_timeline"),
+                            output_measured=_out_measured)
+                else:
+                    _ver_doc["timeline"] = {
+                        "source_verified": None,
+                        "output_measured": (_timing_basis == "packet-span"),
+                        "timing_state": _timing_state,
+                        "timing_basis": _timing_basis,
+                        "source_timing_claimed_verified": False,
+                        "note": "no upstream timeline plan was found",
+                    }
+            except Exception as _tle2:
+                _ver_doc["timeline"] = {"error": str(_tle2),
+                                        "source_timing_claimed_verified": False}
             _ver_doc["checks"] = _checks
             # ---- R14-04：汇总必须**真的决定是否提交** ----
             # 原来这里只把结论写进报告，`publish=False` 也照样往下提交 ——
@@ -2992,16 +3128,77 @@ def main():
                 published=_pres.published,
                 cleanup_pending=_pres.cleanup_pending or None)
 
-            # WSL redirect: copy back to original Linux path
+            # ---- R14-01：WSL 回拷走**同一个 publisher**，媒体+报告一起 ----
+            # 原来这里只拷媒体、且发生在发布之后，报告留在重定向区；
+            # `wsl_copy_back()` 还使用共享的 `<original>.tmp`，并发时会互相踩。
+            # 现在：先复制到**目标侧 attempt 私有暂存**，再用同一个事务协议提交。
             if original_output_path:
-                if wsl_copy_back(output_path, original_output_path):
-                    logger.info("STAGE7_WSL_COPYBACK",
-                               f"Copied result back to {original_output_path}")
-                    output_path = original_output_path
-                else:
-                    logger.error("STAGE7_WSL_COPYBACK_FAIL",
-                                f"Failed to copy {output_path} back to {original_output_path}")
+                _wsl_arts = []
+                _wsl_staged = []
+                try:
+                    # 媒体
+                    _m_stage = (f"{original_output_path}.wsl-{_attempt_id}"
+                                f"{Path(original_output_path).suffix}")
+                    shutil.copyfile(output_path, _m_stage)
+                    _wsl_staged.append(_m_stage)
+                    _wsl_arts.append(_Artifact("media", _m_stage,
+                                               original_output_path))
+                    # 报告：有就一起走，不能只拷媒体
+                    for _suf, _nm in ((".verify.json", "verify"),
+                                      (".fullchain.json", "fullchain")):
+                        _src = f"{output_path}{_suf}"
+                        if not os.path.exists(_src):
+                            continue
+                        _dst_stage = f"{original_output_path}{_suf}.wsl-{_attempt_id}"
+                        shutil.copyfile(_src, _dst_stage)
+                        _wsl_staged.append(_dst_stage)
+                        _wsl_arts.append(_Artifact(_nm, _dst_stage,
+                                                   f"{original_output_path}{_suf}"))
+                except OSError as _we:
+                    for _t in _wsl_staged:
+                        try:
+                            os.remove(_t)
+                        except OSError:
+                            pass
+                    logger.error(
+                        "STAGE7_WSL_STAGE_FAIL",
+                        "Could not stage the result on the WSL target side; "
+                        "the redirected generation is complete but the "
+                        "original path was not updated",
+                        original=original_output_path, error=str(_we))
                     return 82
+
+                _wres = _publish(
+                    _wsl_arts,
+                    journal_path=f"{original_output_path}.journal.json",
+                    backup_dir=os.path.join(str(temp_dir),
+                                            "publish_backup_wsl"),
+                    attempt_id=f"{_attempt_id}-wsl",
+                    decision=_dec,
+                    logger=logger)
+                if not _wres.ok:
+                    for _t in _wsl_staged:
+                        try:
+                            if os.path.exists(_t):
+                                os.remove(_t)
+                        except OSError:
+                            pass
+                    logger.error(
+                        "STAGE7_WSL_COPYBACK_FAIL",
+                        "The WSL copy-back transaction failed; see the "
+                        "publisher result. The redirected generation is "
+                        "complete, the original path is unchanged unless the "
+                        "generation was fully restored.",
+                        original=original_output_path,
+                        failed_at=_wres.failed_at, restored=_wres.restored,
+                        errors=_wres.errors)
+                    return 82
+                logger.info("STAGE7_WSL_COPYBACK",
+                            "Media and reports committed to the WSL original "
+                            "path as one generation",
+                            original=original_output_path,
+                            published=_wres.published)
+                output_path = original_output_path
             
             # ==== R12-05：核对早已在锁外对**候选件**完成 ====
             # 原来这里会再对正式路径跑一次 `verify_output` 并重写 sidecar：
