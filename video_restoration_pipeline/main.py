@@ -58,6 +58,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Video Restoration Pipeline")
     parser.add_argument("--input", "-i", nargs="+", help="Input directories")
     parser.add_argument("--output", "-o", help="Output directory")
+    # R14-06：授权写根。给出时，任何落在根外的写路径都会在**首次落盘前**
+    # 被拦下并说明是哪一项、来自哪个来源。可重复给出多个根。
+    parser.add_argument(
+        "--allow-write-root", action="append", default=None,
+        metavar="DIR",
+        help="Authorised write root (repeatable). Any write path outside "
+             "these roots aborts the job before anything is written.")
+    # R14-06：显式"重新定位输出"。给定时，媒体与**全部**侧车（verify/
+    # fullchain/status/contract/journal）都改到这个目录，只保留原文件名。
+    # temp/log 不受影响（它们有独立语义，且可能被有意分开配置）。
+    parser.add_argument(
+        "--relocate-output", default=None, metavar="DIR",
+        help="Relocate the final media AND all its sidecars into DIR "
+             "(keeps basenames). temp/log are unaffected.")
     parser.add_argument("--config", "-c", default=str(SCRIPT_DIR / "config.yaml"),
                         help="Config file path")
     parser.add_argument("--manifest", "-m", help="Use existing manifest")
@@ -1079,6 +1093,52 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # Merge params
     params = merge_params(job, config, cli_overrides, logger)
     params["output_path"] = job.get("output_path", "")
+
+    # ---- R14-06：有效路径预检，必须先于**首次落盘** ----
+    # 原来 `--output` 只换 output_dir，而最终媒体仍取 job.output_path，
+    # 于是"换了输出目录"其实没换 —— 2026-10-28 那次误覆盖就是这样发生的。
+    # 这里把全部读写路径物化一次，预检通过后写回 params，
+    # 后续 stage 只消费这一份（不在 stage 内重新决定位置）。
+    try:
+        from run_plan import resolve_run_plan as _resolve_run_plan
+    except ImportError:                     # pragma: no cover - 部署异常
+        _resolve_run_plan = None
+
+    if _resolve_run_plan is not None:
+        _roots = (args.get("allow_write_root")
+                  or config.get("allowed_write_roots") or None)
+        _plan = _resolve_run_plan(
+            job, params, write_roots=_roots,
+            relocate_output=args.get("relocate_output"))
+        for _w in _plan.warnings:
+            logger.warning("RUNPLAN_WARN", _w, job_id=job_id)
+        if not _plan.ok:
+            for _e in _plan.errors:
+                logger.error("RUNPLAN_BLOCKED", _e, job_id=job_id)
+            logger.error(
+                "RUNPLAN_ABORT",
+                "Refusing to start: the effective run plan has blocking "
+                "path problems. Nothing has been written for this job. "
+                "Pass --allow-write-root to declare the authorised roots, "
+                "or --relocate-output to move the outputs explicitly.",
+                job_id=job_id, errors=_plan.errors)
+            return 82, "run-plan preflight failed"
+        # 写回唯一计划：媒体、temp、log 都以它为准
+        if _plan.get("output_path"):
+            params["output_path"] = _plan.get("output_path")
+        if _plan.get("temp_dir"):
+            params["temp_dir"] = _plan.get("temp_dir")
+        if _plan.get("log_dir"):
+            params["log_dir"] = _plan.get("log_dir")
+        params["_run_plan"] = _plan.as_dict()
+        logger.info(
+            "RUNPLAN_OK", "effective run plan resolved",
+            job_id=job_id,
+            output=params.get("output_path"),
+            output_source=_plan.source_of("output_path"),
+            temp_source=_plan.source_of("temp_dir"),
+            log_source=_plan.source_of("log_dir"),
+            write_roots=_plan.write_roots or None)
     # ID-02（第七轮）：把**实际执行用的这一份**参数挂到 job 上，
     # 让 build_params_identity() 拿到同一份（含 CLI 覆盖），
     # 而不是退回"空 CLI 覆盖"的另一次合并。
