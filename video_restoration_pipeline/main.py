@@ -2723,6 +2723,69 @@ def main():
               file=sys.stderr)
         sys.exit(82)
 
+    # ---- R15-05：dispatch 前**一次性**检查所有 job 的计划 ----
+    # 冲突检测本来就写好了（且已区分"共享容器目录"与"独占文件"），
+    # 但从来没有调用点 —— 于是两个 job 写到同一份媒体/侧车、或一个 job 的
+    # 输出覆盖另一个 job 的输入，都要等跑完才发现。这里在**任何子进程启动
+    # 之前**算完全部计划并判定。
+    if len(jobs) > 1:
+        try:
+            from run_plan import (
+                resolve_run_plan as _rp_batch,
+                detect_cross_job_conflicts as _detect_batch)
+        except ImportError:
+            _rp_batch = None
+        if _rp_batch is not None:
+            _roots = None
+            try:
+                _raw = getattr(args, "allow_write_root", None)
+                if _raw:
+                    _roots = ([_raw] if isinstance(_raw, str)
+                              else [str(r) for r in _raw])
+            except Exception:
+                _roots = None
+
+            _plans = []
+            _plan_fail = []
+            _mem_log = _BufferedLog(sys.stderr)
+            for _j in jobs:
+                try:
+                    _jparams = merge_params(_j, config, {}, _mem_log)
+                    _p = _rp_batch(_j, _jparams, write_roots=_roots)
+                    _plans.append(_p)
+                    if not _p.ok:
+                        _plan_fail.append((_j.get("job_id", ""), _p.errors))
+                except Exception as _pe:
+                    _plan_fail.append((_j.get("job_id", ""), [str(_pe)]))
+
+            if _plan_fail:
+                for _jid, _errs in _plan_fail:
+                    logger.error("BATCH_PLAN_INVALID",
+                                 "A job's effective path plan is invalid; "
+                                 "refusing to start the batch.",
+                                 job_id=_jid, errors=_errs)
+                print("ERROR: invalid path plan(s); nothing was dispatched.",
+                      file=sys.stderr)
+                sys.exit(82)
+
+            _conflicts = _detect_batch(_plans)
+            if _conflicts:
+                for _c in _conflicts:
+                    logger.error("BATCH_PLAN_CONFLICT", _c)
+                print("ERROR: the jobs in this batch would collide "
+                      f"({len(_conflicts)} conflict(s)); nothing was dispatched. "
+                      "See the log for detail.", file=sys.stderr)
+                sys.exit(82)
+            logger.info("BATCH_PLAN_OK",
+                        "All jobs' path plans were resolved and checked "
+                        "before dispatch; no collisions",
+                        jobs=len(_plans),
+                        write_roots=_roots or "unrestricted")
+        else:
+            logger.warning("BATCH_PLAN_CHECK_SKIPPED",
+                           "shared_modules/run_plan.py is not importable; the "
+                           "batch collision check was NOT performed")
+
     # Parallel worker pool
     workers = max(1, args.workers)
     if workers > 1 and len(jobs) > 1:
