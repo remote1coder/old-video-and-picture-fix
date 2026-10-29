@@ -110,6 +110,7 @@ def check_conservation(src: str, out: str, stage: str,
                        logger=None,
                        exact_max_bytes: int = DEFAULT_EXACT_MAX_BYTES,
                        duration_tolerance: float = DEFAULT_DURATION_TOLERANCE,
+                       expected_fps: Optional[float] = None,
                        ) -> Tuple[bool, Dict[str, Any]]:
     """核对 ``src`` → ``out`` 有没有被重定时/丢帧。
 
@@ -118,6 +119,10 @@ def check_conservation(src: str, out: str, stage: str,
         out: 本阶段写出的中间产物。
         stage: 阶段名，用于日志。
         exact_max_bytes: ``out`` 小于此值时才做精确帧计数。
+        expected_fps: 本次应当产出的帧率。给出时，若 ``out`` 声明的
+            ``r_frame_rate`` 与它明显不符，记一条**告警**并写进报告 ——
+            VFR 中间产物常被 ffmpeg 标成 25/1（时间戳正确、标签错），
+            下游若漏掉 `-fps_mode passthrough` 就会按这个错标签重定时丢帧。
 
     Returns:
         ``(ok, report)``。``ok=False`` 表示**这一阶段的输出不可信**，
@@ -171,6 +176,25 @@ def check_conservation(src: str, out: str, stage: str,
         rep["exact"] = False
         rep["note"] = ("exact counting skipped (file larger than "
                        f"{exact_max_bytes} bytes); metadata check only")
+
+    # ---- 附加：中间产物的帧率标签是否与本次意图一致（只告警）----
+    if expected_fps and b["r_frame_rate"]:
+        _rel = abs(b["r_frame_rate"] - expected_fps) / max(expected_fps, 1e-9)
+        if _rel > 0.001:
+            rep["fps_label_mismatch"] = {
+                "expected": expected_fps,
+                "labeled": b["r_frame_rate"],
+            }
+            if logger is not None:
+                logger.warning(
+                    "FRAME_FPS_LABEL_MISMATCH",
+                    "The intermediate's declared frame rate does not match "
+                    "what this run intended. Timestamps may still be correct, "
+                    "but any downstream ffmpeg call MUST use "
+                    "`-fps_mode passthrough`, otherwise it will re-time and "
+                    "drop frames.",
+                    stage=stage, expected=round(expected_fps, 4),
+                    labeled=round(b["r_frame_rate"], 4))
 
     if logger is not None:
         if rep["ok"]:

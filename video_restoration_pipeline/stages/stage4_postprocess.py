@@ -326,8 +326,13 @@ def main():
             # 链路已经跑完。这里提前判，失败就停。
             try:
                 from frame_conservation import check_conservation
+                # 传本次意图帧率：中间产物若被标成别的值（VFR 常见 25/1），
+                # 记一条告警提示"下游必须用 passthrough"。
+                from rate_spec import parse_rate_or_none as _prn
+                _want = _prn(params.get("original_fps") or params.get("fps"))
                 _ok, _rep = check_conservation(
-                    stage3_output, output_path, "stage4", logger)
+                    stage3_output, output_path, "stage4", logger,
+                    expected_fps=(_want.value if _want else None))
                 if not _ok:
                     logger.error(
                         "STAGE4_FRAME_CONSERVATION_BROKEN",
