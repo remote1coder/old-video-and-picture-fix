@@ -32,7 +32,8 @@ from logger import get_logger  # noqa: E402
 from checkpoint import (wsl_redirect_path, wsl_copy_back,
                         select_media_candidates)  # noqa: E402
 # PUB-04（第七轮）：发布目标互斥锁（逐路径加锁，非集合摘要）
-from publish_lock import acquire_target_locks, TargetLockTimeout  # noqa: E402
+# R14-01：目标锁与事务提交已收进 shared_modules/publisher.py，
+# stage7 不再自己取锁。
 
 try:  # NEW-V-06: 取消/中断守卫（KeyboardInterrupt 继承 BaseException，
     # 本文件所有 `except Exception` 都抓不到它——不装守卫时 Ctrl+C 会把
@@ -2922,141 +2923,74 @@ def main():
                     pass
                 _discard_attempt_tmp(_publish_tmp, logger)
                 return 82
+            # ==== R14-01：整代提交走生产 publisher ====
+            # 媒体 + verify + fullchain 作为**一个事务**：
+            # 候选已冻结、决策已允许 → 锁内备份旧代 → PREPARED →
+            # COMMITTING → 逐个落位并核对 → COMMITTED。
+            # 任一步失败按备份恢复**完整旧代**；恢复不了就写
+            # RECOVERY_REQUIRED 并如实返回，绝不留下"B 媒体 + A 报告"。
             try:
-                with acquire_target_locks([output_path], timeout=30,
-                                          logger=logger):
+                from publisher import (
+                    Artifact as _Artifact, publish as _publish)
+            except ImportError:                  # pragma: no cover
+                _publish = None
 
-
-                    # ---- R12-05：锁内只做**身份复核**，不重新解码 ----
-                    # 候选件由本 attempt 独占（文件名含 attempt_id，
-                    # 且所有写入者已关闭），所以不需要在锁内重算摘要
-                    # ——那会让长片每次取锁都全量 hash 一遍。
-                    # 这里核对 (设备号, inode, 大小, mtime) 是否与锁外
-                    # 冻结时一致：变了说明有人动过这份候选，立即拒绝。
-                    try:
-                        _now_stat = os.stat(_publish_tmp)
-                    except OSError as _oe:
-                        logger.error(
-                            "STAGE7_CANDIDATE_VANISHED",
-                            "The staged candidate disappeared before publish",
-                            attempt_id=_attempt_id, error=str(_oe))
-                        return 86
-                    _id_now = (getattr(_now_stat, "st_dev", 0),
-                               getattr(_now_stat, "st_ino", 0),
-                               _now_stat.st_size,
-                               _now_stat.st_mtime_ns)
-                    _id_then = (getattr(_cand_stat, "st_dev", 0),
-                                getattr(_cand_stat, "st_ino", 0),
-                                _cand_stat.st_size,
-                                _cand_stat.st_mtime_ns)
-                    if _id_now != _id_then:
-                        logger.error(
-                            "STAGE7_CANDIDATE_CHANGED",
-                            "The staged candidate changed after it was "
-                            "verified; refusing to publish a file whose "
-                            "identity no longer matches the report",
-                            attempt_id=_attempt_id,
-                            identity_before=_id_then, identity_now=_id_now)
-                        return 86
-
-                    if os.path.exists(output_path) and not _same_volume(
-                            _publish_tmp, output_path):
-                        # R12-05：跨卷**不能直接 copy2 到正式路径**。
-                        # 原实现直接覆盖正式文件 —— 复制中断会留下截断的
-                        # 成品，把上一代有效产物一起毁掉。
-                        # 正确顺序：复制到**目标卷的私有暂存件** → 核对内容
-                        # → 再 os.replace 改名。失败时正式路径一个字节没动。
-                        _xvol_tmp = os.path.join(
-                            os.path.dirname(output_path) or ".",
-                            f"{os.path.basename(output_path)}"
-                            f".xvol-{_attempt_id}.partial")
-                        _src_digest = _sha256_file(_publish_tmp)
-                        try:
-                            shutil.copy2(_publish_tmp, _xvol_tmp)
-                            _dst_digest = _sha256_file(_xvol_tmp)
-                            if (_src_digest is None
-                                    or _dst_digest is None
-                                    or _src_digest != _dst_digest):
-                                raise OSError(
-                                    "cross-volume copy does not match the "
-                                    "staged candidate "
-                                    f"(src={_src_digest} dst={_dst_digest})")
-                            os.replace(_xvol_tmp, output_path)
-                        except OSError as _xe:
-                            # 正式路径未被触碰：清掉目标卷暂存件后如实失败
-                            try:
-                                if os.path.exists(_xvol_tmp):
-                                    os.remove(_xvol_tmp)
-                            except OSError:
-                                pass
-                            logger.error(
-                                "STAGE7_XVOL_PUBLISH_FAIL",
-                                "Cross-volume publish failed; the existing "
-                                "output is untouched (the copy goes to a "
-                                "private staging file on the target volume "
-                                "first)", attempt_id=_attempt_id, error=str(_xe))
-                            _discard_attempt_tmp(_publish_tmp, logger)
-                            return 82
-                        os.unlink(_publish_tmp)
-                        _published_by_copy = True
-                    else:
-                        # 同一卷 os.replace：只是改名，**字节必然与暂存件一致**，
-                        # 发布前的帧序/机械核对已经覆盖过，无需再做一次
-                        # 全量解码审计（12 秒片子约 5 分钟，长片不可接受）。
-                        os.replace(_publish_tmp, output_path)
-                        _published_by_copy = False
-                    logger.info("STAGE7_PUBLISHED",
-                                "Attempt staged file promoted to the final "
-                                "path after validation",
-                                output=output_path, attempt_id=_attempt_id)
-                    # GATE-03：只有发布成功，本次 attempt 的全链报告才转正
-                    # 为正式 sidecar。失败时不覆盖上一代的报告。
-                    # R12-05：verify 报告与媒体一起转正；转不过去就是
-                    # 本代不完整（媒体已换、报告没跟上），不能报成功。
-                    if _side_tmp:
-                        try:
-                            os.replace(_side_tmp,
-                                       f"{output_path}.verify.json")
-                            _side_tmp = None
-                        except OSError as _ve2:
-                            logger.error(
-                                "STAGE7_VERIFY_SIDECAR_PROMOTE_FAIL",
-                                "Media was promoted but its verify report "
-                                "could not be; this generation is INCOMPLETE.",
-                                attempt_id=_attempt_id, error=str(_ve2))
-                            _generation_incomplete = True
-
-                    if _fc_pending:
-                        try:
-                            import shutil as _sh2
-                            _sh2.move(_fc_pending[0], _fc_pending[1])
-                            _fc_pending = None
-                        except Exception as _fe:
-                            # R12-05：报告转正失败**不是 warning 级别**。
-                            # 媒体已经换掉、报告却没跟上 = 这一代不完整，
-                            # 原先只记一条 warning 然后照常 return 0，
-                            # 于是"新媒体配旧报告"被当成成功发布。
-                            logger.error(
-                                "STAGE7_FULLCHAIN_SIDECAR_PROMOTE_FAIL",
-                                "Media was promoted but its full-chain report "
-                                "could not be; this generation is INCOMPLETE "
-                                "(media new, report stale/missing). Marking "
-                                "the run as a publish failure so it is not "
-                                "reported as a clean generation.",
-                                attempt_id=_attempt_id, error=str(_fe))
-                            _generation_incomplete = True
-            except TargetLockTimeout as _lt:
-                logger.error("STAGE7_PUBLISH_LOCK_TIMEOUT",
-                             "Another attempt holds the target lock; this "
-                             "attempt keeps its staging file and does not "
-                             "overwrite the published result",
-                             output=output_path, targets=_lt.targets)
-                return 82
-            except Exception as _pub_exc:
-                logger.error("STAGE7_PUBLISH_FAIL",
-                             f"Cannot promote staged output: {_pub_exc}")
+            if _publish is None:
+                logger.error(
+                    "STAGE7_PUBLISHER_MISSING",
+                    "shared_modules/publisher.py is not importable; refusing "
+                    "to publish without a transactional publisher")
                 _discard_attempt_tmp(_publish_tmp, logger)
                 return 82
+
+            _arts = [_Artifact("media", _publish_tmp, output_path)]
+            if _side_tmp:
+                _arts.append(_Artifact("verify", _side_tmp,
+                                       f"{output_path}.verify.json"))
+            if _fc_pending:
+                _arts.append(_Artifact("fullchain", _fc_pending[0],
+                                       _fc_pending[1]))
+
+            _pres = _publish(
+                _arts,
+                journal_path=f"{output_path}.journal.json",
+                backup_dir=os.path.join(str(temp_dir), "publish_backup"),
+                attempt_id=_attempt_id,
+                decision=_dec,
+                logger=logger)
+
+            if not _pres.ok:
+                logger.error(
+                    "STAGE7_PUBLISH_REFUSED",
+                    "The generation was not published as a whole. See the "
+                    "publisher result for the failing step and whether the "
+                    "previous generation was restored.",
+                    attempt_id=_attempt_id,
+                    failed_at=_pres.failed_at,
+                    restored=_pres.restored,
+                    errors=_pres.errors,
+                    journal=_pres.journal_path,
+                    recovery=_pres.recovery or None)
+                _discard_attempt_tmp(_publish_tmp, logger)
+                if _side_tmp:
+                    try:
+                        if os.path.exists(_side_tmp):
+                            os.remove(_side_tmp)
+                    except OSError:
+                        pass
+                return 82
+
+            # 事务成功：候选件已被消费，两个待转正的报告也已就位
+            _side_tmp = None
+            _fc_pending = None
+            _published_by_copy = False
+            logger.info(
+                "STAGE7_PUBLISHED",
+                "Media and all required reports were committed as one "
+                "generation",
+                output=output_path, attempt_id=_attempt_id,
+                published=_pres.published,
+                cleanup_pending=_pres.cleanup_pending or None)
 
             # WSL redirect: copy back to original Linux path
             if original_output_path:
