@@ -193,9 +193,30 @@ def test_sources_are_recorded_for_every_path(tmp_path):
     # job 级优先于 params（保留既有逐 job 配置）
     assert plan.source_of("temp_dir") == rp.SOURCE_JOB
     assert "job_tmp" in plan.get("temp_dir")
-    assert plan.source_of("log_dir") == rp.SOURCE_CLI
+    # log_dir 有独立语义：只有显式标记为 CLI 来源时才记 cli，
+    # 否则视为配置值（R15-01 之后不再从 job.log_path 推断）
+    assert plan.source_of("log_dir") in (rp.SOURCE_CONFIG, rp.SOURCE_CLI)
     d = plan.as_dict()
     assert all("source" in v for v in d["paths"].values())
+
+
+def test_log_dir_source_distinguishes_cli_and_config(tmp_path):
+    """CLI 给的 log_dir 与配置给的必须能区分开。"""
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    base = _job(input_path=_touch(tmp_path / "in" / "c.mp4"),
+                output_path=str(allowed / "o.mkv"))
+
+    p_cfg = rp.resolve_run_plan(
+        base, {"temp_dir": str(allowed / "t"), "log_dir": str(allowed / "l")},
+        write_roots=[str(allowed)])
+    assert p_cfg.source_of("log_dir") == rp.SOURCE_CONFIG
+
+    p_cli = rp.resolve_run_plan(
+        base, {"temp_dir": str(allowed / "t"), "log_dir": str(allowed / "l"),
+               "_log_dir_from_cli": True},
+        write_roots=[str(allowed)])
+    assert p_cli.source_of("log_dir") == rp.SOURCE_CLI
 
 
 def test_no_write_roots_only_warns(tmp_path):
@@ -227,7 +248,7 @@ def test_missing_input_is_an_error(tmp_path):
 
 # ---------------------------------------------------------------- 生产接入
 
-def test_process_job_blocks_before_any_write(tmp_path):
+def test_process_job_blocks_before_any_write(tmp_path, capsys):
     """生产 `process_job` 在**落盘之前**拦下越界输出。
 
     这是 2026-10-28 那次误覆盖的直接回归：旧 manifest 带外部绝对输出，
@@ -272,10 +293,16 @@ def test_process_job_blocks_before_any_write(tmp_path):
     rc, msg = vmain.process_job(job, {}, args, log)
 
     assert rc == 82, f"越界必须先拦，实际 rc={rc} msg={msg}"
-    assert log.has("RUNPLAN_BLOCKED"), log.events
-    assert log.has("RUNPLAN_ABORT")
+    # R15-03：计划阶段**零落盘** —— 被拦下的 job 不写自己的日志，
+    # 诊断走 stderr（缓冲 logger），不会在授权根外造目录。
+    err = capsys.readouterr().err
+    assert "RUNPLAN_BLOCKED" in err, err[:400]
+    assert "RUNPLAN_ABORT" in err, err[:400]
     assert not outside.exists(), "拦截后不得创建任何输出目录"
     assert not (outside / "c_restored.mkv").exists()
+    # 也没有任何 job 日志落到外面
+    assert not (tmp_path / "logs").exists(), \
+        "预检未通过时不应创建日志目录"
 
 
 def test_process_job_relocate_redirects_outputs(tmp_path):
