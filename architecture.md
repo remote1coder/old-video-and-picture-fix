@@ -130,6 +130,29 @@ All shared modules are in `shared_modules/` directory.
 | Cancel Guard | `cancel_guard.py` | Cancellation / interrupt guard (rc=88), managed subprocess runner |
 | AI Runtime | `ai_runtime.py` | Resolve AI subprocess interpreter (`WB_AI_PYTHON` → current → `.venv_r4`) |
 | DAT Runtime | `dat_runtime.py` | DAT architecture configs + PyTorch inference (single source of truth); output format follows the output path extension |
+| **Run Plan** | `run_plan.py` | 解析**有效运行计划**（输入/媒体/侧车/journal/备份/attempt/日志/临时），显式 `write_roots` 时越界即阻断；`detect_cross_job_conflicts()` 区分"共享容器目录"与"独占文件" |
+| **Publisher** | `publisher.py` | 整代事务发布：决策→候选冻结→覆盖全目标的锁→备份旧代→`PREPARED`→身份复核→`COMMITTING`→逐个落位核对→`COMMITTED`；失败按备份恢复完整旧代，恢复不了写 `RECOVERY_REQUIRED` |
+| **Timeline Plan** | `timeline_plan.py` | 三个独立结论的跨阶段载体：① `source_verified`（源时间轴可信）② `transform_applied_verified`（用户请求的变换是否落地）③ `output_measured`（输出是否测得）；`claim_source_verified()` 是唯一判定入口 |
+| **Frame Conservation** | `frame_conservation.py` | 中间产物帧数守恒：元数据快查（帧率+时长，几乎免费）+ 小文件精确计数；`expected_fps` 不符时只告警（VFR 无单一帧率） |
+| **Rate Spec** | `rate_spec.py` | 有理数帧率解析（`30000/1001` 精确保留），不做浮点近似 |
+
+### 4.0 计划 → 执行 → 成套发布（第十六轮定型）
+
+审核反复要求的一条链，现在是这个形状：
+
+| 环节 | 旧入口 | 新入口 | 说明 |
+|---|---|---|---|
+| **解析计划** | 各 stage 各自拼路径 | `run_plan.resolve_run_plan()` | 一次解析，执行/发现/标记/resume/复用共用同一份 |
+| **预检** | 无（或只在 `process_job` 里） | `main` 批次级 + `process_job` 级 | 批次在 **worker pool 之前**算完全部计划，`sys.exit(82)` |
+| **执行** | stage0..7 直写 | 同上（路径不变） | 中间产物一律 attempt 独占 |
+| **成套发布** | stage7 自己 replace + 后补报告 | `publisher.publish()` | 媒体 + verify + fullchain 一个事务；WSL 回拷是第二个事务 |
+| **报告** | 各写各的 | `verify.json` / `fullchain.json` / `journal.json` 同代 | `journal` 记 3 个 target 的摘要 |
+| **结论** | 只报"同步正常" | 三个时间轴结论分开 | `source_verified` / `transform_applied_verified` / `output_measured` |
+
+**三条不能互相替代的规则**（都在代码里，不只是文档）：
+1. 输出测得（③）**不能**把源未知（①）洗成已验证 —— `claim_source_verified()` 要求两侧都成立。
+2. 源可信、输出可测，**不代表**用户要求的变速落地了 —— `build_transform_verdict()` 单独判定，并接入发布决策（`FAIL` 阻断、`UNVERIFIED` 令 `verified=false`）。
+3. VFR 中间产物的 `r_frame_rate` 常是 `25/1` 占位值；下游**必须** `-fps_mode passthrough`，**不要**用 `-r` 去"修"（实测会把 8.0s 的可变时序压成 4.0s）。
 
 ### 4.1 Python Path Setup
 每个 stage 脚本把 `shared_modules` 加入 `sys.path`，但**两条链的层级不同**，
