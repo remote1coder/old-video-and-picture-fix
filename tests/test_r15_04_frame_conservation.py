@@ -155,3 +155,62 @@ def test_large_files_skip_exact_counting(tmp_path, monkeypatch):
     assert ok is True
     assert rep["exact"] is False
     assert "exact counting skipped" in rep.get("note", "")
+
+
+# ---------------------------------------------------------------- 帧率标签告警
+
+def test_fps_label_mismatch_warns_but_does_not_fail(tmp_path, monkeypatch):
+    """中间产物帧率标签与意图不符 → **告警**，不判失败。
+
+    VFR 中间产物常被 ffmpeg 标成 25/1（时间戳仍正确）。下游只要用了
+    `-fps_mode passthrough` 就不会丢帧，所以这里只提示、不阻断。
+    """
+    a = tmp_path / "a.mkv"
+    b = tmp_path / "b.mkv"
+    for p in (a, b):
+        p.write_bytes(b"x" * 512)
+
+    monkeypatch.setattr(
+        fc, "describe",
+        lambda p: {"path": p, "r_frame_rate": 25.0, "avg_frame_rate": 25.0,
+                   "duration": 10.0, "bytes": len(b"x" * 512)})
+
+    class L:
+        def __init__(self):
+            self.events = []
+
+        def info(self, e, m="", **k):
+            self.events.append(("info", e))
+
+        def warning(self, e, m="", **k):
+            self.events.append(("warn", e))
+
+        def error(self, e, m="", **k):
+            self.events.append(("error", e))
+
+    log = L()
+    ok, rep = fc.check_conservation(str(a), str(b), "stage4", log,
+                                    expected_fps=30.146,
+                                    exact_max_bytes=10)
+    assert ok is True, "标签不符只告警，不应判失败"
+    assert rep.get("fps_label_mismatch", {}).get("labeled") == 25.0
+    assert ("warn", "FRAME_FPS_LABEL_MISMATCH") in log.events
+
+
+def test_fps_label_match_does_not_warn(tmp_path, monkeypatch):
+    a = tmp_path / "a.mkv"
+    b = tmp_path / "b.mkv"
+    for p in (a, b):
+        p.write_bytes(b"x" * 512)
+
+    monkeypatch.setattr(
+        fc, "describe",
+        lambda p: {"path": p, "r_frame_rate": 30000 / 1001,
+                   "avg_frame_rate": 30000 / 1001,
+                   "duration": 10.0, "bytes": 512})
+
+    ok, rep = fc.check_conservation(str(a), str(b), "stage4",
+                                    expected_fps=30000 / 1001,
+                                    exact_max_bytes=10)
+    assert ok is True
+    assert "fps_label_mismatch" not in rep
