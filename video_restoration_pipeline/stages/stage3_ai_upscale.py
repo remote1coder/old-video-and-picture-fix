@@ -2236,16 +2236,39 @@ def main():
             # 依据执行指令："缺少构造时间轴所必需的信息时，自动模式停止
             # 时间相关处理并说明所缺条件；明确保留人工指定 fps 的入口，
             # 记录 explicit_assumption / UNVERIFIED"。
-            _manual_fps = params.get("original_fps") or params.get("fps")
-            try:
-                _manual_fps = float(_manual_fps) if _manual_fps else 0.0
-            except (TypeError, ValueError):
-                _manual_fps = 0.0
-            if _manual_fps > 0:
-                actual_fps = _manual_fps
+            _manual_spec = params.get("original_fps") or params.get("fps")
+            # R14-08：用**有理数解析器**，不要 `float()`。
+            # `float("30000/1001")` 抛 ValueError → 被当成"用户没给帧率"
+            # → 直接 86：用户填最标准的 NTSC 帧率反而失败。
+            # 同时保留精确分数，避免 float 往返误差。
+            _manual_rate = None
+            if _manual_spec not in (None, ""):
+                try:
+                    from rate_spec import parse_rate as _parse_rate
+                    # R14-05：`job.fps` 是 manifest/probe 来源，
+                    # **不等于**用户明确选择 —— 来源要如实记录。
+                    _src = ("user" if params.get("_fps_from_user")
+                            else "manifest")
+                    _manual_rate = _parse_rate(_manual_spec, source=_src)
+                except Exception as _rse:
+                    logger.error(
+                        "STAGE3_FPS_SPEC_INVALID",
+                        "The provided frame rate is not usable; refusing to "
+                        "guess. Expected a number, a decimal or a fraction "
+                        "like 30000/1001.",
+                        spec=str(_manual_spec),
+                        reason=getattr(_rse, "reason", str(_rse)))
+                    _manual_rate = None
+            if _manual_rate is not None:
+                actual_fps = _manual_rate.value
                 _fps_ok = True
-                _fps_source = "user-assumed"
-                _fps_raw_str = _fps_rational_str(_manual_fps)
+                _fps_source = ("user-assumed"
+                               if _manual_rate.source == "user"
+                               else "manifest-assumed")
+                _fps_raw_str = _manual_rate.as_ffmpeg()
+                logger.info("STAGE3_FPS_FROM_SPEC",
+                            "Using the frame rate from an explicit spec",
+                            rate=_fps_raw_str, source=_fps_source)
                 logger.warning(
                     "STAGE3_FPS_EXPLICIT_ASSUMPTION",
                     "Frame rate could not be measured; using the value the "

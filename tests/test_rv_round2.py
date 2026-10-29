@@ -927,8 +927,16 @@ def test_rv12_real_cancel_during_encoding(tmp_path):
     assert not (out / "clip_restored.avif").exists(), \
         "取消之后最终路径上出现了产物（可能有孤儿写回）"
     assert not partial.exists(), "临时产物没有被清理"
-    status = json.loads((out / "clip_restored.avif.status.json")
-                        .read_text(encoding="utf-8"))
+    # R14-02：取消诊断写 **attempt** 侧车，不写正式 status ——
+    # 编码中取消时上一代产物还在，把它标成 FAILED 等于用失败尝试
+    # 改写上一代的磁盘事实。
+    official = out / "clip_restored.avif.status.json"
+    assert not official.exists(), \
+        "取消不得创建/覆写正式 status（上一代仍然有效）"
+    cancelled = sorted(
+        out.glob("clip_restored.avif.status.json.attempt-*.json"))
+    assert cancelled, "取消必须留下 attempt 级记录"
+    status = json.loads(cancelled[-1].read_text(encoding="utf-8"))
     assert status["status"] == "FAILED"
     assert status["failed_operation"] == "cancelled"
 
