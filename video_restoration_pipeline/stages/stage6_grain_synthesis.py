@@ -511,6 +511,9 @@ def main() -> int:
     ffmpeg_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-i", "-",
+        # R15-04：y4m 管道本身是定帧率声明，但上游若是 VFR 素材，
+        # 这里再加一道 passthrough，保证不因 vsync 重整而丢帧。
+        "-fps_mode", "passthrough",
         "-c:v", "ffv1",
         "-pix_fmt", pix_fmt,
         output_path
