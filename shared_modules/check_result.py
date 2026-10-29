@@ -23,6 +23,19 @@
 ``NOT_APPLICABLE``本代不需要做这项检查（例如同卷改名、功能显式关闭）
 ================  ====================================================
 
+**``status`` 与 ``severity`` 是两件事（R14-04）**
+
+``status`` 回答"结论是什么"，``severity`` 回答"这件事有多严重"。
+把它们塞进一个字段就会出现本轮审核复现的矛盾：同步在 WARN 档
+（120ms）**返回 0 允许出片**，但结果被记成 ``FAIL``，
+汇总得到 ``publish=false`` —— 同一次运行两个相反的结论。
+
+所以：
+
+- ``severity="warning"`` + ``status=PASS`` → 允许出片，报告保留警告；
+- ``severity="error"`` + ``status=FAIL`` → 阻断（除非该项有对应授权）；
+- ``severity="info"`` → 正常。
+
 ``NOT_APPLICABLE`` 与 ``PASS`` 的区别是审计的核心要求：
 "同卷 rename 只复用候选件的检查证据，不构造新 PASS/checked=0 冒充新检查"。
 """
@@ -55,15 +68,19 @@ class CheckResult:
     """
 
     __slots__ = ("name", "status", "reason", "method", "subject_digest",
-                 "forced", "force_key", "hard_error", "evidence")
+                 "forced", "force_key", "hard_error", "evidence", "severity")
 
     def __init__(self, name: str, status: str, reason: str = "",
                  method: str = "", subject_digest: Optional[str] = None,
                  forced: bool = False, force_key: Optional[str] = None,
                  hard_error: bool = False,
-                 evidence: Optional[Dict[str, Any]] = None):
+                 evidence: Optional[Dict[str, Any]] = None,
+                 severity: str = "info"):
         if status not in ALL_STATUSES:
             raise ValueError(f"unknown check status: {status!r}")
+        if severity not in ("info", "warning", "error"):
+            raise ValueError(f"unknown severity: {severity!r}")
+        self.severity = severity
         self.name = name
         self.status = status
         self.reason = reason
@@ -102,7 +119,8 @@ class CheckResult:
 
     def as_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"name": self.name, "status": self.status,
-                             "reason": self.reason, "method": self.method}
+                             "reason": self.reason, "method": self.method,
+                             "severity": self.severity}
         if self.subject_digest:
             d["subject_digest"] = self.subject_digest
         if self.forced:
@@ -122,7 +140,9 @@ class CheckResult:
 
 
 def publish_decision(results: Iterable[CheckResult],
-                     force_enabled: bool = False) -> Dict[str, Any]:
+                     force_enabled: bool = False,
+                     enabled_forces: Optional[Iterable[str]] = None
+                     ) -> Dict[str, Any]:
     """由一组检查结果给出**唯一**的发布决定。
 
     规则（对应审核 §4.4）：
@@ -137,7 +157,11 @@ def publish_decision(results: Iterable[CheckResult],
 
     Args:
         results: 各检查的结论。
-        force_enabled: 用户是否打开了强制开关（``allow_*_fail_publish``）。
+        force_enabled: 粗粒度强制开关（保留给旧调用方）。
+        enabled_forces: 用户**实际打开**的开关名集合（如
+            ``{"allow_sync_fail_publish"}``）。给出时按检查项自己的
+            ``force_key`` 匹配 —— sync 的授权不能替代 verify 的授权。
+            为 None 时退回 ``force_enabled``。
 
     Returns:
         ``{"publish": bool, "verified": bool, "blocked_by": [names],
@@ -148,6 +172,22 @@ def publish_decision(results: Iterable[CheckResult],
     fails = [r for r in rs if r.status == FAIL and not r.hard_error]
     unver = [r for r in rs if r.status == UNVERIFIED]
     passes = [r for r in rs if r.status == PASS]
+    warn = [r.name for r in rs if r.severity == "warning"]
+
+    def _force_ok(r: CheckResult) -> bool:
+        """这一项**自己**的授权是否打开。
+
+        R14-04：sync 的 `allow_sync_fail_publish` 不能替代 verify 的
+        `allow_verify_fail_publish`。没给 `enabled_forces` 时才退回粗粒度开关。
+        """
+        if not r.is_forceable:
+            return False
+        if enabled_forces is None:
+            return bool(force_enabled)
+        key = r.force_key
+        if not key:
+            return bool(force_enabled)
+        return key in set(enabled_forces)
 
     reasons = {r.name: r.reason for r in rs if r.reason}
     decision = {
@@ -156,6 +196,9 @@ def publish_decision(results: Iterable[CheckResult],
         "blocked_by": blocked,
         "forced": False,
         "reasons": reasons,
+        # 警告不阻断，但必须跟着结论走，不能只在日志里
+        "warnings": warn,
+        "forced_checks": [],
     }
 
     if blocked:
@@ -167,11 +210,13 @@ def publish_decision(results: Iterable[CheckResult],
     # 判整个作业失败。所以它只让 verified=False，不阻断发布。
     # （是否允许输出"未验证"的产物属于 profile 策略；默认允许并如实标注。）
     if fails:
-        if not force_enabled:
+        not_forced = [r for r in fails if not _force_ok(r)]
+        if not_forced:
             decision["publish"] = False
-            decision["blocked_by"] = [r.name for r in fails]
+            decision["blocked_by"] = [r.name for r in not_forced]
             return decision
         decision["forced"] = True
+        decision["forced_checks"] = [r.name for r in fails]
         decision["verified"] = False
     if unver:
         decision["verified"] = False
