@@ -1354,12 +1354,26 @@ def _validate_av_sync(muxed_path: str, logger,
         logger.error("STAGE7_SYNC_UNMEASURABLE",
                      "Cannot probe the muxed output; refusing to claim the "
                      "output is in sync (not a pass)", path=muxed_path)
+        # R14-04：这个出口原来没有填 out_check —— 结果集里少一项，
+        # 汇总就"看不见"它。缺失的必需结果必须显式出现，不能消失。
+        if out_check is not None:
+            from check_result import CheckResult as _CRu, UNVERIFIED as _UNV
+            out_check["sync"] = _CRu(
+                "sync", _UNV,
+                reason="audio-stream presence could not be probed",
+                method="_validate_av_sync", severity="error").as_dict()
         return 86
     if presence == "absent":
         logger.warning("STAGE7_SYNC_NO_AUDIO",
                        "No audio stream in the muxed output; sync check not "
                        "applicable (allowed only if the input contract says the "
                        "source has no audio)")
+        if out_check is not None:
+            from check_result import CheckResult as _CRn, NOT_APPLICABLE as _NA
+            out_check["sync"] = _CRn(
+                "sync", _NA,
+                reason="no audio stream in the output",
+                method="_validate_av_sync").as_dict()
         return 0
 
     # 编码器 priming（AAC 常见 1024 样本）：说明"容器时长膨胀"中有多少是
@@ -1547,19 +1561,26 @@ def _validate_av_sync(muxed_path: str, logger,
     _dir_txt = ("no drift" if _worst["name"] == "none"
                 else ("audio lags" if _worst["lag"] else "audio leads"))
 
-    from check_result import CheckResult as _CRs, PASS as _P_, FAIL as _F_
+    # R14-04：**按实际等级映射，不要一刀切**。
+    # 原来写成 `level >= 2 → FAIL`，而 level 2 是 WARN 档、函数 `return 0`
+    # 允许出片 —— 同一次运行里"返回成功"与"汇总 publish=false"并存。
+    # 现在：level 3 → FAIL/error；level 2、1 → PASS + severity=warning；0 → PASS。
+    from check_result import (
+        CheckResult as _CRs, PASS as _P_, FAIL as _F_)
     if out_check is not None:
-        if _worst["level"] >= 2:
-            out_check["sync"] = _CRs(
-                "sync", _F_,
-                reason=(f"{_worst['name']} {_worst['mag']:.0f}ms exceeds "
-                        f"{_worst['thr']:.0f}ms"),
-                method="_validate_av_sync",
-                evidence={"per_component": _comp_ms}).as_dict()
-        else:
-            out_check["sync"] = _CRs(
-                "sync", _P_, method="_validate_av_sync",
-                evidence={"per_component": _comp_ms}).as_dict()
+        _sev = ("error" if _worst["level"] >= 3
+                else ("warning" if _worst["level"] >= 1 else "info"))
+        _reason = ("" if _worst["level"] == 0
+                   else f"{_worst['name']} {_worst['mag']:.0f}ms "
+                        f"vs {_worst['thr']:.0f}ms threshold "
+                        f"(level {_worst['level']})")
+        out_check["sync"] = _CRs(
+            "sync", (_F_ if _worst["level"] >= 3 else _P_),
+            reason=_reason, method="_validate_av_sync",
+            severity=_sev,
+            force_key=("allow_sync_fail_publish"
+                       if _worst["level"] >= 3 else None),
+            evidence={"per_component": _comp_ms}).as_dict()
 
     if _worst["level"] == 3:
         logger.error("STAGE7_SYNC_FAIL",
@@ -2821,19 +2842,61 @@ def main():
                 _ver_doc.setdefault("prechecks", {}).update(_prechecks)
             _ver_doc["attempt_id"] = _attempt_id
             _ver_doc["checks"] = _checks
-            # 汇总：只有全部 PASS（或不需要检查）才算 verified
+            # ---- R14-04：汇总必须**真的决定是否提交** ----
+            # 原来这里只把结论写进报告，`publish=False` 也照样往下提交 ——
+            # 于是"汇总说不能发"和"文件已经发了"同时成立。
             try:
                 from check_result import (
                     CheckResult as _CRr, publish_decision as _pd)
-                _rows = [_CRr(d["name"], d["status"],
-                              hard_error=bool(d.get("hard_error")),
-                              forced=bool(d.get("forced")))
-                         for d in _checks.values()]
-                _dec = _pd(_rows, force_enabled=_force_publish_enabled(
-                    params, "allow_verify_fail_publish"))
+                _rows = []
+                for _d in _checks.values():
+                    # 必须把 severity / force_key / reason 原样带过去，
+                    # 否则汇总会丢掉"这是警告"还是"这是失败"的区别。
+                    _rows.append(_CRr(
+                        _d["name"], _d["status"],
+                        reason=_d.get("reason") or "",
+                        method=_d.get("method") or "",
+                        subject_digest=_d.get("subject_digest"),
+                        forced=bool(_d.get("forced")),
+                        force_key=_d.get("force_key"),
+                        hard_error=bool(_d.get("hard_error")),
+                        evidence=_d.get("evidence") or None,
+                        severity=_d.get("severity") or "info"))
+                # 按检查项自己的授权匹配：sync 的钥匙不替代 verify 的钥匙
+                _enabled: set = set()
+                for _fk in ("allow_verify_fail_publish",
+                            "allow_sync_fail_publish"):
+                    if _force_publish_enabled(params, _fk):
+                        _enabled.add(_fk)
+                _dec = _pd(_rows, enabled_forces=_enabled)
                 _ver_doc["publish_decision"] = _dec
             except Exception as _de:
-                _ver_doc["publish_decision"] = {"error": str(_de)}
+                # 汇总构造失败 → **不能**继续提交（不能让"算不出来"变成放行）
+                logger.error(
+                    "STAGE7_DECISION_ERROR",
+                    "Cannot build the publish decision from the check "
+                    "results; refusing to publish. This is not a pass.",
+                    attempt_id=_attempt_id, error=str(_de),
+                    checks=list(_checks))
+                _discard_attempt_tmp(_publish_tmp, logger)
+                return 86
+
+            if not _dec.get("publish"):
+                logger.error(
+                    "STAGE7_DECISION_BLOCKED",
+                    "The aggregated check decision does NOT allow publication;"
+                    " the existing output is left untouched.",
+                    attempt_id=_attempt_id,
+                    blocked_by=_dec.get("blocked_by"),
+                    reasons=_dec.get("reasons"),
+                    warnings=_dec.get("warnings") or None)
+                _discard_attempt_tmp(_publish_tmp, logger)
+                return 86
+            if _dec.get("warnings"):
+                logger.warning(
+                    "STAGE7_DECISION_WARNINGS",
+                    "Publishing with warnings retained in the report",
+                    attempt_id=_attempt_id, warnings=_dec["warnings"])
             _ver_doc["media_sha256"] = _cand_digest
             _ver_doc["media_bytes"] = _cand_stat.st_size
             _ver_doc["report_scope"] = (
