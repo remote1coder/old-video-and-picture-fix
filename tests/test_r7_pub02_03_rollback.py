@@ -124,10 +124,18 @@ def test_fail_preserves_valid_status_sidecar(tmp_path):
     assert rec["failed_operation"] == "contract"
 
 
-def test_fail_marks_recovery_required_when_not_restored(tmp_path):
-    """回滚未完成 → 固定 status 写 RECOVERY_REQUIRED（这次覆写是对的）。"""
+def test_fail_writes_separate_recovery_record(tmp_path):
+    """R14-02：回滚未完成 → 写**独立恢复记录**，不覆写固定 status。
+
+    旧预期是"这次覆写是对的"。但它让一次失败的尝试改写了上一代的
+    磁盘事实；正式状态应当只随完整代提交。现在：
+    * 固定 status 原样保留；
+    * `<status>.recovery.json` 记录 RECOVERY_REQUIRED + 回滚明细；
+    * `has_unresolved_recovery()` 供消费方判断是否可用。
+    """
     status = tmp_path / "restored.avif.status.json"
     status.write_text(json.dumps({"status": "SUCCESS"}), encoding="utf-8")
+    before = status.read_bytes()
 
     detail = {"restored": [], "removed": [], "impossible": ["x"],
               "failed": [{"path": "y", "error": "EACCES"}],
@@ -135,10 +143,17 @@ def test_fail_marks_recovery_required_when_not_restored(tmp_path):
     s6._fail(None, str(status), "status", "io", paths=[],
              recovery_required=True, rollback_detail=detail)
 
-    after = json.loads(status.read_text(encoding="utf-8"))
+    assert status.read_bytes() == before, "固定 status 不得被改写"
+    assert json.loads(status.read_text(encoding="utf-8"))["status"] == "SUCCESS"
+
+    rec_path = s6.recovery_record_path(str(status))
+    with open(rec_path, encoding="utf-8") as f:
+        after = json.load(f)
     assert after["status"] == "RECOVERY_REQUIRED"
+    assert after["prior_status"] == "SUCCESS"
     assert after["rollback"]["fully_restored"] is False
     assert after["rollback"]["failed"][0]["error"] == "EACCES"
+    assert s6.has_unresolved_recovery(str(status)) is True
 
 
 def test_caller_no_longer_claims_unconditional_restore():
