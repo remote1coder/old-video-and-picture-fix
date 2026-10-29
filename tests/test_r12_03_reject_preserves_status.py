@@ -61,16 +61,44 @@ def test_without_preserve_overwrites_status(tmp_path):
     assert doc["status"] == "FAILED"
 
 
-def test_recovery_required_still_overwrites(tmp_path):
-    """recovery_required 是例外：磁盘处于未知混合代，必须标记阻止误用。"""
+def test_recovery_required_writes_separate_record(tmp_path):
+    """R14-02：恢复失败**不再覆写正式状态**，改写成独立恢复记录。
+
+    旧预期是"必须覆盖成 RECOVERY_REQUIRED 来阻止误用"。问题在于那等于
+    让**一次失败的尝试**改写**上一代的磁盘事实** —— 正式状态本该只随
+    完整代提交。
+
+    现在的机制：
+    * 正式 status 原样保留（旧代号与内容可追溯）；
+    * 写 `<status>.recovery.json`，里面带 `prior_status` 与完整回滚明细；
+    * 消费方用 `has_unresolved_recovery()` 判断是否该继续用这份产物。
+    """
     status = tmp_path / "out.avif.status.json"
     status.write_text(json.dumps({"status": "SUCCESS"}), encoding="utf-8")
+    before = status.read_bytes()
 
+    rb = {"restored": [], "removed": [],
+          "failed": [{"path": "x", "error": "io"}],
+          "impossible": [], "fully_restored": False}
     s6._fail(None, str(status), "rollback_failed", "partial restore",
-             paths=[], recovery_required=True)
+             paths=[], recovery_required=True, rollback_detail=rb)
 
-    doc = json.loads(status.read_text(encoding="utf-8"))
-    assert doc["status"] == "RECOVERY_REQUIRED"
+    # 正式状态一个字节都没变
+    assert status.read_bytes() == before
+    assert json.loads(status.read_text(encoding="utf-8"))["status"] == "SUCCESS"
+
+    # 独立恢复记录：带旧状态原文 + 回滚明细
+    rec_path = s6.recovery_record_path(str(status))
+    assert os.path.exists(rec_path), "必须留下独立恢复记录"
+    with open(rec_path, encoding="utf-8") as f:
+        rec = json.load(f)
+    assert rec["status"] == "RECOVERY_REQUIRED"
+    assert rec["prior_status"] == "SUCCESS"
+    assert rec["rollback"]["fully_restored"] is False
+    assert rec["failed_operation"] == "rollback_failed"
+
+    # 消费方据此判定"别用这份产物"
+    assert s6.has_unresolved_recovery(str(status)) is True
 
 
 def test_precommit_rejections_use_preserve():

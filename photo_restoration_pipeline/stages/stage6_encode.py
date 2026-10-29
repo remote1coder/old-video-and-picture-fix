@@ -307,11 +307,42 @@ def _snapshot_for_rollback(paths: List[str], backup_dir: str,
             # backup_digest 的备份才允许覆盖目标，否则坏备份会盖掉好文件。
             # 备份是 copyfile 出来的，正常情况下两者相同；分开记录是为了
             # 在"备份后被外部改动"时能发现。
+            # R14-03：**摘要读不出来就不能算备份成功**。
+            # 原来无条件写 BACKUP_OK，而 file_digest 对权限/I/O 错误
+            # 返回 None —— 于是"备份存在但无法核对"被当成可恢复，
+            # 回滚时又因为 expected=None 跳过校验并报"已恢复"。
+            _old_digest = file_digest(path)
+            _bk_digest = file_digest(backup)
+            if _old_digest is None or _bk_digest is None:
+                snapshot[path] = {"state": BACKUP_FAILED, "backup": backup,
+                                  "old_digest": _old_digest,
+                                  "backup_digest": _bk_digest}
+                if logger:
+                    logger.error(
+                        "STAGE6_ROLLBACK_BACKUP_DIGEST_UNREADABLE",
+                        "Backup was copied but its digest cannot be read; "
+                        "treating it as a FAILED backup and refusing to "
+                        "prepare the commit. The existing file is untouched.",
+                        path=path, backup=backup,
+                        old_digest=_old_digest, backup_digest=_bk_digest)
+                continue
+            if _old_digest != _bk_digest:
+                snapshot[path] = {"state": BACKUP_FAILED, "backup": backup,
+                                  "old_digest": _old_digest,
+                                  "backup_digest": _bk_digest}
+                if logger:
+                    logger.error(
+                        "STAGE6_ROLLBACK_BACKUP_MISMATCH",
+                        "Backup content does not match the original file; "
+                        "refusing to prepare the commit.",
+                        path=path, old_digest=_old_digest,
+                        backup_digest=_bk_digest)
+                continue
             snapshot[path] = {
                 "state": BACKUP_OK,
                 "backup": backup,
-                "old_digest": file_digest(path),
-                "backup_digest": file_digest(backup),
+                "old_digest": _old_digest,
+                "backup_digest": _bk_digest,
             }
         except OSError as e:
             snapshot[path] = {"state": BACKUP_FAILED, "backup": None,
@@ -749,6 +780,29 @@ def _verify_restored(path: str, step: Dict[str, Any],
         return True
     return file_digest(path) == want
 
+def _read_status_value(status_path: str) -> Optional[str]:
+    """读正式 status 里的 ``status`` 字段；读不出返回 None（不猜）。"""
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("status") if isinstance(d, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def recovery_record_path(status_path: str) -> str:
+    return f"{status_path}.recovery.json"
+
+
+def has_unresolved_recovery(status_path: str) -> bool:
+    """该路径是否存在**未解决**的恢复记录（消费前必须查）。
+
+    存在即表示上一次事务没有恢复到已知状态：调用方不得把正式路径
+    当成有效产物消费，应先走 `_recover_prior_publish()` 或人工介入。
+    """
+    return os.path.isfile(recovery_record_path(status_path))
+
+
 def _fail(logger, status_path: str, operation: str, reason: str,
           paths: Optional[List[str]] = None,
           preserve_valid_status: bool = False,
@@ -791,7 +845,30 @@ def _fail(logger, status_path: str, operation: str, reason: str,
             "fully_restored": rollback_detail.get("fully_restored", False),
         }
 
-    if preserve_valid_status:
+    if recovery_required:
+        # R14-02：**正式 status 只随完整代提交**。
+        # 回滚没恢复完整时，原来会把正式 status 改写成 RECOVERY_REQUIRED
+        # —— 那等于让"一次失败的尝试"去描述"上一代的磁盘事实"。
+        # 现在改为独立的恢复记录：它保留旧状态原文 + 完整回滚明细，
+        # 由它与 journal（`PHASE_RECOVERY_REQUIRED`）共同阻止继续消费。
+        recovery_path = f"{status_path}.recovery.json"
+        rec = dict(payload)
+        rec["prior_status"] = _read_status_value(status_path)
+        rec["note"] = (
+            "The fixed status sidecar was NOT overwritten. Unresolved "
+            "transactions block consumption through this record and the "
+            "journal; a complete new generation is what updates the fixed "
+            "status.")
+        _write_json_sidecar(recovery_path, rec)
+        if logger:
+            logger.error(
+                "STAGE6_RECOVERY_RECORDED",
+                "Rollback did not fully restore the previous generation; "
+                "wrote a dedicated recovery record instead of overwriting "
+                "the fixed status sidecar.",
+                recovery_record=recovery_path,
+                prior_status=rec["prior_status"])
+    elif preserve_valid_status:
         # 旧代完好 → 固定 status 不动，只落一个 attempt 级记录
         attempt_sidecar = (f"{status_path}.attempt-"
                            f"{os.getpid()}-{int(time.time() * 1000)}.json")
@@ -1394,6 +1471,13 @@ def main():
     _iso = f".{job_id}" if job_id else ""
     tmp_avif = f"{work_output_path}{_iso}.partial"
     status_path = publish_output_path + ".status.json"
+    # R14-02：取消/失败诊断写**本次 attempt**，不写正式 status。
+    # 原来把 `status_path` 直接交给 cancel_guard，于是"编码中取消"会让
+    # 旧 AVIF/TIFF 继续存在、旧 SUCCESS 却变成 FAILED —— 一次没发布的
+    # 尝试改掉了上一代的事实记录。`delete_output=False` 只保护媒体，
+    # 不保护状态。
+    attempt_status_path = (
+        f"{status_path}.attempt-{os.getpid()}-{int(time.time() * 1000)}.json")
     contract_path = publish_output_path + ".encode_contract.json"
     if cancel_guard is not None:
         cancel_guard.watch_outputs(
@@ -1401,7 +1485,7 @@ def main():
             extra_paths=[tmp_avif],
             logger=logger, stage=6,
             delete_output=False,          # 不删上一次已发布的有效成品
-            status_path=status_path)      # 取消记录写在发布路径旁
+            status_path=attempt_status_path)  # 取消记录写 attempts，不改正式状态
 
     # --- FIX-V04: 色彩契约（必需转换失败即阻断）---
     _stem = safe_input_stem(input_name)
@@ -1447,7 +1531,7 @@ def main():
                 publish_output_path,
                 extra_paths=[tmp_avif, tmp_tiff],
                 logger=logger, stage=6,
-                delete_output=False, status_path=status_path)
+                delete_output=False, status_path=attempt_status_path)
         tiff_info = write_archival_master(working_path, tmp_tiff, params, logger)
         if tiff_info.get("written"):
             # R2-01：母版**先留在暂存路径**，不在这里覆盖旧母版。
