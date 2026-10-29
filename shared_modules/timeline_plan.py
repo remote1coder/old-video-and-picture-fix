@@ -75,10 +75,108 @@ def build_plan(job_id: str, source_timeline: Optional[str],
         },
         "manual_interpretation": _manual,
         "assumptions": _assumptions,
-        # 以下两项由 stage7 填
+        # stage3 能确定的：用户是否要求把时间轴按某个帧率重解释。
+        # **注意**：这里不再写 `transform_applied_verified: None` ——
+        # 一个"声明了却永远是 None"的字段比没有更糟（读的人会以为它有意义）。
+        # 变换是否真的落地由 stage7 用 `build_transform_verdict()` 裁定。
+        "transform_request": {
+            "fps_reinterpreted": _manual,
+            "fps_source": fps_source,
+            "requested_by_user": (fps_source == "user-assumed"),
+        },
+        # stage7 填
         "output_measured": False,
-        "transform_applied_verified": None,
     }
+
+
+def build_transform_verdict(declared_speed=None, declared_tempo=None,
+                            original_duration=None, processed_duration=None,
+                            timing_state: Optional[str] = None,
+                            tempo_applied: float = 1.0,
+                            tolerance: float = 0.01) -> Dict[str, Any]:
+    """裁定"用户请求的变换是否真的执行了"（结论 ②）。
+
+    `source_verified`（① 源时间轴可信）与 `output_measured`（③ 输出测得）
+    都不能替代它：源可信、输出可测，**不代表**用户要求的变速/重解释落地了；
+    反过来，变换执行正确也不代表源时间轴被验证过。
+
+    Args:
+        declared_speed / declared_tempo: 上游声明的变速意图（None = 没要求）。
+        original_duration / processed_duration: 用于算实测比值。
+        timing_state: ``_decide_timing()`` 的状态
+            （``verified`` / ``adjusted`` / ``unverified`` / ``unexplained``）。
+        tempo_applied: 实际施加的 atempo（1.0 = 没改音频）。
+        tolerance: 相对容差。
+
+    Returns:
+        dict，``status`` ∈ ``NOT_APPLICABLE`` / ``PASS`` / ``FAIL`` / ``UNVERIFIED``。
+        字段永远齐全，不会出现 None 占位。
+    """
+    _declared = None
+    _kind = []
+    for _v, _name in ((declared_tempo, "declared_tempo"),
+                      (declared_speed, "declared_speed")):
+        if _v is None:
+            continue
+        try:
+            _f = float(_v)
+        except (TypeError, ValueError):
+            continue
+        if _f <= 0:
+            continue
+        _kind.append(_name)
+        if _declared is None:
+            _declared = _f
+
+    out: Dict[str, Any] = {
+        "requested": _declared is not None,
+        "kind": "+".join(_kind) if _kind else "none",
+        "expected_ratio": _declared,
+        "observed_ratio": None,
+        "tempo_applied": float(tempo_applied or 1.0),
+        "status": "NOT_APPLICABLE",
+        "reason": "",
+    }
+
+    if _declared is None:
+        out["reason"] = "no speed/tempo change was requested"
+        return out
+
+    # 有请求：先看能不能算出实测比值
+    try:
+        _orig = float(original_duration or 0)
+        _proc = float(processed_duration or 0)
+    except (TypeError, ValueError):
+        _orig = _proc = 0.0
+    if _orig > 0 and _proc > 0:
+        out["observed_ratio"] = round(_orig / _proc, 6)
+
+    if timing_state in ("unverified", "unexplained"):
+        out["status"] = "UNVERIFIED"
+        out["reason"] = (
+            f"the transform was requested ({out['kind']}={_declared}), but the "
+            f"timing could not be verified (timing_state={timing_state}); the "
+            "requested change is NOT confirmed to have been applied")
+        return out
+
+    if out["observed_ratio"] is None:
+        out["status"] = "UNVERIFIED"
+        out["reason"] = ("durations unavailable; cannot confirm the requested "
+                         f"{out['kind']}={_declared} was applied")
+        return out
+
+    _rel = abs(out["observed_ratio"] - _declared) / max(_declared, 1e-9)
+    if _rel <= tolerance:
+        out["status"] = "PASS"
+        out["reason"] = (f"{out['kind']}={_declared} matches the measured "
+                         f"ratio {out['observed_ratio']}")
+    else:
+        out["status"] = "FAIL"
+        out["reason"] = (f"{out['kind']}={_declared} but the measured ratio is "
+                         f"{out['observed_ratio']} "
+                         f"({_rel * 100:.1f}% off, tolerance "
+                         f"{tolerance * 100:.1f}%)")
+    return out
 
 
 def claim_source_verified(plan: Optional[Dict[str, Any]],

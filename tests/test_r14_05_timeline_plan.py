@@ -149,3 +149,96 @@ def test_stage3_and_stage7_use_the_shared_module():
     assert "from timeline_plan import" in s7
     assert "claim_source_verified" in s7, \
         "stage7 必须用共享判定，不能自己写 source_verified and ..."
+
+
+# ---------------------------------------------------------------- 结论②：变换是否执行
+
+def test_no_transform_request_is_not_applicable():
+    """没要求变换 → NOT_APPLICABLE，但**字段齐全**（不是 None）。"""
+    v = tp.build_transform_verdict()
+    assert v["status"] == "NOT_APPLICABLE"
+    assert v["requested"] is False
+    assert v["kind"] == "none"
+    for k in ("requested", "kind", "expected_ratio", "observed_ratio",
+              "tempo_applied", "status", "reason"):
+        assert k in v, f"缺字段 {k}"
+    assert v["reason"]
+
+
+def test_declared_and_matching_is_pass():
+    v = tp.build_transform_verdict(declared_speed=2.0,
+                                   original_duration=10.0,
+                                   processed_duration=5.0,
+                                   timing_state="verified")
+    assert v["status"] == "PASS", v
+    assert v["observed_ratio"] == pytest.approx(2.0)
+    assert "matches" in v["reason"]
+
+
+def test_declared_but_output_differs_is_fail():
+    """声明 2x 但成品只跑了 1.5x → FAIL（这才是"请求没兑现"）。"""
+    v = tp.build_transform_verdict(declared_speed=2.0,
+                                   original_duration=10.0,
+                                   processed_duration=6.6667,
+                                   timing_state="verified")
+    assert v["status"] == "FAIL", v
+    assert "2.0" in v["reason"] and "off" in v["reason"]
+
+
+def test_timing_unverified_means_transform_unverified():
+    """时序本身没验证 → 变换也不能算已验证（不能凭空认账）。"""
+    for st in ("unverified", "unexplained"):
+        v = tp.build_transform_verdict(declared_tempo=1.5,
+                                       original_duration=10.0,
+                                       processed_duration=6.6667,
+                                       timing_state=st)
+        assert v["status"] == "UNVERIFIED", (st, v)
+        assert st in v["reason"]
+
+
+def test_missing_durations_is_unverified_not_pass():
+    v = tp.build_transform_verdict(declared_tempo=1.5,
+                                   original_duration=0,
+                                   processed_duration=0,
+                                   timing_state="verified")
+    assert v["status"] == "UNVERIFIED", v
+    assert v["observed_ratio"] is None
+
+
+def test_both_kinds_are_reported():
+    v = tp.build_transform_verdict(declared_speed=2.0, declared_tempo=2.0,
+                                   original_duration=10.0,
+                                   processed_duration=5.0,
+                                   timing_state="verified")
+    assert "declared_tempo" in v["kind"] and "declared_speed" in v["kind"]
+
+
+def test_invalid_declared_values_are_ignored():
+    for bad in (None, "", "abc", 0, -1):
+        v = tp.build_transform_verdict(declared_speed=bad,
+                                       original_duration=10.0,
+                                       processed_duration=10.0,
+                                       timing_state="verified")
+        assert v["status"] == "NOT_APPLICABLE", (bad, v)
+
+
+def test_plan_no_longer_has_a_permanently_empty_field():
+    """`build_plan()` 不许再写"声明了永远是 None"的字段。"""
+    plan = tp.build_plan("j1", "cfr", fps_value="25", fps_source="probe")
+    assert "transform_applied_verified" not in plan, \
+        "这个字段必须由 stage7 用 build_transform_verdict 填，不能留 None 占位"
+    assert "transform_request" in plan
+    assert plan["transform_request"]["fps_reinterpreted"] is False
+
+
+def test_stage7_fills_the_verdict():
+    """source guard：stage7 必须真的调用裁定并写进报告。"""
+    s7 = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                           "stage7_encode.py"),
+              encoding="utf-8", errors="replace").read()
+    assert "build_transform_verdict" in s7, \
+        "stage7 必须用共享裁定，不能自己拼"
+    assert '"transform_applied_verified": _tv' in s7, \
+        "stage7 必须把裁定写进报告的 timeline 段"
+    assert "transform_applied_verified\": None" not in s7, \
+        "不得再留 None 占位"
