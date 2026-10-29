@@ -45,14 +45,22 @@ import stage6_encode as s6  # noqa: E402
 
 
 def _ok_backup_dir(tmp_path, names):
-    """造一套"每个目标都有可用备份"的 snapshot。"""
+    """造一套"每个目标都有可用备份"的 snapshot。
+
+    R14-03 之后**必须带摘要**：缺摘要属于"状态未知"，回滚不得判通过。
+    真实快照（`_snapshot_for_rollback`）现在也一定是带摘要的。
+    """
     snap = {}
     for n in names:
         target = tmp_path / n
         backup = tmp_path / f"{n}.pubbak"
         target.write_bytes(b"NEW-GARBAGE")
         backup.write_bytes(b"OLD-GOOD")
-        snap[str(target)] = {"state": s6.BACKUP_OK, "backup": str(backup)}
+        snap[str(target)] = {
+            "state": s6.BACKUP_OK, "backup": str(backup),
+            "old_digest": s6.file_digest(str(backup)),
+            "backup_digest": s6.file_digest(str(backup)),
+        }
     return snap
 
 
@@ -163,3 +171,16 @@ def test_caller_no_longer_claims_unconditional_restore():
         "仍有无条件宣布恢复成功的旧文案"
     assert "_rb[\"fully_restored\"]" in src, "调用方未按回滚结果分流"
     assert "STAGE6_RECOVERY_REQUIRED" in src
+
+
+def test_rollback_without_digest_is_not_reported_as_success(tmp_path):
+    """R14-03：快照缺摘要 → 恢复不得判通过（原来"无记录则视为通过"）。"""
+    target = tmp_path / "a.avif"
+    backup = tmp_path / "a.avif.pubbak"
+    target.write_bytes(b"NEW")
+    backup.write_bytes(b"OLD-GOOD")
+    snap = {str(target): {"state": s6.BACKUP_OK, "backup": str(backup)}}
+
+    res = s6._rollback_publish(snap, None)
+    assert res["fully_restored"] is False, \
+        "缺摘要等于没校验，不能报'已完整恢复'"

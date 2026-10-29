@@ -93,9 +93,13 @@ def test_stage6_registers_attempt_status_path():
     src = os.path.join(_ROOT, "photo_restoration_pipeline", "stages",
                        "stage6_encode.py")
     text = open(src, encoding="utf-8", errors="replace").read()
-    assert "status_path=attempt_status_path" in text, \
-        "取消守卫必须用 attempt 级状态路径"
-    assert "status_path=status_path)" not in text, \
+    # 两处注册（早期 + 后位深分支）都必须用 attempt 路径
+    assert text.count("status_path=attempt_status_path") == 2, \
+        "取消守卫的两处注册都必须用 attempt 级状态路径"
+    # 只查取消守卫那一处（`delete_output=..., status_path=status_path)`），
+    # 不要误伤 `_recover_prior_publish(..., status_path=status_path)` ——
+    # 那是把正式 status 交给**恢复入口**，语义完全不同。
+    assert "delete_output=False, status_path=status_path)" not in text, \
         "不得把正式 status 交给取消守卫"
 
 
