@@ -2730,14 +2730,9 @@ def main():
                            f"Lanczos scaling failed: {e}")
 
     # V-P-035 fix: preserve original frame rate
-    fps_cmd = [
-        "ffprobe", "-hide_banner", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        stage2_output,
-    ]
-    # R13-02：同上，复用首次决策；不再重新 probe 后默认 25
+    # R14-05：这里**不再构造 fps_cmd** —— 探测只在计划阶段做一次，
+    # 编码段只消费结论。（原实现留着这条命令并再跑一次，覆盖上面的值。）
+    # R13-02：复用首次决策；不再重新 probe 后默认 25
     if _fps_ok and actual_fps:
         fps_str = (_fps_raw_str or _fps_rational_str(actual_fps))
     else:
@@ -2746,13 +2741,11 @@ def main():
             "Cannot encode without a frame rate; refusing to guess one "
             "(25 fps would silently change the duration)")
         return 86
-    try:
-        r = subprocess.run(fps_cmd, capture_output=True, text=True, errors="replace",
-                          timeout=10, shell=False)
-        if r.returncode == 0:
-            fps_str = r.stdout.strip()
-    except Exception:
-        pass
+    # R14-05：**删掉这里的第二次 ffprobe**。
+    # 原来它在上面已经定好 fps_str 之后又探一次，只要 returncode=0 就
+    # 无条件覆盖 —— 不验空串、不验 0/0、也不管与既定值冲突。
+    # 于是"首次探测成功、第二次失败/返回垃圾"时，编码用的帧率会被悄悄改写，
+    # 而帧数完全正确、时长却变了。计划只解析一次，后段只能消费。
 
     # V-P-031 fix: force_allow suffix (P8-2 + N8-1 corrected)
     inter_name = f"{job_id}_{Path(input_name).stem}" \
@@ -2827,6 +2820,36 @@ def main():
          if t is not None} if all_pts else {},
         total_frames)
     is_vfr = (_tl_encode == "vfr")
+
+    # ---- R14-05：UNKNOWN **不得**在自动模式下悄悄按 CFR 编码 ----
+    # 原实现只判 is_vfr；UNKNOWN 与 CFR 共用 `-framerate`，于是
+    # "标称帧率可读、但 PTS 缺失/不完整"的素材会被 PNG 路径自动重建成
+    # 恒定时间轴 —— 帧数正确、时间映射却是猜的，任何帧数核对都发现不了。
+    #
+    # 只有**用户明确指定**帧率（`user-assumed`）时才允许按假设执行，
+    # 并在报告里保留这个假设；其余情况停下来说明缺什么。
+    if _tl_encode == "unknown":
+        _user_assumed = (_fps_source == "user-assumed")
+        if not _user_assumed:
+            logger.error(
+                "STAGE3_TIMELINE_UNKNOWN",
+                "The source timeline cannot be established (PTS coverage "
+                "incomplete or unreadable). Refusing to rebuild a constant "
+                "frame rate automatically: the frame count would look right "
+                "while the duration/timing silently changes. Provide an "
+                "explicit frame rate (original_fps/fps) to re-interpret the "
+                "timeline as a stated assumption.",
+                timeline=_tl_encode,
+                pts_usable=len(all_pts_map or {}),
+                expected_frames=total_frames,
+                fps_source=_fps_source)
+            return 86
+        logger.warning(
+            "STAGE3_TIMELINE_EXPLICIT_ASSUMPTION",
+            "The source timeline is unknown; encoding at the frame rate the "
+            "user specified. This is an EXPLICIT ASSUMPTION — the original "
+            "timing is NOT verified.",
+            timeline=_tl_encode, fps=str(fps_str), fps_source=_fps_source)
 
     # 诊断：60 帧进、59 帧出的问题就出在这条分岔上。先把它记清楚，
     # 不要再靠猜。

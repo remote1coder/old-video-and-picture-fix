@@ -45,8 +45,8 @@ from publish_lock import acquire_target_locks, TargetLockTimeout  # noqa: E402
 # 持久 journal（第七轮）：让硬终止后"上次做到哪一步"可判断
 from publish_journal import (  # noqa: E402
     JOURNAL_SCHEMA, PHASE_PREPARED, PHASE_COMMITTED,
-    PHASE_RECOVERY_REQUIRED, file_digest, journal_path_for, write_journal,
-    read_journal, validate_journal_paths, classify_recovery)
+    PHASE_RECOVERY_REQUIRED, file_digest, file_state, journal_path_for,
+    write_journal, read_journal, validate_journal_paths, classify_recovery)
 
 try:  # FIX-V01/V05: encode-boundary contracts
     sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
@@ -182,14 +182,25 @@ def _build_journal_records(commit_targets: List[str],
     records: Dict[str, Dict[str, Any]] = {}
     for t in commit_targets:
         entry = snapshot.get(t) or {}
-        existed = os.path.exists(t)
+        # R14-03：**复用 snapshot 里已经核验过的摘要**，不要重读覆盖。
+        # 原实现无条件 `file_digest(t)`，读失败就把已验证的 old_digest
+        # 变成 None —— 审核已用生产函数复现（PREPARED 阶段摘要丢失）。
+        _fstate, _cur_dig = file_state(t)
+        existed = (_fstate == "PRESENT")
+        _old = entry.get("old_digest")
+        if _old is None and existed:
+            _old = _cur_dig            # 兜底：snapshot 没给才读一次
         bk = entry.get("backup")
+        _bkdig = entry.get("backup_digest")
+        if _bkdig is None and bk:
+            _bkdig = file_digest(bk)
         records[t] = {
             "existed": existed,
-            "old_digest": file_digest(t) if existed else None,
+            "file_state": _fstate,     # PRESENT / ABSENT / ERROR
+            "old_digest": _old,
             "new_digest": new_digest_map.get(t),
             "backup": bk,
-            "backup_digest": file_digest(bk) if bk else None,
+            "backup_digest": _bkdig,
             "staging": staging_map.get(t),
             "state": entry.get("state"),
         }
@@ -363,7 +374,8 @@ def _snapshot_has_failure(snapshot: Dict[str, Dict[str, Optional[str]]]) -> bool
 
 def _recover_prior_publish(work_output_path: str,
                            extra_targets: Optional[List[str]] = None,
-                           logger=None) -> Dict[str, Any]:
+                           logger=None,
+                           status_path: Optional[str] = None) -> Dict[str, Any]:
     """A4 方案 1：进入发布临界区前，按 journal 收拾上一次未完成的事务。
 
     **判断层早已就绪，缺的只是这个调用点。**
@@ -386,6 +398,86 @@ def _recover_prior_publish(work_output_path: str,
       `needs_human`    状态无法判定，保留现场等人工（调用方应失败）
     """
     jp = journal_path_for(work_output_path)
+
+    # ---- R14-02：先处理**未解决的恢复记录** ----
+    # 它表示上一次事务没有恢复到已知状态。不能当成"没有旧事务"继续发布，
+    # 也不能因为 journal 缺失就忽略它（两种记录是**并列**的证据）。
+    # 正式 status 在**发布路径**旁，不一定等于 work 路径；
+    # 调用方应显式传进来，未传时退回 work 路径（保持既有测试可用）。
+    _status_path_ = status_path or (work_output_path + ".status.json")
+    _rec_path_ = recovery_record_path(_status_path_)
+    # 用**三态**判断：目录/权限问题不能当成"没有记录"（R14-03 同一原则）。
+    _rec_state, _ = file_state(_rec_path_)
+    if _rec_state == "ERROR":
+        if logger:
+            logger.error(
+                "STAGE6_RECOVERY_RECORD_UNREADABLE",
+                "A recovery record path exists but is not a readable file; "
+                "refusing to treat these paths as valid",
+                recovery_record=_rec_path_)
+        return {"status": "needs_human", "action": None,
+                "report": {"recovery_record": _rec_path_,
+                           "reason": "unreadable"}}
+    if _rec_state == "PRESENT":
+        _rec_doc = None
+        try:
+            with open(_rec_path_, "r", encoding="utf-8") as _rf:
+                _rec_doc = json.load(_rf)
+        except (OSError, ValueError):
+            _rec_doc = None
+        if not isinstance(_rec_doc, dict):
+            if logger:
+                logger.error(
+                    "STAGE6_RECOVERY_RECORD_UNREADABLE",
+                    "An unresolved-recovery record exists but cannot be read; "
+                    "refusing to treat the paths as valid",
+                    recovery_record=_rec_path_)
+            return {"status": "needs_human", "action": None,
+                    "report": {"recovery_record": _rec_path_,
+                               "reason": "unreadable"}}
+
+        # 记录是**可读**的 —— 它表示上一次事务没有恢复到已知状态。
+        # 只有在"磁盘上已经是一份完整新代"（journal 记 COMMITTED）时，
+        # 这条记录才算过期，可以解除；否则必须保留现场等人工。
+        _rec_jp = journal_path_for(work_output_path)
+        _rec_phase = None
+        try:
+            _rec_jdoc = read_journal(_rec_jp)
+            _rec_phase = (_rec_jdoc or {}).get("phase")
+        except Exception:
+            _rec_phase = None
+
+        if _rec_phase == PHASE_COMMITTED:
+            try:
+                os.remove(_rec_path_)
+                if logger:
+                    logger.warning(
+                        "STAGE6_RECOVERY_RECORD_STALE",
+                        "An unresolved-recovery record coexisted with a "
+                        "COMMITTED journal; the generation on disk is complete "
+                        "so the record was cleared",
+                        recovery_record=_rec_path_)
+            except OSError as _rce:
+                if logger:
+                    logger.warning("STAGE6_RECOVERY_RECORD_CLEAR_FAIL",
+                                   str(_rce))
+        else:
+            if logger:
+                logger.error(
+                    "STAGE6_RECOVERY_RECORD_UNRESOLVED",
+                    "An unresolved-recovery record exists and the journal does "
+                    "not show a complete generation; refusing to treat these "
+                    "paths as valid. Inspect the record and the journal.",
+                    recovery_record=_rec_path_,
+                    journal=_rec_jp, journal_phase=_rec_phase,
+                    record_status=(_rec_doc or {}).get("status"),
+                    prior_status=(_rec_doc or {}).get("prior_status"))
+            return {"status": "needs_human", "action": None,
+                    "report": {"recovery_record": _rec_path_,
+                               "journal": _rec_jp,
+                               "journal_phase": _rec_phase,
+                               "reason": "unresolved recovery record"}}
+
     # PHOTO-03：先分清"确实没有 journal"与"journal 坏了/被改过"。
     # 后者状态未知，必须保留现场等人工，不能当成"没有旧事务"继续发布。
     try:
@@ -774,11 +866,24 @@ def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
 
 def _verify_restored(path: str, step: Dict[str, Any],
                      snapshot: Dict[str, Dict[str, Optional[str]]]) -> bool:
-    """恢复后核对：目标内容必须等于记录的旧代摘要（无记录则视为通过）。"""
-    want = (snapshot.get(path) or {}).get("old_digest")
+    """恢复后核对：目标必须**明确**符合记录的旧代状态。
+
+    R14-03：原实现"无记录则视为通过" —— 缺摘要就等于没校验还报成功。
+    现在分三种情形：
+
+    * 旧代本来不存在（``existed is False``）→ 目标必须**确实不在**；
+    * 有 ``old_digest`` → 目标必须存在且摘要相等；
+    * 既没 ``existed=False`` 也没 ``old_digest`` → **判失败**（状态未知）。
+    """
+    snap = snapshot.get(path) or {}
+    if snap.get("existed") is False:
+        _st, _ = file_state(path)
+        return _st == "ABSENT"
+    want = snap.get("old_digest")
     if not want:
-        return True
-    return file_digest(path) == want
+        return False                 # 缺摘要 ≠ 通过
+    _st, _dig = file_state(path)
+    return _st == "PRESENT" and _dig == want
 
 def _read_status_value(status_path: str) -> Optional[str]:
     """读正式 status 里的 ``status`` 字段；读不出返回 None（不猜）。"""
@@ -1761,7 +1866,8 @@ def main():
     # 这些已加锁步骤抛异常时不会释放锁（进程内被捕获时尤其明显）。
     # 这里给前导段补一个兜底：释放后原样重抛，不改变异常语义。
     try:
-        _prior = _recover_prior_publish(work_output_path, commit_targets, logger)
+        _prior = _recover_prior_publish(work_output_path, commit_targets,
+                                        logger, status_path=status_path)
         if _prior.get("status") == "needs_human":
             # 状态无法判定 —— 不猜、不动，让人工介入。此时动任何文件都可能
             # 把一次可恢复的残留变成不可恢复的损失。
@@ -2065,10 +2171,26 @@ def main():
 
         # journal 推进到 COMMITTED（含新代摘要，供下次判断"是否已提交"）
         _done_records = {}
+        _missing = []
         for _t in _journal_targets:
             _r = dict(_journal_records.get(_t) or {})
-            _r["new_digest"] = file_digest(_t)
+            # R14-03：**优先复用 PREPARED 时已核验的新代摘要**。
+            # 原实现无条件重读，读失败就把已知的 new_digest 写成 None，
+            # 随后照常写 COMMITTED、删备份、返回 0 —— 等于"提交成功"
+            # 但记录里没有任何身份信息。
+            _nd = _r.get("new_digest") or file_digest(_t)
+            if not _nd:
+                _missing.append(_t)
+            _r["new_digest"] = _nd
             _done_records[_t] = _r
+        if _missing:
+            logger.error(
+                "STAGE6_COMMITTED_DIGEST_MISSING",
+                "Cannot record a complete COMMITTED journal: some required "
+                "targets have no readable digest. Backups are kept and the "
+                "run is NOT reported as a clean publish.",
+                targets=_missing, journal=_journal_path)
+            return 82
         # FIX-2026-10-20：journal 写失败**不能静默**。
         # 此刻媒体已经发布（上面的 os.replace 已完成），若 journal 仍停在
         # PREPARED / COMMITTING，下次启动会认为"未提交"——可能重复发布，
@@ -2085,6 +2207,39 @@ def main():
             return 82
 
         # ---- 成功提交后清理 `.pubbak` 备份（2026-10-27 实测缺陷）----
+        # ---- R14-02：完整新代已提交 → 解除旧的恢复记录 ----
+        # 只在新代**确实提交成功**之后解除；解除前核对记录里的 attempt
+        # 不是并发的另一个 attempt（旧 attempt 不能误删新记录）。
+        try:
+            _done_rec_path = recovery_record_path(status_path)
+            if os.path.isfile(_done_rec_path):
+                _stale = None
+                try:
+                    with open(_done_rec_path, "r", encoding="utf-8") as _rf2:
+                        _stale = json.load(_rf2)
+                except (OSError, ValueError):
+                    _stale = None
+                _stale_attempt = (_stale or {}).get("attempt_id")
+                # 本次事务的 attempt 标识来自 journal（stage6 没有独立变量）
+                _this_attempt = (_journal_base or {}).get("attempt_id")
+                if (_stale_attempt and _this_attempt
+                        and _stale_attempt != _this_attempt):
+                    logger.warning(
+                        "STAGE6_RECOVERY_RECORD_FOREIGN",
+                        "A recovery record belongs to a different attempt; "
+                        "leaving it in place", recovery_record=_done_rec_path,
+                        record_attempt=_stale_attempt,
+                        current_attempt=_this_attempt)
+                else:
+                    os.remove(_done_rec_path)
+                    logger.info(
+                        "STAGE6_RECOVERY_RECORD_RESOLVED",
+                        "A complete new generation was committed; the "
+                        "previously unresolved recovery record was cleared",
+                        recovery_record=_done_rec_path)
+        except OSError as _rre:
+            logger.warning("STAGE6_RECOVERY_RECORD_CLEAR_FAIL", str(_rre))
+
         # 原实现：COMMITTED 之后直接 return 0，**从不删备份**。
         # 清理只发生在两条「异常恢复」路径（上次已提交 / 回滚成功），
         # 于是正常跑完一遍输出目录里恒留一份完整上一代备份 ——
