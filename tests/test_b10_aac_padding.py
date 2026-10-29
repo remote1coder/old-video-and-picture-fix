@@ -47,10 +47,20 @@ def _probe_ffprobe():
 pytestmark = pytest.mark.skipif(_ffmpeg() is None, reason="需要 ffmpeg")
 
 
-@pytest.fixture(scope="module")
-def encoded(tmp_path_factory):
-    """按 2s/4s 输入各编码一个 AAC，返回 (输入样本, 解码样本) 对。"""
-    d = tmp_path_factory.mktemp("b10")
+@pytest.fixture(scope="function")
+def encoded(tmp_path):
+    """按 2s/4s 输入各编码一个 AAC，返回 (输入样本, 解码样本) 对。
+
+    R15-06：原来是 **module 级 + `tmp_path_factory.mktemp()`**，依赖一个
+    长生命周期的共享 basetemp。整批跑时该目录可能在别的测试之后已经不可用，
+    于是 fixture 建立失败 → 4 条测试全报 `OSError: [Errno 53]`，
+    而单独跑这个文件时又完全正常（典型"只在全量里炸"的隔离问题）。
+
+    改成 function 级 + `tmp_path`：每个测试拿自己那份目录，不再依赖
+    模块级共享状态。代价只是每条测试多编码两次（各约 0.3 秒）。
+    """
+    d = tmp_path / "b10"
+    d.mkdir(exist_ok=True)
     rows = []
     for sec in (2.0, 4.0):
         out = str(d / f"a_{sec}.mka")

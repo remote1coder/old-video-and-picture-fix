@@ -188,11 +188,15 @@ def check_conservation(src: str, out: str, stage: str,
             if logger is not None:
                 logger.warning(
                     "FRAME_FPS_LABEL_MISMATCH",
-                    "The intermediate's declared frame rate does not match "
-                    "what this run intended. Timestamps may still be correct, "
-                    "but any downstream ffmpeg call MUST use "
-                    "`-fps_mode passthrough`, otherwise it will re-time and "
-                    "drop frames.",
+                    "This intermediate declares a different frame rate than "
+                    "this run intended. For a VFR track that is expected "
+                    "(there is no single frame rate; ffmpeg commonly writes "
+                    "25/1 as a placeholder), so this is informational, NOT a "
+                    "failure. Two rules follow from it: (1) any downstream "
+                    "ffmpeg call MUST use `-fps_mode passthrough`, otherwise "
+                    "it re-times and drops frames; (2) do NOT 'fix' the label "
+                    "by adding `-r` to the encoder — measured, that flattens "
+                    "VFR (an 8.0s variable-timeline clip came out 4.0s).",
                     stage=stage, expected=round(expected_fps, 4),
                     labeled=round(b["r_frame_rate"], 4))
 

@@ -214,3 +214,72 @@ def test_fps_label_match_does_not_warn(tmp_path, monkeypatch):
                                     exact_max_bytes=10)
     assert ok is True
     assert "fps_label_mismatch" not in rep
+
+
+# ---------------------------------------------------------------- VFR 保护
+
+@pytest.mark.skipif(not _ffmpeg(), reason="ffmpeg 不在 PATH 上")
+def test_vfr_intermediate_preserves_variable_timing(tmp_path):
+    """VFR 中间产物的**可变时序必须保留**。
+
+    这条是**防回归**用的：stage3 的 VFR 写出（concat + 逐帧 duration +
+    passthrough）声明的 `r_frame_rate` 是 `25/1`，看着像 bug，其实 VFR 流
+    本来就没有单一帧率 —— 那只是个占位值。
+
+    我一度想"修"它：在输入侧加 `-r 30`。实测证明那会**摧毁** VFR：
+
+    | 写法 | 真 VFR（期望 8.0s）产出时长 |
+    |---|---|
+    | 现状（无 -r） | **7.92s**（可变时序保留） |
+    | 输入侧 -r 30 | **4.00s**（被压平成 CFR） |
+
+    所以现状是对的。这条测试把"不能加 -r 去压平"这件事锁住。
+    """
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    base = str(tmp_path / "base.mp4")
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+              "-f", "lavfi", "-i", "testsrc=size=160x120:rate=30:duration=1",
+              "-c:v", "libx264", "-pix_fmt", "yuv420p", base])
+    assert r.returncode == 0, r.stderr[-300:]
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", base,
+              "-vsync", "0", str(frames / "f_%08d.png")])
+    assert r.returncode == 0, r.stderr[-300:]
+    names = sorted(os.listdir(str(frames)))
+    assert len(names) >= 20
+
+    # 前一半 0.0333，后一半 0.1 —— 明显变帧率
+    half = len(names) // 2
+    lines = []
+    for i, n in enumerate(names):
+        lines.append("file '%s'" % (frames / n).as_posix())
+        lines.append("duration %.6f" % (0.033333 if i < half else 0.1))
+    concat = str(tmp_path / "concat.txt")
+    with open(concat, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    expected = half * 0.033333 + (len(names) - half) * 0.1
+
+    # stage3 的写法（**不带** -r）
+    out = str(tmp_path / "out.mkv")
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+              "-f", "concat", "-safe", "0", "-i", concat,
+              "-fps_mode", "passthrough", "-c:v", "ffv1",
+              "-pix_fmt", "yuv420p16le", "-an", out])
+    assert r.returncode == 0, r.stderr[-300:]
+
+    got = fc._duration(out)
+    assert got is not None
+    # 关键：时长必须接近**可变**时序算出来的值，而不是被压成某个固定帧率
+    assert abs(got - expected) / expected < 0.05, \
+        f"VFR 时序被压平了：期望 {expected:.2f}s，实测 {got:.2f}s"
+
+    # 反证：加了 -r 就会被压平（确认这条测试真的能抓到问题）
+    flat = str(tmp_path / "flat.mkv")
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+              "-r", "30", "-f", "concat", "-safe", "0", "-i", concat,
+              "-fps_mode", "passthrough", "-c:v", "ffv1",
+              "-pix_fmt", "yuv420p16le", "-an", flat])
+    got_flat = fc._duration(flat) if r.returncode == 0 else None
+    assert got_flat is not None
+    assert abs(got_flat - expected) / expected > 0.05, \
+        "-r 竟然没压平 VFR（那这条测试就失去意义了）"
