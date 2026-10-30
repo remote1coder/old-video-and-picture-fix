@@ -2973,8 +2973,12 @@ def main():
                 from timeline_plan import (
                     read_plan as _read_tl,
                     claim_source_verified as _claim_src,
-                    build_transform_verdict as _build_tv)
-                _tl_plan = _read_tl(temp_dir, job_id)
+                    build_transform_verdict as _build_tv,
+                    build_identity as _build_tid)
+                # R16-05：读回时核对运行身份 —— 同 job_id 复用 temp 时，
+                # 旧计划（旧源/旧参数）不能被当成本次的"源已验证"。
+                _tl_plan = _read_tl(temp_dir, job_id,
+                                  identity=_build_tid(params))
 
                 # ---- 结论 ②：用户请求的变换是否真的执行了 ----
                 # 以前这里只声明了 `transform_applied_verified: None` 却从没人填，
@@ -2985,7 +2989,8 @@ def main():
                     original_duration=original_duration,
                     processed_duration=processed_duration,
                     timing_state=_timing_state,
-                    tempo_applied=tempo_ratio)
+                    tempo_applied=tempo_ratio,
+                    timing_basis=_timing_basis)
                 if _tv["status"] == "FAIL":
                     logger.error(
                         "STAGE7_TRANSFORM_NOT_APPLIED",

@@ -3037,13 +3037,15 @@ def main():
     # 拿不到 stage3 产物旁的侧车。
     try:
         from timeline_plan import (
-            build_plan as _build_tl, write_plan as _write_tl)
+            build_plan as _build_tl, write_plan as _write_tl,
+            build_identity as _build_tid)
         _tl_doc = _build_tl(
             job_id, _tl_encode, fps_value=fps_str, fps_source=_fps_source,
             pts_usable=len(all_pts_map or {}), expected_frames=total_frames,
             assumptions=(["fps came from a spec, not from measurement"]
                          if _fps_source in ("user-assumed", "manifest-assumed")
-                         else []))
+                         else []),
+                         identity=_build_tid(params))
         _tl_path = _write_tl(temp_dir, _tl_doc)
         if _tl_path:
             logger.info("STAGE3_TIMELINE_PLAN",

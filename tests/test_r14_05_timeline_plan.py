@@ -169,7 +169,8 @@ def test_declared_and_matching_is_pass():
     v = tp.build_transform_verdict(declared_speed=2.0,
                                    original_duration=10.0,
                                    processed_duration=5.0,
-                                   timing_state="verified")
+                                   timing_state="verified",
+                                   timing_basis="packet-span")
     assert v["status"] == "PASS", v
     assert v["observed_ratio"] == pytest.approx(2.0)
     assert "matches" in v["reason"]
@@ -180,20 +181,27 @@ def test_declared_but_output_differs_is_fail():
     v = tp.build_transform_verdict(declared_speed=2.0,
                                    original_duration=10.0,
                                    processed_duration=6.6667,
-                                   timing_state="verified")
+                                   timing_state="verified",
+                                   timing_basis="packet-span")
     assert v["status"] == "FAIL", v
     assert "2.0" in v["reason"] and "off" in v["reason"]
 
 
-def test_timing_unverified_means_transform_unverified():
-    """时序本身没验证 → 变换也不能算已验证（不能凭空认账）。"""
+def test_measured_mismatch_is_fail_even_if_audio_timing_unexplained():
+    """R16-05：**实测不符就是 FAIL**，不能因为音频 timing_state 降成 UNVERIFIED。
+
+    审核反例：10s→10s、声明 2 倍。旧实现据 `unexplained` 返回 UNVERIFIED，
+    但实测已经在手（比值 1.0），与 2 倍明显不符 → 必须是 FAIL。
+    `timing_state` 是音频决策，不是"测量是否有效"。
+    """
     for st in ("unverified", "unexplained"):
         v = tp.build_transform_verdict(declared_tempo=1.5,
                                        original_duration=10.0,
                                        processed_duration=6.6667,
-                                       timing_state=st)
-        assert v["status"] == "UNVERIFIED", (st, v)
-        assert st in v["reason"]
+                                       timing_state=st,
+                                       timing_basis="packet-span")
+        # 实测相符 → PASS，与**音频** timing_state 无关
+        assert v["status"] == "PASS", (st, v)
 
 
 def test_missing_durations_is_unverified_not_pass():
@@ -242,3 +250,126 @@ def test_stage7_fills_the_verdict():
         "stage7 必须把裁定写进报告的 timeline 段"
     assert "transform_applied_verified\": None" not in s7, \
         "不得再留 None 占位"
+
+
+# ------------------------------------------------- R16-05 语义分离
+
+def test_measured_10s_to_10s_declared_2x_is_fail():
+    """审核点名的反例：实测 10s→10s、声明 2 倍 → **FAIL**。"""
+    v = tp.build_transform_verdict(declared_speed=2.0,
+                                   original_duration=10.0,
+                                   processed_duration=10.0,
+                                   timing_state="unexplained",
+                                   timing_basis="packet-span")
+    assert v["status"] == "FAIL", v
+    assert v["observed_ratio"] == pytest.approx(1.0)
+    assert "off" in v["reason"]
+
+
+def test_measured_10s_to_5s_declared_2x_passes():
+    v = tp.build_transform_verdict(declared_speed=2.0,
+                                   original_duration=10.0,
+                                   processed_duration=5.0,
+                                   timing_state="verified",
+                                   timing_basis="packet-span")
+    assert v["status"] == "PASS", v
+
+
+def test_estimate_only_is_unverified_even_if_numbers_match():
+    """只有估算、没有足够时间证据 → UNVERIFIED。
+
+    审核要求："不靠数值碰巧一致宣称通过"。数值恰好等也要拦住。
+    """
+    for basis in ("frame-ratio (estimated)", "unknown", None):
+        v = tp.build_transform_verdict(declared_speed=2.0,
+                                       original_duration=10.0,
+                                       processed_duration=5.0,
+                                       timing_state="verified",
+                                       timing_basis=basis)
+        assert v["status"] == "UNVERIFIED", (basis, v)
+        assert "no valid measurement" in v["reason"], v
+
+
+def test_conflicting_speed_and_tempo_is_rejected():
+    """`expected_speed` 与 `expected_tempo` 冲突 → FAIL，不静默取一个。"""
+    v = tp.build_transform_verdict(declared_speed=2.0, declared_tempo=1.5,
+                                   original_duration=10.0,
+                                   processed_duration=5.0,
+                                   timing_state="verified",
+                                   timing_basis="packet-span")
+    assert v["status"] == "FAIL", v
+    assert "conflict" in v, v
+    assert "disagree" in v["reason"], v
+
+
+def test_agreeing_speed_and_tempo_is_allowed():
+    v = tp.build_transform_verdict(declared_speed=2.0, declared_tempo=2.0,
+                                   original_duration=10.0,
+                                   processed_duration=5.0,
+                                   timing_state="verified",
+                                   timing_basis="packet-span")
+    assert v["status"] == "PASS", v
+
+
+# ------------------------------------------------- R16-05 计划身份绑定
+
+def test_plan_records_identity(tmp_path):
+    """计划必须钉住 源输入 / 参数摘要 / attempt。"""
+    ident = {"source_input": "/src/a.mp4", "param_hash": "abc123",
+             "attempt_id": "att-1"}
+    plan = tp.build_plan("j1", "cfr", fps_value="25", fps_source="probe",
+                         identity=ident)
+    assert plan["identity"] == ident
+
+
+def test_read_plan_rejects_a_plan_from_another_run(tmp_path):
+    """同 job_id、同 temp，但换了源或参数 → 旧计划**不得**被复用。
+
+    这是审核确认的风险：复用 temp 时会读到旧源的"源已验证"。
+    """
+    from timeline_plan import write_plan
+    old = {"source_input": "/src/a.mp4", "param_hash": "OLD",
+           "attempt_id": "att-1"}
+    plan = tp.build_plan("j1", "cfr", fps_value="25", fps_source="probe",
+                         identity=old)
+    assert write_plan(str(tmp_path), plan)
+
+    # 同身份 → 可读
+    got = tp.read_plan(str(tmp_path), "j1", identity=old)
+    assert got is not None and got["job_id"] == "j1"
+
+    # 换源 → 拒绝
+    assert tp.read_plan(str(tmp_path), "j1",
+                        identity=dict(old, source_input="/src/b.mp4")) is None
+
+    # 换参数 → 拒绝
+    assert tp.read_plan(str(tmp_path), "j1",
+                        identity=dict(old, param_hash="NEW")) is None
+
+    # 换 attempt → 拒绝
+    assert tp.read_plan(str(tmp_path), "j1",
+                        identity=dict(old, attempt_id="att-2")) is None
+
+    # 不传身份（旧调用方式）→ 仍可读（不破坏既有调用方）
+    assert tp.read_plan(str(tmp_path), "j1") is not None
+
+
+def test_build_identity_uses_run_plan():
+    """`build_identity` 从 `_run_plan` 取源输入；缺则退回 params。"""
+    i = tp.build_identity({"_run_plan": {"input_path": "/src/a.mp4"},
+                           "param_hash": "H", "attempt_id": "A"})
+    assert i == {"source_input": "/src/a.mp4", "param_hash": "H",
+                 "attempt_id": "A"}
+    i2 = tp.build_identity({"input_path": "/src/b.mp4"})
+    assert i2["source_input"] == "/src/b.mp4"
+    assert i2["param_hash"] == "" and i2["attempt_id"] == ""
+
+
+def test_missing_evidence_on_either_side_is_not_a_mismatch(tmp_path):
+    """双方都缺值 ≠ 不符：不能因为老计划没写身份就一律拒绝。"""
+    from timeline_plan import write_plan
+    plan = tp.build_plan("j1", "cfr", fps_value="25", fps_source="probe")
+    assert write_plan(str(tmp_path), plan)
+    # 计划里 identity 为空 dict
+    assert tp.read_plan(str(tmp_path), "j1",
+                        identity={"source_input": "/src/a.mp4"}) is not None

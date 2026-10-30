@@ -37,11 +37,30 @@ SCHEMA = "timeline-plan/1"
 VERIFIED_STATES = ("cfr", "vfr")
 
 
+def build_identity(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """构造**跨阶段可比对**的运行身份。
+
+    R16-05：计划只按 `job_id` 命名、读回只校验 schema —— 复用 temp 时可能
+    读到**旧源/旧参数**留下的"源已验证"。这里把三样钉进计划：源输入路径、
+    参数摘要、attempt。stage3 写、stage7 读，两边用同一函数算。
+    """
+    _p = params or {}
+    _plan = _p.get("_run_plan") or {}
+    return {
+        "source_input": (_plan.get("input_path")
+                         or _p.get("input_path") or ""),
+        "param_hash": str(_p.get("param_hash") or ""),
+        "attempt_id": str(_p.get("attempt_id") or ""),
+    }
+
+
+
 def build_plan(job_id: str, source_timeline: Optional[str],
                fps_value: Optional[str] = None,
                fps_source: Optional[str] = None,
                pts_usable: int = 0, expected_frames: int = 0,
-               assumptions: Optional[list] = None) -> Dict[str, Any]:
+               assumptions: Optional[list] = None,
+               identity: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """stage3 侧的构造。
 
     Args:
@@ -85,6 +104,8 @@ def build_plan(job_id: str, source_timeline: Optional[str],
             "requested_by_user": (fps_source == "user-assumed"),
         },
         # stage7 填
+        # R16-05：运行身份 —— 读回时必须核对，否则同名计划会被复用。
+        "identity": dict(identity or {}),
         "output_measured": False,
     }
 
@@ -93,7 +114,9 @@ def build_transform_verdict(declared_speed=None, declared_tempo=None,
                             original_duration=None, processed_duration=None,
                             timing_state: Optional[str] = None,
                             tempo_applied: float = 1.0,
-                            tolerance: float = 0.01) -> Dict[str, Any]:
+                            tolerance: float = 0.01,
+                            timing_basis: Optional[str] = None,
+                            ) -> Dict[str, Any]:
     """裁定"用户请求的变换是否真的执行了"（结论 ②）。
 
     `source_verified`（① 源时间轴可信）与 `output_measured`（③ 输出测得）
@@ -107,6 +130,8 @@ def build_transform_verdict(declared_speed=None, declared_tempo=None,
             （``verified`` / ``adjusted`` / ``unverified`` / ``unexplained``）。
         tempo_applied: 实际施加的 atempo（1.0 = 没改音频）。
         tolerance: 相对容差。
+        timing_basis: 时长证据的来源。``"packet-span"`` 表示**实测**；
+            估算或缺失都算"测量不足"。
 
     Returns:
         dict，``status`` ∈ ``NOT_APPLICABLE`` / ``PASS`` / ``FAIL`` / ``UNVERIFIED``。
@@ -142,6 +167,27 @@ def build_transform_verdict(declared_speed=None, declared_tempo=None,
         out["reason"] = "no speed/tempo change was requested"
         return out
 
+    # ---- R16-05：两个声明**冲突**时不许静默取一个 ----
+    _vals = []
+    for _v in (declared_tempo, declared_speed):
+        if _v is None:
+            continue
+        try:
+            _f = float(_v)
+        except (TypeError, ValueError):
+            continue
+        if _f > 0:
+            _vals.append(_f)
+    if len(_vals) >= 2 and abs(_vals[0] - _vals[1]) / max(_vals[0], 1e-9) > \
+            tolerance:
+        out["status"] = "FAIL"
+        out["conflict"] = {"declared_tempo": _vals[0],
+                           "declared_speed": _vals[1]}
+        out["reason"] = (
+            "expected_speed and expected_tempo were both declared but disagree "
+            f"({_vals[1]} vs {_vals[0]}); refusing to silently pick one")
+        return out
+
     # 有请求：先看能不能算出实测比值
     try:
         _orig = float(original_duration or 0)
@@ -151,20 +197,23 @@ def build_transform_verdict(declared_speed=None, declared_tempo=None,
     if _orig > 0 and _proc > 0:
         out["observed_ratio"] = round(_orig / _proc, 6)
 
-    if timing_state in ("unverified", "unexplained"):
+    # ---- R16-05：先分清"测到了没有"和"符不符" ----
+    # 审核反例：10s→10s、声明 2 倍。`_decide_timing` 得到 `unexplained`，
+    # 旧实现据此返回 UNVERIFIED —— 但**实测已经在手**（比值 1.0），
+    # 与声明 2 倍明显不符，那就该是 **FAIL**。
+    # `timing_state` 是**音频**决策（是否改 atempo），不是"测量是否有效"。
+    _measured = (timing_basis == "packet-span")
+    if out["observed_ratio"] is None or not _measured:
         out["status"] = "UNVERIFIED"
         out["reason"] = (
-            f"the transform was requested ({out['kind']}={_declared}), but the "
-            f"timing could not be verified (timing_state={timing_state}); the "
-            "requested change is NOT confirmed to have been applied")
+            f"the transform was requested ({out['kind']}={_declared}) but there "
+            f"is no valid measurement (basis={timing_basis!r}); a coincidental "
+            "number is not evidence")
         return out
+    out["basis"] = timing_basis
 
-    if out["observed_ratio"] is None:
-        out["status"] = "UNVERIFIED"
-        out["reason"] = ("durations unavailable; cannot confirm the requested "
-                         f"{out['kind']}={_declared} was applied")
-        return out
-
+    if timing_state in ("unverified", "unexplained"):
+        out["timing_state"] = timing_state
     _rel = abs(out["observed_ratio"] - _declared) / max(_declared, 1e-9)
     if _rel <= tolerance:
         out["status"] = "PASS"
@@ -213,8 +262,14 @@ def write_plan(temp_dir: str, plan: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def read_plan(temp_dir: str, job_id: str) -> Optional[Dict[str, Any]]:
-    """读回计划；不存在/读不出/结构不对都返回 ``None``（不猜）。"""
+def read_plan(temp_dir: str, job_id: str,
+               identity: Optional[Dict[str, Any]] = None
+               ) -> Optional[Dict[str, Any]]:
+    """读回计划；不存在/读不出/结构不对 **或身份不符** 都返回 ``None``。
+
+    R16-05：原来只校验 schema。同 job_id 复用 temp 时，会读到**上一轮**
+    源/参数留下的"源已验证" —— 那是把旧证据当成本次结论。
+    """
     try:
         path = os.path.join(str(temp_dir), f"{job_id}_timeline_plan.json")
         if not os.path.isfile(path):
@@ -223,6 +278,14 @@ def read_plan(temp_dir: str, job_id: str) -> Optional[Dict[str, Any]]:
             doc = json.load(f)
         if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
             return None
+        if identity is not None:
+            got = doc.get("identity") or {}
+            for _k in ("source_input", "param_hash", "attempt_id"):
+                _want = identity.get(_k)
+                # 只比对**双方都有值**的项：缺证据不等于不符，
+                # 但"值不同"一定是不符。
+                if _want and got.get(_k) and str(got[_k]) != str(_want):
+                    return None
         return doc
     except (OSError, ValueError, TypeError):
         return None
