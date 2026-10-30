@@ -435,6 +435,8 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                         # 终态没写成：下一次仍要能按磁盘事实确认已回滚，
                         # 所以**保留备份**，不谎称完成。
                         res.cleanup_pending.append("journal_rolled_back")
+                        # 终态没落盘 —— 与 COMMITTED 失败同样处理：不能删备份。
+                        res.terminal_pending = True
                         if logger:
                             logger.error(
                                 "PUBLISH_ROLLBACK_TERMINAL_FAIL",

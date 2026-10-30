@@ -346,3 +346,109 @@ def test_stage7_does_not_swallow_fullchain_write_failure():
     m = re.search(r"_fc_pending = \(_fc_tmp, _fc_final\)\s*\n\s*(except[^\n]*)\n(\s*)pass\b",
                   src)
     assert m is None, "fullchain 候选写入仍是 `except: pass`（静默吞掉）"
+
+
+# ---------------------------------------------------------------- B02
+
+def test_b02_rollback_terminal_write_failure_keeps_material(
+        tmp_path, monkeypatch):
+    """B02：回滚成功但**终态日志写失败** → 保留备份，重启仍能确认。
+
+    审核要求："终态日志写入失败时，下一次仍有明确、可验证的恢复办法。"
+    """
+    d, media, verify, full = _gen_a(tmp_path)
+    a_media, a_verify = _read(media), _read(verify)
+    _s, m, v, f = _stage_b(tmp_path)
+    arts = _arts(media, verify, full, m, v, f)
+
+    real_replace = os.replace
+    real_write = pub.write_journal
+
+    def _boom_replace(src, dst):
+        if str(dst).endswith(".verify.json"):
+            raise PermissionError("simulated: verify promote denied")
+        return real_replace(src, dst)
+
+    def _fail_rolled_back(path, doc, **kw):
+        if doc.get("phase") == PHASE_ROLLED_BACK:
+            return False
+        return real_write(path, doc, **kw)
+
+    monkeypatch.setattr(pub.os, "replace", _boom_replace)
+    monkeypatch.setattr(pub, "write_journal", _fail_rolled_back)
+    jp = _journal(tmp_path)
+    bdir = _backup_dir(tmp_path)
+    res = pub.publish(arts, jp, bdir, "att-1", decision={"publish": True},
+                      logger=_Log())
+    monkeypatch.undo()
+
+    # 当次：恢复完整 A，但终态没写成
+    assert res.restored is True
+    assert res.terminal_pending is True, res.as_dict()
+    assert any("journal_rolled_back" in c for c in res.cleanup_pending), \
+        res.cleanup_pending
+    assert _read(media) == a_media and _read(verify) == a_verify
+
+    # **备份必须还在**（下一次恢复的唯一依据）
+    assert [n for n in os.listdir(bdir) if ".pubbak" in n], \
+        "终态未持久化时不能删备份"
+
+    # 重启后：按磁盘事实应能确认"已是完整旧代"，不需要人工
+    rep = pub.recover(jp, bdir, "att-2")
+    assert rep is not None and rep.get("ok") is True, rep
+    assert rep.get("action") == "confirmed_rolled_back", rep
+    assert read_journal(jp)["phase"] == PHASE_ROLLED_BACK
+
+
+# ---------------------------------------------------------------- B06
+
+def test_b06_journal_without_records_changes_nothing(tmp_path):
+    """B06：journal 结构不全（没有 records）→ 一个正式文件都不改。"""
+    d, media, verify, full = _gen_a(tmp_path)
+    a_media, a_verify = _read(media), _read(verify)
+    jp = _journal(tmp_path)
+    # 手写一个"有 schema 有 targets 但没 records"的 journal
+    from publish_journal import write_journal
+    assert write_journal(jp, {"attempt_id": "att-x", "phase": "PREPARING",
+                              "targets": [media, verify]})
+
+    rep = pub.recover(jp, _backup_dir(tmp_path), "att-1")
+    assert rep is not None and rep.get("ok") is False, rep
+    assert _read(media) == a_media and _read(verify) == a_verify
+
+
+def test_b06_directory_journal_is_not_treated_as_absent(tmp_path):
+    """B06：journal 是**目录**时不能等同于"没有事务"。"""
+    d, media, verify, full = _gen_a(tmp_path)
+    jp = _journal(tmp_path)
+    os.makedirs(jp, exist_ok=True)      # 同名目录
+    rep = pub.recover(jp, _backup_dir(tmp_path), "att-1")
+    # 目录 → read_journal 返回 None → recover 返回 ok=False（不能当"没事"）
+    assert rep is None or rep.get("ok") is False, rep
+
+
+def test_b06_recovery_never_trusts_records_over_targets(tmp_path):
+    """B06：records 里的目标若不在 targets 里，恢复不得为之加锁后操作。
+
+    审核："独立 recover 根据 doc.targets 取锁，却按 records 操作"。
+    """
+    d, media, verify, full = _gen_a(tmp_path)
+    a_media = _read(media)
+    outsider = str(tmp_path / "outsider.bin")
+    _write(outsider, b"OUTSIDER")
+
+    from publish_journal import write_journal
+    jp = _journal(tmp_path)
+    assert write_journal(jp, {
+        "attempt_id": "att-x", "phase": "COMMITTING",
+        "targets": [media],                     # 只锁 media
+        "records": {                            # 却想动 outsider
+            outsider: {"existed": True, "old_digest": "deadbeef",
+                       "backup": None, "backup_digest": None},
+        },
+    })
+    rep = pub.recover(jp, _backup_dir(tmp_path), "att-1")
+    # 不管结果是失败还是拒绝，**都不许**在没锁 outsider 的情况下改它
+    assert _read(outsider) == b"OUTSIDER", "越界目标被改了"
+    assert _read(media) == a_media
+    assert rep is None or rep.get("ok") is False, rep
