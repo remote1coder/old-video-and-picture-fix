@@ -330,9 +330,16 @@ def main():
                 # 记一条告警提示"下游必须用 passthrough"。
                 from rate_spec import parse_rate_or_none as _prn
                 _want = _prn(params.get("original_fps") or params.get("fps"))
+                _want_dur = None
+                try:
+                    _wd = params.get("duration")
+                    _want_dur = float(_wd) if _wd else None
+                except (TypeError, ValueError):
+                    _want_dur = None
                 _ok, _rep = check_conservation(
                     stage3_output, output_path, "stage4", logger,
-                    expected_fps=(_want.value if _want else None))
+                    expected_fps=(_want.value if _want else None),
+                    expected_duration=_want_dur)
                 if not _ok:
                     logger.error(
                         "STAGE4_FRAME_CONSERVATION_BROKEN",

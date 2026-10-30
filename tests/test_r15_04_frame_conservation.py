@@ -283,3 +283,52 @@ def test_vfr_intermediate_preserves_variable_timing(tmp_path):
     assert got_flat is not None
     assert abs(got_flat - expected) / expected > 0.05, \
         "-r 竟然没压平 VFR（那这条测试就失去意义了）"
+
+
+# ------------------------------------------------- R16-06 原始时长比对
+
+def test_duration_drift_from_original_is_rejected(tmp_path, monkeypatch):
+    """产物时长偏离**原始素材** → 判失败。
+
+    这是真 VFR 经过 y4m 管道的实测症状：源 15.702s、中间产物 15.172s
+    （-3.4%）。stage3→stage4 两边的 `r_frame_rate` **都是 25/1**，
+    所以只比帧率的检查看不见它 —— 必须与原始时长比。
+    """
+    a = tmp_path / "a.mkv"
+    b = tmp_path / "b.mkv"
+    for p in (a, b):
+        p.write_bytes(b"x" * 512)
+
+    # 两边"帧率一致、时长一致"（旧检查看不出问题）
+    monkeypatch.setattr(
+        fc, "describe",
+        lambda p: {"path": p, "r_frame_rate": 25.0, "avg_frame_rate": 25.0,
+                   "duration": 15.172, "bytes": 512})
+
+    # 不给原始时长 → 通过（旧行为）
+    ok_old, _ = fc.check_conservation(str(a), str(b), "stage4",
+                                      exact_max_bytes=10)
+    assert ok_old is True
+
+    # 给原始时长 15.702 → 3.4% 偏差 → 必须拒绝
+    ok_new, rep = fc.check_conservation(str(a), str(b), "stage4",
+                                        exact_max_bytes=10,
+                                        expected_duration=15.702)
+    assert ok_new is False, rep
+    assert any("deviates from the original" in r for r in rep["reasons"]), \
+        rep["reasons"]
+
+
+def test_duration_match_with_original_passes(tmp_path, monkeypatch):
+    a = tmp_path / "a.mkv"
+    b = tmp_path / "b.mkv"
+    for p in (a, b):
+        p.write_bytes(b"x" * 512)
+    monkeypatch.setattr(
+        fc, "describe",
+        lambda p: {"path": p, "r_frame_rate": 25.0, "avg_frame_rate": 25.0,
+                   "duration": 15.194, "bytes": 512})
+    ok, rep = fc.check_conservation(str(a), str(b), "stage4",
+                                    exact_max_bytes=10,
+                                    expected_duration=15.193)
+    assert ok is True, rep

@@ -111,6 +111,7 @@ def check_conservation(src: str, out: str, stage: str,
                        exact_max_bytes: int = DEFAULT_EXACT_MAX_BYTES,
                        duration_tolerance: float = DEFAULT_DURATION_TOLERANCE,
                        expected_fps: Optional[float] = None,
+                       expected_duration: Optional[float] = None,
                        ) -> Tuple[bool, Dict[str, Any]]:
     """核对 ``src`` → ``out`` 有没有被重定时/丢帧。
 
@@ -119,6 +120,10 @@ def check_conservation(src: str, out: str, stage: str,
         out: 本阶段写出的中间产物。
         stage: 阶段名，用于日志。
         exact_max_bytes: ``out`` 小于此值时才做精确帧计数。
+        expected_duration: **原始素材的时长**。给出时，产物时长必须与它
+            接近 —— 否则说明中间某一环把时间轴改了（VFR 经过 y4m 管道被压成
+            标称帧率就是这样，实测真 VFR 素材会掉 3.4%）。这一项能在 stage4
+            就把问题暴露出来，而不是等 stage7 的全链门再拦。
         expected_fps: 本次应当产出的帧率。给出时，若 ``out`` 声明的
             ``r_frame_rate`` 与它明显不符，记一条**告警**并写进报告 ——
             VFR 中间产物常被 ffmpeg 标成 25/1（时间戳正确、标签错），
@@ -176,6 +181,17 @@ def check_conservation(src: str, out: str, stage: str,
         rep["exact"] = False
         rep["note"] = ("exact counting skipped (file larger than "
                        f"{exact_max_bytes} bytes); metadata check only")
+
+    # ---- 与**原始时长**比对（R16-06：VFR 经 y4m 会掉时长）----
+    if expected_duration and b["duration"]:
+        _drel = abs(b["duration"] - float(expected_duration)) / float(
+            expected_duration)
+        if _drel > duration_tolerance:
+            rep["reasons"].append(
+                f"duration deviates from the original source "
+                f"{float(expected_duration):.3f}s -> {b['duration']:.3f}s "
+                f"({_drel * 100:.1f}%); an intermediate changed the timeline")
+            rep["ok"] = False
 
     # ---- 附加：中间产物的帧率标签是否与本次意图一致（只告警）----
     if expected_fps and b["r_frame_rate"]:
