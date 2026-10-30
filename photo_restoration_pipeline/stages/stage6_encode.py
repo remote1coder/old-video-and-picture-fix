@@ -447,7 +447,37 @@ def _recover_prior_publish(work_output_path: str,
         except Exception:
             _rec_phase = None
 
-        if _rec_phase == PHASE_COMMITTED:
+        # R16-07：**不能只看 phase 字段就解除记录**。
+        # 审核确认：原实现见到 COMMITTED 就先删 recovery 记录，
+        # 之后才校验路径与整代摘要，也没核对 attempt —— 等于
+        # 还没证明已解决就销毁恢复证据。
+        _gen_ok = False
+        _gen_why = "journal not COMMITTED"
+        _rec_attempt = (_rec_doc or {}).get("attempt_id")
+        _doc_attempt = (_rec_jdoc or {}).get("attempt_id")
+        if (_rec_attempt and _doc_attempt
+                and str(_rec_attempt) != str(_doc_attempt)):
+            _gen_why = "recovery record belongs to another attempt"
+        elif _rec_phase == PHASE_COMMITTED:
+            _recs = (_rec_jdoc or {}).get("records") or {}
+            if not _recs:
+                _gen_why = "journal has no records"
+            else:
+                _gen_ok = True
+                for _fin, _row in _recs.items():
+                    _st, _dig = file_state(_fin)
+                    if _st == "ERROR":
+                        _gen_ok = False
+                        _gen_why = "cannot read " + str(_fin)
+                        break
+                    _want = (_row or {}).get("new_digest")
+                    if _st == "ABSENT" or not _want or _dig != _want:
+                        _gen_ok = False
+                        _gen_why = ("target does not match the recorded "
+                                     "new digest: " + str(_fin))
+                        break
+
+        if _gen_ok:
             try:
                 os.remove(_rec_path_)
                 if logger:
@@ -471,7 +501,8 @@ def _recover_prior_publish(work_output_path: str,
                     recovery_record=_rec_path_,
                     journal=_rec_jp, journal_phase=_rec_phase,
                     record_status=(_rec_doc or {}).get("status"),
-                    prior_status=(_rec_doc or {}).get("prior_status"))
+                    prior_status=(_rec_doc or {}).get("prior_status"),
+                    why=_gen_why)
             return {"status": "needs_human", "action": None,
                     "report": {"recovery_record": _rec_path_,
                                "journal": _rec_jp,
@@ -826,12 +857,27 @@ def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
         try:
             if step["action"] == "restore":
                 backup = step["backup"]
+                # R16-07：**不能**直接 copyfile 到正式路径 —— 复制中断会把
+                # 正式文件留成半截，下次既不等于旧摘要也不等于新摘要，只能人工。
+                # 改为：目标侧私有暂存 → 核对摘要 → replace。
+                _stage = f"{path}.restore-{os.getpid()}-{time.time_ns()}"
                 try:
-                    # 复制而不是 replace：备份在整组确认完成前保持可重试，
-                    # 中途再崩一次仍能继续。
-                    shutil.copyfile(backup, path)
-                except OSError:
-                    shutil.copyfile(backup, path)
+                    shutil.copyfile(backup, _stage)
+                    _snap = snapshot.get(path) or {}
+                    _want = _snap.get("old_digest")
+                    if _snap.get("existed") is False:
+                        raise OSError("recorded state says this target did not exist")
+                    _got = file_digest(_stage)
+                    if not _want or _got != _want:
+                        raise OSError(
+                            "copied bytes do not match old_digest (staged restore refused)")
+                    os.replace(_stage, path)
+                finally:
+                    try:
+                        if os.path.exists(_stage):
+                            os.remove(_stage)
+                    except OSError:
+                        pass
                 if not _verify_restored(path, step, snapshot):
                     result["failed"].append({
                         "path": path,
@@ -1947,8 +1993,53 @@ def main():
         # 取消处理器最后是 os._exit，普通 try/finally 根本跑不到，
         # 所以必须注册为取消钩子；提交成功后由 release_outputs() 清除。
         if cancel_guard is not None:
-            cancel_guard.add_cancel_hook(
-                lambda: _rollback_publish(snapshot, logger))
+                # R16-07：钩子**必须读取回滚结果并持久记录**。
+                # 原来是一个忽略返回值的 lambda：取消处理器随后 os._exit，
+                # "回滚完整/回滚失败" 没有任何落盘痕迹，等于取消恢复合同没完成。
+                def _cancel_rollback():
+                    _res = None
+                    try:
+                        _res = _rollback_publish(snapshot, logger)
+                    except BaseException as _ce:
+                        _res = {"fully_restored": False,
+                                "error": f"{type(_ce).__name__}: {_ce}"}
+                        try:
+                            logger.error("STAGE6_CANCEL_ROLLBACK_RAISED",
+                                         "The cancel-time rollback raised; the previous "
+                                         "generation may be incomplete",
+                                         error=_res["error"])
+                        except Exception:
+                            pass
+                    # 持久记录：诊断写失败也要如实反映（异常向上抛，不吞）
+                    try:
+                        _jp = journal_path_for(work_output_path)
+                        _doc = read_journal(_jp)
+                        if _doc is not None:
+                            _doc = dict(_doc)
+                            _doc["cancel_rollback"] = {
+                                "fully_restored": bool(_res.get("fully_restored")),
+                                "failed": _res.get("failed"),
+                                "error": _res.get("error"),
+                                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            }
+                            write_journal(_jp, _doc)
+                    except Exception as _we:
+                        try:
+                            logger.error("STAGE6_CANCEL_ROLLBACK_UNRECORDED",
+                                         "Could not persist the cancel-time rollback result",
+                                         error=str(_we), result=_res)
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            logger.error("STAGE6_CANCEL_ROLLBACK_RESULT",
+                                         "Cancel-time rollback finished",
+                                         fully_restored=bool(
+                                             (_res or {}).get("fully_restored")))
+                        except Exception:
+                            pass
+                    return _res
+                cancel_guard.add_cancel_hook(_cancel_rollback)
         # R3-03 / B03：任一目标备份失败 → **在改动任何旧产物之前停止**。
         if _snapshot_has_failure(snapshot):
             logger.error("STAGE6_PUBLISH_BACKUP_INCOMPLETE",
