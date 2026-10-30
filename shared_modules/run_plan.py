@@ -36,6 +36,7 @@ import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # 路径来源的优先级（数字越小越强）。记录用途：让报告能解释"这个值听谁的"。
+SOURCE_REDIRECT = "redirect"
 SOURCE_CLI_RELOCATE = "cli:relocate"
 SOURCE_JOB = "job"
 SOURCE_CLI = "cli"
@@ -43,11 +44,15 @@ SOURCE_CONFIG = "config"
 SOURCE_DEFAULT = "default"
 
 _SOURCE_RANK = {
-    SOURCE_CLI_RELOCATE: 0,
-    SOURCE_JOB: 1,
-    SOURCE_CLI: 2,
-    SOURCE_CONFIG: 3,
-    SOURCE_DEFAULT: 4,
+    # R16-04：重定向后的**实际**路径最强。
+    # WSL 重定向/空间回退会改写 params.temp_dir（也可能改写输出），
+    # 若仍让 job.temp_dir 优先，二次预检就会批准一个"实际并不使用"的路径。
+    SOURCE_REDIRECT: 0,
+    SOURCE_CLI_RELOCATE: 1,
+    SOURCE_JOB: 2,
+    SOURCE_CLI: 3,
+    SOURCE_CONFIG: 4,
+    SOURCE_DEFAULT: 5,
 }
 
 # 同一目标的侧车后缀。集中在这里，避免各处自己拼。
@@ -85,6 +90,24 @@ class PathValue:
         return f"PathValue({self.key!r}={self.resolved!r}, {self.source})"
 
 
+def _normalize_posix_drive(p: str) -> str:
+    """Windows 上把 Git Bash 风格的 ``/e/codex/...`` 归一成 ``E:////codex////...``。
+
+    直接 ``abspath`` 会得到 ``E:////e////codex////...``（盘符重复）：
+    ``/e/...`` 被当成"当前盘的根下再有一个 e 目录"。manifest/config 里若
+    出现 POSIX 风格路径，产物就会落到完全不存在的位置，且"输入不存在"
+    的报错看不出是这个原因。
+
+    只在**首段像盘符**（单字母 + 分隔符）时才改写，避免误伤 Linux 的
+    ``/etc``、``/usr``。
+    """
+    if os.name != "nt":
+        return p
+    if len(p) >= 3 and p[0] in "/\\" and p[1].isalpha() and p[2] in "/\\":
+        return f"{p[1].upper()}:{p[2:].replace('/', chr(92))}"
+    return p
+
+
 def resolve_path(path: Optional[str]) -> Optional[str]:
     """绝对化 + 解析 symlink/junction。**保留原始大小写。**
 
@@ -102,7 +125,8 @@ def resolve_path(path: Optional[str]) -> Optional[str]:
     """
     if not path:
         return None
-    p = os.path.abspath(os.path.expanduser(str(path)))
+    p = os.path.abspath(_normalize_posix_drive(
+        os.path.expanduser(str(path))))
     tail: List[str] = []
     cur = p
     while not os.path.exists(cur):
@@ -266,7 +290,9 @@ def resolve_final_media_path(job: Dict[str, Any],
 
 def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
                      write_roots: Optional[Sequence[str]] = None,
-                     relocate_output: Optional[str] = None) -> RunPlan:
+                     relocate_output: Optional[str] = None,
+                     redirect_overrides: Optional[Dict[str, str]] = None
+                     ) -> RunPlan:
     """物化一个 job 的有效路径并预检。
 
     Args:
@@ -279,6 +305,10 @@ def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
         relocate_output: 显式"重新定位输出"目录。给定时**所有**由输出
             派生的路径（媒体、四个侧车、journal）都改到这个目录下，
             只保留原 basename；temp/log 不受影响（它们有独立语义）。
+        redirect_overrides: **重定向后的实际路径**（如 WSL 重定向、空间
+            回退产生的 ``temp_dir`` / ``output_dir``）。这些值优先于
+            ``job`` 与 CLI —— 否则二次预检会校验一个实际不使用的路径
+            （R16-04 第 3 项）。键名用计划里的路径键，如 ``temp_dir``。
 
     Returns:
         ``RunPlan``。``plan.ok`` 为 False 时调用方**不得**开始任何落盘。
@@ -286,11 +316,16 @@ def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
     errors: List[str] = []
     warnings: List[str] = []
     roots = [r for r in (write_roots or []) if r]
+    _redir = {k: v for k, v in (redirect_overrides or {}).items()
+              if isinstance(v, str) and v}
 
     # ---- 最终媒体路径 ----
     out_dir = params.get("output_dir") or params.get("output_dir_default") or ""
     out_raw, out_source = resolve_final_media_path(
         job, output_dir=out_dir, relocate_output=relocate_output)
+    # R16-04：重定向后的实际输出最强（WSL 重定向会改写它）。
+    if _redir.get("output_path"):
+        out_raw, out_source = _redir["output_path"], SOURCE_REDIRECT
     if not out_raw:
         out_raw, out_source = "", SOURCE_DEFAULT
         errors.append(
@@ -322,6 +357,9 @@ def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
 
     # ---- 临时目录 ----
     tmp_raw, tmp_source = _pick([
+        # R16-04：重定向后的实际 temp 最强。job.temp_dir 若仍优先，
+        # 二次预检会批准一个实际不使用的路径（审核已静态确认）。
+        (SOURCE_REDIRECT, _redir.get("temp_dir")),
         (SOURCE_JOB, job.get("temp_dir")),
         (SOURCE_CLI, params.get("temp_dir")),
         (SOURCE_CONFIG, params.get("temp_dir_default")),
@@ -338,8 +376,16 @@ def resolve_run_plan(job: Dict[str, Any], params: Dict[str, Any],
     #   文件已存在 → 启动失败；不存在 → 造出一个叫 xxx.log 的目录。
     log_dir_raw = params.get("log_dir") or ""
     if not log_dir_raw:
-        log_dir_raw = "./logs"
-        warnings.append("日志目录未指定，将使用默认 ./logs")
+        # R16-04：授权根已经给出时，默认日志目录**落进根内**。
+        # 原来的 "./logs" 一定在根外 → 只要用了 --allow-write-root 就必然
+        # 被自己的预检拒绝，等于这个开关不可用。
+        if roots:
+            log_dir_raw = os.path.join(roots[0], "logs")
+            warnings.append(
+                f"日志目录未指定，将使用授权根内的默认位置：{log_dir_raw}")
+        else:
+            log_dir_raw = "./logs"
+            warnings.append("日志目录未指定，将使用默认 ./logs")
     log_file_raw = job.get("log_path") or ""
 
     # 来源只做**归因说明**，不改变取值优先级

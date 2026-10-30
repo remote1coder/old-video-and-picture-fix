@@ -1111,6 +1111,86 @@ class _BufferedLog:
                 pass
 
 
+def _build_cli_overrides(args) -> Dict[str, Any]:
+    """从 CLI/args 构造 ``merge_params`` 的覆盖字典。
+
+    **R16-04**：批次预检、串行执行、并行 worker 必须消费**同一份**覆盖，
+    否则三处会各自算出不同的有效路径（审核已确认批次传了空覆盖、
+    worker 又漏了 allow_write_root/relocate_output）。
+    """
+    if not isinstance(args, dict):
+        args = vars(args)
+    ov: Dict[str, Any] = {}
+    _output = args.get("output")
+    _no_wsl = args.get("no_wsl_redirect", False)
+    _keep = args.get("keep_intermediates", False)
+    _gpu = args.get("gpu")
+    _ai_enabled = args.get("ai_enabled")
+    _ai_scale = args.get("ai_upscale_factor")
+    _face_restore = args.get("face_restore")
+    _ai_model = args.get("ai_model")
+    if _output:
+        ov["output_dir"] = _output
+    if _no_wsl:
+        ov["no_wsl_redirect"] = True
+    if _keep:
+        ov["cleanup_intermediates"] = False
+    if _gpu:
+        ov["gpu_backend"] = _gpu
+    # ISSUE-V-MAIN-001 / BUG-047: AI CLI 覆盖必须进 params
+    # FIX-P5-1: 用 ai_ 前缀，与 merge_params 的 ai_config 展开一致
+    if _ai_enabled is True:
+        ov["ai_enabled"] = True
+    if _ai_scale is not None:
+        ov["ai_upscale_scale"] = _ai_scale
+    if _face_restore is not None:
+        ov["ai_face_restore"] = _face_restore
+    if _ai_model is not None:
+        ov["ai_upscale_model"] = _ai_model
+    # FIX-2026-10-22：强制放行 AI 封禁（1080p 素材）。必须在 merge_params
+    # 之前进覆盖，否则 stage 列表里根本没有 stage3 → AI 静默不执行。
+    if args.get("force_allow_banned_upscale"):
+        ov["force_allow_banned_upscale"] = True
+    return ov
+
+
+def _plan_write_roots(args, config: Dict[str, Any]) -> Optional[List[str]]:
+    """授权写根：CLI 优先，其次 config。**批次与单 job 必须是同一集合**。
+
+    返回 ``None`` 表示"未限制"（调用方不得把它当成"任意可写"的许可去放宽）。
+    """
+    _raw = (args.get("allow_write_root") if isinstance(args, dict)
+            else getattr(args, "allow_write_root", None))
+    if not _raw:
+        _raw = config.get("allowed_write_roots")
+    if not _raw:
+        return None
+    if isinstance(_raw, str):
+        return [_raw]
+    return [str(r) for r in _raw if r]
+
+
+def _resolve_plan_for_job(job: Dict[str, Any], config: Dict[str, Any],
+                          args, logger=None):
+    """一次算出 job 的**完整有效计划**（merge_params + resolve_run_plan）。
+
+    返回 ``(params, plan, module_available)``。``plan`` 可能为 ``None``
+    （模块缺失）。调用方**不得**在 ``plan.ok`` 为 False 时开始落盘。
+    """
+    _cli = _build_cli_overrides(args)
+    params = merge_params(job, config, _cli, logger)
+    params["output_path"] = job.get("output_path", "")
+    try:
+        from run_plan import resolve_run_plan as _rp
+    except ImportError:
+        return params, None, False
+    _roots = _plan_write_roots(args, config)
+    _reloc = (args.get("relocate_output") if isinstance(args, dict)
+              else getattr(args, "relocate_output", None))
+    plan = _rp(job, params, write_roots=_roots, relocate_output=_reloc)
+    return params, plan, True
+
+
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 args, logger) -> Tuple[int, str]:
     """Process a single job through all stages. Returns (exit_code, stderr)."""
@@ -1128,40 +1208,9 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     if not isinstance(args, dict):
         args = vars(args)
 
-    # Build CLI overrides
-    cli_overrides = {}
-    _output = args.get("output")
-    _no_wsl = args.get("no_wsl_redirect", False)
-    _keep = args.get("keep_intermediates", False)
-    _gpu = args.get("gpu")
-    _ai_enabled = args.get("ai_enabled")
-    _ai_scale = args.get("ai_upscale_factor")
-    _face_restore = args.get("face_restore")
-    _ai_model = args.get("ai_model")
-    if _output:
-        cli_overrides["output_dir"] = _output
-    if _no_wsl:
-        cli_overrides["no_wsl_redirect"] = True
-    if _keep:
-        cli_overrides["cleanup_intermediates"] = False
-    if _gpu:
-        cli_overrides["gpu_backend"] = _gpu
-    # ISSUE-V-MAIN-001 / BUG-047: propagate AI CLI overrides into params
-    # FIX-P5-1: 必须使用 ai_ 前缀键名，与 merge_params() 中 ai_config 展开逻辑保持一致
-    if _ai_enabled is True:
-        cli_overrides["ai_enabled"] = True
-    if _ai_scale is not None:
-        cli_overrides["ai_upscale_scale"] = _ai_scale
-    if _face_restore is not None:
-        cli_overrides["ai_face_restore"] = _face_restore
-    if _ai_model is not None:
-        cli_overrides["ai_upscale_model"] = _ai_model
-    # FIX-2026-10-22：强制放行 AI 封禁（1080p 素材）。
-    # stage3/4/5 的挂载条件用的是 `not (ai_banned and not force_allow)`，
-    # 所以这个键必须在 merge_params **之前**进 cli_overrides，
-    # 否则 stage 列表里根本不会有 stage3 → AI 静默不执行。
-    if args.get("force_allow_banned_upscale"):
-        cli_overrides["force_allow_banned_upscale"] = True
+    # Build CLI overrides —— **必须与批次预检、并行 worker 同一份**
+    # （R16-04；内联构造曾导致三处算出不同的有效路径）
+    cli_overrides = _build_cli_overrides(args)
 
     # Merge params
     params = merge_params(job, config, cli_overrides, _pre_log)
@@ -1191,8 +1240,7 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             return 82, "run-plan module missing while write roots requested"
 
     if _resolve_run_plan is not None:
-        _roots = (args.get("allow_write_root")
-                  or config.get("allowed_write_roots") or None)
+        _roots = _plan_write_roots(args, config)
         _plan = _resolve_run_plan(
             job, params, write_roots=_roots,
             relocate_output=args.get("relocate_output"))
@@ -1254,8 +1302,17 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             from run_plan import path_key as _pkey
         except ImportError:                 # pragma: no cover
             _pkey = None
+        # R16-04：把**重定向后的实际路径**明确传进去。
+        # 否则 resolver 仍按 job.temp_dir 优先 → 批准一个实际不使用的路径，
+        # 于是"校验过旧路径、实际写新路径"（审核已静态确认）。
+        _redir_ov = {}
+        if params.get("temp_dir"):
+            _redir_ov["temp_dir"] = str(params["temp_dir"])
+        if params.get("output_path"):
+            _redir_ov["output_path"] = str(params["output_path"])
         _plan2 = _resolve_run_plan(job, params, write_roots=_roots,
-                                   relocate_output=args.get("relocate_output"))
+                                   relocate_output=args.get("relocate_output"),
+                                   redirect_overrides=_redir_ov)
         if not _plan2.ok:
             for _e in _plan2.errors:
                 logger.error("RUNPLAN_BLOCKED_AFTER_REDIRECT", _e,
@@ -2723,52 +2780,61 @@ def main():
               file=sys.stderr)
         sys.exit(82)
 
-    # ---- R15-05：dispatch 前**一次性**检查所有 job 的计划 ----
-    # 冲突检测本来就写好了（且已区分"共享容器目录"与"独占文件"），
-    # 但从来没有调用点 —— 于是两个 job 写到同一份媒体/侧车、或一个 job 的
-    # 输出覆盖另一个 job 的输入，都要等跑完才发现。这里在**任何子进程启动
-    # 之前**算完全部计划并判定。
+    # ---- R16-04：dispatch 前**一次性**检查所有 job 的计划 ----
+    # 这里必须用与 job 执行**完全相同**的合并规则和计划解析：
+    #   * 同一份 CLI 覆盖（原来传空 dict → 算出的输出可能与实际不同）
+    #   * 同一份授权根（CLI 优先、其次 config）
+    #   * 同一份 relocate_output（漏传会让"重定位后撞名"在预检里看不见）
+    # 三者任一不同，批次检查就只是在检查另一套计划。
     if len(jobs) > 1:
-        try:
-            from run_plan import (
-                resolve_run_plan as _rp_batch,
-                detect_cross_job_conflicts as _detect_batch)
-        except ImportError:
-            _rp_batch = None
-        if _rp_batch is not None:
-            _roots = None
+        _plans = []
+        _plan_fail = []
+        _mem_log = _BufferedLog(sys.stderr)
+        for _j in jobs:
             try:
-                _raw = getattr(args, "allow_write_root", None)
-                if _raw:
-                    _roots = ([_raw] if isinstance(_raw, str)
-                              else [str(r) for r in _raw])
-            except Exception:
-                _roots = None
+                _jparams, _p, _avail = _resolve_plan_for_job(
+                    _j, config, args, _mem_log)
+                if not _avail:
+                    logger.error(
+                        "BATCH_PLAN_MODULE_MISSING",
+                        "shared_modules/run_plan.py is unavailable; the batch "
+                        "collision check was NOT performed")
+                    _plans = None
+                    break
+                _plans.append(_p)
+                if not _p.ok:
+                    _plan_fail.append((_j.get("job_id", ""), _p.errors))
+            except Exception as _pe:
+                _plan_fail.append((_j.get("job_id", ""), [str(_pe)]))
 
-            _plans = []
-            _plan_fail = []
-            _mem_log = _BufferedLog(sys.stderr)
-            for _j in jobs:
-                try:
-                    _jparams = merge_params(_j, config, {}, _mem_log)
-                    _p = _rp_batch(_j, _jparams, write_roots=_roots)
-                    _plans.append(_p)
-                    if not _p.ok:
-                        _plan_fail.append((_j.get("job_id", ""), _p.errors))
-                except Exception as _pe:
-                    _plan_fail.append((_j.get("job_id", ""), [str(_pe)]))
-
+        if _plans is not None:
             if _plan_fail:
                 for _jid, _errs in _plan_fail:
                     logger.error("BATCH_PLAN_INVALID",
                                  "A job's effective path plan is invalid; "
                                  "refusing to start the batch.",
                                  job_id=_jid, errors=_errs)
+                    # R16-04：光说"计划无效"没用 —— 必须把**哪条路径**越界
+                    # 直接写到 stderr，否则用户只能去翻日志猜。
+                    print(f"ERROR: invalid run plan for job {_jid}:",
+                          file=sys.stderr)
+                    for _e in _errs:
+                        print(f"  - {_e}", file=sys.stderr)
                 print("ERROR: invalid path plan(s); nothing was dispatched.",
                       file=sys.stderr)
                 sys.exit(82)
 
-            _conflicts = _detect_batch(_plans)
+            try:
+                from run_plan import detect_cross_job_conflicts as _detect
+            except ImportError:
+                _detect = None
+            if _detect is None:
+                logger.error("BATCH_PLAN_MODULE_MISSING",
+                             "conflict detection unavailable; refusing to "
+                             "dispatch without the check")
+                sys.exit(82)
+
+            _conflicts = _detect(_plans)
             if _conflicts:
                 for _c in _conflicts:
                     logger.error("BATCH_PLAN_CONFLICT", _c)
@@ -2777,14 +2843,12 @@ def main():
                       "See the log for detail.", file=sys.stderr)
                 sys.exit(82)
             logger.info("BATCH_PLAN_OK",
-                        "All jobs' path plans were resolved and checked "
-                        "before dispatch; no collisions",
+                        "All jobs' path plans were resolved with the same "
+                        "merge rules as job execution and checked before "
+                        "dispatch; no collisions",
                         jobs=len(_plans),
-                        write_roots=_roots or "unrestricted")
-        else:
-            logger.warning("BATCH_PLAN_CHECK_SKIPPED",
-                           "shared_modules/run_plan.py is not importable; the "
-                           "batch collision check was NOT performed")
+                        write_roots=_plan_write_roots(args, config)
+                        or "unrestricted")
 
     # Parallel worker pool
     workers = max(1, args.workers)
@@ -2821,6 +2885,14 @@ def main():
                     "ai_upscale_factor": getattr(args, "ai_upscale_factor", None),
                     "face_restore": getattr(args, "face_restore", None),
                     "ai_model": getattr(args, "ai_model", None),
+                    # ---- R16-04：写入边界也必须传给 worker ----
+                    # 漏掉这两个，worker 里的 `_plan_write_roots()` 拿不到
+                    # 父进程的授权根：父进程以为受限，worker 其实是"无限制"，
+                    # 于是计划解析与冲突判定父子不一致。
+                    "allow_write_root": getattr(args, "allow_write_root", None),
+                    "relocate_output": getattr(args, "relocate_output", None),
+                    "force_allow_banned_upscale": getattr(
+                        args, "force_allow_banned_upscale", False),
                 },
             })
 
