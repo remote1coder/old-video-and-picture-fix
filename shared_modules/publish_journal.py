@@ -65,6 +65,10 @@ PHASE_PREPARED = "PREPARED"
 PHASE_COMMITTING = "COMMITTING"
 PHASE_COMMITTED = "COMMITTED"
 PHASE_RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+# R16-01：完整回滚**成功且已持久化**的终态。
+# 原来回滚成功后仍写 RECOVERY_REQUIRED：磁盘上明明是完整旧代，journal 却说
+# "仍需恢复"，于是下一次 publish 被自己的未解决记录挡住（审核已复现）。
+PHASE_ROLLED_BACK = "ROLLED_BACK"
 
 _VALID_PHASES = {PHASE_PREPARED, PHASE_COMMITTING, PHASE_COMMITTED,
                  PHASE_RECOVERY_REQUIRED}
@@ -175,8 +179,12 @@ def write_journal(journal_path: str, payload: Dict[str, Any]) -> bool:
     doc = dict(payload)
     doc.setdefault("schema", JOURNAL_SCHEMA)
     doc.setdefault("updated_at", _now())
-    data = json.dumps(doc, ensure_ascii=False, sort_keys=True,
-                      indent=2).encode("utf-8")
+    # R16-01：**必须先丢掉 payload 里带来的旧 digest**。
+    # `read_journal()` 为了不改动语义会把 digest 放回返回的对象里，
+    # 于是"读出来 → 改 phase → 再写回"这种更新会把**旧 digest 卷进哈希**：
+    # 写出来的文件自己都读不回来（`read_journal` 校验失败返回 None）。
+    # 这正是 recover 补记终态后立即不可读的原因。
+    doc.pop("digest", None)
     doc["digest"] = hashlib.sha256(
         json.dumps(doc, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()

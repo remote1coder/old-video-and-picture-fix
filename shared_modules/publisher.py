@@ -41,6 +41,7 @@ from publish_journal import (
     PHASE_COMMITTING,
     PHASE_PREPARED,
     PHASE_RECOVERY_REQUIRED,
+    PHASE_ROLLED_BACK,
     file_digest,
     file_state,
     journal_state,
@@ -81,7 +82,7 @@ class PublishResult:
 
     __slots__ = ("ok", "phase", "failed_at", "restored", "errors",
                  "journal_path", "attempt_id", "published", "recovery",
-                 "cleanup_pending")
+                 "cleanup_pending", "terminal_pending")
 
     def __init__(self, attempt_id: str, journal_path: str):
         self.attempt_id = attempt_id
@@ -94,6 +95,9 @@ class PublishResult:
         self.published: List[str] = []
         self.recovery: Optional[Dict[str, Any]] = None
         self.cleanup_pending: List[str] = []
+        # R16-01：终态（COMMITTED / ROLLED_BACK）没能持久化。为 True 时
+        # **必须保留备份**，否则下一次无从恢复/确认。
+        self.terminal_pending: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -409,13 +413,35 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                     dict(doc, phase=PHASE_RECOVERY_REQUIRED,
                          reason="; ".join(res.errors), rollback=rec))
                 if res.restored:
-                    _cleanup_backups(old_snapshot, logger)
-                    if logger:
-                        logger.error(
-                            "PUBLISH_ROLLED_BACK",
-                            "Publish failed but the previous generation was "
-                            "fully restored", attempt_id=attempt_id,
-                            failed_at=res.failed_at, errors=res.errors)
+                    # R16-01：回滚**成功**必须落成 ROLLED_BACK 终态。
+                    # 原来这里保留 RECOVERY_REQUIRED 并删备份：磁盘上是完整旧代，
+                    # journal 却说"仍需恢复"，下一次 recover 要求备份 → 失败 →
+                    # 下一次 publish 也被自己的未解决记录挡住（审核已复现）。
+                    if write_journal(
+                            journal_path,
+                            dict(doc, phase=PHASE_ROLLED_BACK,
+                                 reason="; ".join(res.errors), rollback=rec)):
+                        # 终态已持久化 → 备份不再需要
+                        _cleanup_backups(old_snapshot, logger)
+                        res.phase = PHASE_ROLLED_BACK
+                        if logger:
+                            logger.error(
+                                "PUBLISH_ROLLED_BACK",
+                                "Publish failed but the previous generation was "
+                                "fully restored and recorded",
+                                attempt_id=attempt_id,
+                                failed_at=res.failed_at, errors=res.errors)
+                    else:
+                        # 终态没写成：下一次仍要能按磁盘事实确认已回滚，
+                        # 所以**保留备份**，不谎称完成。
+                        res.cleanup_pending.append("journal_rolled_back")
+                        if logger:
+                            logger.error(
+                                "PUBLISH_ROLLBACK_TERMINAL_FAIL",
+                                "The previous generation was restored but ROLLED_BACK "
+                                "could not be persisted; keeping backups so the next "
+                                "run can confirm it",
+                                attempt_id=attempt_id, failed_at=res.failed_at)
                 else:
                     if logger:
                         logger.error(
@@ -432,6 +458,10 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                 # 媒体已经全部换好；journal 写不进去说明"完成记录"缺失，
                 # 但**不能**因此谎报失败并把已成立的提交撤销。
                 res.cleanup_pending.append("journal_committed")
+                # R16-01：终态没持久化 → **保留备份**。
+                # 原来这里照样清备份，磁盘 journal 停在 COMMITTING，
+                # 下次 recover 因缺备份无法恢复，publish 也被永久挡住。
+                res.terminal_pending = True
                 if logger:
                     logger.error(
                         "PUBLISH_JOURNAL_COMMITTED_FAIL",
@@ -456,7 +486,8 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
         return res
 
     # ---- 10. 清理（与提交成功分开记录）----
-    if res.ok and not keep_backups:
+    if res.ok and not keep_backups and not getattr(res, "terminal_pending", False):
+        # R16-01：终态（COMMITTED / ROLLED_BACK）没写进去时，备份是下一次恢复的唯一依据，不能删。
         for fin, snap in old_snapshot.items():
             bk = snap.get("backup")
             if not bk:
@@ -485,6 +516,66 @@ def _cleanup_backups(snapshot: Dict[str, Dict[str, Any]], logger) -> None:
             if logger:
                 logger.warning("PUBLISH_BACKUP_CLEANUP_FAIL",
                                "Could not remove a backup file", backup=bk)
+
+
+GENERATION_ALL_OLD = "all_old"
+GENERATION_ALL_NEW = "all_new"
+GENERATION_MIXED = "mixed"
+GENERATION_UNKNOWN = "unknown"
+
+
+def classify_generation(records: Optional[Dict[str, Dict[str, Any]]]) -> str:
+    """按**磁盘事实**判定这一组目标现在处于哪一代。
+
+    R16-01：恢复不能只看 journal 的 phase 字段，也不能盲目要求备份存在。
+    磁盘上的完整事实只有四种；只有先分清是哪一种，才知道该回滚、该补记
+    提交、还是必须保留现场。
+
+    Args:
+        records: journal 的 ``records``（final -> row），每行含
+            ``existed`` / ``old_digest`` / ``new_digest``。
+
+    Returns:
+        ``all_old``  每个目标都等于旧代（本就不存在的确实不存在）
+        ``all_new``  每个目标都等于新代
+        ``mixed``    两者混杂 —— 半代，必须处理
+        ``unknown``  有目标读不出摘要或摘要缺失，无法判定
+    """
+    if not records:
+        return GENERATION_UNKNOWN
+
+    n_old = n_new = 0
+    for fin, row in records.items():
+        st, dig = file_state(fin)
+        if st == "ERROR":
+            # 目录 / 不可访问 ≠ 不存在（审核明确要求区分）
+            return GENERATION_UNKNOWN
+        want_old = bool(row.get("existed"))
+        old_d = row.get("old_digest")
+        new_d = row.get("new_digest")
+        if st == "ABSENT":
+            # 目标不存在：只有当"旧代本来就不存在"才算符合旧代
+            if not want_old:
+                n_old += 1
+            else:
+                return GENERATION_MIXED if n_new else GENERATION_UNKNOWN
+            continue
+        # PRESENT
+        if dig is None or (old_d is None and new_d is None):
+            return GENERATION_UNKNOWN
+        if new_d and dig == new_d:
+            n_new += 1
+        elif old_d is not None and dig == old_d:
+            n_old += 1
+        else:
+            # 既不等于旧代也不等于新代 —— 半覆盖/外来内容
+            return GENERATION_UNKNOWN
+
+    if n_new and n_old:
+        return GENERATION_MIXED
+    if n_new:
+        return GENERATION_ALL_NEW
+    return GENERATION_ALL_OLD
 
 
 def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
@@ -579,9 +670,10 @@ def recover(journal_path: str, backup_dir: str, attempt_id: str,
     if doc is None:
         return {"ok": False, "reason": "journal unreadable",
                 "journal_path": journal_path}
-    if doc.get("phase") == PHASE_COMMITTED:
-        return {"ok": True, "action": "already_committed",
-                "journal_path": journal_path}
+    # R16-01 / B07：**不能**在这里提前返回。
+    # 原来看到 phase==COMMITTED 就直接认可，于是"journal 说已提交但磁盘上
+    # 有一份报告是坏的"也会被当成完整 —— 复核全组摘要的逻辑在
+    # `_recover_locked` 里，必须让它跑到。
     targets = doc.get("targets") or []
     try:
         with acquire_target_locks(targets, timeout=30, logger=logger):
@@ -594,17 +686,48 @@ def recover(journal_path: str, backup_dir: str, attempt_id: str,
 
 def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
                     logger=None) -> Optional[Dict[str, Any]]:
-    """锁内版本的恢复（``publish`` 与 ``recover`` 共用）。"""
+    """锁内版本的恢复（``publish`` 与 ``recover`` 共用）。
+
+    **R16-01**：恢复不再"看到未解决就要求备份存在"，而是先按**磁盘事实**
+    判定这一组处于哪一代，再决定动作：
+
+    - ``all_old``  磁盘已是完整旧代 → 只补记 ROLLED_BACK 终态，不动文件
+    - ``all_new``  新代已完整落地但没记录 → 按协议补记 COMMITTED
+    - ``mixed`` / ``unknown`` → 用备份回滚；回滚成功写 ROLLED_BACK
+
+    同样不能只凭 ``phase`` 字段认可完整：COMMITTED / ROLLED_BACK 都要复核
+    全组摘要（审核 B07）。
+    """
     if not os.path.isfile(journal_path):
         return None
     doc = read_journal(journal_path)
     if doc is None:
         return {"ok": False, "reason": "journal unreadable"}
-    phase = doc.get("phase")
-    if phase == PHASE_COMMITTED:
-        return {"ok": True, "action": "already_committed"}
 
     records = doc.get("records") or {}
+    phase = doc.get("phase")
+
+    # ---- 已是终态：复核全组摘要，不能只看字段 ----
+    if phase == PHASE_COMMITTED:
+        gen = classify_generation(records)
+        if gen == GENERATION_ALL_NEW:
+            return {"ok": True, "action": "already_committed",
+                    "generation": gen}
+        return {"ok": False, "generation": gen,
+                "reason": (f"journal says COMMITTED but the group on disk is "
+                           f"{gen}; not destroying the unresolved record")}
+    if phase == PHASE_ROLLED_BACK:
+        gen = classify_generation(records)
+        if gen == GENERATION_ALL_OLD:
+            return {"ok": True, "action": "already_rolled_back",
+                    "generation": gen}
+        return {"ok": False, "generation": gen,
+                "reason": (f"journal says ROLLED_BACK but the group on disk is "
+                           f"{gen}")}
+
+    if not records:
+        return {"ok": False, "reason": "journal has no records"}
+
     snapshot: Dict[str, Dict[str, Any]] = {}
     for fin, rec in records.items():
         snapshot[fin] = {
@@ -613,27 +736,77 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
             "backup": rec.get("backup"),
             "backup_digest": rec.get("backup_digest"),
         }
-    if not snapshot:
-        return {"ok": False, "reason": "journal has no records"}
 
+    gen = classify_generation(records)
+
+    # ---- 磁盘已是完整旧代：只补记终态（不动任何文件）----
+    if gen == GENERATION_ALL_OLD:
+        if write_journal(journal_path,
+                         dict(doc, phase=PHASE_ROLLED_BACK, generation=gen,
+                              resolved=True)):
+            _cleanup_backups(snapshot, logger)
+            if logger:
+                logger.warning(
+                    "PUBLISH_RECOVERY_CONFIRMED_ROLLED_BACK",
+                    "The group on disk is already the complete previous "
+                    "generation; recorded the terminal state",
+                    journal_path=journal_path, generation=gen)
+            return {"ok": True, "action": "confirmed_rolled_back",
+                    "generation": gen, "fully_restored": True}
+        return {"ok": False, "generation": gen, "reason":
+                "rolled back but the terminal state could not be persisted; "
+                "backups are kept"}
+
+    # ---- 新代已完整落地但未记录：按协议补记提交 ----
+    if gen == GENERATION_ALL_NEW:
+        if write_journal(journal_path,
+                         dict(doc, phase=PHASE_COMMITTED, generation=gen,
+                              reason="recorded by recovery: the group matches "
+                                     "the prepared new digests")):
+            _cleanup_backups(snapshot, logger)
+            if logger:
+                logger.warning(
+                    "PUBLISH_RECOVERY_RECORDED_COMMITTED",
+                    "All targets already hold the new generation; recorded "
+                    "COMMITTED so the next run is not blocked",
+                    journal_path=journal_path, generation=gen)
+            return {"ok": True, "action": "recorded_committed",
+                    "generation": gen}
+        return {"ok": False, "generation": gen, "reason":
+                "the new generation is live but COMMITTED could not be "
+                "persisted; backups are kept"}
+
+    # ---- 混合 / 未知：用备份回滚 ----
     rec_report = _restore_locked(snapshot, attempt_id, logger)
     if rec_report.get("fully_restored"):
-        write_journal(journal_path,
-                      dict(doc, phase=PHASE_RECOVERY_REQUIRED,
-                           resolved=True, rollback=rec_report))
+        if write_journal(journal_path,
+                         dict(doc, phase=PHASE_ROLLED_BACK,
+                              rollback=rec_report, resolved=True)):
+            _cleanup_backups(snapshot, logger)
+            if logger:
+                logger.warning(
+                    "PUBLISH_RECOVERED",
+                    "An unfinished transaction was rolled back to the previous "
+                    "generation and recorded",
+                    journal_path=journal_path, rollback=rec_report)
+            return {"ok": True, "action": "rolled_back", "generation": gen,
+                    **rec_report}
         if logger:
-            logger.warning("PUBLISH_RECOVERED",
-                           "An unfinished transaction was rolled back to the "
-                           "previous generation",
-                           journal_path=journal_path, rollback=rec_report)
-        return {"ok": True, "action": "rolled_back", **rec_report}
+            logger.error(
+                "PUBLISH_RECOVERY_TERMINAL_FAIL",
+                "Rolled back but ROLLED_BACK could not be persisted; keeping "
+                "backups", journal_path=journal_path)
+        return {"ok": False, "action": "rolled_back_unrecorded",
+                "generation": gen, **rec_report}
 
     write_journal(journal_path,
                   dict(doc, phase=PHASE_RECOVERY_REQUIRED,
                        rollback=rec_report))
     if logger:
-        logger.error("PUBLISH_RECOVER_INCOMPLETE",
-                     "Cannot roll back to a complete previous generation; "
-                     "backups and journal are kept",
-                     journal_path=journal_path, rollback=rec_report)
-    return {"ok": False, "action": "incomplete", **rec_report}
+        logger.error(
+            "PUBLISH_RECOVER_INCOMPLETE",
+            "Cannot roll back to a complete previous generation; backups and "
+            "journal are kept", journal_path=journal_path,
+            generation=gen, rollback=rec_report)
+    return {"ok": False, "action": "incomplete", "generation": gen,
+            **rec_report}
