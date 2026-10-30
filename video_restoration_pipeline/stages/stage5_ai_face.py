@@ -664,6 +664,35 @@ def _get_frame_pts(video_path: str) -> List[float]:
     return []
 
 
+def _measure_interval_error(out_path: str,
+                            src_pts: List[float]) -> Optional[Dict[str, float]]:
+    """比较产物与源的逐帧间隔，返回最大/平均偏差（秒）。
+
+    R16-06：纯 ffmpeg 的 concat 路径会把 `duration` 量化到 1/25 s
+    （实测 0.0449 → 0.04、0.0898 → 0.08），总时长与帧数仍然对，
+    但**逐帧间隔不准**。本函数把这个残差量出来，供日志与报告如实记录 ——
+    不能因为"总时长差不多"就宣称 VFR 已保住。
+    """
+    try:
+        out_pts = _get_frame_pts(out_path)
+    except Exception:
+        out_pts = []
+    if not out_pts or len(out_pts) != len(src_pts) or len(src_pts) < 2:
+        return None
+    _sd = [src_pts[i + 1] - src_pts[i] for i in range(len(src_pts) - 1)]
+    _od = [out_pts[i + 1] - out_pts[i] for i in range(len(out_pts) - 1)]
+    _errs = [abs(a - b) for a, b in zip(_sd, _od)]
+    if not _errs:
+        return None
+    return {
+        "max_interval_error": max(_errs),
+        "mean_interval_error": sum(_errs) / len(_errs),
+        "frames": len(out_pts),
+        "src_last_pts": src_pts[-1],
+        "out_last_pts": out_pts[-1],
+    }
+
+
 def _estimate_motion(frame_paths: List[str]) -> float:
     """Estimate global motion from frame paths using average frame difference.
 
@@ -2458,18 +2487,67 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     else:
         pix_fmt = "yuv420p"
 
-    encode_cmd = [
-        "ffmpeg", "-hide_banner", "-v", "error", "-y",
-        "-framerate", fps_str,
-        "-i", os.path.join(all_frames_dir, "frame_%08d.png"),
-        "-c:v", "ffv1",
-        "-pix_fmt", pix_fmt,
-        "-color_range", "tv",           # FIX-P9-10: per v7.32 §3.10.3
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
-        "-colorspace", "bt709",
-        output_path
-    ]
+    # ---- R16-06：VFR 必须按**逐帧时长**重新封装 ----
+    # 原来只用单个 `-framerate fps_str`，等于把可变间隔压成常数。
+    # 实测（真 VFR 292 帧：0.0449×227 + 0.0898×42）：
+    #   源 15.702s → 重编码后 13.124s（-16.4%），间隔被抹平。
+    # 有 PTS 时改走 concat + 逐帧 duration + passthrough。
+    _vfr_concat = None
+    _png_count = 0
+    try:
+        _png_count = len([n for n in os.listdir(all_frames_dir)
+                          if n.startswith("frame_") and n.endswith(".png")])
+    except OSError:
+        _png_count = 0
+    if (all_pts_stage5 and len(all_pts_stage5) >= 2
+            and _png_count == len(all_pts_stage5)):
+        _n = len(all_pts_stage5)
+        _durs = []
+        for _i in range(_n):
+            if _i + 1 < _n:
+                _durs.append(max(all_pts_stage5[_i + 1] - all_pts_stage5[_i], 1e-6))
+            else:
+                _durs.append(_durs[-1] if _durs else 1.0 / max(float(fps_val or 25), 1e-6))
+        _vfr_concat = os.path.join(all_frames_dir, "concat_vfr.txt")
+        with open(_vfr_concat, "w", encoding="utf-8") as _cf:
+            for _i in range(_n):
+                _cf.write("file 'frame_%08d.png'" % (_i + 1) + NL)
+                _cf.write("duration %.6f" % (_durs[_i]) + NL)
+
+    if _vfr_concat:
+        encode_cmd = [
+            "ffmpeg", "-hide_banner", "-v", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", _vfr_concat,
+            "-fps_mode", "passthrough",
+            "-c:v", "ffv1",
+            "-pix_fmt", pix_fmt,
+            "-color_range", "tv",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
+            output_path
+        ]
+        logger.info("STAGE5_VFR_PRESERVED",
+                    "Re-encoding with per-frame durations (frame count and total "
+                    "duration preserved)", frames=_n, via="concat+passthrough")
+    else:
+        if all_pts_stage5:
+            logger.warning("STAGE5_VFR_FALLBACK",
+                           "PTS map and extracted frame count disagree; falling "
+                           "back to a single frame rate (intervals may be lost)",
+                           pts=len(all_pts_stage5), png=_png_count)
+        encode_cmd = [
+            "ffmpeg", "-hide_banner", "-v", "error", "-y",
+            "-framerate", fps_str,
+            "-i", os.path.join(all_frames_dir, "frame_%08d.png"),
+            "-c:v", "ffv1",
+            "-pix_fmt", pix_fmt,
+            "-color_range", "tv",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
+            output_path
+        ]
 
     try:
         # NEW-V-06/RV-12: 受管子进程——取消时 ffmpeg 一起收掉，
@@ -2483,10 +2561,38 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                                timeout=3600, shell=False)
         if (r.returncode == 0 and os.path.exists(output_path)
                 and os.path.getsize(output_path) > 0):
+            # ---- R16-06：把 VFR 间隔残差**量出来并如实记录** ----
+            # 纯 ffmpeg 的 concat 路径会把 duration 量化到 1/25 s（实测）：
+            # 帧数与总时长对得上，但逐帧间隔不准。不能因为"总时长差不多"
+            # 就宣称 VFR 已保住 —— 超过半个量化步长就明确告警。
+            _ierr = None
+            if _vfr_concat and all_pts_stage5:
+                _ierr = _measure_interval_error(output_path, all_pts_stage5)
+            if _ierr:
+                _tol = 1.0 / 50.0
+                if _ierr["max_interval_error"] > _tol:
+                    logger.warning(
+                        "STAGE5_VFR_INTERVAL_QUANTIZED",
+                        "Frame count and total duration are preserved, but the "
+                        "per-frame intervals were quantised by the muxer (concat "
+                        "image durations land on 1/25 s). Do NOT claim exact VFR "
+                        "timing for this intermediate.",
+                        max_interval_error=round(_ierr["max_interval_error"], 6),
+                        mean_interval_error=round(_ierr["mean_interval_error"], 6),
+                        tolerance=round(_tol, 6),
+                        src_last_pts=round(_ierr["src_last_pts"], 4),
+                        out_last_pts=round(_ierr["out_last_pts"], 4))
+                else:
+                    logger.info(
+                        "STAGE5_VFR_INTERVALS_OK",
+                        "Per-frame intervals match the source within tolerance",
+                        max_interval_error=round(_ierr["max_interval_error"], 6))
             logger.info("STAGE5_DONE",
                        "Face restore and blend complete",
                        output=output_path,
-                       replaced_frames=replaced_count)
+                       replaced_frames=replaced_count,
+                       vfr_interval_error=(round(
+                           _ierr["max_interval_error"], 6) if _ierr else None))
             shutil.rmtree(all_frames_dir, ignore_errors=True)
             shutil.rmtree(face_frames_dir, ignore_errors=True)
             shutil.rmtree(face_output_dir, ignore_errors=True)
