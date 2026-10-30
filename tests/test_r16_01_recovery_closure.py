@@ -313,3 +313,36 @@ def test_journal_update_is_readable_after_write(tmp_path):
     assert write_journal(jp, third_in) is True
     third = read_journal(jp)
     assert third is not None and third["phase"] == PHASE_COMMITTED
+
+
+# ------------------------------------------------- R16-02 必需成果集合
+
+def test_stage7_does_not_swallow_fullchain_write_failure():
+    """R16-02：fullchain 候选写失败**不许**被 `except: pass` 吞掉。
+
+    审核确认：原来写报告失败会静默，`_fc_pending` 留空，publisher 只提交
+    "媒体 + verify"，根本不知道本代缺 fullchain；若目标已有 A 的 fullchain，
+    就留下 **B 视频 + A 报告**。
+    """
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage7_encode.py"),
+               encoding="utf-8", errors="replace").read()
+
+    # 记录位 + 报错事件必须在
+    assert "_fc_write_error" in src, "写失败必须有记录位"
+    assert "STAGE7_FULLCHAIN_WRITE_FAIL" in src
+
+    # 必需清单 + 发布前硬失败必须在
+    assert 'STAGE7_REQUIRED_ARTIFACT_MISSING' in src, \
+        "缺少必需报告时必须在发布前失败"
+    assert '_required = ["media", "verify"]' in src
+
+    # 禁用时必须有明确的"不适用"报告，避免旧报告被当成新证据
+    assert '"status": "NOT_APPLICABLE"' in src, \
+        "禁用 fullchain 时必须写一份 NOT_APPLICABLE 替换旧报告"
+
+    # 具体反例：fullchain 候选写入的那段 try 不能再是 `except: pass`
+    import re
+    m = re.search(r"_fc_pending = \(_fc_tmp, _fc_final\)\s*\n\s*(except[^\n]*)\n(\s*)pass\b",
+                  src)
+    assert m is None, "fullchain 候选写入仍是 `except: pass`（静默吞掉）"

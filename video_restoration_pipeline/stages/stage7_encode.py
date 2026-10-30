@@ -2586,6 +2586,8 @@ def main():
             # 于是"换了文件却报发布失败"。
             _fc_blocked: List[str] = []
             _fc_pending = None
+            # R16-02：候选报告写失败**不许静默**。记下来，发布前硬失败。
+            _fc_write_error: Optional[str] = None
             _fc_mode = str(params.get("full_chain_verify_mode",
                                       "frames_only")).strip().lower()
             _fc_enabled = bool(params.get("full_chain_verify", True))
@@ -2616,6 +2618,33 @@ def main():
                                "publishes WITHOUT the full-chain check. The "
                                "artifact must be reported as unverified.",
                                attempt_id=_attempt_id)
+                # R16-02：禁用 ≠ 什么都不做。旧代可能留着一份 fullchain
+                # 报告；若不处理，它会看起来像是**本代**的证据。
+                # 这里写一份明确的"本代不适用"候选，随整代一起转正 ——
+                # 旧同名报告被事务性替换，不需要额外的删除操作。
+                try:
+                    import json as _fcj2
+                    _fc_na = str(output_path) + ".fullchain.json"
+                    _fc_na_tmp = (str(output_path)
+                                  + f".fullchain.{_attempt_id}.json")
+                    with open(_fc_na_tmp, "w", encoding="utf-8") as _f2:
+                        _fcj2.dump({
+                            "schema": "fullchain/1",
+                            "status": "NOT_APPLICABLE",
+                            "reason": ("full_chain_verify was disabled for this "
+                                       "run; this generation carries NO "
+                                       "full-chain evidence"),
+                            "attempt_id": _attempt_id,
+                        }, _f2, ensure_ascii=False, indent=2)
+                    _fc_pending = (_fc_na_tmp, _fc_na)
+                except Exception as _nae:
+                    _fc_write_error = f"{type(_nae).__name__}: {_nae}"
+                    logger.error(
+                        "STAGE7_FULLCHAIN_WRITE_FAIL",
+                        "full_chain_verify is disabled but the "
+                        "NOT_APPLICABLE report could not be written; a stale "
+                        "report would be left behind in this generation.",
+                        error=_fc_write_error)
             if _fc_enabled:
                 # try 里任何一步抛异常都会跳到 except；若那时 _fc_blocked
                 # 还没赋值，后面的 `if _fc_blocked:` 会 NameError
@@ -2635,8 +2664,15 @@ def main():
                         with open(_fc_tmp, "w", encoding="utf-8") as _f:
                             _fcj.dump(_fc, _f, ensure_ascii=False, indent=2)
                         _fc_pending = (_fc_tmp, _fc_final)
-                    except Exception:
-                        pass
+                    except Exception as _fcwe:
+                        # R16-02：原来这里 `pass` —— 于是"检查通过、写报告失败"时
+                        # `_fc_pending` 留空，publisher 只提交"媒体 + verify"，
+                        # 根本不知道本代还缺 fullchain。
+                        _fc_write_error = f"{type(_fcwe).__name__}: {_fcwe}"
+                        logger.error(
+                            "STAGE7_FULLCHAIN_WRITE_FAIL",
+                            "Full-chain verification passed but its report could not be written; the generation is incomplete.",
+                            error=_fc_write_error)
                     _ck = (_fc or {}).get("checks") or {}
                     # absolute 档额外跑一次"不看源片基准"的绝对漂移判定
                     _abs_rc = 0
@@ -3141,6 +3177,33 @@ def main():
                     "to publish without a transactional publisher")
                 _discard_attempt_tmp(_publish_tmp, logger)
                 return 82
+
+            # ---- R16-02：本代**必需成果**先确定，再准备 ----
+            # 不能让 artifacts 由"哪些候选碰巧存在"决定：那样 publisher
+            # 会在缺少必需报告时依然认为整代完整（审核已确认这条路径）。
+            _required = ["media", "verify"]
+            if _fc_enabled:
+                _required.append("fullchain")
+            _missing: List[str] = []
+            if _fc_write_error:
+                _missing.append(f"fullchain: {_fc_write_error}")
+            if not _side_tmp:
+                _missing.append("verify: candidate was not produced")
+            if _missing:
+                logger.error(
+                    "STAGE7_REQUIRED_ARTIFACT_MISSING",
+                    "This generation is missing a required report; refusing to "
+                    "publish. The previous generation stays untouched.",
+                    attempt_id=_attempt_id, required=_required, missing=_missing)
+                _discard_attempt_tmp(_publish_tmp, logger)
+                for _t in (_side_tmp, (_fc_pending or (None,))[0]):
+                    if _t:
+                        try:
+                            if os.path.exists(_t):
+                                os.remove(_t)
+                        except OSError:
+                            pass
+                return 86
 
             _arts = [_Artifact("media", _publish_tmp, output_path)]
             if _side_tmp:
