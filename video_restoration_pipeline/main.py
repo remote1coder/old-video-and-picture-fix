@@ -872,6 +872,46 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
     decodes" — which is satisfied by a different input, a different config or
     a different job that happens to share the basename.
     """
+    # ---- R16-03：标记必须绑定**同一代**，不能在锁外重读共享正式文件 ----
+    # 审核确认的交错：A 发布完，B 替换了正式媒体，A 这时再读
+    # `final_path` 写 `.done.json`，就把 A 的输入身份绑到 B 的结果上。
+    # 做法：目标锁内把当前媒体摘要与 verify.json 的 `media_sha256` 核对；
+    # 不一致就**拒绝写标记**（宁可没有标记，也不写错归属）。
+    _gen_digest = None
+    _lock = None
+    try:
+        from publish_lock import acquire_target_locks as _acq
+        _lock = _acq([final_path], timeout=60, logger=logger)
+    except Exception:                      # pragma: no cover
+        _lock = None
+    try:
+        _recorded = None
+        try:
+            with open(str(final_path) + ".verify.json", "r",
+                      encoding="utf-8") as _vf:
+                _recorded = (json.load(_vf) or {}).get("media_sha256")
+        except (OSError, ValueError):
+            _recorded = None
+        _actual = (_chunked_sha256(final_path)
+                   if os.path.exists(final_path) else None)
+        if _recorded and _actual and _recorded != _actual:
+            if logger:
+                logger.error(
+                    "COMPLETION_MARKER_GENERATION_CHANGED",
+                    "The media at this path is no longer the one this "
+                    "job published (digest differs from verify.json). "
+                    "Refusing to bind this job to another generation.",
+                    output_path=str(final_path),
+                    recorded=_recorded[:16], actual=_actual[:16])
+            return False
+        _gen_digest = _actual
+    finally:
+        try:
+            if _lock is not None:
+                _lock.__exit__(None, None, None)
+        except Exception:
+            pass
+
     payload = {
         "impl": VIDEO_IMPL_VERSION,
         "job_id": job.get("job_id", ""),
@@ -883,11 +923,12 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
                         if os.path.exists(final_path) else None),
         # ID-03（第七轮）：成品**内容摘要**。旧实现只有 size —— 等长替换、
         # 重新编码、拷错文件都骗得过它；而"能解码"更不能当身份。
-        "output_sha256": _chunked_sha256(final_path),
+        "output_sha256": _gen_digest or _chunked_sha256(final_path),
         "completed_at": datetime.now().astimezone().isoformat(),
     }
     try:
-        tmp = completion_marker_path(final_path) + ".tmp"
+        # R16-03：`<final>.done.json.tmp` 是共享名，两个进程会互相踩 → 私有化。
+        tmp = (f"{completion_marker_path(final_path)}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
         os.replace(tmp, completion_marker_path(final_path))

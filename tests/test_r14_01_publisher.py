@@ -400,7 +400,11 @@ def test_wsl_staging_is_attempt_private_not_shared_tmp(tmp_path):
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage7_encode.py"),
                encoding="utf-8", errors="replace").read()
-    assert ".wsl-{_attempt_id}" in src, "WSL 暂存必须带 attempt 标识"
+    # 暂存名必须把 attempt 编进去（旧实现是 `{_attempt_id}` 插值，
+    # R16-03 改成字符串拼接 —— 两种写法都算"带 attempt 标识"）
+    assert (".wsl-{_attempt_id}" in src
+            or (".wsl-" in src and "_attempt_id" in src)), \
+        "WSL 暂存必须带 attempt 标识"
     # 只在**非注释行**里查调用（注释里提到旧函数名是正常的）
     code = [ln for ln in src.splitlines()
             if ln.strip() and not ln.strip().startswith("#")]

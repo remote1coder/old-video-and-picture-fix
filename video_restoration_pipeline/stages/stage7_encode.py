@@ -3167,6 +3167,11 @@ def main():
             try:
                 from publisher import (
                     Artifact as _Artifact, publish as _publish)
+                from publish_journal import (file_digest as _fdig,
+                                         file_state as _fstate)
+                from publish_lock import (
+                    acquire_target_locks as _acq_src,
+                    TargetLockTimeout as _LockTimeout)
             except ImportError:                  # pragma: no cover
                 _publish = None
 
@@ -3212,6 +3217,25 @@ def main():
             if _fc_pending:
                 _arts.append(_Artifact("fullchain", _fc_pending[0],
                                        _fc_pending[1]))
+
+            # ---- R16-03：发布前**冻结本代身份**（名称 → 最终路径 + 摘要）----
+            # WSL 回拷不能从"共享正式路径上碰巧是什么"复制：A 拷完媒体后 B 可能
+            # 已发布下一代，A 就会拷到 B 的报告（审核确认的无锁交错）。
+            # 这里在发布前记下每个对象的摘要，回拷时逐一核对。
+            _pub_digests: List[tuple] = []
+            for _a in _arts:
+                try:
+                    _pub_digests.append((_a.name, _a.final,
+                                          _fdig(_a.staging)))
+                except OSError as _fe:
+                    logger.error("STAGE7_GENERATION_DIGEST_FAIL",
+                                 "Could not freeze the prepared artifact digest",
+                                 artifact=_a.name, error=str(_fe))
+                    _pub_digests = []
+                    break
+            if not _pub_digests:
+                _discard_attempt_tmp(_publish_tmp, logger)
+                return 86
 
             _pres = _publish(
                 _arts,
@@ -3262,36 +3286,42 @@ def main():
                 _wsl_arts = []
                 _wsl_staged = []
                 try:
-                    # 媒体
-                    _m_stage = (f"{original_output_path}.wsl-{_attempt_id}"
-                                f"{Path(original_output_path).suffix}")
-                    shutil.copyfile(output_path, _m_stage)
-                    _wsl_staged.append(_m_stage)
-                    _wsl_arts.append(_Artifact("media", _m_stage,
-                                               original_output_path))
-                    # 报告：有就一起走，不能只拷媒体
-                    for _suf, _nm in ((".verify.json", "verify"),
-                                      (".fullchain.json", "fullchain")):
-                        _src = f"{output_path}{_suf}"
-                        if not os.path.exists(_src):
-                            continue
-                        _dst_stage = f"{original_output_path}{_suf}.wsl-{_attempt_id}"
-                        shutil.copyfile(_src, _dst_stage)
-                        _wsl_staged.append(_dst_stage)
-                        _wsl_arts.append(_Artifact(_nm, _dst_stage,
-                                                   f"{original_output_path}{_suf}"))
-                except OSError as _we:
+                    # R16-03：**必须**在源端锁内、按发布前冻结的摘要复制。
+                    #   ① 集合与本次发布**完全一致** —— 原来"存在就拷、不存在就 continue"，
+                    #      缺报告会被静默跳过，目标侧成为不完整的一代；
+                    #   ② 每个文件复制前后都核对摘要 —— 源被下一代替换就中止，
+                    #      绝不提交"A 媒体 + B 报告"。
+                    with _acq_src([output_path], timeout=60, logger=logger):
+                        for _nm, _fin, _want in _pub_digests:
+                            _st, _cur = _fstate(_fin)
+                            if _st != "PRESENT" or _cur != _want:
+                                raise OSError(
+                                    f"source changed underneath: {_nm} at {_fin} "
+                                    f"(state={_st}); refusing to copy a mixed generation")
+                            _suf = ("" if _nm == "media"
+                                    else {"verify": ".verify.json",
+                                          "fullchain": ".fullchain.json"}.get(_nm, "." + _nm))
+                            _stage_path = original_output_path + _suf + ".wsl-" + _attempt_id
+                            shutil.copyfile(_fin, _stage_path)
+                            if _fdig(_stage_path) != _want:
+                                raise OSError(
+                                    f"copied bytes do not match the frozen digest: {_nm}")
+                            _wsl_staged.append(_stage_path)
+                            _wsl_arts.append(_Artifact(_nm, _stage_path,
+                                                       original_output_path + _suf))
+                except (OSError, _LockTimeout) as _we:
                     for _t in _wsl_staged:
                         try:
                             os.remove(_t)
                         except OSError:
                             pass
                     logger.error(
-                        "STAGE7_WSL_STAGE_FAIL",
-                        "Could not stage the result on the WSL target side; "
-                        "the redirected generation is complete but the "
-                        "original path was not updated",
-                        original=original_output_path, error=str(_we))
+                        "STAGE7_WSL_SOURCE_CHANGED",
+                        "Could not take a frozen snapshot of this generation for the WSL "
+                        "target; refusing to copy. The redirected generation is complete but "
+                        "the original path was NOT updated.",
+                        original=original_output_path, error=str(_we),
+                        expected=[(n, d) for n, _f, d in _pub_digests])
                     return 82
 
                 _wres = _publish(
