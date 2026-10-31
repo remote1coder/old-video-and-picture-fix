@@ -205,3 +205,49 @@ def test_b14_absent_target_is_not_recreated(tmp_path):
     # 无论如何都不该在"旧代不存在"的位置凭空写文件
     assert not os.path.exists(tgt), "旧代不存在却被恢复了"
     assert res["fully_restored"] is False or res.get("removed") == [], res
+
+
+# ------------------------------------------------ B13 取消钩子失败必须留痕
+
+def test_b13_cancel_hook_failure_is_logged_not_swallowed():
+    """取消钩子抛异常时：**必须留痕**，且不影响后续钩子。
+
+    审核原话："`CancelGuard` 也吞 hook 异常" —— 原来
+    `except BaseException: continue`，取消时的回滚失败了日志里一个字都没有。
+    """
+    import importlib
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    cg = importlib.import_module("cancel_guard")
+
+    class L:
+        def __init__(self):
+            self.ev = []
+
+        def error(self, e, *a, **k):
+            self.ev.append((e, k))
+
+        def warning(self, e, *a, **k):
+            self.ev.append((e, k))
+
+        info = warning
+
+    guard = cg.CancelGuard()
+    guard._logger = L()
+    ran = []
+
+    def boom():
+        raise RuntimeError("rollback exploded")
+
+    def good():
+        ran.append("good")
+
+    guard.add_cancel_hook(boom)
+    guard.add_cancel_hook(good)
+    guard._run_cancel_hooks()      # 不得向外抛
+
+    assert ran == ["good"], "前面的钩子失败不该挡住后面的"
+    events = [e for e, _ in guard._logger.ev]
+    assert "CANCEL_HOOK_FAILED" in events, events
+    payload = dict(guard._logger.ev)["CANCEL_HOOK_FAILED"]
+    assert "RuntimeError" in payload.get("error", ""), payload

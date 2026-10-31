@@ -225,11 +225,26 @@ class CancelGuard:
             self._cancel_hooks.append(hook)
 
     def _run_cancel_hooks(self) -> None:
+        """R3-03 / R16-07：取消时先跑收尾钩子（如成套回滚）。
+
+        原来这里 `except BaseException: continue` —— **静默吞掉**钩子异常。
+        后果：取消时的回滚失败了，日志里一个字都没有，事后无法判断
+        "到底回滚成功没有"。现在把失败记成事件（记录本身再失败就
+        放行 —— 处理器内部不允许再抛）。
+        """
         for hook in list(self._cancel_hooks):
             try:
                 hook()
-            except BaseException:  # noqa: BLE001 - 处理器内不允许再抛出
-                continue
+            except BaseException as exc:  # noqa: BLE001
+                try:
+                    if self._logger is not None:
+                        self._logger.error(
+                            "CANCEL_HOOK_FAILED",
+                            "A cancel-time hook raised; its cleanup may be incomplete",
+                            hook=getattr(hook, "__name__", repr(hook)),
+                            error=f"{type(exc).__name__}: {exc}")
+                except BaseException:
+                    pass          # 处理器内不允许再抛出
 
     # ------------------------------------------------------------- behaviour
     def _fire(self, signum: int, frame: Any) -> None:
