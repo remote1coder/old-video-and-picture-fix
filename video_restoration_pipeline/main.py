@@ -118,6 +118,11 @@ def parse_args():
     # 缺的只是**命令行**入口：照片链一直有 `--force-allow-banned-upscale`，
     # 视频链没有，而对单个素材临时放行时改 config / 编辑 manifest 都很别扭
     # （config 是全局的，manifest 要手改 YAML）。这里补的是易用性缺口。
+    parser.add_argument(
+        "--fps-interpret", metavar="RATE", default=None,
+        help="Explicitly reinterpret the timeline at this frame rate "
+             "(e.g. 30000/1001). This is a USER ASSUMPTION, not a "
+             "probe result; it overrides whatever ffprobe reports.")
     parser.add_argument("--force-allow-banned-upscale", action="store_true",
                         help="Override the AI-upscale ban for this run "
                              "(e.g. 1080p source). Equivalent to config "
@@ -1190,6 +1195,11 @@ def _build_cli_overrides(args) -> Dict[str, Any]:
         ov["ai_upscale_model"] = _ai_model
     # FIX-2026-10-22：强制放行 AI 封禁（1080p 素材）。必须在 merge_params
     # 之前进覆盖，否则 stage 列表里根本没有 stage3 → AI 静默不执行。
+    # R16-05：用户明确要求重解释时间轴（与"探测到的帧率"分开）
+    _fpsint = args.get("fps_interpret")
+    if _fpsint:
+        ov["fps_interpret"] = _fpsint
+        ov["_fps_from_user"] = True
     if args.get("force_allow_banned_upscale"):
         ov["force_allow_banned_upscale"] = True
     return ov
@@ -2932,6 +2942,7 @@ def main():
                     # 于是计划解析与冲突判定父子不一致。
                     "allow_write_root": getattr(args, "allow_write_root", None),
                     "relocate_output": getattr(args, "relocate_output", None),
+                    "fps_interpret": getattr(args, "fps_interpret", None),
                     "force_allow_banned_upscale": getattr(
                         args, "force_allow_banned_upscale", False),
                 },

@@ -14,6 +14,7 @@
 """
 import os
 import re
+import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _S6 = os.path.join(_ROOT, "photo_restoration_pipeline", "stages",
@@ -74,3 +75,133 @@ def test_cancel_hook_reads_and_persists_rollback_result():
     # 反例：不允许再用忽略返回值的 lambda
     bad = re.search(r"add_cancel_hook\(\s*\n?\s*lambda:", src)
     assert bad is None, "取消钩子仍是忽略返回值的 lambda"
+
+
+# ------------------------------------------------ B11/B12/B14 真实函数
+
+def _load_s6():
+    """导入照片 stage6（只导入定义，不执行 main）。"""
+    import importlib
+    p = os.path.join(_ROOT, "photo_restoration_pipeline", "stages")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    return importlib.import_module("stage6_encode")
+
+
+def _w(p, data):
+    with open(p, "wb") as f:
+        f.write(data)
+    return p
+
+
+def _dig(p):
+    import hashlib
+    with open(p, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+class _L:
+    def __init__(self):
+        self.ev = []
+
+    def info(self, e, *a, **k):
+        self.ev.append(e)
+
+    def warning(self, e, *a, **k):
+        self.ev.append(e)
+
+    def error(self, e, *a, **k):
+        self.ev.append(e)
+
+
+def test_b11_missing_old_digest_blocks_the_whole_rollback(tmp_path):
+    """B11：某个目标缺 `old_digest` → **全组**预检拒绝，一个文件都不改。"""
+    s6 = _load_s6()
+    good = _w(str(tmp_path / "a.bin"), b"GOOD-CURRENT")
+    bad = _w(str(tmp_path / "b.bin"), b"BAD-CURRENT")
+    bk_good = _w(str(tmp_path / "bk_a"), b"OLD-A")
+    bk_bad = _w(str(tmp_path / "bk_b"), b"OLD-B")
+
+    snap = {
+        good: {"state": s6.BACKUP_OK, "backup": bk_good, "old_digest": _dig(bk_good),
+               "backup_digest": _dig(bk_good)},
+        # old_digest 缺失 → 无从核对，必须拒绝整组
+        bad: {"state": s6.BACKUP_OK, "backup": bk_bad, "old_digest": None,
+              "backup_digest": _dig(bk_bad)},
+    }
+    log = _L()
+    res = s6._rollback_publish(snap, log)
+
+    assert res["fully_restored"] is False, res
+    assert res["restored"] == [], res
+    # 一个正式文件都没改
+    assert open(good, "rb").read() == b"GOOD-CURRENT"
+    assert open(bad, "rb").read() == b"BAD-CURRENT"
+    assert "STAGE6_ROLLBACK_PRECHECK_FAILED" in log.ev, log.ev
+
+
+def test_b11_unreadable_backup_blocks_the_whole_rollback(tmp_path):
+    """B11：备份丢失/不可读 → 全组预检拒绝。"""
+    s6 = _load_s6()
+    tgt = _w(str(tmp_path / "a.bin"), b"CURRENT")
+    snap = {
+        tgt: {"state": s6.BACKUP_OK, "backup": str(tmp_path / "does-not-exist"),
+              "old_digest": "deadbeef", "backup_digest": "deadbeef"},
+    }
+    log = _L()
+    res = s6._rollback_publish(snap, log)
+    assert res["fully_restored"] is False, res
+    assert open(tgt, "rb").read() == b"CURRENT"
+    assert "STAGE6_ROLLBACK_PRECHECK_FAILED" in log.ev, log.ev
+
+
+def test_b12_successful_rollback_restores_exact_bytes(tmp_path):
+    """B12 正向：备份与摘要都可信时，恢复出**逐字节相同**的旧代。"""
+    s6 = _load_s6()
+    old = b"OLD-GENERATION-BYTES"
+    tgt = _w(str(tmp_path / "a.bin"), b"NEW-GENERATION")
+    bk = _w(str(tmp_path / "bk"), old)
+    d = _dig(bk)
+    log = _L()
+    res = s6._rollback_publish(
+        {tgt: {"state": s6.BACKUP_OK, "backup": bk, "old_digest": d,
+               "backup_digest": d}}, log)
+    assert res["fully_restored"] is True, res
+    assert open(tgt, "rb").read() == old
+    # 不留下暂存文件
+    left = [n for n in os.listdir(str(tmp_path)) if ".restore-" in n]
+    assert not left, left
+
+
+def test_b12_corrupted_backup_never_overwrites_the_target(tmp_path):
+    """B12 反向：备份内容与摘要不符 → **不许**覆盖目标。"""
+    s6 = _load_s6()
+    tgt = _w(str(tmp_path / "a.bin"), b"CURRENT-GOOD")
+    bk = _w(str(tmp_path / "bk"), b"TAMPERED")
+    snap = {
+        tgt: {"state": s6.BACKUP_OK, "backup": bk,
+              "old_digest": "0" * 64,          # 与 TAMPERED 不符
+              "backup_digest": _dig(bk)},      # 备份自身摘要自洽
+    }
+    log = _L()
+    res = s6._rollback_publish(snap, log)
+    assert res["fully_restored"] is False, res
+    assert open(tgt, "rb").read() == b"CURRENT-GOOD", "坏备份盖掉了好文件"
+
+
+def test_b14_absent_target_is_not_recreated(tmp_path):
+    """B14：旧代本来不存在 → 不得凭备份凭空造出来。"""
+    s6 = _load_s6()
+    tgt = str(tmp_path / "never_existed.bin")
+    bk = _w(str(tmp_path / "bk"), b"SOMETHING")
+    snap = {
+        tgt: {"state": s6.BACKUP_OK, "backup": bk, "old_digest": None,
+              "backup_digest": _dig(bk), "existed": False},
+    }
+    log = _L()
+    res = s6._rollback_publish(snap, log)
+    # 无论如何都不该在"旧代不存在"的位置凭空写文件
+    assert not os.path.exists(tgt), "旧代不存在却被恢复了"
+    assert res["fully_restored"] is False or res.get("removed") == [], res

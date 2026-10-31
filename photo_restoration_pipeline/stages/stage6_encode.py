@@ -802,6 +802,16 @@ def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
             continue
 
         if state == BACKUP_OK and backup and os.path.isfile(backup):
+            # R16-07 / B11：`old_digest` 缺失 = **状态未知** —— 不能进恢复计划。
+            # 原来只在 "old_digest 且不符" 时拒绝，缺失就当没有校验条件：
+            # 结果先恢复了一个目标、另一个才在**执行阶段**失败，
+            # 正式文件已经被改了一半（审核 B11 原文）。
+            if not old_digest:
+                result["impossible"].append(path)
+                result["failed"].append({
+                    "path": path,
+                    "error": "old_digest is not recorded; the previous content cannot be proven, so nothing will be touched"})
+                continue
             actual = file_digest(backup)
             # 备份必须同时满足"记录里的摘要"和"旧代摘要"才可用。
             if bk_digest and actual != bk_digest:

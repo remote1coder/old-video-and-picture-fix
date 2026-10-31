@@ -2287,6 +2287,36 @@ def main():
                     expected_frames=total_frames)
                 return 86
 
+    # ---- R16-05：用户**明确要求重解释时间轴**时，优先于 probe ----
+    # 审核确认：`_manual_spec` 只在"probe 失败"分支里用，有效 probe 优先，
+    # 于是用户真要按 25fps 重解释时请求被静默忽略。这里补一条独立入口。
+    _reinterp = params.get("fps_interpret")
+    if not _reinterp and params.get("_fps_from_user"):
+        _reinterp = params.get("original_fps") or params.get("fps")
+    if _reinterp not in (None, ""):
+        try:
+            from rate_spec import parse_rate as _parse_rate2
+            _ri = _parse_rate2(_reinterp, source="user")
+            _old_fps, _old_src = actual_fps, _fps_source
+            actual_fps = _ri.value
+            _fps_ok = True
+            _fps_raw_str = _ri.as_ffmpeg()
+            _fps_source = "user-assumed"
+            logger.warning(
+                "STAGE3_FPS_USER_REINTERPRET",
+                "The user explicitly asked to reinterpret the timeline at this "
+                "frame rate; it overrides whatever the probe reported. Timing is "
+                "an EXPLICIT ASSUMPTION, not a measurement.",
+                requested=_fps_raw_str, previous_fps=_old_fps,
+                previous_source=_old_src)
+        except Exception as _rie:
+            logger.error(
+                "STAGE3_FPS_INTERPRET_INVALID",
+                "fps_interpret is not usable; refusing to guess.",
+                spec=str(_reinterp), reason=getattr(_rie, "reason", str(_rie)))
+            return 86
+
+
     # FIX-P8-9: Collect window dirs for batch processing
     # ORIGINAL: Per-window run_realesrgan (model loaded per window)
     # FIX-P8-8: Collect PTS for VFR preservation

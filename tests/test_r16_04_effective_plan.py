@@ -228,3 +228,60 @@ def test_shared_temp_and_log_dirs_are_not_conflicts(tmp_path):
     p1 = rp.resolve_run_plan(j1, params, write_roots=None)
     p2 = rp.resolve_run_plan(j2, params, write_roots=None)
     assert rp.detect_cross_job_conflicts([p1, p2]) == []
+
+
+# ------------------------------------------------- R16-05 手动 FPS 贯通
+
+def test_fps_interpret_cli_reaches_cli_overrides():
+    """`--fps-interpret` 必须进 cli_overrides，并标 `_fps_from_user`。
+
+    审核确认：`_fps_from_user` 在 stage3 被读取，但 main 从来没有设置入口，
+    于是"用户要求重解释时间轴"根本传不下去。
+    """
+    args = _Args(manifest="x.yaml", fps_interpret="30000/1001")
+    ov = _build_cli_overrides(args)
+    assert ov.get("fps_interpret") == "30000/1001"
+    assert ov.get("_fps_from_user") is True
+
+
+def test_fps_interpret_absent_by_default():
+    ov = _build_cli_overrides(_Args(manifest="x.yaml"))
+    assert "fps_interpret" not in ov
+    assert "_fps_from_user" not in ov
+
+
+def test_fps_interpret_survives_worker_arg_dict():
+    """worker 收到的是 dict，父进程是 Namespace —— 两者必须等价。"""
+    ns = _Args(fps_interpret="25", output="/o")
+    d = {"fps_interpret": "25", "output": "/o"}
+    assert _build_cli_overrides(ns) == _build_cli_overrides(d)
+
+
+def test_argparse_exposes_fps_interpret():
+    """真实 argparse 必须认这个参数（防止只改了 override 没加开关）。"""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(_ROOT, "video_restoration_pipeline"))
+    import main as _m
+    _old = _sys.argv
+    try:
+        _sys.argv = ["main.py", "--manifest", "x.yaml",
+                     "--fps-interpret", "30000/1001"]
+        a = _m.parse_args()
+        assert getattr(a, "fps_interpret", None) == "30000/1001"
+    finally:
+        _sys.argv = _old
+
+
+def test_stage3_reinterpret_overrides_probe():
+    """stage3 必须让用户的**重解释**压过 probe，并如实标 user-assumed。"""
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage3_ai_upscale.py"),
+               encoding="utf-8", errors="replace").read()
+    assert "STAGE3_FPS_USER_REINTERPRET" in src, \
+        "重解释必须有自己的事件（否则无法与 probe 结果区分）"
+    assert 'params.get("fps_interpret")' in src
+    assert '_fps_source = "user-assumed"' in src
+    # 反例：这段必须在 `if not _fps_ok:` 之外（否则 probe 成功就永远走不到）
+    _i_re = src.find('params.get("fps_interpret")')
+    _i_blk = src.find("if not _fps_ok:")
+    assert _i_re > _i_blk, "重解释逻辑落在了 probe 失败分支里"

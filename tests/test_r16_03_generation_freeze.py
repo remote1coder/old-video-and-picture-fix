@@ -136,3 +136,75 @@ def test_wsl_copyback_uses_frozen_digests_and_full_set():
     # 复制后必须再核对一次摘要
     assert src.count("_fdig(_stage_path) != _want") >= 1, \
         "复制后必须核对摘要，否则复制期间的替换检测不到"
+
+
+# ------------------------------------------------ B09 两进程写标记
+
+import subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_WRITER = r"""
+import json, os, sys
+sys.path.insert(0, {root!r})
+sys.path.insert(0, {shared!r})
+sys.path.insert(0, {pipe!r})
+import main as vmain
+
+final = {final!r}
+job = {{"job_id": {jid!r}, "input_path": {inp!r},
+        "detected_class": "HDV_AVCHD", "recommended_params": {{}},
+        "user_overrides": {{}}}}
+class L:
+    def info(self, *a, **k): pass
+    warning = error = info
+ok = vmain.write_completion_marker(final, job, {{}}, L())
+print("OK" if ok else "REFUSED")
+"""
+
+
+def test_b09_two_processes_do_not_corrupt_the_marker(tmp_path):
+    """两个进程同时写同一个标记：只能留一份合法 JSON，不留临时文件。
+
+    原来临时名是共享的 `<final>.done.json.tmp` —— 两进程互相踩，
+    可能写出半个 JSON，使 resume 永远判定"标记不可读"。
+    """
+    final = tmp_path / "clip_restored.mkv"
+    final.write_bytes(b"GEN")
+    (tmp_path / "clip_restored.mkv.verify.json").write_text(
+        json.dumps({"media_sha256": vmain._chunked_sha256(str(final))}),
+        encoding="utf-8")
+    inp = tmp_path / "in.mp4"
+    inp.write_bytes(b"src")
+
+    root = str(_ROOT)
+    shared = os.path.join(_ROOT, "shared_modules")
+    procs = []
+    for jid in ("j1", "j2"):
+        code = _WRITER.format(root=root, shared=shared,
+                              pipe=os.path.join(root, "video_restoration_pipeline"),
+                              final=str(final), jid=jid, inp=str(inp))
+        procs.append(subprocess.Popen(
+            [_sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+
+    outs = [p.communicate(timeout=180) for p in procs]
+    for (o, e), p in zip(outs, procs):
+        assert p.returncode == 0, e[-400:]
+
+    marker = vmain.completion_marker_path(str(final))
+    assert os.path.exists(marker), "标记必须写出来（至少一个进程成功）"
+    # 必须是一份**完整可读**的 JSON
+    doc = json.load(open(marker, encoding="utf-8"))
+    assert doc["job_id"] in ("j1", "j2"), doc
+    assert doc["output_sha256"], doc
+
+    # 不能留下临时文件
+    leftovers = [n for n in os.listdir(str(tmp_path)) if ".done.json.tmp" in n]
+    assert not leftovers, f"临时文件没清理：{leftovers}"
+
+
+def test_b09_marker_tmp_is_unique_per_process():
+    """源码守卫：临时名必须带 pid（两进程不会同名）。"""
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
+               encoding="utf-8", errors="replace").read()
+    assert "tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}" in src
