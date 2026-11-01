@@ -778,6 +778,29 @@ def _chunked_sha256(path: str, chunk: int = 1 << 20) -> Optional[str]:
 IDENTITY_DIGEST_MODE = "full-stream-sha256"
 
 
+def _plain_sha256(path: str, chunk: int = 1 << 20) -> Optional[str]:
+    """**纯内容** SHA-256 —— 与 `publish_journal.file_digest` 同口径。
+
+    R16-03 修正：`_chunked_sha256()` 在内容之后**又拼了 size 字符串**，
+    与项目里其余摘要（publisher / journal / stage7 的 verify 报告 /
+    artifact_verify）**不是同一套算法**。拿它去比报告里的 `media_sha256`
+    必然不等 —— 实测同一份成品：纯内容 `3f1fbf3c…`、内容+size
+    `bb52754f…`，于是**每个视频 job 的完成标记都被误拒**。
+
+    用途区分：
+      * 跨模块比对（对报告 / 对 journal）→ 本函数
+      * 需要"内容 + 大小"的输入身份 → 继续用 `_chunked_sha256()`
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(chunk), b""):
+                h.update(block)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 def build_input_identity(input_path: str) -> Dict[str, Any]:
     """RV-09 / R2-07: identity of the *source* material an artifact was made from."""
     ident: Dict[str, Any] = {"path": str(input_path), "size": None,
@@ -897,7 +920,9 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
                 _recorded = (json.load(_vf) or {}).get("media_sha256")
         except (OSError, ValueError):
             _recorded = None
-        _actual = (_chunked_sha256(final_path)
+        # 与报告同口径（纯内容）。`output_sha256` 仍用 _chunked_sha256 ——
+        # resume 的比对端也是它，两边自洽，不能单边改。
+        _actual = (_plain_sha256(final_path)
                    if os.path.exists(final_path) else None)
         if _recorded and _actual and _recorded != _actual:
             if logger:
@@ -909,7 +934,7 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
                     output_path=str(final_path),
                     recorded=_recorded[:16], actual=_actual[:16])
             return False
-        _gen_digest = _actual
+        _gen_digest = None
     finally:
         try:
             if _lock is not None:

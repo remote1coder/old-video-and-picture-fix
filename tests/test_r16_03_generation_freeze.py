@@ -52,8 +52,10 @@ def test_marker_refuses_when_media_changed_after_publish(tmp_path):
     # verify.json 记录的是**本代**发布时的摘要（A 代）
     other = tmp_path / "other.bin"
     other.write_bytes(b"GENERATION-A")
+    # 报告里的 media_sha256 是**纯内容** SHA-256（stage7 的口径），
+    # 这里必须用同一套算法，否则"挡下来"的原因是算法不同而不是媒体换了。
     (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": vmain._chunked_sha256(str(other))}),
+        json.dumps({"media_sha256": vmain._plain_sha256(str(other))}),
         encoding="utf-8")
 
     class L:
@@ -82,7 +84,8 @@ def test_marker_written_when_digest_matches(tmp_path):
     """摘要一致时标记正常写入，并记录**已核对**的摘要。"""
     media = tmp_path / "clip_restored.mkv"
     media.write_bytes(b"GENERATION-A")
-    dig = vmain._chunked_sha256(str(media))
+    # 报告记的是**纯内容**摘要（stage7 口径）
+    dig = vmain._plain_sha256(str(media))
     (tmp_path / "clip_restored.mkv.verify.json").write_text(
         json.dumps({"media_sha256": dig}), encoding="utf-8")
     inp = tmp_path / "in.mp4"
@@ -97,7 +100,11 @@ def test_marker_written_when_digest_matches(tmp_path):
                                          {}, L()) is True
     marker = json.load(open(vmain.completion_marker_path(str(media)),
                             encoding="utf-8"))
-    assert marker["output_sha256"] == dig
+    # 标记自己的 output_sha256 仍是"内容 + size"口径 —— resume 的比对端
+    # （`resume_artifact_matches`）也是它，两边必须自洽。
+    assert marker["output_sha256"] == vmain._chunked_sha256(str(media))
+    assert marker["output_sha256"] != dig, \
+        "两种口径必须不同，否则说明混用了"
     assert marker["job_id"] == "j1"
 
 
@@ -170,8 +177,9 @@ def test_b09_two_processes_do_not_corrupt_the_marker(tmp_path):
     """
     final = tmp_path / "clip_restored.mkv"
     final.write_bytes(b"GEN")
+    # 报告口径是纯内容 SHA-256（stage7 写的就是它）
     (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": vmain._chunked_sha256(str(final))}),
+        json.dumps({"media_sha256": vmain._plain_sha256(str(final))}),
         encoding="utf-8")
     inp = tmp_path / "in.mp4"
     inp.write_bytes(b"src")
@@ -208,3 +216,57 @@ def test_b09_marker_tmp_is_unique_per_process():
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
                encoding="utf-8", errors="replace").read()
     assert "tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}" in src
+
+
+# ------------------------------------------------ 摘要口径（R16-03 后修）
+
+def test_plain_and_chunked_digests_differ_by_construction(tmp_path):
+    """`_plain_sha256` 与 `_chunked_sha256` **必然不同**（后者拼了 size）。
+
+    这条锁住"为什么守卫必须用纯内容口径"。
+    """
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"hello")
+    a = vmain._plain_sha256(str(f))
+    b = vmain._chunked_sha256(str(f))
+    assert a and b and a != b, (a, b)
+    # 纯内容口径要和项目其它模块一致
+    from publish_journal import file_digest
+    assert a == file_digest(str(f))
+
+
+def test_guard_compares_like_with_like(tmp_path):
+    """报告写纯内容摘要 → 标记**必须**写得出来（原来会被误拒）。
+
+    实测反例：同一份成品 `3f1fbf3c…`（纯内容）vs `bb52754f…`（内容+size），
+    守卫拿后者比前者的记录值，**每个视频 job 都被拒**。
+    """
+    media = tmp_path / "clip_restored.mkv"
+    media.write_bytes(b"GENUINE")
+    plain = vmain._plain_sha256(str(media))
+    (tmp_path / "clip_restored.mkv.verify.json").write_text(
+        json.dumps({"media_sha256": plain}), encoding="utf-8")
+    inp = tmp_path / "in.mp4"
+    inp.write_bytes(b"src")
+
+    class L:
+        def __init__(self):
+            self.ev = []
+
+        def info(self, e, *a, **k):
+            self.ev.append(e)
+
+        def warning(self, e, *a, **k):
+            self.ev.append(e)
+
+        def error(self, e, *a, **k):
+            self.ev.append(e)
+
+    log = L()
+    ok = vmain.write_completion_marker(str(media),
+                                       {"job_id": "j1", "input_path": str(inp),
+                                        "detected_class": "HDV_AVCHD",
+                                        "recommended_params": {},
+                                        "user_overrides": {}}, {}, log)
+    assert ok is True, log.ev
+    assert "COMPLETION_MARKER_GENERATION_CHANGED" not in log.ev, log.ev
