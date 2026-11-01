@@ -2766,6 +2766,68 @@ def main():
             # 就会读到 B 的文件、却写着 A 的结论。
             # 现在核对对象固定为本 attempt 独占的 `_publish_tmp`，
             # 报告也绑定它的摘要，锁内只做"身份复核 + 两个 rename"。
+            # ---- R16-06：用**源素材**的逐帧时间戳把候选件重定时 ----
+            # stage1/2/4/6 的 y4m 管道与 stage5 的 concat 都会把可变帧间隔压平
+            # （实测真 VFR 292 帧：源 15.702s → 中间 15.160s，间隔被量化成常数）。
+            # 这里在**发布前**按源 PTS 重新封装容器，一处修全链。
+            # 没装 mkvmerge 时明确告警，不声称"保住了"。
+            _retime_info = None
+            try:
+                from vfr_timecodes import (
+                    find_mkvmerge as _find_mkv, is_variable as _is_var,
+                    probe_pts as _probe_pts, retime_to_source_pts as _retime)
+                _rp_paths = (params.get("_run_plan") or {}).get("paths") or {}
+                _orig_src = ((_rp_paths.get("input_path") or {}).get("resolved")
+                             or (params.get("_run_plan") or {}).get("input_path"))
+                # 主开关用 stage3 已经写下的结论，避免对 CFR 素材白跑一遍全片扫描
+                # 这里在 prepublish 校验**之前**，全局 `_tl_plan` 还没读 → 就地读一次
+                _plan_tl = None
+                try:
+                    from timeline_plan import read_plan as _read_tlp
+                    _plan_tl = ((_read_tlp(str(temp_dir), job_id) or {})
+                                .get("source_timeline"))
+                except Exception:
+                    _plan_tl = None
+                _mkv = _find_mkv()
+                if not _orig_src or not os.path.isfile(_orig_src):
+                    _retime_info = {"action": "skipped", "reason": "original source unknown"}
+                elif not _mkv and _plan_tl == "vfr":
+                    # 源是 VFR 而本机没有 mkvmerge → **不能发布**：中间产物已经把
+                    # 间隔压平，发出去就是一条时间轴错的成品。
+                    logger.error(
+                        "STAGE7_VFR_RETIME_UNAVAILABLE",
+                        "The source has a variable frame rate but mkvmerge is not "
+                        "installed, so its per-frame timestamps cannot be restored. "
+                        "Refusing to publish a timeline that is known to be wrong. "
+                        "Install MKVToolNix to enable this path.",
+                        plan_timeline=_plan_tl)
+                    _discard_attempt_tmp(_publish_tmp, logger)
+                    return 86
+                elif not _mkv:
+                    logger.warning(
+                        "STAGE7_VFR_RETIME_UNAVAILABLE",
+                        "mkvmerge is not installed; the source is not variable-rate "
+                        "so the timeline is expected to be constant anyway.",
+                        plan_timeline=_plan_tl)
+                    _retime_info = {"action": "unavailable", "reason": "no mkvmerge"}
+                elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
+                    _ok_r, _retime_info = _retime(_orig_src, _publish_tmp, _mkv,
+                                                  work_dir=str(temp_dir), logger=logger)
+                    if not _ok_r:
+                        logger.error(
+                            "STAGE7_VFR_RETIME_FAIL",
+                            "The source has a variable frame rate and the candidate could "
+                            "not be re-timed to match it. Refusing to publish a timeline "
+                            "that is known to be wrong.",
+                            error=(_retime_info or {}).get("reason"), info=_retime_info)
+                        _discard_attempt_tmp(_publish_tmp, logger)
+                        return 86
+                else:
+                    _retime_info = {"action": "skipped", "reason": "constant frame rate"}
+            except Exception as _retime_exc:      # 诊断不能阻断发布
+                logger.warning("STAGE7_VFR_RETIME_ERROR", str(_retime_exc))
+                _retime_info = {"action": "error", "reason": str(_retime_exc)}
+
             # ---- GATE-01：阻断性检查必须在**发布之前**执行 ----
             # 原实现先 os.replace 覆盖正式路径，之后才做机械核对与
             # 帧序对齐。一旦新件帧序错位，旧成品已被换掉，失败的
@@ -3188,61 +3250,6 @@ def main():
                 _discard_attempt_tmp(_publish_tmp, logger)
                 return 82
 
-            # ---- R16-06：用**源素材**的逐帧时间戳把候选件重定时 ----
-            # stage1/2/4/6 的 y4m 管道与 stage5 的 concat 都会把可变帧间隔压平
-            # （实测真 VFR 292 帧：源 15.702s → 中间 15.160s，间隔被量化成常数）。
-            # 这里在**发布前**按源 PTS 重新封装容器，一处修全链。
-            # 没装 mkvmerge 时明确告警，不声称"保住了"。
-            _retime_info = None
-            try:
-                from vfr_timecodes import (
-                    find_mkvmerge as _find_mkv, is_variable as _is_var,
-                    probe_pts as _probe_pts, retime_to_source_pts as _retime)
-                _rp_paths = (params.get("_run_plan") or {}).get("paths") or {}
-                _orig_src = ((_rp_paths.get("input_path") or {}).get("resolved")
-                             or (params.get("_run_plan") or {}).get("input_path"))
-                # 主开关用 stage3 已经写下的结论，避免对 CFR 素材白跑一遍全片扫描
-                _plan_tl = ((_tl_plan or {}).get("source_timeline")
-                            if isinstance(_tl_plan, dict) else None)
-                _mkv = _find_mkv()
-                if not _orig_src or not os.path.isfile(_orig_src):
-                    _retime_info = {"action": "skipped", "reason": "original source unknown"}
-                elif not _mkv and _plan_tl == "vfr":
-                    # 源是 VFR 而本机没有 mkvmerge → **不能发布**：中间产物已经把
-                    # 间隔压平，发出去就是一条时间轴错的成品。
-                    logger.error(
-                        "STAGE7_VFR_RETIME_UNAVAILABLE",
-                        "The source has a variable frame rate but mkvmerge is not "
-                        "installed, so its per-frame timestamps cannot be restored. "
-                        "Refusing to publish a timeline that is known to be wrong. "
-                        "Install MKVToolNix to enable this path.",
-                        plan_timeline=_plan_tl)
-                    _discard_attempt_tmp(_publish_tmp, logger)
-                    return 86
-                elif not _mkv:
-                    logger.warning(
-                        "STAGE7_VFR_RETIME_UNAVAILABLE",
-                        "mkvmerge is not installed; the source is not variable-rate "
-                        "so the timeline is expected to be constant anyway.",
-                        plan_timeline=_plan_tl)
-                    _retime_info = {"action": "unavailable", "reason": "no mkvmerge"}
-                elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
-                    _ok_r, _retime_info = _retime(_orig_src, _publish_tmp, _mkv,
-                                                  work_dir=str(temp_dir), logger=logger)
-                    if not _ok_r:
-                        logger.error(
-                            "STAGE7_VFR_RETIME_FAIL",
-                            "The source has a variable frame rate and the candidate could "
-                            "not be re-timed to match it. Refusing to publish a timeline "
-                            "that is known to be wrong.",
-                            error=(_retime_info or {}).get("reason"), info=_retime_info)
-                        _discard_attempt_tmp(_publish_tmp, logger)
-                        return 86
-                else:
-                    _retime_info = {"action": "skipped", "reason": "constant frame rate"}
-            except Exception as _retime_exc:      # 诊断不能阻断发布
-                logger.warning("STAGE7_VFR_RETIME_ERROR", str(_retime_exc))
-                _retime_info = {"action": "error", "reason": str(_retime_exc)}
 
 
             # ---- R16-02：本代**必需成果**先确定，再准备 ----
