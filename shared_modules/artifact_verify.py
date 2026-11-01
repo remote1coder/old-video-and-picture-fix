@@ -99,6 +99,19 @@ def _probe(path: str, entries: str, extra: Optional[List[str]] = None,
     return out.strip()
 
 
+def _probe_all_streams(path: str, entries: str) -> Optional[str]:
+    """不筛选流的探针 —— 用于判断"有没有音轨"这类全局事实。
+
+    `_probe()` 写死了 `-select_streams v:0`，用它查 codec_type 永远只拿到
+    "video"，`has_audio` 会恒为 False（那样 R16-06 的轨构成判断就失效）。
+    """
+    out = _run(["ffprobe", "-v", "error", "-show_entries", entries,
+                "-of", "default=nw=1:nokey=1", path])
+    if out is None:
+        return None
+    return out.strip()
+
+
 def probe_media_facts(path: str) -> Dict[str, Any]:
     """一个媒体文件的硬事实：帧数、时长、分辨率、像素格式、首末帧哈希。
 
@@ -129,6 +142,23 @@ def probe_media_facts(path: str) -> Dict[str, Any]:
             facts["duration"] = float(d.splitlines()[0])
         except (ValueError, IndexError):
             pass
+
+    # R16-06：**容器时长 ≠ 视频时长**。容器取所有轨的最大值；成品带音轨、
+    # 中间产物常常只有视频轨，两边直接比 `format.duration` 会得出假的
+    # "时长差 3.6%"（实测：源视频 15.1307 / 源音频 15.7020 /
+    # 中间产物 15.172 / 成品容器 15.723）。
+    facts["video_duration"] = None
+    facts["has_audio"] = None
+    vd = _probe(path, "stream=duration")
+    if vd:
+        try:
+            facts["video_duration"] = float(vd.splitlines()[0])
+        except (ValueError, IndexError):
+            pass
+    ct = _probe_all_streams(path, "stream=codec_type")
+    if ct:
+        types = [x.strip() for x in ct.splitlines() if x.strip()]
+        facts["has_audio"] = ("audio" in types)
 
     for key, entry in (("width", "stream=width"), ("height", "stream=height"),
                        ("pix_fmt", "stream=pix_fmt")):
@@ -358,7 +388,36 @@ def verify_output(source_path: str, output_path: str,
     #
     # 改成"差了几帧"：帧数本身已经严格校验（第 2 项），时长只是辅助，
     # 所以只要差不超过 max(2 帧, 3%) 就算一致。
-    if src.get("duration") and out.get("duration"):
+    # ---- R16-06：先决定**用哪个时长**比 ----
+    # 两边都有视频轨时长 → 用它（同一口径）。
+    # 否则，若一边有音轨、另一边没有，容器时长本来就不可比 → 不判失败。
+    _sv, _ov = src.get("video_duration"), out.get("video_duration")
+    _cmp_src = _cmp_out = None
+    if _sv and _ov:
+        _cmp_src, _cmp_out = _sv, _ov
+    elif (src.get("has_audio") is not None
+          and out.get("has_audio") is not None
+          and src.get("has_audio") != out.get("has_audio")):
+        checks["duration"] = {
+            "ok": None,
+            "note": ("两边的轨构成不同（一边有音轨、一边没有），"
+                     "容器时长不可比；本次不按时长判定"),
+            "src_container": src.get("duration"),
+            "out_container": out.get("duration"),
+            "src_has_audio": src.get("has_audio"),
+            "out_has_audio": out.get("has_audio"),
+        }
+        issues.append({"level": "warning",
+                       "code": "DURATION_NOT_COMPARABLE",
+                       "message": ("成品与中间产物的轨构成不同，容器时长"
+                                   "不可比（源 "
+                                   f"{src.get('duration')}s / 成品 "
+                                   f"{out.get('duration')}s）——未按时长判定")})
+    else:
+        _cmp_src, _cmp_out = src.get("duration"), out.get("duration")
+
+    if _cmp_src and _cmp_out:
+        rel = abs(_cmp_out - _cmp_src) / _cmp_src
         rel = abs(out["duration"] - src["duration"]) / src["duration"]
         diff_frames = None
         allowed_frames = None

@@ -203,3 +203,111 @@ def test_no_mkvmerge_is_reported_not_faked(monkeypatch):
                   encoding="utf-8", errors="replace").read()
     assert "STAGE7_VFR_RETIME_UNAVAILABLE" in src, \
         "没有 mkvmerge 时必须告警，不能默默按 CFR 发布"
+
+
+# ------------------------------------------------ 容器时长 vs 视频时长
+
+@pytestmark_ffmpeg
+def test_audio_bearing_output_is_not_a_duration_mismatch(tmp_path):
+    """成品带音轨、中间产物只有视频轨 → **不得**判时长不符。
+
+    这是实测踩到的假阳性：源视频 15.1307s、源音频 15.7020s，
+    中间产物（纯视频）15.172s，成品容器 15.723s。三个数各有各的口径，
+    直接比 `format.duration` 会得出 "时长差 3.6%" 并把整条链拦死。
+    """
+    import artifact_verify as av
+
+    frames = _pngs(tmp_path / "f", 30)
+    # 中间产物：只有视频轨
+    vid = str(tmp_path / "vid.mkv")
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+              "-framerate", "30", "-i", str(frames / "f_%08d.png"),
+              "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-an", vid])
+    assert r.returncode == 0, r.stderr[-300:]
+
+    # 成品：视频 + **更长的**音轨（容器时长会被音轨拉长）
+    out = str(tmp_path / "out.mkv")
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+              "-framerate", "30", "-i", str(frames / "f_%08d.png"),
+              "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+              "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-c:a", "aac",
+              "-shortest", out])
+    assert r.returncode == 0, r.stderr[-300:]
+
+    fv = av.probe_media_facts(vid)
+    fo = av.probe_media_facts(out)
+    assert fv.get("has_audio") is False, fv
+    assert fo.get("has_audio") is True, fo
+
+    rep = av.verify_output(vid, out, {})
+    codes = [i.get("code") for i in (rep.get("issues") or [])]
+    dur = (rep.get("checks") or {}).get("duration") or {}
+    # 要么按视频轨口径比（ok 为 True/False），要么明确"不可比"
+    if dur.get("ok") is None:
+        assert "DURATION_NOT_COMPARABLE" in codes, codes
+    assert not any(
+        i.get("code") == "DURATION_MISMATCH" and i.get("level") == "error"
+        for i in (rep.get("issues") or [])), \
+        "带音轨的成品被误判为时长不符"
+
+
+def test_probe_all_streams_sees_the_audio_track():
+    """`_probe()` 写死 v:0，查 codec_type 永远只有 video —— 必须另有全流探针。"""
+    src = io.open(os.path.join(_ROOT, "shared_modules", "artifact_verify.py"),
+                  encoding="utf-8", errors="replace").read()
+    assert "def _probe_all_streams(" in src
+    assert '_probe_all_streams(path, "stream=codec_type")' in src
+
+
+# ------------------------------------------------ 容器时长 vs 视频时长
+
+@pytestmark_ffmpeg
+def test_audio_bearing_output_is_not_a_duration_mismatch(tmp_path):
+    """成品带音轨、中间产物只有视频轨 → **不得**判时长不符。
+
+    这是实测踩到的假阳性：源视频 15.1307s、源音频 15.7020s，
+    中间产物（纯视频）15.172s，成品容器 15.723s。三个数各有各的口径，
+    直接比 `format.duration` 会得出 "时长差 3.6%" 并把整条链拦死。
+    """
+    import artifact_verify as av
+
+    frames = _pngs(tmp_path / "f", 30)
+    # 中间产物：只有视频轨
+    vid = str(tmp_path / "vid.mkv")
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+              "-framerate", "30", "-i", str(frames / "f_%08d.png"),
+              "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-an", vid])
+    assert r.returncode == 0, r.stderr[-300:]
+
+    # 成品：视频 + **更长的**音轨（容器时长会被音轨拉长）
+    out = str(tmp_path / "out.mkv")
+    r = _run(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+              "-framerate", "30", "-i", str(frames / "f_%08d.png"),
+              "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+              "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-c:a", "aac",
+              "-shortest", out])
+    assert r.returncode == 0, r.stderr[-300:]
+
+    fv = av.probe_media_facts(vid)
+    fo = av.probe_media_facts(out)
+    assert fv.get("has_audio") is False, fv
+    assert fo.get("has_audio") is True, fo
+
+    rep = av.verify_output(vid, out, {})
+    codes = [i.get("code") for i in (rep.get("issues") or [])]
+    dur = (rep.get("checks") or {}).get("duration") or {}
+    # 要么按视频轨口径比（ok 为 True/False），要么明确"不可比"
+    if dur.get("ok") is None:
+        assert "DURATION_NOT_COMPARABLE" in codes, codes
+    assert not any(
+        i.get("code") == "DURATION_MISMATCH" and i.get("level") == "error"
+        for i in (rep.get("issues") or [])), \
+        "带音轨的成品被误判为时长不符"
+
+
+def test_probe_all_streams_sees_the_audio_track():
+    """`_probe()` 写死 v:0，查 codec_type 永远只有 video —— 必须另有全流探针。"""
+    src = io.open(os.path.join(_ROOT, "shared_modules", "artifact_verify.py"),
+                  encoding="utf-8", errors="replace").read()
+    assert "def _probe_all_streams(" in src
+    assert '_probe_all_streams(path, "stream=codec_type")' in src
