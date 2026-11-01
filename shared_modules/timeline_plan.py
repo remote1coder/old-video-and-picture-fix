@@ -46,9 +46,16 @@ def build_identity(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     _p = params or {}
     _plan = _p.get("_run_plan") or {}
+    # `RunPlan.as_dict()` 的结构是 {"paths": {"input_path": {"resolved": ...}}}，
+    # **不是**顶层 `input_path`。原来按顶层取，`source_input` 永远是空串 ——
+    # 身份绑定里最关键的一项等于没生效（读回时"双方都没值"被判为不冲突）。
+    _paths = _plan.get("paths") or {}
+    _inp = _paths.get("input_path") or {}
+    _src = (_inp.get("resolved")
+            or _plan.get("input_path")
+            or _p.get("input_path") or "")
     return {
-        "source_input": (_plan.get("input_path")
-                         or _p.get("input_path") or ""),
+        "source_input": str(_src or ""),
         "param_hash": str(_p.get("param_hash") or ""),
         "attempt_id": str(_p.get("attempt_id") or ""),
     }
