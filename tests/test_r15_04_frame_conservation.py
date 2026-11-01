@@ -287,7 +287,7 @@ def test_vfr_intermediate_preserves_variable_timing(tmp_path):
 
 # ------------------------------------------------- R16-06 原始时长比对
 
-def test_duration_drift_from_original_is_rejected(tmp_path, monkeypatch):
+def test_duration_drift_from_original_is_warned(tmp_path, monkeypatch):
     """产物时长偏离**原始素材** → 判失败。
 
     这是真 VFR 经过 y4m 管道的实测症状：源 15.702s、中间产物 15.172s
@@ -310,13 +310,15 @@ def test_duration_drift_from_original_is_rejected(tmp_path, monkeypatch):
                                       exact_max_bytes=10)
     assert ok_old is True
 
-    # 给原始时长 15.702 → 3.4% 偏差 → 必须拒绝
+    # 给原始时长 15.702 → 3.4% 偏差 → **告警但不失败**
+    # 中间产物掉时长是 y4m 的已知症状；真正的修复在 stage7 的时间码重封装。
+    # 这里判失败会把整条链拦在中途，stage7 根本没机会修。
     ok_new, rep = fc.check_conservation(str(a), str(b), "stage4",
                                         exact_max_bytes=10,
                                         expected_duration=15.702)
-    assert ok_new is False, rep
-    assert any("deviates from the original" in r for r in rep["reasons"]), \
-        rep["reasons"]
+    assert ok_new is True, rep
+    assert any("deviates from the original" in w
+               for w in rep.get("warnings", [])), rep.get("warnings")
 
 
 def test_duration_match_with_original_passes(tmp_path, monkeypatch):

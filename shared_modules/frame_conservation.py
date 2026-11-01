@@ -183,15 +183,18 @@ def check_conservation(src: str, out: str, stage: str,
                        f"{exact_max_bytes} bytes); metadata check only")
 
     # ---- 与**原始时长**比对（R16-06：VFR 经 y4m 会掉时长）----
+    # **只告警，不判失败**。中间产物掉时长是已知的架构症状（y4m 只带文件级
+    # 帧率）；真正的修复与保证在 stage7（按源 PTS 重新封装容器）。
+    # 这里判失败会把整条链拦在中途，stage7 根本没机会修。
     if expected_duration and b["duration"]:
         _drel = abs(b["duration"] - float(expected_duration)) / float(
             expected_duration)
         if _drel > duration_tolerance:
-            rep["reasons"].append(
+            rep.setdefault("warnings", []).append(
                 f"duration deviates from the original source "
                 f"{float(expected_duration):.3f}s -> {b['duration']:.3f}s "
-                f"({_drel * 100:.1f}%); an intermediate changed the timeline")
-            rep["ok"] = False
+                f"({_drel * 100:.1f}%); the timeline must be restored before "
+                "the final publish (see vfr_timecodes)")
 
     # ---- 附加：中间产物的帧率标签是否与本次意图一致（只告警）----
     if expected_fps and b["r_frame_rate"]:

@@ -3207,12 +3207,23 @@ def main():
                 _mkv = _find_mkv()
                 if not _orig_src or not os.path.isfile(_orig_src):
                     _retime_info = {"action": "skipped", "reason": "original source unknown"}
+                elif not _mkv and _plan_tl == "vfr":
+                    # 源是 VFR 而本机没有 mkvmerge → **不能发布**：中间产物已经把
+                    # 间隔压平，发出去就是一条时间轴错的成品。
+                    logger.error(
+                        "STAGE7_VFR_RETIME_UNAVAILABLE",
+                        "The source has a variable frame rate but mkvmerge is not "
+                        "installed, so its per-frame timestamps cannot be restored. "
+                        "Refusing to publish a timeline that is known to be wrong. "
+                        "Install MKVToolNix to enable this path.",
+                        plan_timeline=_plan_tl)
+                    _discard_attempt_tmp(_publish_tmp, logger)
+                    return 86
                 elif not _mkv:
                     logger.warning(
                         "STAGE7_VFR_RETIME_UNAVAILABLE",
-                        "mkvmerge is not installed, so the source's per-frame timestamps "
-                        "cannot be restored; the output keeps whatever timeline the "
-                        "intermediates produced.",
+                        "mkvmerge is not installed; the source is not variable-rate "
+                        "so the timeline is expected to be constant anyway.",
                         plan_timeline=_plan_tl)
                     _retime_info = {"action": "unavailable", "reason": "no mkvmerge"}
                 elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
