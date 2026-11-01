@@ -1197,9 +1197,34 @@ def main():
         #     而**进程退出码仍是 0**，看起来"成功"。
         # 批量模式不受影响（manifest 里每个 job 都有自己的 output_path，
         # 后写入覆盖）。这里只在目标确实是目录（或以分隔符结尾）时补齐。
+        # R16 补充：`--output` 的语义必须**显式**。
+        # 原来只有"已存在且是目录"或"以分隔符结尾"才当目录，
+        # 否则原样当文件名 —— 于是 `--output out_rgb16`（不存在、无扩展名）
+        # 会产出一个**没有扩展名**的 AVIF，下游认不出、也不好排查。
+        # 现在：无扩展名且目标不存在 → 按"输出目录"处理并创建（照片链的
+        # `--output` 历来就是目录），同时记一条事件让人看得见。
+        _MEDIA_EXTS = (".avif", ".tif", ".tiff", ".png", ".jpg", ".jpeg",
+                        ".webp", ".bmp")
+        _ext = os.path.splitext(_out)[1].lower()
+        if (not os.path.exists(_out) and _ext not in _MEDIA_EXTS):
+            # 注意：`logger` 是在 `_process_single()` 里创建的，此处（main 开头）
+            # 还没有 —— 用 stderr，与已有的 `[preflight ...]` 输出保持一致。
+            try:
+                os.makedirs(_out, exist_ok=True)
+                print(f"  [output] --output has no media extension and did not "
+                      f"exist; treating it as a directory: {_out}",
+                      file=sys.stderr)
+            except OSError as _oe:
+                print(f"  [output] cannot create the output directory "
+                      f"({_oe}); refusing to write to an ambiguous path: {_out}",
+                      file=sys.stderr)
+                return 82
         if os.path.isdir(_out) or _out.endswith(("/", "\\")):
             _stem = Path(args.input).stem if args.input else "output"
             _out = str(Path(_out) / f"{_stem}_restored.avif")
+        elif _ext not in _MEDIA_EXTS:
+            print(f"  [output] unusual extension '{_ext}' for --output; "
+                  f"writing anyway: {_out}", file=sys.stderr)
         cli_params["output_path"] = _out
     if args.crf is not None:
         cli_params["crf"] = args.crf

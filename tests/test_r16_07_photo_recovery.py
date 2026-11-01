@@ -251,3 +251,39 @@ def test_b13_cancel_hook_failure_is_logged_not_swallowed():
     assert "CANCEL_HOOK_FAILED" in events, events
     payload = dict(guard._logger.ev)["CANCEL_HOOK_FAILED"]
     assert "RuntimeError" in payload.get("error", ""), payload
+
+
+# ------------------------------------------------ photo --output 语义
+
+def test_photo_output_without_extension_becomes_a_directory():
+    """`--output` 无扩展名且不存在 → 按**目录**处理，不能产出无扩展名文件。
+
+    实测踩到：`--output E://...//out_rgb16`（不存在、无扩展名）→ 直接把
+    AVIF 写成了这个无扩展名的路径，下游认不出。
+    """
+    src = open(os.path.join(_ROOT, "photo_restoration_pipeline", "main.py"),
+               encoding="utf-8", errors="replace").read()
+    assert "_MEDIA_EXTS" in src, "必须有媒体扩展名白名单"
+    assert "os.makedirs(_out, exist_ok=True)" in src
+    assert "treating it as a directory" in src, "必须明确告知按目录处理"
+    # 判定链：先补目录，再走原来的"是目录或以分隔符结尾"
+    _i_ext = src.find("_ext = os.path.splitext(_out)[1].lower()")
+    _i_isdir = src.find('if os.path.isdir(_out) or _out.endswith(("/", ')
+    assert 0 < _i_ext < _i_isdir, "扩展名判定必须在 isdir 分支之前"
+
+
+def test_photo_output_messages_do_not_use_an_undefined_logger():
+    """那段代码在 `main()` 开头，`logger` 还没创建 —— 只能用 stderr。
+
+    实测：用了 `logger.info(...)` 直接 `NameError: name 'logger' is not defined`，
+    `logger` 是在 `_process_single()` 里才 `get_logger` 出来的。
+    """
+    src = open(os.path.join(_ROOT, "photo_restoration_pipeline", "main.py"),
+               encoding="utf-8", errors="replace").read()
+    i0 = src.find("_MEDIA_EXTS = (")
+    i1 = src.find('if os.path.isdir(_out) or _out.endswith(("/", ')
+    assert i0 > 0 and i1 > i0
+    block = src[i0:i1]
+    assert "logger." not in block, \
+        "main() 开头没有 logger，这段必须用 print(..., file=sys.stderr)"
+    assert "file=sys.stderr" in block
