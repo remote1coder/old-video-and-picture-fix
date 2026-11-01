@@ -582,7 +582,8 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                                       if n.endswith(".png")])
             except OSError:
                 pass
-        _ai_timeout = max(300, min(7200, _total_frames * 30))
+        _ai_timeout = max(300, min(_AI_SUBPROC_TIMEOUT_CAP,
+                              _total_frames * 30))
         if logger:
             logger.info("STAGE3_AI_SUBPROC_START",
                         "Launching AI subprocess under cancel-guard",
@@ -956,6 +957,21 @@ def _fps_rational_str(fps: float) -> str:
     from fractions import Fraction
     fr = Fraction(float(fps)).limit_denominator(1001)
     return "%d/%d" % (fr.numerator, fr.denominator)
+
+
+#: AI 子进程的**超时上限**（秒）。
+#:
+#: 原来是 `min(7200, frames*30)` —— 硬顶 **2 小时**。这在短片上看不出问题，
+#: 但**流式路径是整段视频一个子进程**（不受 ai_window_size 限制）：
+#: 实测 4K 输出约 **2.0 s/帧**（1920×1088→3840×2176，292 帧跑了 9.9 分钟），
+#: 一段 16 分钟 1080p（28840 帧）需要 **~16 小时** → 2 小时上限必然把它砍掉。
+#:
+#: 这里把上限对齐 `stage_hard_timeout_hours`（默认 48）。这不代表放宽了
+#: 卡死检测：真正的卡死由**阶段级看门狗**负责 —— `main.run_stage` 的
+#: `progress_watch` 统计 temp + 本 job 成品前缀的大小，流式路径的输出 MKV
+#: 是边跑边写的，30 分钟不长就会被判 STAGE_STALLED。
+#: 本超时只是"子进程彻底不返回"的最后一道保险。
+_AI_SUBPROC_TIMEOUT_CAP = 48 * 3600
 
 
 def _classify_timeline(pts_map, expected_frames: int = None) -> str:
@@ -1518,7 +1534,8 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "subprocess would do nothing and still exit 0. Check that "
                 "paths are Windows-style (E:/...) and that extraction ran.",
                 windows=[list(w) for w in window_dirs][:3])
-        _batch_timeout = max(300, min(7200, _batch_frames * 30))
+        _batch_timeout = max(300, min(_AI_SUBPROC_TIMEOUT_CAP,
+                                 _batch_frames * 30))
         if logger:
             logger.info("STAGE3_AI_SUBPROC_START",
                         "Launching AI subprocess under cancel-guard",
