@@ -1009,7 +1009,24 @@ def _classify_timeline(pts_map, expected_frames: int = None) -> str:
     med = sorted(d)[len(d) // 2]
     if med <= 0:
         return "unknown"
-    return "vfr" if (max(d) - min(d)) / med > 0.01 else "cfr"
+
+    # ---- 容差必须**大于容器的量化步长** ----
+    # 原实现用 1% 相对容差。但 stage1 输出的时间基是整数毫秒：
+    #   30fps 的 33.333ms 会被舍成 33/34 交替 → 抖动 1ms = 3.0% > 1%
+    #   → **CFR 被判成 VFR**。
+    # 实测（150 帧 CFR 30fps）：源 0.03333 全同；stage1 后 0.033×99 + 0.034×50。
+    # 后果不只是统计难看：`source_timeline=vfr` 会让流式超分路径被永久跳过
+    # （它要求"确认 CFR"），而 30/29.97/23.976 恰恰是最常见的帧率。
+    #
+    # 真 VFR 的步长远不止 1ms（实测 0.0449 vs 0.0898 差 45ms），
+    # 所以用"2ms 绝对下限，或中位间隔的 1%，取大者"：
+    #   30fps（抖动 1ms）    → cfr
+    #   25fps（40ms 精确）   → cfr
+    #   23.976（41.7→41/42） → cfr
+    #   真 VFR（33 vs 66）  → vfr
+    _tol = max(0.002, 0.01 * med)
+    _spread = max(d) - min(d)
+    return "vfr" if _spread > _tol else "cfr"
 
 
 def _clear_stale_frame_dirs(temp_dir, job_id, logger=None):
