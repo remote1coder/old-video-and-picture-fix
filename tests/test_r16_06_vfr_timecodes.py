@@ -311,3 +311,155 @@ def test_probe_all_streams_sees_the_audio_track():
                   encoding="utf-8", errors="replace").read()
     assert "def _probe_all_streams(" in src
     assert '_probe_all_streams(path, "stream=codec_type")' in src
+
+
+# ------------------------------------------------ 心跳看门狗
+
+def test_no_absolute_timeout_left_in_stage3_or_stage7():
+    """**不许**再出现"按帧数/固定值猜出来的总时长"。
+
+    实测代价：4K 长片 stage3 约 16 小时、stage7 约 32 小时，
+    任何猜出来的上限都会误杀，且每换一个更长的素材就要改一次常量。
+    正确做法是心跳（产出是否还在增长），素材多长都不误杀。
+    """
+    for rel in (os.path.join("video_restoration_pipeline", "stages",
+                             "stage3_ai_upscale.py"),
+                os.path.join("video_restoration_pipeline", "stages",
+                             "stage7_encode.py")):
+        src = open(os.path.join(_ROOT, rel), encoding="utf-8",
+                   errors="replace").read()
+        assert "inactivity_timeout=" in src, f"{rel} 必须有心跳阈值"
+        assert "progress_watch=" in src, f"{rel} 必须有心跳源"
+        assert "_AI_SUBPROC_TIMEOUT_CAP" not in src
+        assert "_ENCODE_TIMEOUT_CAP" not in src
+        assert "min(7200," not in src, "旧的 2 小时硬顶应已删除"
+
+
+def test_stream_pipeline_uses_heartbeat_not_wait_timeout():
+    """流式三进程管道必须用 `wait_with_heartbeat`，不能三个 `wait(timeout=)`。"""
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage3_ai_upscale.py"),
+               encoding="utf-8", errors="replace").read()
+    assert "wait_with_heartbeat(" in src
+    # 心跳源必须是输出文件大小（编码器边跑边写）
+    assert "os.path.getsize(output_mkv)" in src
+
+
+def test_wait_with_heartbeat_kills_on_stall(tmp_path):
+    """心跳不变超过阈值 → 抛 StageStalled，且**必须先杀进程**。"""
+    import subprocess
+    import time
+
+    import cancel_guard as cg
+
+    # 一个不会自己结束的子进程
+    p = subprocess.Popen([sys.executable, "-c",
+                          "import time; time.sleep(60)"])
+    t0 = time.monotonic()
+    with pytest.raises(cg.StageStalled):
+        cg.wait_with_heartbeat([p], heartbeat=lambda: 0,
+                               inactivity_timeout=1.0, poll_interval=0.2)
+    assert time.monotonic() - t0 < 30, "应该在阈值附近就返回"
+    assert p.poll() is not None, "卡死时必须把进程杀掉"
+    try:
+        p.kill()
+    except Exception:
+        pass
+
+
+def test_wait_with_heartbeat_lets_a_slow_job_run(tmp_path):
+    """只要心跳还在变，**永远不超时** —— 这正是"长片不用调参"的关键。"""
+    import subprocess
+    import time
+
+    import cancel_guard as cg
+
+    # 一个活 2.5 秒的子进程
+    p = subprocess.Popen([sys.executable, "-c",
+                          "import time; time.sleep(2.5)"])
+    start = time.monotonic()
+
+    def hb():
+        # 心跳随真实时间增长（模拟"产出还在增加"）
+        return int(time.monotonic() - start)
+
+    rc = cg.wait_with_heartbeat([p], heartbeat=hb,
+                                inactivity_timeout=0.6, poll_interval=0.2)
+    assert rc == [0], rc
+    assert time.monotonic() - start >= 2.4
+
+
+# ------------------------------------------------ 心跳看门狗
+
+def test_no_absolute_timeout_left_in_stage3_or_stage7():
+    """**不许**再出现"按帧数/固定值猜出来的总时长"。
+
+    实测代价：4K 长片 stage3 约 16 小时、stage7 约 32 小时，
+    任何猜出来的上限都会误杀，且每换一个更长的素材就要改一次常量。
+    正确做法是心跳（产出是否还在增长），素材多长都不误杀。
+    """
+    for rel in (os.path.join("video_restoration_pipeline", "stages",
+                             "stage3_ai_upscale.py"),
+                os.path.join("video_restoration_pipeline", "stages",
+                             "stage7_encode.py")):
+        src = open(os.path.join(_ROOT, rel), encoding="utf-8",
+                   errors="replace").read()
+        assert "inactivity_timeout=" in src, f"{rel} 必须有心跳阈值"
+        assert "progress_watch=" in src, f"{rel} 必须有心跳源"
+        assert "_AI_SUBPROC_TIMEOUT_CAP" not in src
+        assert "_ENCODE_TIMEOUT_CAP" not in src
+        assert "min(7200," not in src, "旧的 2 小时硬顶应已删除"
+
+
+def test_stream_pipeline_uses_heartbeat_not_wait_timeout():
+    """流式三进程管道必须用 `wait_with_heartbeat`，不能三个 `wait(timeout=)`。"""
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage3_ai_upscale.py"),
+               encoding="utf-8", errors="replace").read()
+    assert "wait_with_heartbeat(" in src
+    # 心跳源必须是输出文件大小（编码器边跑边写）
+    assert "os.path.getsize(output_mkv)" in src
+
+
+def test_wait_with_heartbeat_kills_on_stall(tmp_path):
+    """心跳不变超过阈值 → 抛 StageStalled，且**必须先杀进程**。"""
+    import subprocess
+    import time
+
+    import cancel_guard as cg
+
+    # 一个不会自己结束的子进程
+    p = subprocess.Popen([sys.executable, "-c",
+                          "import time; time.sleep(60)"])
+    t0 = time.monotonic()
+    with pytest.raises(cg.StageStalled):
+        cg.wait_with_heartbeat([p], heartbeat=lambda: 0,
+                               inactivity_timeout=1.0, poll_interval=0.2)
+    assert time.monotonic() - t0 < 30, "应该在阈值附近就返回"
+    assert p.poll() is not None, "卡死时必须把进程杀掉"
+    try:
+        p.kill()
+    except Exception:
+        pass
+
+
+def test_wait_with_heartbeat_lets_a_slow_job_run(tmp_path):
+    """只要心跳还在变，**永远不超时** —— 这正是"长片不用调参"的关键。"""
+    import subprocess
+    import time
+
+    import cancel_guard as cg
+
+    # 一个活 2.5 秒的子进程
+    p = subprocess.Popen([sys.executable, "-c",
+                          "import time; time.sleep(2.5)"])
+    start = time.monotonic()
+
+    def hb():
+        # 心跳随真实时间增长（模拟"产出还在增加"）
+        return int(time.monotonic() - start)
+
+    rc = cg.wait_with_heartbeat([p], heartbeat=hb,
+                                inactivity_timeout=0.6, poll_interval=0.2)
+    assert rc == [0], rc
+    assert time.monotonic() - start >= 2.4

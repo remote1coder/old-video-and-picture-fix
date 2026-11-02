@@ -652,6 +652,88 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
     return out, err, proc.returncode
 
 
+def wait_with_heartbeat(procs, heartbeat, inactivity_timeout,
+                       poll_interval=None, logger=None, label="pipeline"):
+    """等一组进程结束：**按"心跳不变"判卡死，不设总运行时长上限**。
+
+    为什么不能给绝对超时
+    --------------------
+    同一段 16 分钟素材，4K 输出按实测 2.0 s/帧要十几小时；换台机器、换模型、
+    换个 CPU 占用都可能成倍波动。任何"猜出来的总时长"都迟早误杀正常任务，
+    而每来一个更长的素材就得再调一次 —— 这正是要避免的。
+
+    systemd 的做法可以照搬：`WatchdogSec` 管的是**两次心跳之间的间隔**，
+    不是总运行时间（"the watchdog isn't about overall execution time;
+    it's about responsiveness"）。而且心跳必须绑定**真实进展**，
+    不能用一个独立定时器空转 —— 否则主循环卡死了照样心跳。
+
+    这里的"真实进展"由调用方给：通常就是**输出文件的大小**
+    （编码器边跑边写，卡住就不长了）。
+
+    Args:
+        procs: 要等的 ``Popen`` 序列（通常是 解码 → AI → 编码 三个）。
+        heartbeat: 无参可调用对象，返回可比较的进度标记（如文件字节数）。
+        inactivity_timeout: 连续这么多秒标记不变就判卡死。
+        poll_interval: 采样间隔；默认取 ``inactivity_timeout / 8``，
+            上限 30 秒（systemd 建议喂狗频率约为超时的一半，这里更密一些）。
+        logger: 可选日志器。
+        label: 日志里标识是哪条管道。
+
+    Returns:
+        三个进程的返回码列表。
+
+    Raises:
+        StageStalled: 心跳停止超过 ``inactivity_timeout``（已杀掉整组进程）。
+    """
+    import time as _time
+
+    if poll_interval is None:
+        try:
+            poll_interval = max(1.0, min(30.0, float(inactivity_timeout) / 8.0))
+        except (TypeError, ValueError):
+            poll_interval = 30.0
+
+    try:
+        last_mark = heartbeat()
+    except BaseException:
+        last_mark = None
+    last_change = _time.monotonic()
+    next_poll = last_change + poll_interval
+
+    while True:
+        if all(p.poll() is not None for p in procs):
+            return [p.returncode for p in procs]
+        now = _time.monotonic()
+        if inactivity_timeout is not None and now >= next_poll:
+            next_poll = now + poll_interval
+            try:
+                mark = heartbeat()
+            except BaseException:
+                mark = last_mark
+            if mark != last_mark:
+                last_mark = mark
+                last_change = now
+            elif (now - last_change) >= inactivity_timeout:
+                for p in procs:
+                    try:
+                        _kill_tree_quietly(p)
+                    except BaseException:
+                        pass
+                if logger is not None:
+                    try:
+                        logger.error(
+                            "PIPELINE_STALLED",
+                            f"No progress for {inactivity_timeout:.0f}s "
+                            f"(last marker={last_mark}); whole pipeline killed. "
+                            "This is evidence of a hang, not of slowness.",
+                            inactivity_timeout=inactivity_timeout,
+                            last_progress=last_mark, label=label)
+                    except BaseException:
+                        pass
+                raise StageStalled([label], inactivity_timeout, last_mark)
+        _time.sleep(0.5)
+
+
 def run_managed(cmd, timeout=None, logger=None, progress_watch=None,
                 inactivity_timeout=None, poll_interval=30.0, **kwargs):
     """Run a child process under cancel-guard supervision.

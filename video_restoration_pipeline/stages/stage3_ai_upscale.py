@@ -344,6 +344,9 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
             "-s", str(scale),
             "-g", str(gpu_id),
         ]
+        # 注：ncnn-vulkan 后端**本机未安装**（shutil.which 返回 None），
+        # 这条分支走不到；固定 3600s 不影响主链。将来若启用该后端，
+        # 需按同样方式加心跳（它的进度在 stdout，这里被 capture 掉了）。
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                             timeout=3600, shell=False)
@@ -582,22 +585,44 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                                       if n.endswith(".png")])
             except OSError:
                 pass
-        _ai_timeout = max(300, min(_AI_SUBPROC_TIMEOUT_CAP,
-                              _total_frames * 30))
+        # ---- 用**心跳**判卡死，不再给"按帧数猜出来的总时长" ----
+        # 原来 `max(300, min(CAP, frames*30))`：既是一个猜出来的总时长，
+        # 又要为每个新素材重新调。正确的证据是**产出还在不在增长** ——
+        # PNG 路径里 AI 逐帧写进 `window_dirs` 的输出目录，所以
+        # 心跳 = 这些目录的总字节数。素材再长、机器再慢，只要还在写就不杀。
+        _ai_timeout = None
+        _ai_inactivity = float(params.get("stage_inactivity_timeout", 1800.0))
+
+        def _ai_out_bytes():
+            """心跳：本窗口所有输出目录的字节数（AI 逐帧写 PNG）。"""
+            total = 0
+            for _fd, _od in window_dirs:
+                try:
+                    for _n in os.listdir(_od):
+                        try:
+                            total += os.path.getsize(os.path.join(_od, _n))
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+            return total
+
         if logger:
             logger.info("STAGE3_AI_SUBPROC_START",
                         "Launching AI subprocess under cancel-guard",
-                        frames=_total_frames, timeout_s=_ai_timeout,
+                        frames=_total_frames,
+                        inactivity_timeout_s=_ai_inactivity,
                         interpreter=ai_py)
         try:
             if _cancel_guard is not None:
                 r = _cancel_guard.run_managed(
                     cmd, capture_output=True, text=True, timeout=_ai_timeout,
+                    progress_watch=_ai_out_bytes,
+                    inactivity_timeout=_ai_inactivity,
                     shell=False, env=env, logger=logger)
             else:
                 r = subprocess.run(cmd, capture_output=True, text=True,
-                                   errors="replace", timeout=_ai_timeout,
-                                   shell=False, env=env)
+                                   errors="replace", shell=False, env=env)
         except subprocess.TimeoutExpired as _te:
             if logger:
                 logger.error(
@@ -741,7 +766,8 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 # ORIGINAL: Per-window model loading via run_realesrgan (slow for Python API)
 def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          fps_str, model, model_dir, ai_py, gpu_id=0,
-                         timeout_s=7200, logger=None, cancel_guard=None,
+                         timeout_s=None, inactivity_s=1800,
+                         logger=None, cancel_guard=None,
                          color_opts=None):
     """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
 
@@ -853,9 +879,28 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
             except Exception:
                 _cg_mod = None
         try:
-            enc.wait(timeout=timeout_s)
-            ai.wait(timeout=timeout_s)
-            dec.wait(timeout=timeout_s)
+            # ---- 按**心跳**等，不按总时长 ----
+            # 原来是三个 `wait(timeout=timeout_s)` 绝对超时。绝对超时要么误杀
+            # 正常的长任务、要么每换一个更长的素材就得改一次常量 —— 这正是
+            # 要避免的。心跳的语义是"产出还在不在增长"：
+            #   * 编码器边跑边写 output_mkv，卡住就不长了（真进展）；
+            #   * 素材再长、机器再慢，只要还在推进就永不超时。
+            # 参照 systemd WatchdogSec：管的是**两次心跳的间隔**，不是总时长。
+            _hw = (lambda: (os.path.getsize(output_mkv)
+                            if os.path.exists(output_mkv) else 0))
+            if _cg_mod is not None and hasattr(_cg_mod, "wait_with_heartbeat"):
+                _cg_mod.wait_with_heartbeat(
+                    [dec, ai, enc], heartbeat=_hw,
+                    inactivity_timeout=inactivity_s,
+                    logger=logger, label="stage3-stream")
+            elif timeout_s is not None:     # 守卫缺失时的退路（旧行为）
+                enc.wait(timeout=timeout_s)
+                ai.wait(timeout=timeout_s)
+                dec.wait(timeout=timeout_s)
+            else:
+                enc.wait()
+                ai.wait()
+                dec.wait()
         finally:
             if _cg_mod is not None:
                 for _p in (dec, ai, enc):
@@ -868,6 +913,16 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                 try: p_.kill()
                 except Exception: pass
         return False, f"streaming timeout after {timeout_s}s", 0
+    except Exception as _stall_exc:
+        # StageStalled：**产出停止增长**才判卡死 —— 是卡死，不是慢。
+        if type(_stall_exc).__name__ == "StageStalled":
+            for p_ in (dec, ai, enc):
+                if p_ is not None:
+                    try: p_.kill()
+                    except Exception: pass
+            return (False, "streaming stalled: no output growth for "
+                    f"{inactivity_s}s (hang, not slowness)", 0)
+        raise
     except Exception as e:
         for p_ in (dec, ai, enc):
             if p_ is not None:
@@ -959,19 +1014,6 @@ def _fps_rational_str(fps: float) -> str:
     return "%d/%d" % (fr.numerator, fr.denominator)
 
 
-#: AI 子进程的**超时上限**（秒）。
-#:
-#: 原来是 `min(7200, frames*30)` —— 硬顶 **2 小时**。这在短片上看不出问题，
-#: 但**流式路径是整段视频一个子进程**（不受 ai_window_size 限制）：
-#: 实测 4K 输出约 **2.0 s/帧**（1920×1088→3840×2176，292 帧跑了 9.9 分钟），
-#: 一段 16 分钟 1080p（28840 帧）需要 **~16 小时** → 2 小时上限必然把它砍掉。
-#:
-#: 这里把上限对齐 `stage_hard_timeout_hours`（默认 48）。这不代表放宽了
-#: 卡死检测：真正的卡死由**阶段级看门狗**负责 —— `main.run_stage` 的
-#: `progress_watch` 统计 temp + 本 job 成品前缀的大小，流式路径的输出 MKV
-#: 是边跑边写的，30 分钟不长就会被判 STAGE_STALLED。
-#: 本超时只是"子进程彻底不返回"的最后一道保险。
-_AI_SUBPROC_TIMEOUT_CAP = 48 * 3600
 
 
 def _classify_timeline(pts_map, expected_frames: int = None) -> str:
@@ -1534,12 +1576,29 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
                 "subprocess would do nothing and still exit 0. Check that "
                 "paths are Windows-style (E:/...) and that extraction ran.",
                 windows=[list(w) for w in window_dirs][:3])
-        _batch_timeout = max(300, min(_AI_SUBPROC_TIMEOUT_CAP,
-                                 _batch_frames * 30))
+        # 心跳判卡死（同前）：AI 逐帧写进 window_dirs 的输出目录。
+        _batch_timeout = None
+        _batch_inactivity = float((params or {}).get(
+            "stage_inactivity_timeout", 1800.0))
+
+        def _batch_out_bytes():
+            total = 0
+            for _fd, _od in window_dirs:
+                try:
+                    for _n in os.listdir(_od):
+                        try:
+                            total += os.path.getsize(os.path.join(_od, _n))
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+            return total
+
         if logger:
             logger.info("STAGE3_AI_SUBPROC_START",
                         "Launching AI subprocess under cancel-guard",
-                        frames=_batch_frames, timeout_s=_batch_timeout,
+                        frames=_batch_frames,
+                        inactivity_timeout_s=_batch_inactivity,
                         interpreter=ai_py)
         # 诊断开关：把子进程的 stdout/stderr **实时**写到文件。
         # `capture_output=True` 要等进程结束才拿得到内容 —— 正好在最需要
@@ -1582,6 +1641,8 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
             elif _cancel_guard is not None:
                 r = _cancel_guard.run_managed(
                     cmd, capture_output=True, text=True, timeout=_batch_timeout,
+                    progress_watch=_batch_out_bytes,
+                    inactivity_timeout=_batch_inactivity,
                     shell=False, env=env, logger=logger)
             else:
                 r = subprocess.run(cmd, capture_output=True, text=True,
@@ -2469,7 +2530,9 @@ def main():
                         fps_str=_s_fps, model=model,
                         model_dir=str(SCRIPT_DIR.parent / "models"),
                         ai_py=_s_ai_py, gpu_id=0,
-                        timeout_s=max(600, total_frames * 30),
+                        timeout_s=None,
+                        inactivity_s=float(params.get(
+                            "stage_inactivity_timeout", 1800.0)),
                         logger=logger, cancel_guard=_cancel_guard,
                         color_opts=_s_copts)
                     if _s_ok and os.path.exists(_s_out) and os.path.getsize(_s_out) > 0:
@@ -3011,13 +3074,21 @@ def main():
     try:
         # NEW-V-06/RV-12: 受管子进程——取消时 ffmpeg 一起收掉，
         # 否则守卫删掉的半截 mkv 会被孤儿 ffmpeg 重新写回来。
+        # 心跳判卡死：编码器边跑边写 output_path，卡住就不长了。
+        # 原先是固定 3600s —— 4K 长片按 2 s/帧远超它。
+        _enc_inactivity = float((params or {}).get(
+            "stage_inactivity_timeout", 1800.0))
+        _enc_hb = (lambda: (os.path.getsize(output_path)
+                            if os.path.exists(output_path) else 0))
         if _cancel_guard is not None:
             r = _cancel_guard.run_managed(encode_cmd, capture_output=True,
-                                          text=True, timeout=3600,
+                                          text=True, timeout=None,
+                                          progress_watch=_enc_hb,
+                                          inactivity_timeout=_enc_inactivity,
                                           shell=False, logger=logger)
         else:  # pragma: no cover - 守卫缺失时退回原行为
             r = subprocess.run(encode_cmd, capture_output=True, text=True, errors="replace",
-                               timeout=3600, shell=False)
+                               shell=False)
         if r.returncode != 0 or not Path(output_path).exists():
             logger.error("STAGE3_ENCODE_FAIL",
                          f"Failed to encode MKV: {r.stderr[:300]}")

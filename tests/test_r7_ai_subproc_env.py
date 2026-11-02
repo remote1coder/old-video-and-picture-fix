@@ -67,13 +67,13 @@ def test_batch_timeout_is_not_two_hours():
     src = open(s3.__file__, encoding="utf-8").read()
     assert "timeout=7200, shell=False, env=env)  # Longer timeout" not in src, \
         "批量路径仍是固定两小时超时"
-    # 2026-11-02：上限从硬编码 7200 提到 `_AI_SUBPROC_TIMEOUT_CAP`（48h），
-    # 因为**流式路径是整段一个子进程**，4K 长片按 2.0 s/帧要跑十几小时，
-    # 2 小时上限会把正常任务砍掉。卡死检测改由阶段级看门狗负责。
-    assert "_batch_timeout = max(300, min(_AI_SUBPROC_TIMEOUT_CAP," in src
-    assert "_AI_SUBPROC_TIMEOUT_CAP = 48 * 3600" in src
-    # 每帧 30s 的预算不变（只是上限变了）
-    assert "_batch_frames * 30)" in src
+    # 2026-11-02：**彻底去掉按帧数猜出来的总时长**。卡死改由心跳判定：
+    # 秒级证据是"产出还在不在增长"，素材多长都不会误杀，也不用每次调常量。
+    assert "_batch_timeout = None" in src, \
+        "批量路径不该再按帧数算绝对超时"
+    assert "progress_watch=_batch_out_bytes" in src, "必须有心跳源"
+    assert "inactivity_timeout=_batch_inactivity" in src
+    assert "_AI_SUBPROC_TIMEOUT_CAP" not in src, "旧常量应已删除"
 
 
 def test_batch_uses_cancel_guard():

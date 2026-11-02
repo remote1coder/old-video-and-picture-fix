@@ -638,12 +638,6 @@ def _decide_timing(original_duration: float, processed_duration: float,
     return tempo_ratio, state
 
 
-#: 主编码子进程的超时上限（秒）。对齐 `stage_hard_timeout_hours`（默认 48）。
-#:
-#: 原来是 `3600*2`（2 小时）。短片无感，但 4K 长片按实测 4.0 s/帧算，
-#: 16 分钟素材就要 ~32 小时 —— 会被上限误杀。卡死由阶段级看门狗兜底，
-#: 这里不承担卡死检测职责。
-_ENCODE_TIMEOUT_CAP = 48 * 3600
 
 
 def _sha256_file(path: str, chunk: int = 1 << 20) -> Optional[str]:
@@ -2436,20 +2430,25 @@ def main():
     try:
         # NEW-V-06/RV-12: 受管子进程——取消时 ffmpeg 一起收掉，
         # 否则守卫删掉的半截成品会被孤儿 ffmpeg 重新写回来。
-        # 编码超时：原来硬顶 `3600*2`（2 小时）。
-        # 实测 4K 输出约 **4.0 s/帧**（1920×1088→3840×2176，292 帧的 stage7
-        # 用了 19.3 分钟），一段 16 分钟 1080p（28840 帧）需要 **~32 小时** ——
-        # 2 小时上限会把正常的长片砍掉。这里对齐 `stage_hard_timeout_hours`。
-        # 卡死检测仍由阶段级看门狗负责（`progress_watch` 看 temp + 成品前缀
-        # 的大小），本超时只是最后一道保险。
+        # ---- 用**心跳**判卡死，不给总时长 ----
+        # 原来是 `timeout=3600*2`（2 小时）。4K 长片按实测 4.0 s/帧算，
+        # 16 分钟素材就要 ~32 小时 —— 任何猜出来的总时长都会误杀，
+        # 而且每换一个更长的素材还得再改一次。
+        # 真正的证据是**产出还在不在增长**：编码器边跑边写 `_publish_tmp`，
+        # 卡住就不长了。这与 systemd WatchdogSec 的语义一致（管的是
+        # 两次心跳的间隔，不是总运行时长）。
+        _enc_inactivity = float(params.get("stage_inactivity_timeout", 1800.0))
+        _enc_hb = (lambda: (os.path.getsize(_publish_tmp)
+                            if os.path.exists(_publish_tmp) else 0))
         if _cancel_guard is not None:
             r = _cancel_guard.run_managed(video_cmd, capture_output=True,
-                                          text=True,
-                                          timeout=_ENCODE_TIMEOUT_CAP,
+                                          text=True, timeout=None,
+                                          progress_watch=_enc_hb,
+                                          inactivity_timeout=_enc_inactivity,
                                           shell=False, logger=logger)
         else:  # pragma: no cover - 守卫缺失时退回原行为
             r = subprocess.run(video_cmd, capture_output=True, text=True, errors="replace",
-                               timeout=_ENCODE_TIMEOUT_CAP, shell=False)
+                               shell=False)
         # FIX-P7-9: Use pathlib.Path per CLAUDE.md §4
         # PUB-01: 校验对象是**本次 attempt 的暂存文件**，不是最终路径。
         if r.returncode == 0 and Path(_publish_tmp).exists() and Path(_publish_tmp).stat().st_size > 0:
