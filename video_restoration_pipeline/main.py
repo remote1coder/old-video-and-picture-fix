@@ -440,6 +440,51 @@ def _calculate_timeout(video_duration: float, has_ai: bool = False,
     return hard
 
 
+def _write_stage_params_file(params: Dict[str, Any],
+                             params_json: str) -> Optional[str]:
+    """把超长参数写进**计划内目录**的临时文件，返回路径。
+
+    为什么不能裸用 ``mkstemp()``
+    ---------------------------
+    不传 ``dir`` 时它会落到系统临时目录（Windows 上是 C 盘用户 temp）。
+    那既不在本轮的授权写根内（审核 R17-06："mkstemp 未指定计划内目录"），
+    也违反"项目内优先、别塞 C 盘"的约定。
+
+    目录选择顺序：``params["temp_dir"]`` → 项目内 ``temp/``。
+    绝不退回系统临时目录 —— 宁可报错，也不写到计划外。
+    """
+    import tempfile as _tempfile
+
+    _pf_dir = str(params.get("temp_dir") or "")
+    if not _pf_dir:
+        _pf_dir = str(SCRIPT_DIR / "temp")
+    try:
+        os.makedirs(_pf_dir, exist_ok=True)
+    except OSError:
+        pass
+    fd, _path = _tempfile.mkstemp(suffix=".json", prefix="vparams_",
+                                  dir=_pf_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(params_json)
+    return _path
+
+
+def _resolve_log_dir(log_dir: Any) -> str:
+    """把 bootstrap 日志目录解析成**确定的绝对路径**。
+
+    原实现直接用配置值（默认 ``"./logs"``）→ 相对**当前工作目录**：
+    同一个 run 从不同 cwd 启动会写到不同地方，甚至写到项目之外。
+    审核 R17-06：bootstrap 日志可以有自己的授权位置，但不能默认为不受约束。
+
+    相对路径锚到**项目根**（与"从项目根启动"时的既有落点一致，不改变布局）；
+    显式配置的绝对路径原样尊重 —— 那是用户的选择。
+    """
+    _raw = str(log_dir if log_dir not in (None, "") else "./logs")
+    if os.path.isabs(_raw):
+        return _raw
+    return str((SCRIPT_DIR.parent / _raw).resolve())
+
+
 def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
               config_path: str) -> Tuple[int, str]:
     """Run a stage script and return (exit_code, stderr)."""
@@ -462,9 +507,7 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     # Windows cmd limit is 32767; leave safety margin. Also use file for any long dict.
     if len(params_json) > 30000:
         try:
-            fd, params_file = tempfile.mkstemp(suffix=".json", prefix="vparams_")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(params_json)
+            params_file = _write_stage_params_file(params, params_json)
             cmd.extend(["--params-file", params_file])
         except Exception:
             # Fallback to inline JSON if temp file fails
@@ -2291,6 +2334,13 @@ def main():
     config = load_config(args.config)
     gcfg = config.get("global", {})
     log_dir = gcfg.get("log_dir", "./logs")
+    # ---- bootstrap 日志必须有**确定且受控**的落点 ----
+    # 原实现直接用配置里的相对路径（默认 "./logs"）→ 相对**当前工作目录**：
+    # 同一个 run 从不同 cwd 启动会写到不同地方，甚至写到项目之外。
+    # 审核 R17-06：bootstrap 日志可以有自己的授权位置，但不能默认为不受约束。
+    # 这里把相对路径锚到**项目根**（与"从项目根启动"时的既有落点一致，
+    # 不改变现有布局）；显式配置的绝对路径原样尊重 —— 那是用户的选择。
+    log_dir = _resolve_log_dir(log_dir)
     logger = get_logger(log_dir=log_dir, level=gcfg.get("log_level", "INFO"))
     logger.info("PIPELINE_START", "Video restoration pipeline starting")
 
@@ -2847,6 +2897,36 @@ def main():
                     "and not bumping the global generation")
         print("No jobs to process.")
         return
+    # ---- 领取（= 改写 manifest）之前必须先过路径校验 ----
+    # 审核 R17-06：'manifest ownership 写入早于完整计划检查'。领取会**改写
+    # manifest 文件本身**；如果它落在授权写根之外，就变成"先写再验"——
+    # 事后报错也已经写过磁盘了。这里在写之前先判一次。
+    _pre_roots = []
+    try:
+        _awr = getattr(args, "allow_write_root", None)
+        if _awr:
+            _pre_roots.append(_awr)
+        _cwr = config.get("allowed_write_roots") or []
+        if isinstance(_cwr, str):
+            _cwr = [_cwr]
+        _pre_roots.extend([str(r) for r in _cwr if r])
+    except Exception:                     # pragma: no cover
+        _pre_roots = []
+    if _pre_roots:
+        try:
+            from run_plan import is_within as _is_within
+        except Exception:                 # pragma: no cover
+            _is_within = None
+        if _is_within is not None and not any(
+                _is_within(manifest_path, r) for r in _pre_roots):
+            logger.error(
+                "MANIFEST_OUTSIDE_WRITE_ROOTS",
+                "The manifest would be rewritten to claim this run, but it "
+                "is outside every authorized write root; refusing to write "
+                "before validating the path plan.",
+                manifest_path=str(manifest_path), write_roots=_pre_roots)
+            return 82
+
     run_generation = acquire_run_ownership(
         manifest_path, _claimed_ids, owner=run_owner)
     if run_generation is None:
