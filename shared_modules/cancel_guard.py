@@ -503,6 +503,37 @@ class StageStalled(Exception):
         self.last_progress = last_progress
 
 
+def _safe_getpgid(pid):
+    """取进程组 id；取不到/平台不支持时返回 None（不抛）。"""
+    fn = getattr(os, "getpgid", None)
+    if fn is None:          # Windows 没有 getpgid
+        return None
+    try:
+        return int(fn(pid))
+    except BaseException:
+        return None
+
+
+def _may_killpg(pid, own_pid=0) -> bool:
+    """能否安全地对该 pid 的进程组发 killpg。
+
+    判据必须**同时**成立：
+      ① 子进程是该组的组长（pgid == pid）—— 组是它自己拉起来的；
+      ② 该组不是调用方自己的组 —— 否则 killpg 会把调用方及其兄弟进程一起杀掉。
+
+    任何一个条件不满足就返回 False，调用方退化为按 pid 单杀：
+    **宁可少杀，也不能误杀调用方**。
+
+    这是纯判定函数，不产生任何副作用，便于单独测试 —— 真实发送信号的行为
+    不适合在当前用户会话里反复实测。
+    """
+    child_pg = _safe_getpgid(pid)
+    own_pg = _safe_getpgid(own_pid)
+    if child_pg is None or own_pg is None:
+        return False          # 平台不支持或无权限 → 保守退化为单杀
+    return child_pg == pid and child_pg != own_pg
+
+
 def _kill_tree_quietly(proc: Any) -> None:
     """Kill a child **and all of its descendants**; never raises.
 
@@ -533,10 +564,21 @@ def _kill_tree_quietly(proc: Any) -> None:
             except BaseException:
                 pass
         else:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except BaseException:
-                pass
+            # ---- 只终止**我们确认拥有的**独立进程组 ----
+            # 判据两条同时成立才 killpg：
+            #   ① 子进程是该组的组长（pgid == pid）—— 说明组是它自己拉起来的；
+            #   ② 该组**不是**调用方自己的组 —— 否则一条 killpg 会连自己一起杀。
+            # 任一不满足就退化为按 pid 单杀：宁可少杀，也不能误杀调用方。
+            if _may_killpg(pid):
+                try:
+                    os.killpg(_safe_getpgid(pid), signal.SIGKILL)
+                except BaseException:
+                    pass
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except BaseException:
+                    pass
     # 兜底：即使上面的树杀失败，至少收掉直接子进程并 reap
     _kill_quietly(proc)
 
@@ -848,11 +890,22 @@ def run_managed(cmd, timeout=None, logger=None, progress_watch=None,
         kwargs.setdefault("stdout", subprocess.PIPE)
         kwargs.setdefault("stderr", subprocess.PIPE)
     kwargs.setdefault("shell", False)
-    try:  # Windows: 独立进程组，便于 CTRL_BREAK_EVENT
-        kwargs.setdefault("creationflags",
-                          subprocess.CREATE_NEW_PROCESS_GROUP)
-    except Exception:  # pragma: no cover - 非 Windows 平台无此属性
-        pass
+    # ---- 必须让子进程拥有**自己的**进程组/会话 ----
+    # 原实现只在 Windows 上加 CREATE_NEW_PROCESS_GROUP，而 POSIX 没有这个常量，
+    # `subprocess.CREATE_NEW_PROCESS_GROUP` 会抛 AttributeError 被 except 吞掉 ——
+    # 于是 **POSIX 下子进程继承了调用方的进程组**。
+    # 而 `_kill_tree_quietly()` 用 `os.killpg(os.getpgid(pid))` 收树：继承组的情况
+    # 下 getpgid(pid) 就是**调用方自己的组**，一条 killpg 会把整个进程组（含
+    # 调用方及其兄弟进程）杀掉。审核 R17-05 点名了这条。
+    if os.name == "nt":
+        try:  # 便于 CTRL_BREAK_EVENT，也便于 taskkill /T
+            kwargs.setdefault("creationflags",
+                              subprocess.CREATE_NEW_PROCESS_GROUP)
+        except Exception:  # pragma: no cover
+            pass
+    else:
+        # 新 session ⇒ 新会话首进程必然是新进程组的组长（pgid == pid）
+        kwargs.setdefault("start_new_session", True)
 
     proc = subprocess.Popen(cmd, **kwargs)
     guard.watch_process(proc)

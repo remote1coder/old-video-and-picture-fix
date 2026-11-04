@@ -245,3 +245,60 @@ def test_T09_stream_pipeline_has_single_cleanup_path():
     assert "_reap_stream_pipeline([dec, ai, enc]" in src, "必须有统一收尾"
     # 旧的"raise 后再也到不了下一个 except"写法必须消失
     assert "except Exception as _stall_exc:" not in src
+
+
+# ------------------------------------------------ R17-05 进程组归属
+
+def test_R17_05_may_killpg_refuses_own_group():
+    """**核心安全约束**：子进程与调用方同组时，绝不能允许 killpg。
+
+    原实现无条件 `os.killpg(os.getpgid(pid), SIGKILL)`。POSIX 下若子进程
+    没建独立 session（原 spawn 在 POSIX 上 AttributeError 被吞掉），
+    `getpgid(pid)` 就等于**调用方自己的组** —— 一条 killpg 会把调用方
+    和它的兄弟进程一起杀掉。
+    """
+    from unittest import mock
+
+    # 子进程与调用方同属 1000 组
+    with mock.patch.object(cg, "_safe_getpgid",
+                           lambda pid: 1000, create=True):
+        assert cg._may_killpg(4242) is False
+
+
+def test_R17_05_may_killpg_allows_owned_leader():
+    """子进程是独立组组长（pgid == pid 且 != 我方组）才允许 killpg。"""
+    from unittest import mock
+
+    with mock.patch.object(
+            cg, "_safe_getpgid",
+            lambda pid: 4242 if pid else 1000, create=True):
+        assert cg._may_killpg(4242) is True
+
+
+def test_R17_05_may_killpg_refuses_when_unknown():
+    """取不到进程组（Win32/权限不足）→ 保守退化为单杀。"""
+    from unittest import mock
+
+    with mock.patch.object(cg, "_safe_getpgid", lambda pid: None,
+                           create=True):
+        assert cg._may_killpg(4242) is False
+
+
+def test_R17_05_may_killpg_refuses_non_leader():
+    """子进程不是组长（pgid != pid）→ 不该按组杀。"""
+    from unittest import mock
+
+    with mock.patch.object(
+            cg, "_safe_getpgid",
+            lambda pid: 7777 if pid else 1000, create=True):
+        assert cg._may_killpg(4242) is False
+
+
+def test_R17_05_spawn_creates_own_group_on_posix():
+    """POSIX 必须传 `start_new_session=True` —— 否则组归属判定根本不成立。"""
+    src = open(os.path.join(_ROOT, "shared_modules", "cancel_guard.py"),
+               encoding="utf-8", errors="replace").read()
+    assert 'kwargs.setdefault("start_new_session", True)' in src, \
+        "POSIX 上必须自建 session/进程组"
+    # 不能再无条件 killpg
+    assert "os.killpg(os.getpgid(pid), signal.SIGKILL)" not in src
