@@ -524,6 +524,11 @@ GENERATION_ALL_OLD = "all_old"
 GENERATION_ALL_NEW = "all_new"
 GENERATION_MIXED = "mixed"
 GENERATION_UNKNOWN = "unknown"
+GENERATION_IDENTICAL = "identical"
+#: 全组「新旧字节完全相同」：既满足旧代也满足新代。
+#: 这种情形不能凭"先匹配 new"决定 —— 那会把"已回滚到旧代、
+#: 但新旧内容恰好相同"误判成新代。终态由事务状态（journal
+#: phase）决定。
 
 
 def classify_generation(records: Optional[Dict[str, Dict[str, Any]]]) -> str:
@@ -546,7 +551,7 @@ def classify_generation(records: Optional[Dict[str, Dict[str, Any]]]) -> str:
     if not records:
         return GENERATION_UNKNOWN
 
-    n_old = n_new = 0
+    n_old = n_new = n_ident = 0
     for fin, row in records.items():
         st, dig = file_state(fin)
         if st == "ERROR":
@@ -565,6 +570,15 @@ def classify_generation(records: Optional[Dict[str, Dict[str, Any]]]) -> str:
         # PRESENT
         if dig is None or (old_d is None and new_d is None):
             return GENERATION_UNKNOWN
+        # ---- 中性对象：新旧摘要相同 ----
+        # 此时"等于旧代"和"等于新代"是同一件事。原实现先匹配 new，于是
+        # "媒体已回滚到旧代、但新旧字节恰好一样"被记成 n_new —— 整组随后
+        # 被判 mixed，尽管磁盘其实完整等于旧代（审核探针复现）。
+        if old_d is not None and new_d is not None and old_d == new_d:
+            if dig != old_d:
+                return GENERATION_UNKNOWN   # 与两者都不符
+            n_ident += 1
+            continue
         if new_d and dig == new_d:
             n_new += 1
         elif old_d is not None and dig == old_d:
@@ -573,11 +587,17 @@ def classify_generation(records: Optional[Dict[str, Dict[str, Any]]]) -> str:
             # 既不等于旧代也不等于新代 —— 半覆盖/外来内容
             return GENERATION_UNKNOWN
 
-    if n_new and n_old:
+    # 真正的"混杂"必须同时存在**明确的**旧代与**明确的**新代；
+    # 中性对象（n_ident）不参与这个判断 —— 它对两种终态都成立。
+    if n_old and n_new:
         return GENERATION_MIXED
+    if n_old:
+        return GENERATION_ALL_OLD
     if n_new:
         return GENERATION_ALL_NEW
-    return GENERATION_ALL_OLD
+    if n_ident:
+        return GENERATION_IDENTICAL
+    return GENERATION_UNKNOWN
 
 
 def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
@@ -666,8 +686,16 @@ def recover(journal_path: str, backup_dir: str, attempt_id: str,
     Returns:
         ``None`` 表示没有需要处理的事务；否则是恢复报告。
     """
+    # ---- "存在但不是普通文件" ≠ "没有事务" ----
+    # 原来用 `not os.path.isfile(...)` 一并吞掉：journal 路径上是**目录**
+    # （或被替换成设备/链接）时返回 None，调用方会当成"无事务"直接继续发布，
+    # 把一份未知状态当成干净起点。审核要求：目录/不可访问是**未知或错误**。
+    if not os.path.exists(journal_path):
+        return None                     # 真的没有事务
     if not os.path.isfile(journal_path):
-        return None
+        return {"ok": False,
+                "reason": "journal path exists but is not a regular file",
+                "journal_path": journal_path}
     doc = read_journal(journal_path)
     if doc is None:
         return {"ok": False, "reason": "journal unreadable",
@@ -700,8 +728,16 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
     同样不能只凭 ``phase`` 字段认可完整：COMMITTED / ROLLED_BACK 都要复核
     全组摘要（审核 B07）。
     """
+    # ---- "存在但不是普通文件" ≠ "没有事务" ----
+    # 原来用 `not os.path.isfile(...)` 一并吞掉：journal 路径上是**目录**
+    # （或被替换成设备/链接）时返回 None，调用方会当成"无事务"直接继续发布，
+    # 把一份未知状态当成干净起点。审核要求：目录/不可访问是**未知或错误**。
+    if not os.path.exists(journal_path):
+        return None                     # 真的没有事务
     if not os.path.isfile(journal_path):
-        return None
+        return {"ok": False,
+                "reason": "journal path exists but is not a regular file",
+                "journal_path": journal_path}
     doc = read_journal(journal_path)
     if doc is None:
         return {"ok": False, "reason": "journal unreadable"}
@@ -712,7 +748,9 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
     # ---- 已是终态：复核全组摘要，不能只看字段 ----
     if phase == PHASE_COMMITTED:
         gen = classify_generation(records)
-        if gen == GENERATION_ALL_NEW:
+        # IDENTICAL：新旧字节相同，COMMITTED 与 ROLLED_BACK 都成立 ——
+        # 事务已声明提交，按提交收尾。
+        if gen in (GENERATION_ALL_NEW, GENERATION_IDENTICAL):
             return {"ok": True, "action": "already_committed",
                     "generation": gen}
         return {"ok": False, "generation": gen,
@@ -720,7 +758,7 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
                            f"{gen}; not destroying the unresolved record")}
     if phase == PHASE_ROLLED_BACK:
         gen = classify_generation(records)
-        if gen == GENERATION_ALL_OLD:
+        if gen in (GENERATION_ALL_OLD, GENERATION_IDENTICAL):
             return {"ok": True, "action": "already_rolled_back",
                     "generation": gen}
         return {"ok": False, "generation": gen,
@@ -742,7 +780,9 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
     gen = classify_generation(records)
 
     # ---- 磁盘已是完整旧代：只补记终态（不动任何文件）----
-    if gen == GENERATION_ALL_OLD:
+    # IDENTICAL 也走这里：两种终态在磁盘上等价，而"补记回滚"**不动任何文件**，
+    # 是唯一不会产生副作用的选择。
+    if gen in (GENERATION_ALL_OLD, GENERATION_IDENTICAL):
         if write_journal(journal_path,
                          dict(doc, phase=PHASE_ROLLED_BACK, generation=gen,
                               resolved=True)):
