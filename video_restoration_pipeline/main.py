@@ -1705,8 +1705,15 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 (args.get("chain") if isinstance(args, dict)
                  else getattr(args, "chain", None))
                 or _cfg_chain.get("mode") or "none").strip().lower()
+        # 融合的"接受未验证像素差异"开关（默认 False）。
+        # 它必须**显式**为真才允许 stage3 降级为融合执行。
+        if "chain_allow_unverified_pixel_diff" not in params:
+            params["chain_allow_unverified_pixel_diff"] = bool(
+                _cfg_chain.get("allow_unverified_pixel_diff", False))
         job_logger.info("CHAIN_MODE", "Effective execution-group mode",
-                        chain_mode=params.get("chain_mode"))
+                        chain_mode=params.get("chain_mode"),
+                        allow_unverified_pixel_diff=params.get(
+                            "chain_allow_unverified_pixel_diff"))
     except Exception as _cm_exc:          # pragma: no cover
         job_logger.warning("CHAIN_MODE_FAIL", str(_cm_exc))
         params["chain_mode"] = "none"

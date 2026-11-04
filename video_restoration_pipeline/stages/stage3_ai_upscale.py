@@ -831,6 +831,25 @@ def _reap_stream_pipeline(procs, logger=None, label="pipeline"):
                 pass
 
 
+def _load_stage4_filter_builder():
+    """加载 stage4 的滤镜构造器（**按文件路径**，不依赖 sys.path）。
+
+    为什么不用 `from stage4_postprocess import ...`
+    ------------------------------------------------
+    实测（G34 首次跑批）报 `No module named 'stage4_postprocess'`：
+    stage3 作为子进程启动时 `sys.path` 里并不保证有 stages 目录。
+    按 `__file__` 的兄弟文件加载，与 sys.path 无关，也不会被同名模块
+    （照片链也有 stage4）串味。
+    """
+    import importlib.util as _ilu
+    _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "stage4_postprocess.py")
+    _spec = _ilu.spec_from_file_location("_stage4_for_g34", _p)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod.build_filter_chain
+
+
 def _sha256_text(text):
     """文本的 SHA-256（用于把滤镜图身份写进回执）。"""
     import hashlib
@@ -915,10 +934,20 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 帧率必须用 `-framerate`（rawvideo 输入的专用选项）。
     # 实测用 `-r 25` 放在 -i 之前，输出被写成 48.52s（≈6.18fps）而不是
     # 300/25=12.0s —— 时间戳整个错掉。输出侧再加一个 `-r` 兜底。
-    enc_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y",
-               "-f", "rawvideo", "-vcodec", "rawvideo",
-               "-pix_fmt", "rgb48le", "-s", f"{out_w}x{out_h}",
-               "-framerate", str(fps_str), "-i", "-"]
+    _enc_head = ["ffmpeg", "-hide_banner", "-v", "error", "-y",
+                 "-f", "rawvideo", "-vcodec", "rawvideo",
+                 "-pix_fmt", "rgb48le", "-s", f"{out_w}x{out_h}",
+                 "-framerate", str(fps_str)]
+    if post_filter_chain and color_opts:
+        # ---- 融合时颜色标签必须同时作为**输入**选项 ----
+        # 经典路径里 step3 已经带着 colorspace 标签落盘，stage4 读回来做
+        # RGB→YUV 转换时用的是**标签指定的矩阵**；融合路径的 rawvideo 没有
+        # 任何颜色元数据，ffmpeg 会按默认规则猜（通常是 BT.601），
+        # 于是滤镜图里的 `format=yuv420p` 用错矩阵 → U/V 平面整体偏掉。
+        # 实测（G34 首轮对照）：Y 39 dB 但 U/V 只有 10 dB。
+        # 把同一组标签补到输入侧，让两条路径的转换前提一致。
+        _enc_head += list(color_opts)
+    enc_cmd = _enc_head + ["-i", "-"]
     # ---- G34 融合：把 stage4 的滤镜图接在编码器上 ----
     # 滤镜链来自 `stage4_postprocess.build_filter_chain()`（**同一份构造**，
     # 不是复制的字符串）。输入标签 `[0:v]` 在这里就是 stdin 的 rawvideo，
@@ -2573,11 +2602,30 @@ def main():
                 # PNG / VFR 仍然走经典两阶段 —— 那是本轮未验证的范围，
                 # 不是"技术上不可能"。
                 _s_fuse34 = _chain_mode(params) in ("stage34", "both")
+                # ---- 等价性未达标的硬闸门 ----
+                # 实测（tools_r4/g34_equiv.py，60 帧 1080p→4K，同一路线）：
+                #   经典 vs 融合的逐帧 PSNR = Y 38.9 dB / U 10.3 dB / V 10.1 dB
+                # —— **不等价**，差异集中在色度平面。审核明确要求
+                # "有差异就定位原因，不能直接放宽为肉眼差不多"。
+                # 因此:未显式承认这一差异时，**拒绝降级为融合执行**，
+                # 照常走经典两阶段。这比"开着但没人知道不等价"安全得多。
+                if _s_fuse34 and not params.get(
+                        "chain_allow_unverified_pixel_diff", False):
+                    _s_fuse34 = False
+                    logger.warning(
+                        "STAGE3_FUSE34_BLOCKED_UNVERIFIED",
+                        "G34 fusion is implemented but its output is NOT "
+                        "pixel-equivalent to the classic two-stage path "
+                        "(measured: Y 38.9 dB, U 10.3 dB, V 10.1 dB on a "
+                        "60-frame 1080p->4K sample). Falling back to the "
+                        "classic path; set chain.allow_unverified_pixel_diff "
+                        "to true only if you accept that difference.",
+                        chain_mode=_chain_mode(params))
                 _s_chain = None
                 _s_pix_fmt = None
                 if _s_fuse34:
                     try:
-                        from stage4_postprocess import build_filter_chain as _bfc
+                        _bfc = _load_stage4_filter_builder()
                         _s_chain = _bfc(params)
                         _s_pix_fmt = ("yuv420p16le"
                                       if params.get("vs_bit_depth", 16) == 16

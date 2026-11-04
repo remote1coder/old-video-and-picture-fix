@@ -2151,10 +2151,37 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
             [p for _pat in step3_patterns
              for p in glob.glob(os.path.join(temp_dir, _pat))])
         if not step3_candidates:
-            logger.error("STAGE5_ORDER_ERROR",
-                         "AI upscale enabled but no stage3 output found. "
-                         "Stage5 must run after stage3 per v7.32 §3.10.5")
-            return 82
+            # ---- G34 融合：step3 被并进 step4 了，没有独立的 step3 文件 ----
+            # 顺序检查的**目的**是"确认 AI 超分确实跑过"，而不是"必须有那个
+            # 文件"。融合模式下 stage3 直接产出 step4 并留下回执，回执 +
+            # 产物存在同样能证明这一点。
+            _fused_rcpt = glob.glob(os.path.join(
+                temp_dir, f"{job_id}_{_stem}_step4_postprocess*"
+                          f".fused_stage34.json"))
+            _fused_ok = False
+            for _r in sorted(_fused_rcpt):
+                try:
+                    import json as _json
+                    with open(_r, "r", encoding="utf-8") as _rf:
+                        _rd = _json.load(_rf) or {}
+                    _out = _rd.get("output")
+                    if _out and os.path.exists(_out):
+                        _fused_ok = True
+                        break
+                except Exception:
+                    continue
+            if _fused_ok:
+                logger.info(
+                    "STAGE5_ORDER_OK_FUSED",
+                    "No standalone step3 exists because stage3 and stage4 ran "
+                    "as one execution group (G34); the fusion receipt and its "
+                    "step4 output prove the AI upscale ran",
+                    receipt=_r)
+            else:
+                logger.error("STAGE5_ORDER_ERROR",
+                             "AI upscale enabled but no stage3 output found. "
+                             "Stage5 must run after stage3 per v7.32 §3.10.5")
+                return 82
 
     if not input_source:
         logger.error("STAGE5_NO_INPUT",
