@@ -965,13 +965,44 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
         _lock_ctx = _nullcontext()
 
     with _lock_ctx:
-        _recorded = None
+        _receipt = None
         try:
             with open(str(final_path) + ".verify.json", "r",
                       encoding="utf-8") as _vf:
-                _recorded = (json.load(_vf) or {}).get("media_sha256")
+                _report = json.load(_vf) or {}
+            _receipt = _report.get("run_identity")
+            _recorded = _report.get("media_sha256")
         except (OSError, ValueError):
             _recorded = None
+
+        # ---- R17-01：核对"这份报告是不是本 job 这一代写的" ----
+        # 只比对 media_sha256 与当前文件是不够的：B 把两者一起换掉后它们
+        # 仍然彼此自洽。这里改看 stage7 回写的 run_identity。
+        try:
+            _own_in = build_input_identity(job.get("input_path", ""))
+        except Exception:                 # pragma: no cover
+            _own_in = {}
+        _got_in = ((_receipt or {}).get("input") or {})
+        if not _receipt:
+            if logger:
+                logger.error(
+                    "COMPLETION_MARKER_NO_RECEIPT",
+                    "verify.json carries no run_identity; cannot prove this "
+                    "artifact belongs to this job's generation. Refusing to "
+                    "write a marker.",
+                    output_path=str(final_path))
+            return False
+        if (_got_in.get("digest") and _own_in.get("digest")
+                and _got_in.get("digest") != _own_in.get("digest")):
+            if logger:
+                logger.error(
+                    "COMPLETION_MARKER_FOREIGN_GENERATION",
+                    "The published artifact was produced from a different "
+                    "input than this job's; refusing to bind them.",
+                    output_path=str(final_path),
+                    expected=str(_own_in.get("digest") or "")[:16],
+                    found=str(_got_in.get("digest") or "")[:16])
+            return False
         # 与报告同口径（纯内容）。`output_sha256` 仍用 _chunked_sha256 ——
         # resume 的比对端也是它，两边自洽，不能单边改。
         _actual = (_plain_sha256(final_path)
@@ -1589,6 +1620,23 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     traditional_stage_completed = False
     # ID-04：本 job 内"每个 stage 本次真正产出的路径"，供下游精确消费
     _last_produced: Dict[int, List[str]] = {}
+
+    # ---- R17-01：把"本次 run 的身份"随 params 传给 stage ----
+    # 审核要求：marker 不能只比对"当前 verify 与当前媒体彼此一致" —— 只要
+    # B 把媒体和报告一起换掉，两者仍然自洽，A 无法察觉这份报告已不是自己那代。
+    # 做法：main 把自己算出的**输入身份 + 参数身份**塞进 params，stage7 原样
+    # 回写进 verify.json。B 换代时会覆盖成 B 的身份，A 一比就知道不是自己的。
+    # 成本为零（不额外读素材），且两边用的是同一份数值，不会各算各的。
+    # 注意：`_` 前缀会被 `_identity_semantics()` 跳过，因此不会改变
+    # params 身份摘要，也不会影响 CORE_QUALITY_PARAMS 的缓存判定。
+    try:
+        params["_run_identity"] = {
+            "input": build_input_identity(job.get("input_path", "")),
+            "params": build_params_identity(config, job, job_logger,
+                                            params=params),
+        }
+    except Exception as _rid_exc:         # pragma: no cover
+        job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
 
     for stage_num, script_name in stages:
         # ID-04（第七轮）：把**上一个 stage 本次真正产出**的精确路径传下去，

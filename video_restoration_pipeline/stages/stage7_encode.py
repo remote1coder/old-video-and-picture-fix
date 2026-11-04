@@ -3039,6 +3039,12 @@ def main():
             if _prechecks:
                 _ver_doc.setdefault("prechecks", {}).update(_prechecks)
             _ver_doc["attempt_id"] = _attempt_id
+            # R17-01：把本次 run 的身份**原样回写**。marker 靠它判断
+            # "这份报告是不是本 job 这一代写的" —— 只比对媒体摘要不够，
+            # 因为下一代会把媒体与报告一起替换，两者仍然自洽。
+            _ri = params.get("_run_identity")
+            if _ri:
+                _ver_doc["run_identity"] = _ri
 
             # ---- R14-05：消费 stage3 的时间轴计划，分开三个结论 ----
             # ① 源时间轴是否已验证（stage3 判定）

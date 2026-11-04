@@ -54,8 +54,14 @@ def test_marker_refuses_when_media_changed_after_publish(tmp_path):
     other.write_bytes(b"GENERATION-A")
     # 报告里的 media_sha256 是**纯内容** SHA-256（stage7 的口径），
     # 这里必须用同一套算法，否则"挡下来"的原因是算法不同而不是媒体换了。
+    # R17-01：报告必须带 run_identity（本 job 这一代的输入身份），
+    # 否则 marker 会因"无法证明归属"而拒写 —— 见 COMPLETION_MARKER_NO_RECEIPT。
+    _inp_early = tmp_path / "in.mp4"
+    _inp_early.write_bytes(b"src")
     (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": vmain._plain_sha256(str(other))}),
+        json.dumps({"media_sha256": vmain._plain_sha256(str(other)),
+                    "run_identity": {
+                        "input": vmain.build_input_identity(str(_inp_early))}}),
         encoding="utf-8")
 
     class L:
@@ -86,10 +92,13 @@ def test_marker_written_when_digest_matches(tmp_path):
     media.write_bytes(b"GENERATION-A")
     # 报告记的是**纯内容**摘要（stage7 口径）
     dig = vmain._plain_sha256(str(media))
-    (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": dig}), encoding="utf-8")
     inp = tmp_path / "in.mp4"
     inp.write_bytes(b"src")
+    (tmp_path / "clip_restored.mkv.verify.json").write_text(
+        json.dumps({"media_sha256": dig,
+                    "run_identity": {
+                        "input": vmain.build_input_identity(str(inp))}}),
+        encoding="utf-8")
 
     class L:
         def info(self, *a, **k):
@@ -178,11 +187,14 @@ def test_b09_two_processes_do_not_corrupt_the_marker(tmp_path):
     final = tmp_path / "clip_restored.mkv"
     final.write_bytes(b"GEN")
     # 报告口径是纯内容 SHA-256（stage7 写的就是它）
-    (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": vmain._plain_sha256(str(final))}),
-        encoding="utf-8")
     inp = tmp_path / "in.mp4"
     inp.write_bytes(b"src")
+    # R17-01：带 run_identity，否则 marker 会以 NO_RECEIPT 拒写
+    (tmp_path / "clip_restored.mkv.verify.json").write_text(
+        json.dumps({"media_sha256": vmain._plain_sha256(str(final)),
+                    "run_identity": {
+                        "input": vmain.build_input_identity(str(inp))}}),
+        encoding="utf-8")
 
     root = str(_ROOT)
     shared = os.path.join(_ROOT, "shared_modules")
@@ -244,10 +256,13 @@ def test_guard_compares_like_with_like(tmp_path):
     media = tmp_path / "clip_restored.mkv"
     media.write_bytes(b"GENUINE")
     plain = vmain._plain_sha256(str(media))
-    (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": plain}), encoding="utf-8")
     inp = tmp_path / "in.mp4"
     inp.write_bytes(b"src")
+    (tmp_path / "clip_restored.mkv.verify.json").write_text(
+        json.dumps({"media_sha256": plain,
+                    "run_identity": {
+                        "input": vmain.build_input_identity(str(inp))}}),
+        encoding="utf-8")
 
     class L:
         def __init__(self):

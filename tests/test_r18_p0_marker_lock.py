@@ -78,7 +78,9 @@ def _prepare(tmp_path, media_bytes=b"GEN-A", verify_sha=None):
     inp.write_bytes(b"src")
     sha = verify_sha if verify_sha is not None else vmain._plain_sha256(str(media))
     (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": sha, "attempt_id": "A-1"}),
+        json.dumps({"media_sha256": sha, "attempt_id": "A-1",
+                    "run_identity": {
+                        "input": vmain.build_input_identity(str(inp))}}),
         encoding="utf-8")
     return media, inp
 
@@ -182,10 +184,6 @@ def test_R17_01_refuses_when_media_changed(tmp_path, monkeypatch):
     assert not os.path.exists(vmain.completion_marker_path(str(media)))
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "R17-01 已知缺口：verify.json 没有输入/参数身份，B 把媒体与报告一起换掉后"
-    "两者仍自洽，A 无法识别。需 publisher 冻结回执（attempt+完整成果集合+"
-    "输入/参数身份）后由 marker 核对。"))
 def test_T01_input_identity_cannot_bind_to_another_generation(tmp_path,
                                                               monkeypatch):
     """T01：A 的输入不得被绑到 B 的媒体上。
@@ -205,10 +203,12 @@ def test_T01_input_identity_cannot_bind_to_another_generation(tmp_path,
     media = tmp_path / "clip_restored.mkv"
     media.write_bytes(b"GEN-B-RESULT")
 
-    # B 的 verify 报告：与 B 的媒体自洽
+    # B 的 verify 报告：媒体摘要与**B 自己的输入身份**都自洽
     (tmp_path / "clip_restored.mkv.verify.json").write_text(
         json.dumps({"media_sha256": vmain._plain_sha256(str(media)),
-                    "attempt_id": "B-1"}),
+                    "attempt_id": "B-1",
+                    "run_identity": {
+                        "input": vmain.build_input_identity(str(inp_b))}}),
         encoding="utf-8")
 
     @contextlib.contextmanager
@@ -222,3 +222,5 @@ def test_T01_input_identity_cannot_bind_to_another_generation(tmp_path,
 
     # 期望：拒绝（因为报告属于 B，不是 A）
     assert ok is False, "A 的输入被绑到了 B 的媒体上"
+    assert "COMPLETION_MARKER_FOREIGN_GENERATION" in log.events, log.events
+    assert not os.path.exists(vmain.completion_marker_path(str(media)))
