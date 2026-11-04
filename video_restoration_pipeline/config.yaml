@@ -385,3 +385,12 @@ audio:
   arnndn_model: "std.rnnn"          # Xiph RNNoise 原版通用模型（.rnnn，非 .pb）
   multichannel_preserve: true
   compand_syntax_note: "subprocess_list_mode_points_pipe_or_space_separated"
+
+# ---- 执行组（可选串联）----
+# 决定**怎么执行**，不影响功能开关：
+#   none     经典逐阶段落盘（默认，行为与改动前一致）
+#   stage34  stage3+stage4 合成一个执行组（不产生 step3）
+#   stage67  stage6+stage7 合成一个执行组（暂未实现，等同 none）
+#   both     两者都启用（stage67 未实现时只生效 stage34）
+chain:
+  mode: none

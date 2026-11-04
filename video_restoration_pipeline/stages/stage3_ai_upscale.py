@@ -831,11 +831,29 @@ def _reap_stream_pipeline(procs, logger=None, label="pipeline"):
                 pass
 
 
+def _sha256_text(text):
+    """文本的 SHA-256（用于把滤镜图身份写进回执）。"""
+    import hashlib
+    return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()
+
+
+def _chain_mode(params) -> str:
+    """读取执行组模式（`chain.mode`）。默认 none —— 行为与改动前一致。"""
+    try:
+        raw = (params or {}).get("chain_mode") or "none"
+        if isinstance(raw, dict):
+            raw = raw.get("mode") or "none"
+        return str(raw).strip().lower()
+    except Exception:
+        return "none"
+
+
 def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          fps_str, model, model_dir, ai_py, gpu_id=0,
                          timeout_s=None, inactivity_s=1800,
                          logger=None, cancel_guard=None,
-                         color_opts=None):
+                         color_opts=None, post_filter_chain=None,
+                         out_pix_fmt=None):
     """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
 
     为什么这样做
@@ -900,8 +918,18 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     enc_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y",
                "-f", "rawvideo", "-vcodec", "rawvideo",
                "-pix_fmt", "rgb48le", "-s", f"{out_w}x{out_h}",
-               "-framerate", str(fps_str), "-i", "-",
-               "-c:v", "ffv1", "-r", str(fps_str)]
+               "-framerate", str(fps_str), "-i", "-"]
+    # ---- G34 融合：把 stage4 的滤镜图接在编码器上 ----
+    # 滤镜链来自 `stage4_postprocess.build_filter_chain()`（**同一份构造**，
+    # 不是复制的字符串）。输入标签 `[0:v]` 在这里就是 stdin 的 rawvideo，
+    # 因此整条链的语义与"先写 step3 再由 stage4 读回"一致。
+    if post_filter_chain:
+        enc_cmd += ["-filter_complex", str(post_filter_chain),
+                    "-map", "[vout]"]
+        if out_pix_fmt:
+            # stage4 也是"滤镜之后再转输出格式"，两边在同一个位置做转换
+            enc_cmd += ["-pix_fmt", str(out_pix_fmt)]
+    enc_cmd += ["-c:v", "ffv1", "-r", str(fps_str)]
     # 颜色标签必须与主流程 PNG 路线一致（COL-04），否则中间产物不带
     # colorspace 标签，下游 stage7 会按自己的猜测补标签 → 可能错标。
     enc_cmd += list(color_opts or [])
@@ -2539,6 +2567,41 @@ def main():
                                 f"_step3_forced_upscale_p{param_hash}")
                 _s_out = str(Path(temp_dir) / f"{_s_inter}.mkv")
 
+                # ---- G34：可选融合执行组（stage3+stage4 一次跑完） ----
+                # `chain.mode` 决定**怎么执行**，不决定用户能用哪些功能：
+                # 只有"默认关闭 + 显式开启"才走融合，且只限本路径（raw+CFR）。
+                # PNG / VFR 仍然走经典两阶段 —— 那是本轮未验证的范围，
+                # 不是"技术上不可能"。
+                _s_fuse34 = _chain_mode(params) in ("stage34", "both")
+                _s_chain = None
+                _s_pix_fmt = None
+                if _s_fuse34:
+                    try:
+                        from stage4_postprocess import build_filter_chain as _bfc
+                        _s_chain = _bfc(params)
+                        _s_pix_fmt = ("yuv420p16le"
+                                      if params.get("vs_bit_depth", 16) == 16
+                                      else "yuv420p10le")
+                        # 产物直接叫 step4：下游（stage5/6）是**按 glob**
+                        # `*_step4_postprocess*` 找输入的，不依赖 hash。
+                        _s_out = str(Path(temp_dir) / (
+                            f"{job_id}_{Path(input_name).stem}"
+                            f"_step4_postprocess_p{param_hash}.mkv"))
+                        logger.info(
+                            "STAGE3_FUSE34_ENABLED",
+                            "stage3+stage4 will run as one execution group; "
+                            "no step3 file will be produced",
+                            output=_s_out, chain_mode=_chain_mode(params))
+                    except Exception as _fe:
+                        # 构造不出来就**回退经典**，不静默改变功能
+                        _s_fuse34 = False
+                        _s_chain = None
+                        _s_out = str(Path(temp_dir) / f"{_s_inter}.mkv")
+                        logger.warning("STAGE3_FUSE34_DISABLED",
+                                       "could not build the stage4 filter "
+                                       "chain; falling back to the classic "
+                                       "two-stage execution", error=str(_fe))
+
                 # R13-02：**不能在这里第二次猜 fps**。
                 # 原实现重新 probe 一次、失败就用 "25"；于是首次成功得到
                 # 30000/1001、第二次失败时，同一批帧会按 25fps 编码 ——
@@ -2599,6 +2662,7 @@ def main():
                             pass
                     _s_ok, _s_why, _s_n = _stream_raw_upscale(
                         input_video=stage2_output, output_mkv=_s_out,
+                        post_filter_chain=_s_chain, out_pix_fmt=_s_pix_fmt,
                         width=_s_dims[0], height=_s_dims[1], scale=scale,
                         fps_str=_s_fps, model=model,
                         model_dir=str(SCRIPT_DIR.parent / "models"),
@@ -2618,6 +2682,51 @@ def main():
                                     "Zero-disk raw-pipe upscale succeeded; "
                                     "skipping PNG extract/encode entirely",
                                     frames=_s_n, output=_s_out)
+                        if _s_fuse34:
+                            # ---- 融合回执：告诉 main"stage4 已经在这里做完了" ----
+                            # 没有它 main 会照常去跑 stage4，而 stage4 找不到
+                            # step3 输入 → NO_INPUT，把一次成功的融合判成失败。
+                            # 回执与产物同名同目录，按 glob 也能找到；
+                            # 内容足够证明"是这一次、这一份参数、这一张图"。
+                            try:
+                                import json as _json
+                                _rcpt = {
+                                    "chain_mode": _chain_mode(params),
+                                    "logical_stages": ["stage3", "stage4"],
+                                    # 不为一个字符串去 import main（会带来
+                                    # 循环/副作用）；融合身份用"滤镜图摘要 +
+                                    # 阶段脚本 + 模式"表达，比全局 impl 更具体。
+                                    "impl": {
+                                        "group": "stage34-fusion",
+                                        "stage_script": "stage3_ai_upscale.py",
+                                        "stage_mtime": int(os.path.getmtime(__file__)),
+                                    },
+                                    "job_id": job_id,
+                                    "param_hash": param_hash,
+                                    "output": str(_s_out),
+                                    "output_size": os.path.getsize(_s_out),
+                                    "frames": _s_n,
+                                    "filter_chain_sha256": _sha256_text(_s_chain or ""),
+                                    "out_pix_fmt": _s_pix_fmt,
+                                    "written_at": __import__("datetime").datetime.now().astimezone().isoformat(),
+                                }
+                                with open(str(_s_out) + ".fused_stage34.json",
+                                          "w", encoding="utf-8") as _rf:
+                                    _json.dump(_rcpt, _rf, ensure_ascii=False,
+                                               indent=2)
+                                logger.info("STAGE3_FUSE34_RECEIPT",
+                                            "Recorded that stage4 ran inside "
+                                            "this execution group",
+                                            receipt=str(_s_out) + ".fused_stage34.json")
+                            except Exception as _rexc:   # pragma: no cover
+                                # 回执写不出来 → 必须当失败处理：否则 main 会
+                                # 再跑一遍 stage4，结果不可预测。
+                                logger.error(
+                                    "STAGE3_FUSE34_RECEIPT_FAIL",
+                                    "Could not record the fusion receipt; "
+                                    "refusing to leave a half-fused state",
+                                    error=str(_rexc))
+                                return 86
                         # ---- R12-12：成功路径不能就此 return ----
                         # 原来直接 return 0，绕过了 PNG 路径末尾的三段收尾：
                         #   ① 执行指纹侧车（"这次到底跑了什么"）

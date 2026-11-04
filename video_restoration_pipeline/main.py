@@ -86,6 +86,10 @@ def parse_args():
                         help="Alias for --preview-only (preview mode, no execution)")
     parser.add_argument("--keep-intermediates", action="store_true",
                         help="Keep intermediate files")
+    parser.add_argument("--chain", default=None,
+                        choices=["none", "stage34", "stage67", "both"],
+                        help="execution-group mode; only changes HOW stages run, "
+                             "never which features are available")
     parser.add_argument("--no-wsl-redirect", action="store_true",
                         help="Disable WSL path redirect")
     parser.add_argument("--stage", type=int, help="Run single stage only")
@@ -1344,6 +1348,60 @@ def _resolve_plan_for_job(job: Dict[str, Any], config: Dict[str, Any],
     return params, plan, True
 
 
+def _chain_mode_on(params) -> bool:
+    """当前是否启用了含 stage34 的融合执行组。"""
+    try:
+        return str((params or {}).get("chain_mode") or "none").lower() in (
+            "stage34", "both")
+    except Exception:
+        return False
+
+
+def _fused_step34(params, job, logger=None):
+    """找 stage3 留下的 G34 融合回执，返回被融合产出的 step4 路径或 None。
+
+    判据不只看"回执文件在"——还要确认它指向的产物**确实存在且尺寸一致**，
+    否则回执过期（产物被清理）时会误跳过 stage4，最终成品缺一段处理。
+    """
+    try:
+        import glob as _glob
+        import json as _json
+        temp_dir = (params or {}).get("temp_dir") or "."
+        stem = Path(job.get("input_path", "")).stem
+        job_id = job.get("job_id", "")
+        pattern = os.path.join(temp_dir,
+                               f"{job_id}_{stem}_step4_postprocess*"
+                               f".fused_stage34.json")
+        hits = sorted(_glob.glob(pattern))
+        if not hits:
+            return None
+        with open(hits[-1], "r", encoding="utf-8") as fh:
+            rcpt = _json.load(fh) or {}
+        out = rcpt.get("output")
+        if not out or not os.path.exists(out):
+            if logger:
+                logger.warning(
+                    "STAGE4_FUSED_RECEIPT_STALE",
+                    "A G34 receipt exists but its output is gone; running "
+                    "stage4 the classic way instead", receipt=hits[-1],
+                    output=out)
+            return None
+        if rcpt.get("output_size") and                 os.path.getsize(out) != int(rcpt["output_size"]):
+            if logger:
+                logger.warning(
+                    "STAGE4_FUSED_RECEIPT_SIZE_MISMATCH",
+                    "The fused step4 changed size after the receipt was "
+                    "written; treating the receipt as stale",
+                    receipt=hits[-1], recorded=rcpt.get("output_size"),
+                    actual=os.path.getsize(out))
+            return None
+        return out
+    except Exception as exc:              # pragma: no cover
+        if logger:
+            logger.warning("STAGE4_FUSED_RECEIPT_ERROR", str(exc))
+        return None
+
+
 def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 args, logger) -> Tuple[int, str]:
     """Process a single job through all stages. Returns (exit_code, stderr)."""
@@ -1638,7 +1696,36 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     except Exception as _rid_exc:         # pragma: no cover
         job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
 
+    # ---- chain.mode：默认 none，行为与改动前一致 ----
+    # 它只决定**怎么执行**（经典两阶段 vs 融合执行组），不影响功能开关。
+    try:
+        if not params.get("chain_mode"):
+            _cfg_chain = config.get("chain") or {}
+            params["chain_mode"] = str(
+                (args.get("chain") if isinstance(args, dict)
+                 else getattr(args, "chain", None))
+                or _cfg_chain.get("mode") or "none").strip().lower()
+        job_logger.info("CHAIN_MODE", "Effective execution-group mode",
+                        chain_mode=params.get("chain_mode"))
+    except Exception as _cm_exc:          # pragma: no cover
+        job_logger.warning("CHAIN_MODE_FAIL", str(_cm_exc))
+        params["chain_mode"] = "none"
+
     for stage_num, script_name in stages:
+        # ---- G34：stage3 已经把 stage4 一起做完了吗 ----
+        # 融合模式下 stage3 直接产出 step4 并留下回执；这里必须**跳过**
+        # stage4，否则它会去找不存在的 step3 → NO_INPUT，把一次成功的融合
+        # 判成失败。回执不成立（缺失/尺寸不符/产物不在）时照常跑 stage4。
+        if stage_num == 4 and _chain_mode_on(params):
+            _fused = _fused_step34(params, job, job_logger)
+            if _fused:
+                job_logger.info(
+                    "STAGE4_SKIPPED_FUSED",
+                    "stage4 already ran inside the G34 execution group; "
+                    "skipping the standalone stage to avoid a NO_INPUT failure",
+                    output=_fused, chain_mode=params.get("chain_mode"))
+                _last_produced[4] = [_fused]
+                continue
         # ID-04（第七轮）：把**上一个 stage 本次真正产出**的精确路径传下去，
         # 让下游不再 glob 重选。
         #

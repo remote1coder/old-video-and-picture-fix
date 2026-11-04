@@ -24,6 +24,7 @@ import json
 import argparse
 import subprocess
 from pathlib import Path
+from typing import Any, Dict
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
@@ -57,6 +58,103 @@ def _cg_heartbeat(guard, path):
     """取 cancel_guard 的文件增长心跳；旧版本没有该助手时返回 None。"""
     fn = getattr(guard, "file_growth_watch", None)
     return fn(path) if fn is not None else None
+
+
+def build_filter_chain(params: Dict[str, Any]) -> str:
+    """构造 stage4 的选择性后处理滤镜图（filter_complex 语法）。
+
+    **经典执行与融合执行共用同一份构造** —— 修改这里的滤镜会同时影响
+    两条路径，不会出现"融合版悄悄少了一道处理"。
+
+    输入标签固定 `[0:v]`、输出固定 `[vout]`：经典路径输入是 step3 文件，
+    融合路径输入是 rawvideo stdin，两者都是 `0:v`。
+    """
+    def _to_offset(v: float) -> float:
+        return max(-1.0, min(1.0, float(v) - 1.0))
+    lift_r = _to_offset(params.get("color_lift_r", 1.02))   # shadows offset
+    lift_g = _to_offset(params.get("color_lift_g", 1.01))
+    lift_b = _to_offset(params.get("color_lift_b", 1.01))
+    gamma_r = _to_offset(params.get("color_gamma_r", 0.98))  # midtones offset
+    gamma_g = _to_offset(params.get("color_gamma_g", 0.98))
+    gamma_b = _to_offset(params.get("color_gamma_b", 0.98))
+    gain_r = _to_offset(params.get("color_gain_r", 1.02))    # highlights offset
+    gain_g = _to_offset(params.get("color_gain_g", 1.02))
+    gain_b = _to_offset(params.get("color_gain_b", 1.02))
+
+    # FIX-P8-4: Selective local processing per v6.32 §3
+    # ORIGINAL: No skin/hair protection; unsharp applied to textured regions
+    # Per v6.32 §3: "Human subjects, skin, hair regions are COMPLETELY
+    # EXCLUDED from the mask." Flat regions: mild gblur denoise.
+    # Textured regions: preserve original (no sharpening per spec).
+    # FIX-R8-W8 (方案B): hair is high-frequency texture — edgedetect classifies
+    # it as textured → enters the copy (preserve) branch, so it is implicitly
+    # protected from gblur. Explicit hair segmentation (OpenCV/face parsing)
+    # is deferred pending user decision on precision requirements (round_8 §5).
+    chain = (
+        # FIX-R6-04: 多输入滤镜图必须走 filter_complex（-vf 只支持单入单出）。
+        # 原链 `split[main][tmp]` 之后 `[main]` 被引用 4 次，但 split 只产出
+        # 一份 main；[main] 还是 -vf 专属的输入别名，-filter_complex 下
+        # 会报 "Invalid stream specifier: main"。实测（2026-10-18）该选择性
+        # 处理图从未成功执行过：先卡 geq 选项逗号语法，修好后又报
+        # "had 4 input(s) and 1 output(s)"。标准写法：[0:v]split=5 出 5 份，
+        # 各分支独立标签，整图末尾统一 [vout] 供 -map 使用。
+        "[0:v]split=5[main1][main2][main3][main4][tmp];"
+        # Edge-based region mask (detect flat vs textured)
+        "[tmp]edgedetect=mode=colormix:low=0.05:high=0.15,"
+        "format=gray,"
+        "geq=lum='if(lt(lum(X,Y),30),0,"
+        "if(gt(lum(X,Y),90),255,"
+        "255*(lum(X,Y)-30)/60))'[maskraw];"
+        # Skin-tone detection mask (YCbCr skin range)
+        # Per v6.32 §3: protect human subjects from any processing
+        # FIX-R6-04: geq 的命名选项必须用 ':' 分隔（lum/cb/cr 是同一滤镜的
+        # 三个选项）。原来用 ',' 会被解析成新滤镜 cb='128' → ffmpeg 报
+        # "No option name near '128'"。
+        "[main1]format=yuv420p,"
+        "geq=lum='if(between(cb(X,Y),77,127)*between(cr(X,Y),133,173)"
+        "*gt(lum(X,Y),80),255,0)':"
+        "cb='128':cr='128'[skinmask];"
+        # FIX-R8-W8 (方案A): explicit hair mask per v6.32 §3 ("人物主体、皮肤、
+        # 头发区域完全排除"). Hair is typically dark (Y 16-80) but not pure black
+        # (avoid protecting black borders). Blended with skin mask via screen
+        # (union) so the person mask covers both skin and hair. ORIGINAL
+        # (方案B) relied on edgedetect classifying hair as textured -> copy
+        # branch, which protects it implicitly but fails on low-edge dark hair.
+        "[main2]format=yuv420p,"
+        "geq=lum='if(gt(lum(X,Y),16)*lt(lum(X,Y),80),255,0)':"
+        "cb='128':cr='128'[hairmask];"
+        "[skinmask][hairmask]blend=all_mode=screen[personmask];"
+        # Invert: person(=skin+hair)=0 (protect), non-person=255 (allow)
+        "[personmask]negate[noskin];"
+        # Combine: flat non-skin areas only
+        "[maskraw][noskin]blend=all_mode=multiply[combinedmask];"
+        # Feathered mask via gaussian blur (sigma=6 -> ~12px, >=8px per spec)
+        "[combinedmask]gblur=sigma=6[mask];"
+        # Flat branch: mild denoise for smooth regions
+        "[main3]gblur=sigma=0.6[flat];"
+        # Detail branch: preserve original (no unsharp per v6.32 §3)
+        # FIX-P8-9: Removed unsharp; textured regions kept as-is
+        "[main4]copy[detail];"
+        # Masked merge with feathered transition
+        "[flat][detail][mask]maskedmerge,"
+        # Final color grading: lift/gamma/gain via colorbalance
+        f"colorbalance=rs={lift_r}:gs={lift_g}:bs={lift_b}:"
+        f"rm={gamma_r}:gm={gamma_g}:bm={gamma_b}:"
+        f"rh={gain_r}:gh={gain_g}:bh={gain_b}"
+    )
+
+    # FIX-P8-10: Only apply saturation/contrast if explicitly configured
+    # ORIGINAL: Always applied eq=saturation=1.05:contrast=1.02
+    # Per v6.32 §3: no implicit saturation/contrast changes
+    saturation = params.get("post_saturation", 1.0)
+    contrast = params.get("post_contrast", 1.0)
+    if saturation != 1.0 or contrast != 1.0:
+        chain += (
+            f",eq=saturation={saturation}:contrast={contrast}"
+        )
+    # FIX-R6-04: 整图输出标签（filter_complex + -map [vout]）
+    chain += "[vout]"
+    return chain
 
 
 def main():
@@ -209,91 +307,7 @@ def main():
     # offset = (multiplier - 1.0), clamped to [-1,1]. This prevents out-of-
     # range values (e.g. gain=1.02 → +0.02 offset, not 1.02 which exceeds
     # [-1,1] and would be rejected by FFmpeg).
-    def _to_offset(v: float) -> float:
-        return max(-1.0, min(1.0, float(v) - 1.0))
-    lift_r = _to_offset(params.get("color_lift_r", 1.02))   # shadows offset
-    lift_g = _to_offset(params.get("color_lift_g", 1.01))
-    lift_b = _to_offset(params.get("color_lift_b", 1.01))
-    gamma_r = _to_offset(params.get("color_gamma_r", 0.98))  # midtones offset
-    gamma_g = _to_offset(params.get("color_gamma_g", 0.98))
-    gamma_b = _to_offset(params.get("color_gamma_b", 0.98))
-    gain_r = _to_offset(params.get("color_gain_r", 1.02))    # highlights offset
-    gain_g = _to_offset(params.get("color_gain_g", 1.02))
-    gain_b = _to_offset(params.get("color_gain_b", 1.02))
-
-    # FIX-P8-4: Selective local processing per v6.32 §3
-    # ORIGINAL: No skin/hair protection; unsharp applied to textured regions
-    # Per v6.32 §3: "Human subjects, skin, hair regions are COMPLETELY
-    # EXCLUDED from the mask." Flat regions: mild gblur denoise.
-    # Textured regions: preserve original (no sharpening per spec).
-    # FIX-R8-W8 (方案B): hair is high-frequency texture — edgedetect classifies
-    # it as textured → enters the copy (preserve) branch, so it is implicitly
-    # protected from gblur. Explicit hair segmentation (OpenCV/face parsing)
-    # is deferred pending user decision on precision requirements (round_8 §5).
-    filter_chain = (
-        # FIX-R6-04: 多输入滤镜图必须走 filter_complex（-vf 只支持单入单出）。
-        # 原链 `split[main][tmp]` 之后 `[main]` 被引用 4 次，但 split 只产出
-        # 一份 main；[main] 还是 -vf 专属的输入别名，-filter_complex 下
-        # 会报 "Invalid stream specifier: main"。实测（2026-10-18）该选择性
-        # 处理图从未成功执行过：先卡 geq 选项逗号语法，修好后又报
-        # "had 4 input(s) and 1 output(s)"。标准写法：[0:v]split=5 出 5 份，
-        # 各分支独立标签，整图末尾统一 [vout] 供 -map 使用。
-        "[0:v]split=5[main1][main2][main3][main4][tmp];"
-        # Edge-based region mask (detect flat vs textured)
-        "[tmp]edgedetect=mode=colormix:low=0.05:high=0.15,"
-        "format=gray,"
-        "geq=lum='if(lt(lum(X,Y),30),0,"
-        "if(gt(lum(X,Y),90),255,"
-        "255*(lum(X,Y)-30)/60))'[maskraw];"
-        # Skin-tone detection mask (YCbCr skin range)
-        # Per v6.32 §3: protect human subjects from any processing
-        # FIX-R6-04: geq 的命名选项必须用 ':' 分隔（lum/cb/cr 是同一滤镜的
-        # 三个选项）。原来用 ',' 会被解析成新滤镜 cb='128' → ffmpeg 报
-        # "No option name near '128'"。
-        "[main1]format=yuv420p,"
-        "geq=lum='if(between(cb(X,Y),77,127)*between(cr(X,Y),133,173)"
-        "*gt(lum(X,Y),80),255,0)':"
-        "cb='128':cr='128'[skinmask];"
-        # FIX-R8-W8 (方案A): explicit hair mask per v6.32 §3 ("人物主体、皮肤、
-        # 头发区域完全排除"). Hair is typically dark (Y 16-80) but not pure black
-        # (avoid protecting black borders). Blended with skin mask via screen
-        # (union) so the person mask covers both skin and hair. ORIGINAL
-        # (方案B) relied on edgedetect classifying hair as textured -> copy
-        # branch, which protects it implicitly but fails on low-edge dark hair.
-        "[main2]format=yuv420p,"
-        "geq=lum='if(gt(lum(X,Y),16)*lt(lum(X,Y),80),255,0)':"
-        "cb='128':cr='128'[hairmask];"
-        "[skinmask][hairmask]blend=all_mode=screen[personmask];"
-        # Invert: person(=skin+hair)=0 (protect), non-person=255 (allow)
-        "[personmask]negate[noskin];"
-        # Combine: flat non-skin areas only
-        "[maskraw][noskin]blend=all_mode=multiply[combinedmask];"
-        # Feathered mask via gaussian blur (sigma=6 -> ~12px, >=8px per spec)
-        "[combinedmask]gblur=sigma=6[mask];"
-        # Flat branch: mild denoise for smooth regions
-        "[main3]gblur=sigma=0.6[flat];"
-        # Detail branch: preserve original (no unsharp per v6.32 §3)
-        # FIX-P8-9: Removed unsharp; textured regions kept as-is
-        "[main4]copy[detail];"
-        # Masked merge with feathered transition
-        "[flat][detail][mask]maskedmerge,"
-        # Final color grading: lift/gamma/gain via colorbalance
-        f"colorbalance=rs={lift_r}:gs={lift_g}:bs={lift_b}:"
-        f"rm={gamma_r}:gm={gamma_g}:bm={gamma_b}:"
-        f"rh={gain_r}:gh={gain_g}:bh={gain_b}"
-    )
-
-    # FIX-P8-10: Only apply saturation/contrast if explicitly configured
-    # ORIGINAL: Always applied eq=saturation=1.05:contrast=1.02
-    # Per v6.32 §3: no implicit saturation/contrast changes
-    saturation = params.get("post_saturation", 1.0)
-    contrast = params.get("post_contrast", 1.0)
-    if saturation != 1.0 or contrast != 1.0:
-        filter_chain += (
-            f",eq=saturation={saturation}:contrast={contrast}"
-        )
-    # FIX-R6-04: 整图输出标签（filter_complex + -map [vout]）
-    filter_chain += "[vout]"
+    filter_chain = build_filter_chain(params)
 
     # v6.3 §3.6: Intermediate format must be FFV1 YUV420P16
     vs_bit_depth = params.get("vs_bit_depth", 16)
