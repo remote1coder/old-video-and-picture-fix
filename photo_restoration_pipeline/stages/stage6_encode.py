@@ -746,6 +746,36 @@ def _purge_publish_residue(journal_path: str, report: Dict[str, Any],
     return result
 
 
+def _persist_cancel_rollback(work_output_path: str, result) -> bool:
+    """把"取消时回滚的结果"持久写进 journal。
+
+    审核 R17 指出：原来直接调 `write_journal(...)` 却**忽略返回值** ——
+    只有抛异常才会记 `STAGE6_CANCEL_ROLLBACK_UNRECORDED`。而
+    `write_journal` 写失败时是**返回 False**（不抛），于是"回滚结果没落盘"
+    这件事被当成成功吞掉了。探针确认了这个差别。
+
+    现在：返回 False 也当作持久化失败抛出，交给调用方记 UNRECORDED；
+    "取消结果能否追溯"必须如实报告，不能因为没抛异常就当写成了。
+    """
+    _jp = journal_path_for(work_output_path)
+    _doc = read_journal(_jp)
+    if _doc is None:
+        # 没有 journal 可写 —— 不是"写成功"，也不是"写失败"，
+        # 而是**没有可记录的载体**，同样要留痕。
+        raise OSError("no readable journal to persist the cancel result into")
+    _doc = dict(_doc)
+    _doc["cancel_rollback"] = {
+        "fully_restored": bool((result or {}).get("fully_restored")),
+        "failed": (result or {}).get("failed"),
+        "error": (result or {}).get("error"),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if not write_journal(_jp, _doc):
+        raise OSError("write_journal returned False; the cancel rollback "
+                      "result was NOT persisted")
+    return True
+
+
 def _rollback_publish(snapshot: Dict[str, Dict[str, Optional[str]]],
                       logger=None) -> Dict[str, Any]:
     """把每个目标路径恢复成提交前的内容。
@@ -2022,17 +2052,7 @@ def main():
                             pass
                     # 持久记录：诊断写失败也要如实反映（异常向上抛，不吞）
                     try:
-                        _jp = journal_path_for(work_output_path)
-                        _doc = read_journal(_jp)
-                        if _doc is not None:
-                            _doc = dict(_doc)
-                            _doc["cancel_rollback"] = {
-                                "fully_restored": bool(_res.get("fully_restored")),
-                                "failed": _res.get("failed"),
-                                "error": _res.get("error"),
-                                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                            }
-                            write_journal(_jp, _doc)
+                        _persist_cancel_rollback(work_output_path, _res)
                     except Exception as _we:
                         try:
                             logger.error("STAGE6_CANCEL_ROLLBACK_UNRECORDED",
