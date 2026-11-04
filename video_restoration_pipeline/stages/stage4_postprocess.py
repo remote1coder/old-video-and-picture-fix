@@ -45,6 +45,20 @@ def _load_params(args):
     return json.loads(args.params) if args.params else {}
 
 
+def _inactivity_s(params):
+    """无进展阈值（秒），与阶段级看门狗同源。"""
+    try:
+        return float((params or {}).get("stage_inactivity_timeout", 1800.0))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _cg_heartbeat(guard, path):
+    """取 cancel_guard 的文件增长心跳；旧版本没有该助手时返回 None。"""
+    fn = getattr(guard, "file_growth_watch", None)
+    return fn(path) if fn is not None else None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -312,9 +326,11 @@ def main():
         # NEW-V-06/RV-12: 受管子进程——取消时 ffmpeg 一起收掉，
         # 否则守卫删掉的半截 mkv 会被孤儿 ffmpeg 重新写回来。
         if _cancel_guard is not None:
-            r = _cancel_guard.run_managed(cmd, capture_output=True,
-                                          text=True, timeout=3600,
-                                          shell=False, logger=logger)
+            r = _cancel_guard.run_managed(
+                cmd, capture_output=True, text=True, timeout=None,
+                progress_watch=_cg_heartbeat(_cancel_guard, output_path),
+                inactivity_timeout=_inactivity_s(params),
+                shell=False, logger=logger)
         else:  # pragma: no cover - 守卫缺失时退回原行为
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                                timeout=3600, shell=False)

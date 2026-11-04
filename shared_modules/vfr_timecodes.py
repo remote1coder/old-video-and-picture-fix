@@ -46,6 +46,8 @@ DURATION_TOLERANCE = 0.005
 #: 逐帧间隔容差（秒）。mkvmerge v2 支持小数毫秒、默认 scale 1ms，
 #: 正常误差 1–2ms；20ms 既留余量又能抓住"中间错 40ms"这类真实缺陷。
 INTERVAL_TOLERANCE = 0.02
+#: 重封装的无进展阈值（秒）。与阶段级看门狗同源；只看输出是否继续增长，不设总时长。
+INACTIVITY_TIMEOUT_S = 1800.0
 
 #: mkvmerge 的常见位置（按优先级）。项目内优先，其次系统安装目录。
 _CANDIDATES = (
@@ -215,12 +217,39 @@ def retime_to_source_pts(source_video: str, target_video: str,
 
     tmp_out = target_video + ".retimed" + (os.path.splitext(target_video)[1]
                                            or ".mkv")
+    # ---- 重封装也是"写文件"，按输出增长判活，不设总时长 ----
+    # 原来固定 `timeout=1800`：4K 16 位 ffv1 中间件单件约 250 GB，重封装要
+    # 逐包拷贝整条流，30 分钟根本不够；而换一个更长的素材又得再调一次。
+    # mkvmerge 不报进度，但**输出文件一直在长** —— 这就是真实进展。
+    # 注意必须并发排空管道，否则 stderr 写满会把它卡住。
     try:
-        r = subprocess.run(
+        _proc = subprocess.Popen(
             [mkvmerge, "-q", "-o", tmp_out, "--timestamps", "0:" + tc,
              target_video],
-            capture_output=True, text=True, errors="replace",
-            timeout=1800, shell=False)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+        try:
+            import cancel_guard as _cg
+            _outs, _rcs = _cg.collect_outputs_while_waiting(
+                [_proc], heartbeat=_cg.file_growth_watch(tmp_out),
+                inactivity_timeout=INACTIVITY_TIMEOUT_S, logger=None,
+                label="vfr-remux")
+            _err_txt = _outs[0]["stderr"].decode("utf-8", "replace")
+
+            class _R:
+                returncode = _rcs[0]
+                stderr = _err_txt
+                stdout = ""
+            r = _R()
+        except Exception:
+            # 守卫不可用时退回有界等待（行为与改动前一致）
+            _o, _e = _proc.communicate(timeout=1800)
+            _err_txt = _e.decode("utf-8", "replace") if _e else ""
+
+            class _R2:
+                returncode = _proc.returncode
+                stderr = _err_txt
+                stdout = ""
+            r = _R2()
     except (OSError, subprocess.SubprocessError) as exc:
         info["reason"] = f"mkvmerge failed to start: {exc}"
         return False, info

@@ -81,6 +81,26 @@ def test_R17_03_frame_doubling_is_not_rejected_as_vfr_mismatch():
 
 # ------------------------------------------------ 逐帧间隔阻断
 
+class _FakePopen:
+    """替身：满足 collect_outputs_while_waiting 所需的最小接口。
+
+    只替换**外部工具**（mkvmerge），不替换被测逻辑本身。
+    """
+
+    def __init__(self, cmd, **kw):
+        import io as _io
+        self.cmd = cmd
+        self.returncode = 0
+        self.stdout = _io.BytesIO(b"")
+        self.stderr = _io.BytesIO(b"mkvmerge fake ok\n")
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 def _fake_pts(n, step=1 / 30.0):
     return [i * step for i in range(n)]
 
@@ -122,16 +142,11 @@ def test_T13_middle_interval_error_blocks_even_if_last_pts_matches(
             return _fake_pts(30, 0.04)
         return list(bad)              # 重封装"之后"出现了 40ms 偏差
 
-    class _R:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
     monkeypatch.setattr(vt, "probe_pts", fake_probe)
     monkeypatch.setattr(vt, "write_timecodes_v2",
                         lambda pts, path, origin=0: (open(path, "w").close()
                                                      or True))
-    monkeypatch.setattr(vt.subprocess, "run", lambda *a, **k: _R())
+    monkeypatch.setattr(vt.subprocess, "Popen", _FakePopen)
 
     ok, info = vt.retime_to_source_pts(str(src), str(tgt), "mkvmerge",
                                        work_dir=str(tmp_path))
@@ -156,16 +171,11 @@ def test_T13_clean_retime_still_succeeds(tmp_path, monkeypatch):
         calls["n"] += 1
         return list(src_pts) if calls["n"] == 1 else list(shifted)
 
-    class _R:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
     monkeypatch.setattr(vt, "probe_pts", fake_probe)
     monkeypatch.setattr(vt, "write_timecodes_v2",
                         lambda pts, path, origin=0: (open(path, "w").close()
                                                      or True))
-    monkeypatch.setattr(vt.subprocess, "run", lambda *a, **k: _R())
+    monkeypatch.setattr(vt.subprocess, "Popen", _FakePopen)
 
     ok, info = vt.retime_to_source_pts(str(src), str(tgt), "mkvmerge",
                                        work_dir=str(tmp_path))

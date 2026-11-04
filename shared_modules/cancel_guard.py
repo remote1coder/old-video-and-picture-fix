@@ -583,6 +583,84 @@ def _kill_tree_quietly(proc: Any) -> None:
     _kill_quietly(proc)
 
 
+def file_growth_watch(path):
+    """心跳源：某个输出文件的字节数。
+
+    编码/封装类子进程都是"边跑边写"，卡住就不长了 —— 这是**真实进展**，
+    比"总耗时"可靠得多（见 `wait_with_heartbeat` 的说明）。
+    文件还不存在时返回 0，仍然是一个合法且可比较的标记。
+    """
+    def _watch():
+        try:
+            return os.path.getsize(path) if os.path.exists(path) else 0
+        except BaseException:
+            return 0
+    return _watch
+
+
+def collect_outputs_while_waiting(procs, heartbeat, inactivity_timeout,
+                                  logger=None, label="pipeline"):
+    """等一组已启动的进程，**并发排空**它们的 stdout/stderr，按心跳判卡死。
+
+    为什么不能只 wait
+    ----------------
+    `communicate()` 之所以能用于管道，是因为它**同时**在读管道。直接换成
+    `wait()` 会在子进程写满管道缓冲区（Windows 约 64KB）时把它卡死 ——
+    于是"换成心跳"反而制造了一个死锁。
+
+    所以这里先给每个非 None 的 stdout/stderr 起一个排空线程，再按心跳等待。
+    返回 ``(outputs, returncodes)``，``outputs[i]`` 是第 i 个进程的
+    ``{"stdout": bytes, "stderr": bytes}``。
+
+    Raises:
+        StageStalled: 心跳停止超过 ``inactivity_timeout``（整组已被杀掉）。
+    """
+    import threading
+
+    sinks = []
+    threads = []
+    for proc in procs:
+        if proc is None:
+            sinks.append({"stdout": [], "stderr": []})
+            continue
+        buf = {"stdout": [], "stderr": []}
+        for attr in ("stdout", "stderr"):
+            pipe = getattr(proc, attr, None)
+            if pipe is None:
+                continue
+
+            def _pump(pipe=pipe, sink=buf[attr]):
+                try:
+                    while True:
+                        chunk = pipe.read(65536)
+                        if not chunk:
+                            break
+                        sink.append(chunk)
+                except BaseException:
+                    pass
+
+            t = threading.Thread(target=_pump, daemon=True)
+            t.start()
+            threads.append(t)
+        sinks.append(buf)
+
+    try:
+        wait_with_heartbeat([p for p in procs if p is not None],
+                            heartbeat=heartbeat,
+                            inactivity_timeout=inactivity_timeout,
+                            logger=logger, label=label)
+    finally:
+        for t in threads:
+            try:
+                t.join(timeout=10)
+            except BaseException:
+                pass
+
+    outputs = [{"stdout": b"".join(b["stdout"]),
+                "stderr": b"".join(b["stderr"])} for b in sinks]
+    return outputs, [getattr(p, "returncode", None) for p in procs]
+
+
 def _decode_like_subprocess(data, encoding, errors):
     """把收集到的 bytes 按 **subprocess.run(text=True) 完全相同**的语义解码。
 

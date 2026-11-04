@@ -1122,6 +1122,14 @@ def _load_params(args):
     return json.loads(args.params) if args.params else {}
 
 
+def _inactivity_s(params):
+    """无进展阈值（秒）。与阶段级看门狗同源，默认 1800。"""
+    try:
+        return float((params or {}).get("stage_inactivity_timeout", 1800.0))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -1319,7 +1327,22 @@ def main():
             _cancel_guard.watch_process(vp)
             _cancel_guard.watch_process(ff)
         try:
-            _, stderr = ff.communicate(timeout=7200)
+            # ---- 按**心跳**等，不按总时长 ----
+            # 原来是 `ff.communicate(timeout=7200)`：整段 QTGMC 预处理在长片上
+            # 远超 2 小时（4K 长片按实测是十几小时量级）。心跳 = 输出文件字节数，
+            # 只要还在增长就永不超时；真卡死（停满异常阈值）才杀。
+            # 注意 `collect_outputs_while_waiting` 会**并发排空**管道，
+            # 否则 stderr 写满 64KB 会把 ffmpeg 卡住。
+            _cg = _cancel_guard
+            if _cg is not None and hasattr(_cg, "collect_outputs_while_waiting"):
+                _outs, _rcs = _cg.collect_outputs_while_waiting(
+                    [vp, ff],
+                    heartbeat=_cg.file_growth_watch(inter_path),
+                    inactivity_timeout=_inactivity_s(params),
+                    logger=logger, label="stage1-preprocess")
+                stderr = _outs[1]["stderr"]
+            else:                       # pragma: no cover - 守卫缺失时退回旧行为
+                _, stderr = ff.communicate(timeout=7200)
         finally:
             if _cancel_guard is not None:
                 _cancel_guard.unwatch_process(vp)
@@ -1381,7 +1404,19 @@ def main():
                     ff2 = subprocess.Popen(ffmpeg_cmd_srestore, stdin=vp2.stdout,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
                     vp2.stdout.close()
-                    _, stderr2 = ff2.communicate(timeout=7200)
+                    # 同上：按输出文件增长判活，不设总时长
+                    _cg2 = _cancel_guard
+                    if (_cg2 is not None
+                            and hasattr(_cg2, "collect_outputs_while_waiting")):
+                        _outs2, _ = _cg2.collect_outputs_while_waiting(
+                            [vp2, ff2],
+                            heartbeat=_cg2.file_growth_watch(
+                                srestore_inter_path),
+                            inactivity_timeout=_inactivity_s(params),
+                            logger=logger, label="stage1-srestore")
+                        stderr2 = _outs2[1]["stderr"]
+                    else:               # pragma: no cover
+                        _, stderr2 = ff2.communicate(timeout=7200)
                     if ff2.returncode == 0 and Path(srestore_inter_path).exists():
                         # Atomic replace: only overwrite original on success
                         import shutil
