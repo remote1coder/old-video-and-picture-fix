@@ -286,12 +286,23 @@ def read_plan(temp_dir: str, job_id: str,
         if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
             return None
         if identity is not None:
-            got = doc.get("identity") or {}
+            # ---- "缺身份"不等于"没有冲突" ----
+            # 原实现只比对**双方都有值**的项，于是**旧计划（根本没有
+            # identity 字段）**会被当成"没有冲突"接受 —— 同 job_id 复用
+            # temp 时，上一轮的"源已验证"会被当成本次结论（审核探针确认）。
+            #
+            # 新规则：调用方期望了某一维度，计划就**必须**有该维度且相等；
+            # 缺项一律视为不可比 → 拒绝。调用方没给的维度才跳过。
+            got = doc.get("identity")
+            if not isinstance(got, dict) or not got:
+                return None
             for _k in ("source_input", "param_hash", "attempt_id"):
                 _want = identity.get(_k)
-                # 只比对**双方都有值**的项：缺证据不等于不符，
-                # 但"值不同"一定是不符。
-                if _want and got.get(_k) and str(got[_k]) != str(_want):
+                if not _want:
+                    continue
+                if not got.get(_k):
+                    return None      # 期望有值、计划却没有 → 不可比
+                if str(got[_k]) != str(_want):
                     return None
         return doc
     except (OSError, ValueError, TypeError):

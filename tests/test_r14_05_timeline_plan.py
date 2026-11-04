@@ -365,11 +365,25 @@ def test_build_identity_uses_run_plan():
     assert i2["param_hash"] == "" and i2["attempt_id"] == ""
 
 
-def test_missing_evidence_on_either_side_is_not_a_mismatch(tmp_path):
-    """双方都缺值 ≠ 不符：不能因为老计划没写身份就一律拒绝。"""
+def test_plan_without_identity_is_rejected_when_identity_is_expected(tmp_path):
+    """**R17-04 改变了这条规则**：缺身份 ≠ 相符。
+
+    原用例（`test_missing_evidence_on_either_side_is_not_a_mismatch`）断言
+    "计划没写身份 → 照样接受"。审核用探针确认了它的后果：
+
+    - 同 job_id 复用 temp 时，**上一轮**留下的计划（没有 identity 字段）
+      会被当成本次的"源已验证"；
+    - `read_plan` 只比对"双方都有值"的项，于是缺项永远不冲突。
+
+    "量不出来"不能被当作"没有问题"（本项目已多次栽在这类判据上）。
+    新规则：调用方**期望了**某一维度，计划就必须有该维度且相等；
+    调用方没给的维度才跳过（`identity=None` 时保持原语义）。
+    """
     from timeline_plan import write_plan
     plan = tp.build_plan("j1", "cfr", fps_value="25", fps_source="probe")
     assert write_plan(str(tmp_path), plan)
-    # 计划里 identity 为空 dict
+    # 计划里 identity 为空/缺失 → 与"期望了 source_input"不可比 → 拒绝
     assert tp.read_plan(str(tmp_path), "j1",
-                        identity={"source_input": "/src/a.mp4"}) is not None
+                        identity={"source_input": "/src/a.mp4"}) is None
+    # 但调用方没有期望时仍可读（不是所有入口都有期望身份）
+    assert tp.read_plan(str(tmp_path), "j1") is not None

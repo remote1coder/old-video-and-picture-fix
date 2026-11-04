@@ -497,12 +497,27 @@ def test_rv09_output_without_completion_marker_is_not_reused(tmp_path):
     assert ok is False and reason
 
 
+def _write_receipt(final, src):
+    """写一份"本代"的 verify 报告（含 run_identity）。
+
+    R17-01 之后，marker 要求 verify.json 带 run_identity 才肯写 ——
+    只比对"当前 verify 与当前媒体彼此一致"已经不够（下一代会把两者一起
+    替换，二者仍然自洽）。这些用例原本不写报告，现在必须补上。
+    """
+    import json as _json
+    with open(str(final) + ".verify.json", "w", encoding="utf-8") as f:
+        _json.dump({"media_sha256": vmain._plain_sha256(str(final)),
+                    "run_identity": {
+                        "input": vmain.build_input_identity(str(src))}}, f)
+
+
 def test_rv09_matching_marker_is_accepted(tmp_path):
     src = tmp_path / "clip.mp4"
     src.write_bytes(b"\x01" * 64)
     final = tmp_path / "clip_restored.mkv"
     final.write_bytes(b"\x02" * 64)
     job = {"job_id": "j1", "input_path": str(src)}
+    _write_receipt(final, src)
     assert vmain.write_completion_marker(str(final), job, {}, None)
     ok, reason = vmain.resume_artifact_matches(str(final), job, {}, None)
     assert ok is True, reason
@@ -514,6 +529,7 @@ def test_rv09_changed_input_invalidates_the_artifact(tmp_path):
     final = tmp_path / "clip_restored.mkv"
     final.write_bytes(b"\x02" * 64)
     job = {"job_id": "j1", "input_path": str(src)}
+    _write_receipt(final, src)
     vmain.write_completion_marker(str(final), job, {}, None)
     src.write_bytes(b"\x09" * 64)  # 素材换了
     ok, _reason = vmain.resume_artifact_matches(str(final), job, {}, None)
@@ -525,6 +541,7 @@ def test_rv09_same_basename_different_job_is_not_reused(tmp_path):
     src.write_bytes(b"\x01" * 64)
     final = tmp_path / "clip_restored.mkv"
     final.write_bytes(b"\x02" * 64)
+    _write_receipt(final, src)
     vmain.write_completion_marker(str(final),
                                   {"job_id": "j1", "input_path": str(src)},
                                   {}, None)

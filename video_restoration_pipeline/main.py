@@ -2949,43 +2949,6 @@ def main():
     # 审核 R17-06：'manifest ownership 写入早于完整计划检查'。领取会**改写
     # manifest 文件本身**；如果它落在授权写根之外，就变成"先写再验"——
     # 事后报错也已经写过磁盘了。这里在写之前先判一次。
-    _pre_roots = []
-    try:
-        _awr = getattr(args, "allow_write_root", None)
-        if _awr:
-            _pre_roots.append(_awr)
-        _cwr = config.get("allowed_write_roots") or []
-        if isinstance(_cwr, str):
-            _cwr = [_cwr]
-        _pre_roots.extend([str(r) for r in _cwr if r])
-    except Exception:                     # pragma: no cover
-        _pre_roots = []
-    if _pre_roots:
-        try:
-            from run_plan import is_within as _is_within
-        except Exception:                 # pragma: no cover
-            _is_within = None
-        if _is_within is not None and not any(
-                _is_within(manifest_path, r) for r in _pre_roots):
-            logger.error(
-                "MANIFEST_OUTSIDE_WRITE_ROOTS",
-                "The manifest would be rewritten to claim this run, but it "
-                "is outside every authorized write root; refusing to write "
-                "before validating the path plan.",
-                manifest_path=str(manifest_path), write_roots=_pre_roots)
-            return 82
-
-    run_generation = acquire_run_ownership(
-        manifest_path, _claimed_ids, owner=run_owner)
-    if run_generation is None:
-        # R3-11：领取失败意味着"结果无处可写"，必须停止，不能照常执行并报成功。
-        logger.error("RUN_CLAIM_FAILED",
-                     "Could not claim this run's jobs in the manifest; "
-                     "refusing to report success later")
-        print("ERROR: could not claim this run's jobs in the manifest; "
-              "not producing artifacts that cannot be recorded.",
-              file=sys.stderr)
-        sys.exit(82)
 
     # ---- R16-04：dispatch 前**一次性**检查所有 job 的计划 ----
     # 这里必须用与 job 执行**完全相同**的合并规则和计划解析：
@@ -3056,6 +3019,25 @@ def main():
                         jobs=len(_plans),
                         write_roots=_plan_write_roots(args, config)
                         or "unrestricted")
+
+    # ---- R16-04 / R17-06：**先校验，再改写 manifest** ----
+    # 审核指出"manifest ownership 写入早于完整计划检查"。claim 会**改写
+    # manifest 文件本身**，所以它必须排在批次计划校验之后：
+    # 计划不成立时，一个字节都不该写进 manifest。
+    # （注意：不能给 manifest 强加"必须在写根内"的约束 —— `--allow-write-root`
+    #  管的是媒体/临时/日志产物，manifest 是用户在命令行显式指定的，
+    #  实测那样会把合法的"manifest 在根外、产物在根内"批次也拒掉。）
+    run_generation = acquire_run_ownership(
+        manifest_path, _claimed_ids, owner=run_owner)
+    if run_generation is None:
+        # R3-11：领取失败意味着"结果无处可写"，必须停止，不能照常执行并报成功。
+        logger.error("RUN_CLAIM_FAILED",
+                     "Could not claim this run's jobs in the manifest; "
+                     "refusing to report success later")
+        print("ERROR: could not claim this run's jobs in the manifest; "
+              "not producing artifacts that cannot be recorded.",
+              file=sys.stderr)
+        sys.exit(82)
 
     # Parallel worker pool
     workers = max(1, args.workers)

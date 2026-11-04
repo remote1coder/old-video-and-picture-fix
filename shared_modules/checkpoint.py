@@ -100,6 +100,11 @@ CORE_QUALITY_PARAMS = frozenset([
     "qtgmc_chromamotion", "qtgmc_sourcematch", "qtgmc_fps_divisor",
     # IVTC
     "ivtc",
+    # R17-04：人工帧率重解释**会改变输出时间轴**，必须参与身份。
+    # 实测：固定输入下 25 / 30000/1001 / 50 曾得到同一个 param_hash，
+    # 于是"改了帧率解释却复用旧中间产物"在文件名层面看不出来。
+    # （更完整的 stage identity 能补偿一部分，但不能靠补偿掩盖缺口。）
+    "fps_interpret",
     "vfm_mode",           # FIX-P2-5: VFM mode per v7.32 §3.7 / §3.10.19
     "vdecimate_cycle",    # FIX-P2-5: VDecimate cycle per v7.32 §3.7 / §3.10.19
     # Color space

@@ -83,16 +83,19 @@ def test_log_dir_default_is_not_cwd_relative():
             os.path.abspath(str(vmain.SCRIPT_DIR.parent)))
 
 
-def test_manifest_claim_is_guarded_by_write_roots():
-    """结构守卫：领取（改写 manifest）之前必须有写根校验。
+def test_manifest_claim_happens_after_the_batch_plan_check():
+    """结构守卫：claim（改写 manifest）必须排在**批次计划校验之后**。
 
-    这是"先写再验"的反面 —— 校验必须出现在 `acquire_run_ownership` 调用**之前**。
+    审核 R17-06 的原话是"manifest ownership 写入早于完整计划检查"——
+    要的是**顺序**，不是给 manifest 加"必须在写根内"的约束。
+    （第一版我加过那种约束，结果把"manifest 在根外、产物在根内"的合法批次
+      也拒掉了，既有 5 条测试由 rc=82 变成静默 rc=0。已回退。）
     """
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
                encoding="utf-8", errors="replace").read()
-    i_guard = src.find("MANIFEST_OUTSIDE_WRITE_ROOTS")
+    i_plan = src.find("BATCH_PLAN_CONFLICT")
     i_claim = src.find("run_generation = acquire_run_ownership(")
-    assert i_guard > 0, "缺少 manifest 写根校验"
+    assert i_plan > 0, "缺少批次计划冲突检查"
     assert i_claim > 0
-    assert i_guard < i_claim, \
-        "写根校验必须在 acquire_run_ownership 之前（否则就是先写再验）"
+    assert i_claim > i_plan, \
+        "claim 必须在批次计划校验之后（否则计划不成立时已经改写了 manifest）"
