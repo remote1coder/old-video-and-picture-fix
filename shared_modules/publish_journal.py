@@ -288,6 +288,53 @@ def _is_within(child: str, parent: str) -> bool:
     return os.path.normcase(c).startswith(os.path.normcase(p) + os.sep)
 
 
+def validate_journal_structure(doc: Dict[str, Any]) -> List[str]:
+    """校验 journal 的**结构完整性**（与路径越界校验分开）。
+
+    审核 R17-02 指出：`validate_journal_paths` 只管"路径在不在授权根内"，
+    没有校验 `targets` 与 `records` 的**对应关系**。受控探针构造了
+    "records 里有未列入 targets 的对象"的 journal，恢复逻辑仍然对它执行了
+    删除计划 —— 等于让 journal 自行扩张它的作用域。
+
+    返回违规说明列表（空列表 = 通过）。检查项：
+    - `records` 必须是非空 dict；
+    - `targets` 必须是非空字符串列表；
+    - **每个 record 的键都必须在 targets 里**（records 不能超出目标集合）；
+    - `phase` 若存在必须是字符串。
+    """
+    problems: List[str] = []
+    if not isinstance(doc, dict):
+        return ["journal document is not an object"]
+
+    targets = doc.get("targets")
+    if not isinstance(targets, (list, tuple)) or not targets:
+        problems.append("targets is missing or empty")
+        targets = []
+    else:
+        for t in targets:
+            if not isinstance(t, str) or not t.strip():
+                problems.append(f"targets contains a non-string entry: {t!r}")
+    _tset = {str(t) for t in targets if isinstance(t, str)}
+
+    records = doc.get("records")
+    if not isinstance(records, dict) or not records:
+        problems.append("records is missing or empty")
+    else:
+        for key in records:
+            if not isinstance(key, str):
+                problems.append(f"records has a non-string key: {key!r}")
+                continue
+            if _tset and key not in _tset:
+                problems.append(
+                    f"records contains a path that is not in targets: {key}")
+
+    phase = doc.get("phase")
+    if phase is not None and not isinstance(phase, str):
+        problems.append(f"phase is not a string: {phase!r}")
+
+    return problems
+
+
 def validate_journal_paths(doc: Dict[str, Any],
                            allowed_roots: Sequence[str]) -> List[str]:
     """校验 journal 里所有路径都在 `allowed_roots` 内。

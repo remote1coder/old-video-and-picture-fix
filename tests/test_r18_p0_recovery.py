@@ -182,3 +182,151 @@ def test_R17_02_missing_journal_still_returns_none(tmp_path):
     res = pub.recover(str(tmp_path / "nope.json"), str(tmp_path / "bak"),
                       "att-F")
     assert res is None
+
+
+# ------------------------------------------------ T03 journal 结构
+
+def test_T03_validate_structure_flags_records_outside_targets():
+    """records 里有未列入 targets 的路径 → 必须报结构问题。
+
+    审核受控探针：这种 journal 会让恢复对"目标集合之外"的对象执行删除计划。
+    """
+    from publish_journal import validate_journal_structure as vjs
+
+    doc = {
+        "phase": "PREPARED",
+        "targets": ["/allowed/a.mkv"],
+        "records": {
+            "/allowed/a.mkv": {"existed": True},
+            "/elsewhere/b.mkv": {"existed": True},   # ← 越界
+        },
+    }
+    problems = vjs(doc)
+    assert problems, "records 超出 targets 必须被报出来"
+    assert any("not in targets" in p for p in problems), problems
+
+
+def test_T03_validate_structure_accepts_a_consistent_journal():
+    """一致的结构不能误报（防止修过头把正常 journal 也拒了）。"""
+    from publish_journal import validate_journal_structure as vjs
+
+    doc = {
+        "phase": "PREPARED",
+        "targets": ["/allowed/a.mkv", "/allowed/a.json"],
+        "records": {
+            "/allowed/a.mkv": {"existed": True},
+            "/allowed/a.json": {"existed": True},
+        },
+    }
+    assert vjs(doc) == []
+
+
+def test_T03_validate_structure_flags_missing_targets():
+    from publish_journal import validate_journal_structure as vjs
+    assert vjs({"records": {"/x": {}}})
+    assert vjs({"targets": ["/x"], "records": {}})
+
+
+def test_T03_recover_refuses_inconsistent_journal_and_touches_nothing(tmp_path):
+    """**核心**：结构不成立 → 恢复拒绝，且越界路径**一个字节都不动**。"""
+    inside = tmp_path / "a.mkv"
+    inside.write_bytes(b"INSIDE")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.bin"
+    victim.write_bytes(b"MUST-NOT-BE-TOUCHED")
+
+    jp = str(tmp_path / "journal.json")
+    doc = {
+        "attempt_id": "att-X",
+        "phase": "PREPARED",
+        "targets": [str(inside)],
+        "records": {
+            str(inside): {"existed": True,
+                          "old_digest": "0" * 64, "new_digest": "1" * 64},
+            str(victim): {"existed": True,
+                          "old_digest": "2" * 64, "new_digest": "3" * 64},
+        },
+    }
+    assert write_journal(jp, doc) is True
+
+    res = pub.recover(jp, str(tmp_path / "bak"), "att-Y")
+    assert res is not None
+    assert res.get("ok") is False, res
+    assert "structure" in (res.get("reason") or "").lower(), res
+    # 越界对象必须原封不动
+    assert victim.exists() and victim.read_bytes() == b"MUST-NOT-BE-TOUCHED"
+
+
+# ------------------------------------------------ T03 journal 结构
+
+def test_T03_validate_structure_flags_records_outside_targets():
+    """records 里有未列入 targets 的路径 → 必须报结构问题。
+
+    审核受控探针：这种 journal 会让恢复对"目标集合之外"的对象执行删除计划。
+    """
+    from publish_journal import validate_journal_structure as vjs
+
+    doc = {
+        "phase": "PREPARED",
+        "targets": ["/allowed/a.mkv"],
+        "records": {
+            "/allowed/a.mkv": {"existed": True},
+            "/elsewhere/b.mkv": {"existed": True},   # ← 越界
+        },
+    }
+    problems = vjs(doc)
+    assert problems, "records 超出 targets 必须被报出来"
+    assert any("not in targets" in p for p in problems), problems
+
+
+def test_T03_validate_structure_accepts_a_consistent_journal():
+    """一致的结构不能误报（防止修过头把正常 journal 也拒了）。"""
+    from publish_journal import validate_journal_structure as vjs
+
+    doc = {
+        "phase": "PREPARED",
+        "targets": ["/allowed/a.mkv", "/allowed/a.json"],
+        "records": {
+            "/allowed/a.mkv": {"existed": True},
+            "/allowed/a.json": {"existed": True},
+        },
+    }
+    assert vjs(doc) == []
+
+
+def test_T03_validate_structure_flags_missing_targets():
+    from publish_journal import validate_journal_structure as vjs
+    assert vjs({"records": {"/x": {}}})
+    assert vjs({"targets": ["/x"], "records": {}})
+
+
+def test_T03_recover_refuses_inconsistent_journal_and_touches_nothing(tmp_path):
+    """**核心**：结构不成立 → 恢复拒绝，且越界路径**一个字节都不动**。"""
+    inside = tmp_path / "a.mkv"
+    inside.write_bytes(b"INSIDE")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.bin"
+    victim.write_bytes(b"MUST-NOT-BE-TOUCHED")
+
+    jp = str(tmp_path / "journal.json")
+    doc = {
+        "attempt_id": "att-X",
+        "phase": "PREPARED",
+        "targets": [str(inside)],
+        "records": {
+            str(inside): {"existed": True,
+                          "old_digest": "0" * 64, "new_digest": "1" * 64},
+            str(victim): {"existed": True,
+                          "old_digest": "2" * 64, "new_digest": "3" * 64},
+        },
+    }
+    assert write_journal(jp, doc) is True
+
+    res = pub.recover(jp, str(tmp_path / "bak"), "att-Y")
+    assert res is not None
+    assert res.get("ok") is False, res
+    assert "structure" in (res.get("reason") or "").lower(), res
+    # 越界对象必须原封不动
+    assert victim.exists() and victim.read_bytes() == b"MUST-NOT-BE-TOUCHED"

@@ -742,6 +742,27 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
     if doc is None:
         return {"ok": False, "reason": "journal unreadable"}
 
+    # ---- R17-02：先校验**结构**，再做任何基于 records 的动作 ----
+    # 恢复是按 records 迭代的。如果 records 里有**未列入 targets** 的对象，
+    # 恢复就会对"目标集合之外"的路径执行删除/回滚计划 ——
+    # 等于让 journal 自行扩张它的作用域（审核受控探针复现）。
+    # 结构不成立时按"未知"处理：一个路径都不碰。
+    try:
+        from publish_journal import validate_journal_structure as _vjs
+        _struct_problems = _vjs(doc)
+    except Exception:                     # pragma: no cover
+        _struct_problems = []
+    if _struct_problems:
+        if logger:
+            logger.error(
+                "PUBLISH_JOURNAL_STRUCTURE_INVALID",
+                "The journal's structure is inconsistent; refusing to act on "
+                "any of its records.",
+                journal_path=journal_path, problems=_struct_problems[:5])
+        return {"ok": False, "journal_path": journal_path,
+                "reason": ("journal structure is inconsistent: "
+                           + "; ".join(_struct_problems[:3]))}
+
     records = doc.get("records") or {}
     phase = doc.get("phase")
 
