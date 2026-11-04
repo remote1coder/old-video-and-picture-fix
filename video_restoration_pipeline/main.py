@@ -906,13 +906,22 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
     # 做法：目标锁内把当前媒体摘要与 verify.json 的 `media_sha256` 核对；
     # 不一致就**拒绝写标记**（宁可没有标记，也不写错归属）。
     _gen_digest = None
-    _lock = None
+    # ---- 锁必须真正进入（enter），不能只拿到上下文管理器 ----
+    # 原实现 `_lock = _acq(...)` 之后**从未 __enter__**，只在 finally 里调了
+    # `__exit__`。而 acquire_target_locks 是 **generator 型**上下文管理器：
+    # 不 next() 就一行都不执行 —— 于是
+    #   ① 核验**在无锁状态下**进行（审核探针确认"核验 verify 时未持锁"）；
+    #   ② finally 里的 __exit__ 反而把生成器启动，锁被获取后永不释放
+    #      （contextlib 在"生成器没停"时抛 RuntimeError，又被 except 吞掉）。
+    # 现在改成标准的 with 用法：进入即在锁内，退出必释放。
     try:
         from publish_lock import acquire_target_locks as _acq
-        _lock = _acq([final_path], timeout=60, logger=logger)
+        _lock_ctx = _acq([final_path], timeout=60, logger=logger)
     except Exception:                      # pragma: no cover
-        _lock = None
-    try:
+        from contextlib import nullcontext as _nullcontext
+        _lock_ctx = _nullcontext()
+
+    with _lock_ctx:
         _recorded = None
         try:
             with open(str(final_path) + ".verify.json", "r",
@@ -935,12 +944,6 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
                     recorded=_recorded[:16], actual=_actual[:16])
             return False
         _gen_digest = None
-    finally:
-        try:
-            if _lock is not None:
-                _lock.__exit__(None, None, None)
-        except Exception:
-            pass
 
     payload = {
         "impl": VIDEO_IMPL_VERSION,
