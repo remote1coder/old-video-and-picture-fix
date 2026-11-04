@@ -541,6 +541,52 @@ def _kill_tree_quietly(proc: Any) -> None:
     _kill_quietly(proc)
 
 
+def _decode_like_subprocess(data, encoding, errors):
+    """把收集到的 bytes 按 **subprocess.run(text=True) 完全相同**的语义解码。
+
+    区别在于**换行**：`subprocess` 用 ``io.TextIOWrapper(..., newline=None)``
+    包装管道，会把 ``\r\n`` / ``\r`` 统一成 ``\n``；裸 ``bytes.decode()``
+    不会。实测同一子进程：
+        subprocess.run(text=True).stdout  -> 'o\n'
+        bytes.decode()                    -> 'o\r\n'
+    两者不一致会让"与 subprocess.run 语义相同"的承诺落空，也会让 grep/断言
+    在 Windows 上莫名其妙地失败。这里用同样的 TextIOWrapper 复现。
+    """
+    import io as _io
+
+    if not isinstance(data, (bytes, bytearray)):
+        return data
+    try:
+        return _io.TextIOWrapper(_io.BytesIO(bytes(data)),
+                                 encoding=encoding, errors=errors,
+                                 newline=None).read()
+    except (LookupError, ValueError):
+        # 编码名非法等极端情况：退化为普通解码，不要让日志收集抛错
+        return bytes(data).decode("utf-8", "replace")
+
+
+def _join_chunks(chunks):
+    """把收集到的管道块拼成 bytes。
+
+    正常路径全是 bytes（Popen 由 run_managed 统一建成二进制）。
+    这里保留一条防御性兜底：真混进 str 时也**不能**让日志收集抛
+    TypeError 把子进程的真实失败原因掩盖掉 —— 那正是本函数要修的缺陷。
+    """
+    if not chunks:
+        return b""
+    if isinstance(chunks[0], (bytes, bytearray)):
+        try:
+            return b"".join(chunks)
+        except TypeError:
+            return b"".join(
+                c.encode("utf-8", "replace") if isinstance(c, str) else c
+                for c in chunks)
+    # 首块是 str：整体按文本拼接后再编码，交给上层按需解码
+    return "".join(
+        c.decode("utf-8", "replace") if isinstance(c, (bytes, bytearray)) else c
+        for c in chunks).encode("utf-8", "replace")
+
+
 def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
                              inactivity_timeout, poll_interval):
     """轮询子进程进度，无进展超阈值则杀掉并抛 :class:`StageStalled`。
@@ -619,8 +665,8 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
         for t in threads:
             t.join(timeout=10)
 
-    out = b"".join(chunks["out"])
-    err = b"".join(chunks["err"])
+    out = _join_chunks(chunks["out"])
+    err = _join_chunks(chunks["err"])
     if stalled:
         if logger is not None:
             try:
@@ -774,7 +820,30 @@ def run_managed(cmd, timeout=None, logger=None, progress_watch=None,
     import subprocess
 
     capture = kwargs.pop("capture_output", False)
-    text = kwargs.pop("text", False)
+
+    # ---- 输出模式必须**由这里决定**，不能交给 Popen 隐式判定 ----
+    # CPython 的判定是：`text_mode = encoding or errors or text or universal_newlines`
+    # 也就是说 **`errors='replace'` 单独存在就会让 Popen 变成文本流**。
+    # 原实现只 pop 了 `text`、把 `errors` 留在 kwargs 里，于是：
+    #   * Popen 实际是文本模式 → 管道产出 str；
+    #   * `_supervise_with_watchdog` 却用 `b"".join` 收集 → **TypeError**；
+    #   * 而 `text=True` 的调用方拿到的反而是 bytes（与 subprocess.run 不符）。
+    # 实测：`Popen(..., errors='replace').communicate()` 返回 `str`，
+    # 不带 errors 时返回 `bytes`。
+    #
+    # 现在统一：Popen 一律二进制，收集完再在边界按需解码。这样
+    #   * 收集器永远只看 bytes，不会因日志内容炸掉；
+    #   * 调了 text/encoding/errors 的调用方拿到 str（与 subprocess.run 一致）；
+    #   * 没调的调用方（如 stage5 的编码）仍是 bytes，`r.stderr.decode()`
+    #     这类既有用法不受影响。
+    _text_req = kwargs.pop("text", False)
+    _univ_req = kwargs.pop("universal_newlines", None)
+    _enc_req = kwargs.pop("encoding", None)
+    _err_req = kwargs.pop("errors", None)
+    text_mode = bool(_text_req or _univ_req or _enc_req is not None
+                     or _err_req is not None)
+    _dec_enc = _enc_req or "utf-8"
+    _dec_err = _err_req or "replace"
     if capture:
         kwargs.setdefault("stdout", subprocess.PIPE)
         kwargs.setdefault("stderr", subprocess.PIPE)
@@ -808,12 +877,10 @@ def run_managed(cmd, timeout=None, logger=None, progress_watch=None,
     finally:
         guard.unwatch_process(proc)
 
-    if text:
-        # watchdog 路径下 _pump 收集到的已经是 str（Popen(text=True) 建的是
-        # 文本流），只有 communicate() 路径给的是 bytes —— 必须按类型判断，
-        # 否则对 str 调 .decode 会 AttributeError。
-        if isinstance(out, (bytes, bytearray)):
-            out = bytes(out).decode("utf-8", "replace")
-        if isinstance(err, (bytes, bytearray)):
-            err = bytes(err).decode("utf-8", "replace")
+    # 两条路径（communicate / watchdog）现在**都**是 bytes，
+    # 按调用方是否要求文本模式统一解码。仍保留 isinstance 判断，
+    # 万一将来某条路径改了实现也不会 AttributeError。
+    if text_mode:
+        out = _decode_like_subprocess(out, _dec_enc, _dec_err)
+        err = _decode_like_subprocess(err, _dec_enc, _dec_err)
     return subprocess.CompletedProcess(cmd, returncode, out, err)

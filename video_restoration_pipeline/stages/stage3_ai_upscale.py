@@ -764,6 +764,73 @@ def _run_dat_batch(window_dirs: List[Tuple[str, str]], model: str,
 
 # FIX-P8-9: Batch model loading for Python API path
 # ORIGINAL: Per-window model loading via run_realesrgan (slow for Python API)
+def _reap_stream_pipeline(procs, logger=None, label="pipeline"):
+    """无条件收尾一组管道进程：停止 → 等退出 → 杀残留 → 关句柄。
+
+    为什么需要它：三进程管道（解码→AI→编码）任何一个环节出错，都必须把
+    **整组**收掉。只杀当前那个会留下上游/下游孤儿，它们会继续往输出文件
+    写数据，而取消守卫已经把半成品删了 —— 结果是"删了又被重建"（RV-12）。
+
+    本函数不抛异常：收尾阶段再抛错只会掩盖真正的原因。
+    """
+    import time as _time
+
+    def _note(evt, **kw):
+        if logger is not None:
+            try:
+                logger.warning(evt, "pipeline cleanup", **kw)
+            except BaseException:
+                pass
+
+    live = []
+    for p in procs:
+        if p is None:
+            continue
+        try:
+            if p.poll() is None:
+                live.append(p)
+        except BaseException:
+            continue
+
+    # ① 先礼后兵：terminate 让 ffmpeg 有机会写完整尾巴
+    for p in live:
+        try:
+            p.terminate()
+        except BaseException:
+            pass
+
+    # ② 有界等待，超时才 kill
+    deadline = _time.monotonic() + 10.0
+    for p in live:
+        remaining = max(0.1, deadline - _time.monotonic())
+        try:
+            p.wait(timeout=remaining)
+        except BaseException:
+            try:
+                p.kill()
+            except BaseException:
+                pass
+            try:
+                p.wait(timeout=5)
+            except BaseException:
+                _note("STAGE3_PIPE_REAP_INCOMPLETE",
+                      label=label, pid=getattr(p, "pid", None))
+
+    # ③ 关闭残留句柄（stderr 已由 with 关闭，stdout 可能还开着）
+    for p in procs:
+        if p is None:
+            continue
+        for attr in ("stdout", "stderr", "stdin"):
+            h = getattr(p, attr, None)
+            if h is None:
+                continue
+            try:
+                if not h.closed:
+                    h.close()
+            except BaseException:
+                pass
+
+
 def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          fps_str, model, model_dir, ai_py, gpu_id=0,
                          timeout_s=None, inactivity_s=1800,
@@ -847,6 +914,10 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     err_paths = {}
     for _tag in ("dec", "ai", "enc"):
         err_paths[_tag] = os.path.join(tmpd, f"{_tag}.err")
+
+    # 失败原因在这里累积，**收尾统一交给下面的 finally**。
+    # 不在 except 里直接 return：那样会绕过公共清理路径（见下方注释）。
+    _failed = None
     try:
         with open(err_paths["dec"], "wb") as _fe:
             dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE,
@@ -908,27 +979,29 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                         try: _cg_mod.unwatch_process(_p)
                         except Exception: pass
     except subprocess.TimeoutExpired:
-        for p_ in (dec, ai, enc):
-            if p_ is not None:
-                try: p_.kill()
-                except Exception: pass
-        return False, f"streaming timeout after {timeout_s}s", 0
-    except Exception as _stall_exc:
-        # StageStalled：**产出停止增长**才判卡死 —— 是卡死，不是慢。
-        if type(_stall_exc).__name__ == "StageStalled":
-            for p_ in (dec, ai, enc):
-                if p_ is not None:
-                    try: p_.kill()
-                    except Exception: pass
-            return (False, "streaming stalled: no output growth for "
-                    f"{inactivity_s}s (hang, not slowness)", 0)
-        raise
-    except Exception as e:
-        for p_ in (dec, ai, enc):
-            if p_ is not None:
-                try: p_.kill()
-                except Exception: pass
-        return False, f"streaming pipeline error: {e}", 0
+        _failed = f"streaming timeout after {timeout_s}s"
+    except Exception as _exc:
+        # ---- 这里**只记录原因**，不在 except 里 return / raise ----
+        # 原来对非 StageStalled 的异常直接 `raise`，导致紧跟其后的
+        # 通用 `except Exception` 永远不可达 —— 异常真的发生时，
+        # dec/ai/enc 三个子进程不会被回收，留下孤儿继续写文件
+        # （与 RV-12 同族）。审核 R17-05 点名了这一点。
+        #
+        # 现在：所有异常都落到同一个 finally，由它负责
+        #   ① 停止整组进程 ② 等待退出 ③ 关闭残留管道/句柄 ④ 保留失败信息
+        if type(_exc).__name__ == "StageStalled":
+            _failed = ("streaming stalled: no output growth for "
+                       f"{inactivity_s}s (hang, not slowness)")
+        else:
+            _failed = (f"streaming pipeline error: "
+                       f"{type(_exc).__name__}: {_exc}")
+    finally:
+        # 统一收尾。成功路径下三个进程已自然退出，这里的操作都是无害的。
+        _reap_stream_pipeline([dec, ai, enc], logger=logger,
+                              label="stage3-stream")
+
+    if _failed is not None:
+        return False, _failed, 0
 
     def _read_err(tag):
         try:
