@@ -2870,6 +2870,58 @@ def main():
                         declared_speed=params.get("expected_speed"),
                         declared_tempo=params.get("expected_tempo"),
                         fps_interpret=params.get("fps_interpret"))
+
+                    # ---- P0-C：按**声明的变换**核对候选，而不是与源比 ----
+                    # 不回填 ≠ 不校验。原来这里直接放过，于是"交付了一个时间轴
+                    # 不对的候选"没有任何判据能发现（审核 T12 的另一半）。
+                    # 现在算出期望的逐帧 PTS，与候选实测对照；帧数、末帧跨度、
+                    # 逐帧间隔三项都参与判定。
+                    try:
+                        from time_mapping import (
+                            transform_from_params as _tfp,
+                            expected_pts as _exp_pts,
+                            check_against_expected as _check_map,
+                            describe_mapping as _desc_map)
+                        _tsrc = _probe_pts(_orig_src)
+                        _tt = _tfp(params)
+                        if _tsrc and len(_tsrc) >= 2 and _tt.kind != "identity":
+                            _exp = _exp_pts(_tsrc, _tt)
+                            _act = _probe_pts(_publish_tmp)
+                            _m_ok, _m_problems, _m_metrics = _check_map(_act, _exp)
+                            _retime_info.update({
+                                "expected_mapping": _desc_map(_tsrc, _tt),
+                                "mapping_ok": bool(_m_ok),
+                                "mapping_problems": _m_problems[:4],
+                                "mapping_metrics": _m_metrics,
+                            })
+                            if _m_ok:
+                                logger.info(
+                                    "STAGE7_EXPECTED_MAPPING_OK",
+                                    "The candidate matches the expected output "
+                                    "mapping for the declared transform",
+                                    transform=_tt.kind, value=_tt.value)
+                            else:
+                                logger.error(
+                                    "STAGE7_EXPECTED_MAPPING_FAIL",
+                                    "The candidate does not match the expected "
+                                    "output mapping for the declared transform. "
+                                    "Refusing to publish a timeline that is known "
+                                    "to be wrong.",
+                                    transform=_tt.kind, value=_tt.value,
+                                    problems=_m_problems[:4],
+                                    metrics=_m_metrics)
+                                if params.get("timeline_mapping_strict", True):
+                                    _discard_attempt_tmp(_publish_tmp, logger)
+                                    return 86
+                        else:
+                            _retime_info["mapping_ok"] = None
+                            _retime_info["mapping_reason"] = (
+                                "no declared transform, or source PTS unusable")
+                    except Exception as _mexc:      # pragma: no cover
+                        logger.warning("STAGE7_EXPECTED_MAPPING_ERROR",
+                                       str(_mexc))
+                        _retime_info["mapping_ok"] = None
+                        _retime_info["mapping_error"] = str(_mexc)
                 elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
                     _ok_r, _retime_info = _retime(_orig_src, _publish_tmp, _mkv,
                                                   work_dir=str(temp_dir), logger=logger)
