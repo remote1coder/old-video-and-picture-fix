@@ -1659,6 +1659,29 @@ def _discard_attempt_tmp(path: str, logger=None) -> None:
                            staging_path=path)
 
 
+def _has_timing_transform(params) -> bool:
+    """本次运行是否声明了**时间变换**。
+
+    判据只认"确实会改变时间轴"的声明：``expected_speed`` / ``expected_tempo``
+    不等于 1，或给了 ``fps_interpret``。这类运行**不能**用源 PTS 回填 ——
+    那等于把用户要求的变换抹掉。
+    """
+    def _not_one(v):
+        if v is None or v == "":
+            return False
+        try:
+            return abs(float(v) - 1.0) > 1e-9
+        except (TypeError, ValueError):
+            return False
+
+    try:
+        return bool(_not_one((params or {}).get("expected_speed"))
+                    or _not_one((params or {}).get("expected_tempo"))
+                    or (params or {}).get("fps_interpret"))
+    except Exception:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -2824,6 +2847,29 @@ def main():
                         "so the timeline is expected to be constant anyway.",
                         plan_timeline=_plan_tl)
                     _retime_info = {"action": "unavailable", "reason": "no mkvmerge"}
+                elif _has_timing_transform(params):
+                    # 用户/上游声明了**时间变换**（变速、重解释帧率、倍帧/抽帧）。
+                    # 此时按"源 PTS"回填是错的：
+                    #   * 同帧数变速（2×）会被改回源速度 —— 变换被抹掉；
+                    #   * 倍帧/抽帧帧数不同，_retime 会直接拒绝合法结果。
+                    # 审核 R17-03 用受控探针复现了这两种情况。
+                    # 先保留候选自身的时间轴，由后面的 build_transform_verdict
+                    # 按**声明的变换**裁定；完整预期映射留待 P0-C 后续实现。
+                    _retime_info = {
+                        "action": "skipped",
+                        "reason": "a timing transform was declared; back-filling "
+                                  "the source PTS would undo it",
+                        "declared_speed": params.get("expected_speed"),
+                        "declared_tempo": params.get("expected_tempo"),
+                        "fps_interpret": params.get("fps_interpret"),
+                    }
+                    logger.info(
+                        "STAGE7_RETIME_SKIPPED_TRANSFORM",
+                        "A timing transform is in effect; not back-filling the "
+                        "source timestamps over it.",
+                        declared_speed=params.get("expected_speed"),
+                        declared_tempo=params.get("expected_tempo"),
+                        fps_interpret=params.get("fps_interpret"))
                 elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
                     _ok_r, _retime_info = _retime(_orig_src, _publish_tmp, _mkv,
                                                   work_dir=str(temp_dir), logger=logger)

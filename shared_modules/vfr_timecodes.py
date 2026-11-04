@@ -43,6 +43,9 @@ from typing import Any, Dict, List, Optional, Tuple
 #: 视为"时间轴已足够接近"的相对容差（0.5%）。低于它就不必重封装 ——
 #: 省一次全片重写，也避免对纯 CFR 素材做无谓改动。
 DURATION_TOLERANCE = 0.005
+#: 逐帧间隔容差（秒）。mkvmerge v2 支持小数毫秒、默认 scale 1ms，
+#: 正常误差 1–2ms；20ms 既留余量又能抓住"中间错 40ms"这类真实缺陷。
+INTERVAL_TOLERANCE = 0.02
 
 #: mkvmerge 的常见位置（按优先级）。项目内优先，其次系统安装目录。
 _CANDIDATES = (
@@ -258,6 +261,24 @@ def retime_to_source_pts(source_video: str, target_video: str,
                 duration_error=round(err_abs, 6),
                 max_interval_error=round(max_err, 6),
                 before_last=round(tgt_last, 4))
+
+    # ---- 逐帧间隔也要参与阻断，不能只看末帧 ----
+    # 审核探针：重封装结果"末 PTS 相同、中间某处间隔错 40 ms"，helper 仍返回
+    # 成功 —— 因为 max_err 只被算出来写进 info，从未用于判定。
+    # 只核终点等于承认"中间随便错"。这里给一个**有依据**的容差：
+    # mkvmerge 的 timestamp v2 支持小数毫秒，默认 timestamp scale 为 1 ms，
+    # 正常结果误差应在 1–2 ms；取 20 ms 留足余量，同时能抓住 40 ms 级别的错误。
+    # 容差按目标时间基设定，**不因失败而放宽**。
+    if max_err > INTERVAL_TOLERANCE:
+        info["reason"] = (
+            f"re-timed per-frame intervals still off by {max_err:.3f}s "
+            f"(tolerance {INTERVAL_TOLERANCE:.3f}s); matching the last PTS "
+            f"alone is not evidence the timeline is correct")
+        try:
+            os.remove(tmp_out)
+        except OSError:
+            pass
+        return False, info
 
     # 末帧偏差超过 50 ms 视为没对上（v2 的 1 ms 量化不该到这个量级）
     if err_abs > 0.05:
