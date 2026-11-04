@@ -94,7 +94,8 @@ def _build_vs_script(input_source: str, vs_format: str,
 def _run_grain_pipeline(vs_script_str: str, vs_path: str,
                         vspipe_cmd: list, ffmpeg_cmd: list,
                         output_path: str, logger,
-                        fallback_label: str = "") -> tuple:
+                        fallback_label: str = "",
+                        inactivity_s: float = 1800.0) -> tuple:
     """Run grain synthesis pipeline (vspipe → ffmpeg FFV1).
 
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
@@ -116,15 +117,60 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
         if _cancel_guard is not None:
             _cancel_guard.watch_process(vspipe_proc)
             _cancel_guard.watch_process(ffmpeg_proc)
+        # ---- 按**心跳**等，不按总时长；同时必须并发排空 stderr ----
+        # 原来是 `ffmpeg_proc.communicate(timeout=3600)`：4K 长片一次颗粒合成
+        # 远超 1 小时，会被硬砍（审核 R17-05 点名 stage6 仍是绝对超时）。
+        #
+        # 但直接换成 wait 会引入**新死锁**：communicate() 内部是并发排空管道的，
+        # 而 ffmpeg/vspipe 都挂了 stderr=PIPE，没人读的话写满 64KB 缓冲区就会
+        # 把子进程卡住。所以先起排空线程，再按心跳等。
+        import threading
+
+        _sinks = {"enc": [], "vs": []}
+
+        def _pump(pipe, sink):
+            if pipe is None:
+                return
+            try:
+                while True:
+                    chunk = pipe.read(65536)
+                    if not chunk:
+                        break
+                    sink.append(chunk)
+            except BaseException:
+                pass
+
+        _threads = []
+        for _pipe, _key in ((getattr(ffmpeg_proc, "stderr", None), "enc"),
+                            (getattr(vspipe_proc, "stderr", None), "vs")):
+            _t = threading.Thread(target=_pump, args=(_pipe, _sinks[_key]),
+                                 daemon=True)
+            _t.start()
+            _threads.append(_t)
+
         try:
-            stdout, stderr = ffmpeg_proc.communicate(timeout=3600)
-            vspipe_stderr = (vspipe_proc.stderr.read()
-                             if vspipe_proc.stderr else b"")
-            vspipe_proc.wait()
+            _hb = (lambda: (os.path.getsize(output_path)
+                            if os.path.exists(output_path) else 0))
+            if _cancel_guard is not None and hasattr(_cancel_guard,
+                                                     "wait_with_heartbeat"):
+                _cancel_guard.wait_with_heartbeat(
+                    [ffmpeg_proc, vspipe_proc], heartbeat=_hb,
+                    inactivity_timeout=inactivity_s,
+                    logger=logger, label="stage6-grain")
+            else:  # pragma: no cover - 守卫缺失时退回有界等待
+                ffmpeg_proc.wait(timeout=inactivity_s)
+                vspipe_proc.wait(timeout=inactivity_s)
         finally:
+            # 排空线程先收尾（否则 read 还在阻塞时关句柄会报错）
+            for _t in _threads:
+                _t.join(timeout=10)
+            # 取消守卫的登记必须解掉：否则后续 stage 的取消会误伤已完成的进程
             if _cancel_guard is not None:
                 _cancel_guard.unwatch_process(vspipe_proc)
                 _cancel_guard.unwatch_process(ffmpeg_proc)
+        stderr = b"".join(_sinks["enc"])
+        vspipe_stderr = b"".join(_sinks["vs"])
+        stdout = b""
         if ffmpeg_proc.returncode == 0:
             if fallback_label:
                 logger.info("STAGE6_DONE",
@@ -521,7 +567,9 @@ def main() -> int:
 
     result = _run_grain_pipeline(
         vs_script, vs_path, vspipe_cmd, ffmpeg_cmd,
-        output_path, logger)
+        output_path, logger,
+        # 卡死阈值与阶段级看门狗同源：只看"产出是否停止增长"，不设总时长。
+        inactivity_s=float(params.get("stage_inactivity_timeout", 1800.0)))
     if result[0] == 0:
         # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
         if _cancel_guard is not None:
