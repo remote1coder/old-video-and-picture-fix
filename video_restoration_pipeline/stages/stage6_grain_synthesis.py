@@ -36,12 +36,39 @@ except Exception:  # pragma: no cover - 缺失时不阻断 stage，仅失去该�
     _cancel_guard = None
 
 
+def _vs_deterministic(params) -> bool:
+    """本次运行是否要求确定性渲染（`vs.deterministic`）。"""
+    try:
+        from vs_render import wants_deterministic
+        return bool(wants_deterministic(params))
+    except Exception:                 # pragma: no cover
+        return False
+
+
+def _determinism_block(deterministic: bool) -> str:
+    """生成 vpy 里的确定性前置代码（`core.num_threads = 1` 等）。
+
+    必须放在 `core = vs.core` 之后、**任何 filter 创建之前**。
+    stage6 用的是 `haf.GrainFactory3`（含 `temp_avg` 时域平均），
+    与 stage1 的 mvtools 同属"可能受并行影响"的一类，所以走同一开关。
+    """
+    if not deterministic:
+        return ""
+    try:
+        from vs_render import determinism_preamble as _dp
+        lines = _dp({"vs_deterministic": True})
+    except Exception:                 # pragma: no cover
+        return ""
+    return "".join(line + "\n" for line in lines)
+
+
 def _build_vs_script(input_source: str, vs_format: str,
                      g1str: float, g2str: float, g3str: float,
                      addgrainc_ratio: float,
                      use_addgrainc: bool = False,
                      addgrainc_after_gf3: bool = False,
-                     temp_avg: float = 0.0) -> str:
+                     temp_avg: float = 0.0,
+                     deterministic: bool = False) -> str:
     """Build VapourSynth grain synthesis script.
 
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
@@ -60,6 +87,7 @@ def _build_vs_script(input_source: str, vs_format: str,
         return (
             f"import vapoursynth as vs\n"
             f"core = vs.core\n"
+            + _determinism_block(deterministic) +
             f"clip = core.ffms2.Source(source={repr(input_source)})\n"
             f"clip = core.resize.Bicubic(clip, format={vs_format})\n"
             f"clip = core.grain.Add(clip, var={var}, uvar={uvar}, "
@@ -71,6 +99,7 @@ def _build_vs_script(input_source: str, vs_format: str,
     script = (
         f"import vapoursynth as vs\n"
         f"core = vs.core\n"
+        + _determinism_block(deterministic) +
         f"import havsfunc as haf\n"
         f"clip = core.ffms2.Source(source={repr(input_source)})\n"
         f"clip = core.resize.Bicubic(clip, format={vs_format})\n"
@@ -544,7 +573,8 @@ def main() -> int:
         input_source, vs_format, g1str, g2str, g3str,
         addgrainc_ratio, use_addgrainc=False,
         addgrainc_after_gf3=addgrainc_enabled,
-        temp_avg=temp_avg)
+        temp_avg=temp_avg,
+        deterministic=_vs_deterministic(params))
     # FIX-P9-11: removed redundant write here — _run_grain_pipeline writes vs_path internally
 
     # Fix: Use vspipe directly (standard VapourSynth CLI tool)
@@ -598,7 +628,8 @@ def main() -> int:
         addgrain_script = _build_vs_script(
             input_source, vs_format, g1str * 0.5, g2str * 0.5, g3str * 0.5,
             addgrainc_ratio, use_addgrainc=True,
-            temp_avg=temp_avg)
+            temp_avg=temp_avg,
+            deterministic=_vs_deterministic(params))
         result2 = _run_grain_pipeline(
             addgrain_script, vs_path, vspipe_cmd, ffmpeg_cmd,
             output_path, logger, fallback_label="AddGrainC")

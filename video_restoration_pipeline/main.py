@@ -1705,15 +1705,26 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 (args.get("chain") if isinstance(args, dict)
                  else getattr(args, "chain", None))
                 or _cfg_chain.get("mode") or "none").strip().lower()
-        # 融合的"接受未验证像素差异"开关（默认 False）。
-        # 它必须**显式**为真才允许 stage3 降级为融合执行。
-        if "chain_allow_unverified_pixel_diff" not in params:
-            params["chain_allow_unverified_pixel_diff"] = bool(
-                _cfg_chain.get("allow_unverified_pixel_diff", False))
+        # ---- vs.deterministic：VapourSynth 渲染确定性（默认关）----
+        # 打开后 stage1/stage6 会在 vpy 里写 `core.num_threads = 1`，
+        # 输出逐像素可复现，代价是渲染慢约 4.78 倍。
+        # 不打开时两次跑批的差异本底为 Y~48.7 / U~51.5 / V~39.6（min 42.07），
+        # 任何低于这个量级的"差异"都不能作为不等价的证据。
+        if "vs_deterministic" not in params:
+            _cfg_vs = config.get("vs") or {}
+            if not isinstance(_cfg_vs, dict):
+                _cfg_vs = {}
+            params["vs_deterministic"] = bool(
+                _cfg_vs.get("deterministic", False))
+            if params["vs_deterministic"]:
+                job_logger.warning(
+                    "VS_DETERMINISTIC_ON",
+                    "VapourSynth rendering is forced to a single thread so "
+                    "outputs are pixel-reproducible. This is about 4.78x "
+                    "slower; use it for acceptance runs, not bulk production.")
+
         job_logger.info("CHAIN_MODE", "Effective execution-group mode",
-                        chain_mode=params.get("chain_mode"),
-                        allow_unverified_pixel_diff=params.get(
-                            "chain_allow_unverified_pixel_diff"))
+                        chain_mode=params.get("chain_mode"))
     except Exception as _cm_exc:          # pragma: no cover
         job_logger.warning("CHAIN_MODE_FAIL", str(_cm_exc))
         params["chain_mode"] = "none"

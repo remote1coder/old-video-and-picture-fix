@@ -154,3 +154,47 @@ def test_fusion_is_off_by_default_in_config():
                                "config.yaml"), encoding="utf-8").read()
     assert "chain:" in cfg
     assert "mode: none" in cfg, "默认必须是 none（行为与改动前一致）"
+
+
+# ------------------------------------------------ 像素格式等价性（本轮定位的根因）
+
+def test_fusion_chain_forces_planar_gbrp16le_before_filters():
+    """结构守卫：融合进链前**必须**补 `format=gbrp16le`。
+
+    这是本轮定位到的根因（`tools_r4/g34_pixfmt_probe.py` 实测）：
+
+    | 喂法 | Y | U | V |
+    |---|---|---|---|
+    | packed rgb48le 直接进链 | 43.19 | **12.97** | **12.37** |
+    | 补 format=gbrp16le | 999 | 999 | 999 |
+
+    原因：经典路径的 step3 是 **gbrp16le**（planar RGB 16，ffmpeg 实测），
+    融合路径的 rawvideo 是 **rgb48le**（packed）。滤镜图里
+    `format=yuv420p` + `geq(cb/cr)` 的肤色掩模对格式敏感 ——
+    swscale 的 packed→4:2:0 与 planar→4:2:0 不是同一条路径，
+    色度下采样结果不同，掩模就会判错区域。
+
+    `format=gbrp16le` 是**无损重排**（不缩放不量化），补它不改变任何像素值。
+    """
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage3_ai_upscale.py"),
+               encoding="utf-8", errors="replace").read()
+    i_block = src.find("if post_filter_chain:")
+    assert i_block > 0, "找不到融合注入块"
+    block = src[i_block:i_block + 2600]
+    assert "format=gbrp16le" in block, \
+        "融合进链前必须补 format=gbrp16le（否则色度会整片偏）"
+    # 必须插在链的最前面（[0:v] 之后、split 之前），不能插在中间
+    assert '_tag + "format=gbrp16le,"' in block or \
+        '"format=gbrp16le," + _chain' in block, \
+        "format=gbrp16le 必须接在 [0:v] 之后，不能插到链中间"
+
+
+def test_probe_script_exists_and_documents_the_numbers():
+    """根因探针必须留在仓库里，且注释里带着实测数字（可复跑可核对）。"""
+    probe = os.path.join(_ROOT, "tests", "probes",
+                         "g34_pixfmt_probe.py")
+    assert os.path.isfile(probe), "根因探针脚本必须留在仓库中"
+    txt = open(probe, encoding="utf-8", errors="replace").read()
+    for token in ("gbrp16le", "rgb48le", "ROOT_CAUSE_CONFIRMED"):
+        assert token in txt, f"探针里缺少 {token}"

@@ -394,7 +394,19 @@ audio:
 #   both     两者都启用（stage67 未实现时只生效 stage34）
 chain:
   mode: none
-  # G34 融合已实现，但实测**像素不等价**（Y 38.9 dB / U 10.3 dB / V 10.1 dB）。
-  # 只有在明确接受这一差异时才可置 true —— 否则一律走经典两阶段。
-  # 证据：evidence/G34_EQUIV.json（60 帧 1080p→4K，同一路线对照）
-  allow_unverified_pixel_diff: false
+  # 等价性已验证（2026-11-06）：在 vs.deterministic=true 下，
+  # 融合与经典逐像素相同（60 帧 1080p→4K，PSNR 全 inf，文件大小相同）。
+  # 此前那道 allow_unverified_pixel_diff 闸门的前提（"不等价"）已推翻，
+  # 它来自 stage1 渲染的非确定性抖动，不是融合的误差。闸门已移除。
+
+# ---- VapourSynth 渲染确定性 ----
+# 实测：VapourSynth 的帧级并行会让 mvtools（TemporalDegrain / Depan）产生
+# 非确定输出 —— 同一素材连跑两次，60 帧里 30~35 帧不同，
+# 本底噪声 Y 48.7 / U 51.5 / V 39.6（min 42.07 dB）。
+# 线程数扫描：默认 4.95s/35 帧不同 -> 8:5.72s/27 -> 4:7.39s/27
+#             -> 2:12.25s/13 -> 1:23.47s/0（完全确定）
+# 所以只有单线程能保证可复现，代价 4.78 倍。
+#   false（默认）：生产要速度
+#   true         ：验收对照、问题复现、"同输入必同输出"的场合
+vs:
+  deterministic: false

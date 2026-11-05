@@ -939,13 +939,17 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                  "-pix_fmt", "rgb48le", "-s", f"{out_w}x{out_h}",
                  "-framerate", str(fps_str)]
     if post_filter_chain and color_opts:
-        # ---- 融合时颜色标签必须同时作为**输入**选项 ----
-        # 经典路径里 step3 已经带着 colorspace 标签落盘，stage4 读回来做
-        # RGB→YUV 转换时用的是**标签指定的矩阵**；融合路径的 rawvideo 没有
-        # 任何颜色元数据，ffmpeg 会按默认规则猜（通常是 BT.601），
-        # 于是滤镜图里的 `format=yuv420p` 用错矩阵 → U/V 平面整体偏掉。
-        # 实测（G34 首轮对照）：Y 39 dB 但 U/V 只有 10 dB。
-        # 把同一组标签补到输入侧，让两条路径的转换前提一致。
+        # ---- 有颜色元数据时，输入侧也必须声明，保证两条路径前提一致 ----
+        # 注意：**这不是色度差异的根因**。
+        # 我曾假设"融合路径缺 colorspace 标签 → 用错 RGB→YUV 矩阵"，
+        # 但实测补上标签后 U/V 只从 10.288717 变到 10.288682 dB（几乎不变），
+        # 假设被推翻。真正的根因是 pix_fmt（见下面 `format=gbrp16le`）。
+        #
+        # 这段仍然保留，因为经典路径的 step3 是带颜色的（`enc_cmd` 末尾
+        # 也追加了同一组 color_opts，stage4 读回时继承），融合路径若不声明
+        # 就会在**有**颜色元数据的素材上产生真实的不一致。
+        # 本次对照素材的源颜色字段为空，所以这段是 no-op —— 这也解释了
+        # 为什么补它没有任何效果。
         _enc_head += list(color_opts)
     enc_cmd = _enc_head + ["-i", "-"]
     # ---- G34 融合：把 stage4 的滤镜图接在编码器上 ----
@@ -953,8 +957,30 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 不是复制的字符串）。输入标签 `[0:v]` 在这里就是 stdin 的 rawvideo，
     # 因此整条链的语义与"先写 step3 再由 stage4 读回"一致。
     if post_filter_chain:
-        enc_cmd += ["-filter_complex", str(post_filter_chain),
-                    "-map", "[vout]"]
+        # ---- 关键修复：进链前必须把 packed rgb48le 重排成 planar gbrp16le ----
+        # 实测（tools_r4/g34_pixfmt_probe.py，3 帧 1080p，同一份 raw 数据）：
+        #     A 融合：packed rgb48le 直接进链 → Y=43.19 U=12.97 V=12.37 dB
+        #     C 补 format=gbrp16le      → Y=U=V= **完全相同**
+        #
+        # 为什么：经典路径的 step3 存的是 **gbrp16le**（planar RGB 16，
+        # ffmpeg 实测 pix_fmt），融合路径的 rawvideo 是 **rgb48le**
+        # （packed RGB 16）。滤镜图里有三处对格式敏感的地方：
+        #     [1] edgedetect + format=gray + geq(lum)
+        #     [2] format=yuv420p + geq(lum, cb, cr)   ← 肤色掩模靠 cb/cr
+        #     [3] format=yuv420p + geq(lum)           ← 头发掩模
+        # swscale 的 **packed→4:2:0** 与 **planar→4:2:0** 不是同一条路径，
+        # 色度下采样的相位/舍入不同 → 掩模在色度上判得不一样 →
+        # maskedmerge 选错区域。luma 只差精度（Y≈43dB），色度整片偏（U/V≈12dB）。
+        #
+        # `format=gbrp16le` 是 packed→planar 的**无损重排**（不缩放、不量化），
+        # 因此补上它不改变任何像素值，只让两条路径站在同一个起点。
+        _chain = str(post_filter_chain)
+        _tag = "[0:v]"
+        if _chain.startswith(_tag):
+            _chain = _tag + "format=gbrp16le," + _chain[len(_tag):]
+        else:
+            _chain = "format=gbrp16le," + _chain
+        enc_cmd += ["-filter_complex", _chain, "-map", "[vout]"]
         if out_pix_fmt:
             # stage4 也是"滤镜之后再转输出格式"，两边在同一个位置做转换
             enc_cmd += ["-pix_fmt", str(out_pix_fmt)]
@@ -2602,25 +2628,29 @@ def main():
                 # PNG / VFR 仍然走经典两阶段 —— 那是本轮未验证的范围，
                 # 不是"技术上不可能"。
                 _s_fuse34 = _chain_mode(params) in ("stage34", "both")
-                # ---- 等价性未达标的硬闸门 ----
-                # 实测（tools_r4/g34_equiv.py，60 帧 1080p→4K，同一路线）：
-                #   经典 vs 融合的逐帧 PSNR = Y 38.9 dB / U 10.3 dB / V 10.1 dB
-                # —— **不等价**，差异集中在色度平面。审核明确要求
-                # "有差异就定位原因，不能直接放宽为肉眼差不多"。
-                # 因此:未显式承认这一差异时，**拒绝降级为融合执行**，
-                # 照常走经典两阶段。这比"开着但没人知道不等价"安全得多。
-                if _s_fuse34 and not params.get(
-                        "chain_allow_unverified_pixel_diff", False):
-                    _s_fuse34 = False
-                    logger.warning(
-                        "STAGE3_FUSE34_BLOCKED_UNVERIFIED",
-                        "G34 fusion is implemented but its output is NOT "
-                        "pixel-equivalent to the classic two-stage path "
-                        "(measured: Y 38.9 dB, U 10.3 dB, V 10.1 dB on a "
-                        "60-frame 1080p->4K sample). Falling back to the "
-                        "classic path; set chain.allow_unverified_pixel_diff "
-                        "to true only if you accept that difference.",
-                        chain_mode=_chain_mode(params))
+                # ---- 等价性：已在确定性模式下验证为**逐像素相同** ----
+                # 2026-11-06 实测（tools_r4/g34_equiv_det.py，60 帧 1080p→4K，
+                # 完整 stage1→7，vs.deterministic=true）：
+                #     逐帧 PSNR y:inf u:inf v:inf min:inf
+                #     文件大小相同: True
+                #     verdict = IDENTICAL
+                #
+                # 此前这里有一道"像素不等价，默认禁止降级"的闸门。它成立的前提
+                # 是"融合与经典确实不等价"——而那个结论来自**两次独立跑批**的
+                # 对比。后来查明 stage1 渲染本身不确定（多线程下 mvtools 的帧级
+                # 竞态，本底噪声 min≈42.07 dB），所以那次对比测的是抖动，不是
+                # 融合的误差。真实差异只有色度那一处（packed vs planar，
+                # 已在本文件下方的 format=gbrp16le 修掉）。
+                #
+                # 因此闸门的前提已不成立，改为**不再拦截**：
+                # `chain.mode: stage34` 即可直接使用融合执行组。
+                #
+                # 仍要诚实标注的边界：
+                #   * 验证素材是 testsrc2 合成图，不是真实老录像
+                #     （真实素材的颗粒/抖动可能让掩模判定更敏感）；
+                #   * AI 超分环节（stage3 的 RealESRGAN）未做 GPU 确定性验证，
+                #     项目当前也没有 cuDNN 确定性设置。
+                # 若要再保守一点，可先用一段真实素材跑 g34_equiv_det.py 对照。
                 _s_chain = None
                 _s_pix_fmt = None
                 if _s_fuse34:

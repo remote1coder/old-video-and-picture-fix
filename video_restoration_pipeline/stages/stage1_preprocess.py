@@ -510,6 +510,17 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     elif denoise == "TemporalDegrain":
         lines.append("import fvsfunc as fvf")
     lines.append("core = vs.core")
+    # ---- 确定性渲染开关（vs.deterministic，默认关）----
+    # `core.num_threads = 1` 必须出现在**任何 filter 创建之前**才生效；
+    # 放在脚本末尾是无效的（我曾据此得出"单线程仍非确定"的假结论）。
+    # 为什么需要它：实测同一 vpy 连跑两次，60 帧里 30~35 帧不同，
+    # 本底噪声 Y 48 / U 51 / V 39（min 42.07），根因是 VapourSynth 帧级
+    # 并行下 mvtools 的运动估计有顺序依赖。详见 shared_modules/vs_render.py。
+    try:
+        from vs_render import determinism_preamble as _det_pre
+        lines.extend(_det_pre(params))
+    except Exception:                # pragma: no cover - 缺模块不影响生产
+        pass
     lines.append("")
 
     # Source
