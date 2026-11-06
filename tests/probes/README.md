@@ -12,6 +12,22 @@
 | `g34_equiv.py` | 经典 vs 融合的整链路对照（默认多线程） | 差异落在 stage1 本底噪声内，**不能据此判等价** |
 | `g34_equiv_det.py` | 同上，但开 `vs.deterministic: true` | **IDENTICAL**（60 帧，PSNR 全 inf，文件大小相同） |
 | `vs_determinism_probe.py` | 逐段定位 VapourSynth 渲染的非确定源 | `source+resize` 确定 → `TemporalDegrain` 出现 0.005 LSB 差异 → `haf.Stab` 放大 400 倍；只有 `num_threads=1` 完全确定（4.78× 慢） |
+| `ai_determinism_probe.py` | AI 超分（RealESRGAN）的 GPU 确定性，含**跨进程**模式 | 默认配置下**同进程与跨进程都逐像素相同**（max\|Δ\|=0）→ AI 不是非确定源。原因：`cudnn.benchmark=False`（默认）不做 autotune，SRVGGNetCompact 全 conv+PReLU 无非确定算子 |
+| `raw_vs_png_probe.py` | 重测第十七轮「raw 流式 vs PNG 中转等价」，确定性模式下对比 stage3 | 见 `_media_r17_20261031T0004/rawcmp2/result.json` |
+
+### 关于 `raw_vs_png_probe.py` 为什么要重测
+
+第十七轮的原始数字是 `PSNR y:42.80 u:54.94 v:54.22 avg:44.42 **min:32.19**`，
+判为"等价"。两个问题：
+
+1. 那是在**多线程**下测的，avg 44.42 落在本底噪声内（Y≈48.7/min≈42.1），
+   单看 avg 说明不了任何事；
+2. **min 32.19 低于本底** —— 说明确实存在真差异；
+3. 当时对比的是 **stage3 输出**，不含 stage6 颗粒，所以"差异与随机颗粒相符"
+   这个解释不成立。
+
+重测时把 `vs.deterministic: true` 打开、直接对比 step3，差异才能严格归属
+到两条 AI 路径。
 
 ## 复跑注意
 

@@ -158,36 +158,50 @@ def test_fusion_is_off_by_default_in_config():
 
 # ------------------------------------------------ 像素格式等价性（本轮定位的根因）
 
-def test_fusion_chain_forces_planar_gbrp16le_before_filters():
-    """结构守卫：融合进链前**必须**补 `format=gbrp16le`。
+def test_fusion_chain_forces_unified_pix_fmt_before_filters():
+    """结构守卫：融合进链前**必须**把输入统一成 `yuv420p16le`。
 
-    这是本轮定位到的根因（`tools_r4/g34_pixfmt_probe.py` 实测）：
+    这条走了两步（都被实测钉住）：
+
+    **第一步**：经典 step3 原本是 `gbrp16le`（planar RGB 16），而融合的
+    rawvideo 是 `rgb48le`（packed RGB 16）。滤镜图里
+    `format=yuv420p` + `geq(cb/cr)` 的肤色掩模对格式敏感 ——
+    swscale 的 packed→4:2:0 与 planar→4:2:0 不是同一条路径，
+    色度下采样结果不同，掩模判错区域。实测：
 
     | 喂法 | Y | U | V |
     |---|---|---|---|
     | packed rgb48le 直接进链 | 43.19 | **12.97** | **12.37** |
-    | 补 format=gbrp16le | 999 | 999 | 999 |
+    | 补 format=gbrp16le | inf | inf | inf |
 
-    原因：经典路径的 step3 是 **gbrp16le**（planar RGB 16，ffmpeg 实测），
-    融合路径的 rawvideo 是 **rgb48le**（packed）。滤镜图里
-    `format=yuv420p` + `geq(cb/cr)` 的肤色掩模对格式敏感 ——
-    swscale 的 packed→4:2:0 与 planar→4:2:0 不是同一条路径，
-    色度下采样结果不同，掩模就会判错区域。
-
-    `format=gbrp16le` 是**无损重排**（不缩放不量化），补它不改变任何像素值。
+    **第二步**：随后又把 step3 统一成 `yuv420p16le`（raw 路径原来不指定
+    pix_fmt，PNG 路径显式写了它，两条路格式不同）。统一后省 52% 磁盘
+    （909.6 MB → 434.7 MB），成品差异 66.00 dB。融合侧的进链格式
+    随之改成 `yuv420p16le`，与经典路径进入 stage4 时保持一致。
     """
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage3_ai_upscale.py"),
                encoding="utf-8", errors="replace").read()
     i_block = src.find("if post_filter_chain:")
     assert i_block > 0, "找不到融合注入块"
-    block = src[i_block:i_block + 2600]
-    assert "format=gbrp16le" in block, \
-        "融合进链前必须补 format=gbrp16le（否则色度会整片偏）"
-    # 必须插在链的最前面（[0:v] 之后、split 之前），不能插在中间
-    assert '_tag + "format=gbrp16le,"' in block or \
-        '"format=gbrp16le," + _chain' in block, \
-        "format=gbrp16le 必须接在 [0:v] 之后，不能插到链中间"
+    block = src[i_block:i_block + 3000]
+    assert "format=yuv420p16le" in block, \
+        "融合进链前必须补 format=yuv420p16le（否则色度会整片偏）"
+    assert '_tag + "format=yuv420p16le,"' in block or \
+        '"format=yuv420p16le," + _chain' in block, \
+        "必须在 [0:v] 之后立刻统一格式，不能插到链中间"
+
+
+def test_output_pix_fmt_written_by_both_paths():
+    """结构守卫：raw 编码器必须显式写 `-pix_fmt yuv420p16le`。
+
+    不写的话 ffv1 会把 rgb48le 存成 gbrp16le，与 PNG 路径分叉。
+    """
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage3_ai_upscale.py"),
+               encoding="utf-8", errors="replace").read()
+    assert '"-pix_fmt", "yuv420p16le", "-c:v", "ffv1"' in src, \
+        "raw 路径的编码器必须显式指定 yuv420p16le，否则会存成 gbrp16le"
 
 
 def test_probe_script_exists_and_documents_the_numbers():

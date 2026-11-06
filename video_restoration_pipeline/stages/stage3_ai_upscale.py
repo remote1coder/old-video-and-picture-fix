@@ -972,19 +972,43 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
         # 色度下采样的相位/舍入不同 → 掩模在色度上判得不一样 →
         # maskedmerge 选错区域。luma 只差精度（Y≈43dB），色度整片偏（U/V≈12dB）。
         #
-        # `format=gbrp16le` 是 packed→planar 的**无损重排**（不缩放、不量化），
-        # 因此补上它不改变任何像素值，只让两条路径站在同一个起点。
+        # 修复分两步：
+        #   ① 早先补的是 `format=gbrp16le` —— 让融合与**当时的**经典路径
+        #      （step3 = gbrp16le）站到同一起点，实测逐像素完全相同。
+        #   ② 本轮又把 step3 统一成 yuv420p16le（见上面的注释，为省一半磁盘
+        #      并消除 raw/PNG 的格式分叉），所以这里换成 `format=yuv420p16le`，
+        #      与经典路径进入 stage4 时的格式保持一致。
+        #
+        # `format=yuv420p16le` 同样只做格式转换（RGB→YUV 4:2:0 16-bit），
+        # 与 PNG 路径在 stage3 编码时做的是同一件事，因此两条路径可对齐。
         _chain = str(post_filter_chain)
         _tag = "[0:v]"
         if _chain.startswith(_tag):
-            _chain = _tag + "format=gbrp16le," + _chain[len(_tag):]
+            _chain = _tag + "format=yuv420p16le," + _chain[len(_tag):]
         else:
-            _chain = "format=gbrp16le," + _chain
+            _chain = "format=yuv420p16le," + _chain
         enc_cmd += ["-filter_complex", _chain, "-map", "[vout]"]
         if out_pix_fmt:
             # stage4 也是"滤镜之后再转输出格式"，两边在同一个位置做转换
             enc_cmd += ["-pix_fmt", str(out_pix_fmt)]
-    enc_cmd += ["-c:v", "ffv1", "-r", str(fps_str)]
+    # ---- step3 统一输出 yuv420p16le ----
+    # 原来 raw 路径不指定 pix_fmt，ffv1 就把 rgb48le 存成 **gbrp16le**
+    # （planar RGB 16）；而 PNG 路径显式写了 `-pix_fmt yuv420p16le`。
+    # 于是同一个 job 换条路径就得到**格式不同**的 step3，下游 stage4 的
+    # `format=yuv420p` 在两种输入上的转换前提不同 —— 成品会有差异
+    # （实测 avg 53.88 dB，min 51.95；作为对照，两条路径格式一致时是 inf）。
+    #
+    # 统一成 yuv420p16le 的三个理由：
+    #   ① **省一半磁盘**：实测 909.6 MB → 434.7 MB（-52%）；
+    #      gbrp16le 是 3×16bit/像素，yuv420p16le 是 3×16bit/2 像素。
+    #   ② 成品差异极小：同一 stage4 滤镜处理两种格式的 step3，
+    #      得到的 step4 相差 **66.00 dB**（min 63.74，约 0.06 LSB @16bit）。
+    #   ③ 下游本来就是 YUV：stage4 第一句就是 `format=yuv420p`，
+    #      最终成品是 yuv420p10le。早转一步可以少一次格式协商。
+    #
+    # 注意：stage3 每次跑批都会重新生成 step3（没有"已存在则跳过"的逻辑），
+    # 所以改这里不会导致旧中间件被复用。
+    enc_cmd += ["-pix_fmt", "yuv420p16le", "-c:v", "ffv1", "-r", str(fps_str)]
     # 颜色标签必须与主流程 PNG 路线一致（COL-04），否则中间产物不带
     # colorspace 标签，下游 stage7 会按自己的猜测补标签 → 可能错标。
     enc_cmd += list(color_opts or [])
