@@ -118,7 +118,11 @@ def test_execution_mode_is_frozen_before_the_reuse_plan():
     """
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
                encoding="utf-8", errors="replace").read()
-    i_mode = src.find('params["chain_mode"] = str(')
+    # R20-B06 起 chain_mode 先经已知值校验再赋值，形态变了
+    i_mode = min(
+        (k for k in (src.find('params["chain_mode"] = str('),
+                     src.find('params["chain_mode"] = _raw_mode'))
+         if k >= 0), default=-1)
     i_plan = src.find("_reuse_plan = build_reuse_plan(")
     assert i_mode > 0, "找不到 chain_mode 赋值"
     assert i_plan > 0, "找不到 build_reuse_plan 调用"
@@ -130,7 +134,64 @@ def test_vs_deterministic_is_frozen_before_the_reuse_plan():
     """同上：`vs_deterministic` 也要先冻。"""
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
                encoding="utf-8", errors="replace").read()
-    i_vs = src.find('params["vs_deterministic"] = bool(')
+    # R20-B06 起改用严格布尔（避免 bool("false")==True）
+    i_vs = min(
+        (k for k in (src.find('params["vs_deterministic"] = bool('),
+                     src.find('params["vs_deterministic"] = _strict_bool('))
+         if k >= 0), default=-1)
     i_plan = src.find("_reuse_plan = build_reuse_plan(")
     assert i_vs > 0 and i_plan > 0
     assert i_vs < i_plan, "vs_deterministic 必须在构建复用计划之前冻结"
+
+
+# ------------------------------------------------ R20-B06：身份必须晚于模式
+
+def test_run_identity_is_frozen_after_execution_mode():
+    """`_run_identity` 必须**晚于** chain_mode / vs_deterministic。
+
+    审核 R19-B06：
+    > `_run_identity` 在约 1577 行构造，chain_mode 在约 1590 行、
+    > vs_deterministic 在 1603 行才注入。
+
+    顺序错了的话，身份摘要记录的是"模式未知"的 params，与实际执行模式不符。
+    """
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
+               encoding="utf-8", errors="replace").read()
+    i_ident = src.find('params["_run_identity"] = {')
+    i_mode = min((k for k in (src.find('params["chain_mode"] = str('),
+                              src.find('params["chain_mode"] = _raw_mode'))
+                  if k >= 0), default=-1)
+    i_vs = min((k for k in (src.find('params["vs_deterministic"] = bool('),
+                            src.find('params["vs_deterministic"] = _strict_bool('))
+                if k >= 0), default=-1)
+    assert i_ident > 0 and i_mode > 0 and i_vs > 0
+    assert i_ident > i_mode, "身份必须晚于 chain_mode 冻结"
+    assert i_ident > i_vs, "身份必须晚于 vs_deterministic 冻结"
+
+
+def test_unknown_chain_mode_is_not_silently_zeroed():
+    """未知模式必须告警，不能静默归零。"""
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
+               encoding="utf-8", errors="replace").read()
+    assert "CHAIN_MODE_UNKNOWN" in src, "缺少未知模式告警"
+    assert "_KNOWN_CHAIN_MODES" in src, "缺少允许值白名单"
+
+
+def test_strict_bool_rejects_string_false():
+    """`_strict_bool("false")` 必须是 False，不是 `bool("false")`。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_main_for_bool",
+        os.path.join(_ROOT, "video_restoration_pipeline", "main.py"))
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+    except SystemExit:
+        pass
+    f = m._strict_bool
+    assert f("false") is False
+    assert f("False") is False
+    assert f("0") is False
+    assert f(None) is False
+    assert f("true") is True
+    assert f(True) is True

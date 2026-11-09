@@ -887,6 +887,43 @@ def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+#: 允许的执行组模式。未知值**不得静默归零**（审核 R19-B06）。
+_KNOWN_CHAIN_MODES = frozenset({"none", "stage34"})
+
+
+def _strict_bool(value, default: bool = False) -> bool:
+    """把配置值解析成**严格**布尔。
+
+    审核 R19-B06：
+    > `bool('false')` 转为 True …… 同样未关闭。
+
+    YAML 正常写 ``false`` 会得到 Python ``False``，但 CLI/env 传进来的
+    ``"false"`` 是字符串 —— 直接 ``bool()`` 会变成 ``True``，
+    等于"用户想关、系统却打开"。
+
+    Args:
+        value: 原始值（bool / str / int / None）。
+        default: 无法识别时的返回值。
+
+    Returns:
+        bool
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off", ""):
+            return False
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
 def build_params_identity(config: Dict[str, Any], job: Dict[str, Any],
                           logger=None,
                           params: Optional[Dict[str, Any]] = None) -> str:
@@ -1565,32 +1602,24 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # `param_affects_stage()` 会跳过 `_` 前缀（R18-A04 一并修复），
     # 所以它不会污染任何 stage 的身份。
 
-    # ---- R17-01：把"本次 run 的身份"随 params 传给 stage ----
-    # 审核要求：marker 不能只比对"当前 verify 与当前媒体彼此一致" —— 只要
-    # B 把媒体和报告一起换掉，两者仍然自洽，A 无法察觉这份报告已不是自己那代。
-    # 做法：main 把自己算出的**输入身份 + 参数身份**塞进 params，stage7 原样
-    # 回写进 verify.json。B 换代时会覆盖成 B 的身份，A 一比就知道不是自己的。
-    # 成本为零（不额外读素材），且两边用的是同一份数值，不会各算各的。
-    # 注意：`_` 前缀会被 `_identity_semantics()` 跳过，因此不会改变
-    # params 身份摘要，也不会影响 CORE_QUALITY_PARAMS 的缓存判定。
-    try:
-        params["_run_identity"] = {
-            "input": build_input_identity(job.get("input_path", "")),
-            "params": build_params_identity(config, job, job_logger,
-                                            params=params),
-        }
-    except Exception as _rid_exc:         # pragma: no cover
-        job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
 
     # ---- chain.mode：默认 none，行为与改动前一致 ----
     # 它只决定**怎么执行**（经典两阶段 vs 融合执行组），不影响功能开关。
     try:
         if not params.get("chain_mode"):
             _cfg_chain = config.get("chain") or {}
-            params["chain_mode"] = str(
+            _raw_mode = str(
                 (args.get("chain") if isinstance(args, dict)
                  else getattr(args, "chain", None))
                 or _cfg_chain.get("mode") or "none").strip().lower()
+            if _raw_mode not in _KNOWN_CHAIN_MODES:
+                job_logger.warning(
+                    "CHAIN_MODE_UNKNOWN",
+                    "Unknown chain mode; falling back to none. "
+                    "See allowed values.",
+                    requested=_raw_mode, allowed=sorted(_KNOWN_CHAIN_MODES))
+                _raw_mode = "none"
+            params["chain_mode"] = _raw_mode
         # ---- vs.deterministic：VapourSynth 渲染确定性（默认关）----
         # 打开后 stage1/stage6 会在 vpy 里写 `core.num_threads = 1`，
         # 输出逐像素可复现，代价是渲染慢约 4.78 倍。
@@ -1600,8 +1629,9 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             _cfg_vs = config.get("vs") or {}
             if not isinstance(_cfg_vs, dict):
                 _cfg_vs = {}
-            params["vs_deterministic"] = bool(
-                _cfg_vs.get("deterministic", False))
+            # 审核 R19-B06：`bool("false")` 为 True，会把字符串 false 读成开。
+            params["vs_deterministic"] = _strict_bool(
+                _cfg_vs.get("deterministic"), default=False)
             if params["vs_deterministic"]:
                 job_logger.warning(
                     "VS_DETERMINISTIC_ON",
@@ -1614,6 +1644,33 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     except Exception as _cm_exc:          # pragma: no cover
         job_logger.warning("CHAIN_MODE_FAIL", str(_cm_exc))
         params["chain_mode"] = "none"
+        params.setdefault("vs_deterministic", False)
+
+    # ---- R17-01：把"本次 run 的身份"随 params 传给 stage ----
+    # 审核要求：marker 不能只比对"当前 verify 与当前媒体彼此一致" —— 只要
+    # B 把媒体和报告一起换掉，两者仍然自洽，A 无法察觉这份报告已不是自己那代。
+    # 做法：main 把自己算出的**输入身份 + 参数身份**塞进 params，stage7 原样
+    # 回写进 verify.json。B 换代时会覆盖成 B 的身份，A 一比就知道不是自己的。
+    # 成本为零（不额外读素材），且两边用的是同一份数值，不会各算各的。
+    # 注意：`_` 前缀会被 `_identity_semantics()` 与 `param_affects_stage()` 跳过
+    # （R18-A04），因此不会改变 params 身份摘要，也不影响 CORE_QUALITY_PARAMS。
+    #
+    # ---- ①②之后：执行模式已冻结，**这时**才算全局身份 ----
+    # 审核 R19-B06：
+    #   > `_run_identity` 在约 1577 行构造，chain_mode 在约 1590 行、
+    #   > vs_deterministic 在 1603 行才注入。模式冻结 → 内部身份 → 局部身份/计划
+    #   > 还没有完全实现。
+    # 顺序必须是：chain_mode / vs_deterministic 落定 → 再算 _run_identity，
+    # 否则身份摘要里记录的是"模式未知"的 params，与实际执行模式不符。
+    try:
+        params["_run_identity"] = {
+            "input": build_input_identity(job.get("input_path", "")),
+            "params": build_params_identity(config, job, job_logger,
+                                            params=params),
+        }
+    except Exception as _rid_exc:         # pragma: no cover
+        job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
+
 
     # Determine stage order
     stages = [
