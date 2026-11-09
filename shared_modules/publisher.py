@@ -82,7 +82,8 @@ class PublishResult:
 
     __slots__ = ("ok", "phase", "failed_at", "restored", "errors",
                  "journal_path", "attempt_id", "published", "recovery",
-                 "cleanup_pending", "terminal_pending")
+                 "cleanup_pending", "terminal_pending",
+                 "generation_receipt")
 
     def __init__(self, attempt_id: str, journal_path: str):
         self.attempt_id = attempt_id
@@ -98,6 +99,11 @@ class PublishResult:
         # R16-01：终态（COMMITTED / ROLLED_BACK）没能持久化。为 True 时
         # **必须保留备份**，否则下一次无从恢复/确认。
         self.terminal_pending: bool = False
+        #: R20-A01：成功发布后产出的**整代回执**（GenerationReceipt）。
+        #: `ok=True` 且 `terminal_pending=False` 时才有意义；
+        #: 调用方应把它原子写到**本 attempt 私有**的 result JSON，
+        #: 而不是让 main 去 glob/猜最新文件。
+        self.generation_receipt: Optional[Any] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -108,6 +114,14 @@ class PublishResult:
             "journal_path": self.journal_path,
             "cleanup_pending": self.cleanup_pending,
             "recovery": self.recovery,
+            # 审核 R19-A01：
+            # > `publisher.py:458–474` 在 COMMITTED 写失败时设置
+            # > terminal_pending，但仍返回 ok=True；as_dict 未包含
+            # > terminal_pending。媒体已经晋升与任务已经可靠完成是两种状态。
+            "terminal_pending": self.terminal_pending,
+            "generation_receipt": (
+                self.generation_receipt.to_dict()
+                if self.generation_receipt is not None else None),
         }
 
     def __repr__(self) -> str:      # pragma: no cover - 调试用
@@ -205,7 +219,11 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
             attempt_id: str, decision: Optional[Dict[str, Any]] = None,
             logger=None, lock_timeout: float = 30.0,
             keep_backups: bool = False,
-            allowed_output_roots: Optional[List[str]] = None) -> PublishResult:
+            allowed_output_roots: Optional[List[str]] = None,
+            run_identity: Optional[str] = None,
+            required_objects: Optional[List[str]] = None,
+            marker_digest: str = ""
+            ) -> PublishResult:
     """把一组候选件作为一个事务提交到各自的最终路径。
 
     Args:
@@ -502,6 +520,35 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                         attempt_id=attempt_id)
             res.phase = PHASE_COMMITTED
             res.ok = True
+
+            # ---- R20-A01：产出整代回执 ----
+            # 关键点（审核 §3.2 第 7 条）：
+            #   `terminal_pending=True` 时**不能**声称完成 ——
+            #   媒体已晋升 ≠ 任务已可靠完成。
+            try:
+                from receipts import GenerationReceipt as _GR
+                _digs = {row["artifact"].final: row["digest"]
+                         for row in plan_rows}
+                res.generation_receipt = _GR(
+                    generation=int(doc.get("run_generation") or 1),
+                    attempt_id=attempt_id,
+                    run_identity=(run_identity or ""),
+                    required_objects=(list(required_objects)
+                                      if required_objects
+                                      else list(_digs.keys())),
+                    object_digests=_digs,
+                    # marker 由**调用方**准备并列入同一事务的必需对象；
+                    # publish 只记录它的摘要（不自己生成，避免循环定义）
+                    marker_digest=(marker_digest or ""),
+                    terminal_persisted=not res.terminal_pending,
+                    journal_phase=PHASE_COMMITTED,
+                    check_digest="",
+                )
+            except Exception as _rex:        # pragma: no cover
+                if logger:
+                    logger.error("PUBLISH_RECEIPT_FAIL",
+                                 "publish succeeded but the generation receipt "
+                                 "could not be built", error=str(_rex))
     except TargetLockTimeout as exc:
         res.failed_at = "lock"
         res.errors.append(f"could not acquire the target locks: {exc}")
