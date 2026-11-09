@@ -391,6 +391,44 @@ def validate_journal_structure(doc: Dict[str, Any]) -> List[str]:
                 problems.append(
                     f"records[{key!r}] is not an object "
                     f"(got {type(val).__name__})")
+                continue
+            # ---- record 字段完整性（审核 R19-B02）----
+            # 空 record `{}` 曾经能通过，恢复时 `bool({}.get('existed'))`
+            # 得到 False → 被当成"原来不存在" → 直接删目标。
+            # **未知不能等同 ABSENT**：字段缺失就报错。
+            for _k in ("artifact", "staging", "new_digest"):
+                _v = val.get(_k)
+                if not isinstance(_v, str) or not _v.strip():
+                    problems.append(
+                        f"records[{key!r}].{_k} is missing or empty")
+            if "existed" not in val:
+                problems.append(
+                    f"records[{key!r}].existed is missing — an unknown "
+                    f"state must not be treated as ABSENT")
+            elif not isinstance(val["existed"], bool):
+                problems.append(
+                    f"records[{key!r}].existed must be a bool, got "
+                    f"{type(val['existed']).__name__}")
+            elif val["existed"]:
+                # "原来存在"必须有可核对的旧内容摘要。
+                _od = val.get("old_digest")
+                if not isinstance(_od, str) or not _od.strip():
+                    problems.append(
+                        f"records[{key!r}].old_digest is required when "
+                        f"existed=True")
+                # backup / backup_digest **成对**要求，而不是无条件要求：
+                # 新旧字节相同时（old_digest == new_digest）恢复不需要备份，
+                # 生产也不会写它（`classify_generation` 判 already_* 即可）。
+                # 但"只写了一半"仍然是坏记录。
+                _bk = val.get("backup")
+                _bd = val.get("backup_digest")
+                _has_bk = isinstance(_bk, str) and bool(_bk.strip())
+                _has_bd = isinstance(_bd, str) and bool(_bd.strip())
+                if _has_bk != _has_bd:
+                    problems.append(
+                        f"records[{key!r}]: backup and backup_digest must "
+                        f"appear together (got backup={bool(_has_bk)}, "
+                        f"backup_digest={bool(_has_bd)})")
         if len(set(rkeys)) != len(rkeys):
             problems.append(
                 "records contains duplicate paths after normalisation")

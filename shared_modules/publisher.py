@@ -649,7 +649,14 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
 
     # --- 预检（只读）---
     for fin, snap in snapshot.items():
-        if not snap.get("existed"):
+        # 审核 R19-B02：`existed` 只认**真布尔**。
+        # `not snap.get("existed")` 会把 None（未知）也当成"原来不存在"，
+        # 随后在执行阶段直接删目标。未知必须进 impossible，交给人工。
+        _ex = snap.get("existed")
+        if _ex is None:
+            impossible.append(fin)
+            continue
+        if _ex is False:
             # 旧代本来不存在 → 恢复动作是"撤下本次新建的文件"
             continue
         bk = snap.get("backup")
@@ -675,7 +682,13 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
     # --- 执行 ---
     for fin, snap in snapshot.items():
         try:
-            if not snap.get("existed"):
+            _ex2 = snap.get("existed")
+            if _ex2 is None:
+                # 未知身份：**保留现场**，不删不改
+                failed.append({"target": fin,
+                               "reason": "existed is unknown; kept in place"})
+                continue
+            if _ex2 is False:
                 # 本次新建的 → 撤下
                 if os.path.exists(fin):
                     os.remove(fin)
@@ -891,7 +904,11 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
     snapshot: Dict[str, Dict[str, Any]] = {}
     for fin, rec in records.items():
         snapshot[fin] = {
-            "existed": bool(rec.get("existed")),
+            # 审核 R19-B02：**不能** bool(rec.get(...)) —— 字段缺失会被
+            # 读成"原来不存在"，随后走进删除分支。校验器已保证这里是真 bool；
+            # 这里再兜一层：非 bool 直接当未知，交给调用方拒绝。
+            "existed": rec.get("existed") if isinstance(
+                rec.get("existed"), bool) else None,
             "old_digest": rec.get("old_digest"),
             "backup": rec.get("backup"),
             "backup_digest": rec.get("backup_digest"),

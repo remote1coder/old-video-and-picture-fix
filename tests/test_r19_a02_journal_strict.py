@@ -40,9 +40,35 @@ def _sha(path):
     return h.hexdigest()
 
 
-def _doc(targets, records, attempt="att-A", phase=pj.PHASE_PREPARED):
+def _doc(targets, records, attempt="att-A", phase=pj.PHASE_PREPARED,
+         fill=True):
+    """构造 journal。
+
+    R20-B02 起 `validate_journal_structure` 会校验 record 的**字段完整性**
+    （`artifact`/`staging`/`new_digest`/`existed`，`existed=True` 时还要
+    `old_digest`/`backup`/`backup_digest`）。测试只关心某一项时，其余字段
+    用占位值补足 —— 与生产 `publisher` 写出的形状一致（它总是写全 7 个）。
+    需要**故意**构造残缺 record 的用例传 ``fill=False``。
+    """
+    full = {}
+    for t, rec in dict(records).items():
+        if not isinstance(rec, dict):
+            # 故意构造的非 dict 值：原样保留，交给校验器报错
+            full[t] = rec
+            continue
+        rec = dict(rec)
+        if fill:
+            rec.setdefault("artifact", "media")
+            rec.setdefault("staging", t + ".staging")
+            rec.setdefault("new_digest", "d" * 64)
+            rec.setdefault("existed", False)
+            if rec.get("existed") is True:
+                rec.setdefault("old_digest", "e" * 64)
+                rec.setdefault("backup", t + ".pubbak")
+                rec.setdefault("backup_digest", "f" * 64)
+        full[t] = rec
     return {"attempt_id": attempt, "phase": phase,
-            "targets": list(targets), "records": dict(records)}
+            "targets": list(targets), "records": full}
 
 
 # ================================================ 结构层

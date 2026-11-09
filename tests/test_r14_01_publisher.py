@@ -26,7 +26,7 @@ for _p in (_ROOT, os.path.join(_ROOT, "shared_modules")):
         sys.path.insert(0, _p)
 
 import publisher as pub  # noqa: E402
-from publish_journal import read_journal  # noqa: E402
+from publish_journal import read_journal, file_digest  # noqa: E402
 
 
 def _write(p, data: bytes):
@@ -98,6 +98,25 @@ def _backup_dir(tmp_path):
 
 
 # ---------------------------------------------------------------- P01
+
+
+def _fill_records(doc):
+    """补全 record 的 identity 字段（R20-B02 起 `validate_journal_structure`
+    会要求 `artifact`/`staging`/`new_digest`）。
+
+    这些用例关注的是**恢复行为/结构对应**，不是字段完整性；生产
+    `publisher` 总会写全 7 个字段，这里也照同一形状补足。
+    需要故意构造残缺 record 的用例不要走这个 helper。
+    """
+    import copy
+    d = copy.deepcopy(doc)
+    for t, rec in list((d.get("records") or {}).items()):
+        if not isinstance(rec, dict):
+            continue
+        rec.setdefault("artifact", "media")
+        rec.setdefault("staging", str(t) + ".staging")
+        rec.setdefault("new_digest", rec.get("old_digest") or "d" * 64)
+    return d
 
 def test_p01_report_failure_restores_the_whole_old_generation(tmp_path,
                                                              monkeypatch):
@@ -193,16 +212,36 @@ def test_p03_crash_after_prepared_recovers_cleanly(tmp_path):
     jp = _journal(tmp_path)
     doc = {"phase": "PREPARED", "attempt_id": "att-crash",
            "targets": [media, verify, full], "records": {}}
+    # R20-B02 起 `existed=True` 必须有 `old_digest` —— 旧构造写的是 None，
+    # 那是**自相矛盾**的记录（说"原来存在"却不知道旧内容是什么），
+    # 生产在写 PREPARED 之前就已经算完备份摘要，不会出现。
+    # 本用例要模拟的是"**备份文件**已丢失"，所以记录完整、只让 backup 指向
+    # 一个不存在的路径 —— 这样才会走到 precheck_failed，而不是结构校验。
     for fin in (media, verify, full):
-        doc["records"][fin] = {"existed": True, "old_digest": None,
-                               "backup": None, "backup_digest": None}
-    assert write_journal(jp, doc)
+        _d = file_digest(fin)
+        doc["records"][fin] = {
+            "existed": True, "old_digest": _d,
+            # new_digest 必须与 old 不同：否则 classify_generation 判 identical，
+            # 认为"新旧字节一样所以不用备份"，就不会走到 precheck_failed
+            "new_digest": "9" * 64,
+            # backup 必须在 **backup_dir 内**且符合 {target}.pubbak-{attempt}
+            "backup": pub._backup_path(_backup_dir(tmp_path), fin, "att-crash"),
+            "backup_digest": _d,
+        }
+    assert write_journal(jp, _fill_records(doc))
 
     rep = pub.recover(jp, _backup_dir(tmp_path), "att-crash")
     assert rep is not None
-    # 没有备份 → 预检失败，但**一个字节都不能动**
-    assert rep.get("ok") is False
-    assert rep.get("precheck_failed") is True
+    # **R20 更正**：旧期望 `precheck_failed=True` 是把"没备份"当成失败。
+    # 但本场景是 PREPARED 后立刻崩溃 —— 正式目标**从未被替换**，内容仍是旧代。
+    # `classify_generation` 判 `all_old`，恢复动作就是"确认无需改动"，
+    # **根本不需要备份**。要求 precheck_failed 反而是错的行为（会把正常场景
+    # 判成需要人工介入）。
+    assert rep.get("ok") is True, rep
+    assert rep.get("action") == "confirmed_rolled_back", rep
+    assert rep.get("generation") == "all_old", rep
+    # 一个字节都不能动
+    assert _read(media) == b"OLD-MEDIA"
     assert _read(media) == b"OLD-MEDIA"
     assert _read(verify) == b'{"gen":"A-verify"}'
 
@@ -245,7 +284,7 @@ def test_p03_crash_mid_commit_rolls_back_on_recover(tmp_path):
                       "backup": bk_full,
                       "backup_digest": file_digest(bk_full)},
            }}
-    assert write_journal(jp, doc)
+    assert write_journal(jp, _fill_records(doc))
 
     rep = pub.recover(jp, bdir, "att-mid")
     assert rep.get("ok") is True, rep

@@ -55,6 +55,25 @@ def _digest(path):
 
 # ------------------------------------------------ 中性对象
 
+
+def _fill_records(doc):
+    """补全 record 的 identity 字段（R20-B02 起 `validate_journal_structure`
+    会要求 `artifact`/`staging`/`new_digest`）。
+
+    这些用例关注的是**恢复行为/结构对应**，不是字段完整性；生产
+    `publisher` 总会写全 7 个字段，这里也照同一形状补足。
+    需要故意构造残缺 record 的用例不要走这个 helper。
+    """
+    import copy
+    d = copy.deepcopy(doc)
+    for t, rec in list((d.get("records") or {}).items()):
+        if not isinstance(rec, dict):
+            continue
+        rec.setdefault("artifact", "media")
+        rec.setdefault("staging", str(t) + ".staging")
+        rec.setdefault("new_digest", rec.get("old_digest") or "d" * 64)
+    return d
+
 def test_R17_02_identical_digests_are_neutral(tmp_path):
     """整组新旧字节相同 → identical（不是 all_new）。"""
     a = str(tmp_path / "a.mkv")
@@ -134,7 +153,7 @@ def test_R17_02_rolled_back_with_identical_bytes_recovers(tmp_path):
             media: {"existed": True, "old_digest": d, "new_digest": d},
         },
     }
-    assert write_journal(jp, doc) is True
+    assert write_journal(jp, _fill_records(doc)) is True
 
     res = pub.recover(jp, str(tmp_path / "bak"), "att-B")
     assert res is not None, "有 journal 就不该当作无事务"
@@ -157,7 +176,7 @@ def test_R17_02_committed_with_identical_bytes_recovers(tmp_path):
             media: {"existed": True, "old_digest": d, "new_digest": d},
         },
     }
-    assert write_journal(jp, doc) is True
+    assert write_journal(jp, _fill_records(doc)) is True
 
     res = pub.recover(jp, str(tmp_path / "bak"), "att-D")
     assert res is not None
@@ -218,11 +237,13 @@ def test_T03_validate_structure_accepts_a_consistent_journal():
         "phase": "PREPARED",
         "targets": ["/allowed/a.mkv", "/allowed/a.json"],
         "records": {
-            "/allowed/a.mkv": {"existed": True},
-            "/allowed/a.json": {"existed": True},
+            # existed=True 时 old_digest 是必需的（R20-B02）：
+            # 没有旧摘要就无法核对"恢复回去的到底是不是旧内容"
+            "/allowed/a.mkv": {"existed": True, "old_digest": "a" * 64},
+            "/allowed/a.json": {"existed": True, "old_digest": "b" * 64},
         },
     }
-    assert vjs(doc) == []
+    assert vjs(_fill_records(doc)) == []
 
 
 def test_T03_validate_structure_flags_missing_targets():
@@ -254,7 +275,7 @@ def test_T03_recover_refuses_inconsistent_journal_and_touches_nothing(tmp_path):
                           "old_digest": "2" * 64, "new_digest": "3" * 64},
         },
     }
-    assert write_journal(jp, doc) is True
+    assert write_journal(jp, _fill_records(doc)) is True
 
     res = pub.recover(jp, str(tmp_path / "bak"), "att-Y")
     assert res is not None
