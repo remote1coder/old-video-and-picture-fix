@@ -1554,6 +1554,67 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     _pre_log.flush_into(logger)
     _pre_log.flush_into(job_logger)
 
+    # ---- 执行模式必须在构建复用计划**之前**冻结 ----
+    # 审核 R18-A04：原来 `build_reuse_plan()` 在前，
+    # 注入 chain_mode / vs_deterministic / _run_identity 在后 ——
+    # 于是"计划时用的 params"与"stage 实际执行的 params"不是同一份，
+    # 局部 stage 身份对不上，下次比较必然不同 → 每个 stage 都被判失效。
+    #
+    # 现在先确定执行模式（含能力回退原因），再算身份与复用计划。
+    # 注意：`_run_identity` 是**内部回执**，不是内容语义 ——
+    # `param_affects_stage()` 会跳过 `_` 前缀（R18-A04 一并修复），
+    # 所以它不会污染任何 stage 的身份。
+
+    # ---- R17-01：把"本次 run 的身份"随 params 传给 stage ----
+    # 审核要求：marker 不能只比对"当前 verify 与当前媒体彼此一致" —— 只要
+    # B 把媒体和报告一起换掉，两者仍然自洽，A 无法察觉这份报告已不是自己那代。
+    # 做法：main 把自己算出的**输入身份 + 参数身份**塞进 params，stage7 原样
+    # 回写进 verify.json。B 换代时会覆盖成 B 的身份，A 一比就知道不是自己的。
+    # 成本为零（不额外读素材），且两边用的是同一份数值，不会各算各的。
+    # 注意：`_` 前缀会被 `_identity_semantics()` 跳过，因此不会改变
+    # params 身份摘要，也不会影响 CORE_QUALITY_PARAMS 的缓存判定。
+    try:
+        params["_run_identity"] = {
+            "input": build_input_identity(job.get("input_path", "")),
+            "params": build_params_identity(config, job, job_logger,
+                                            params=params),
+        }
+    except Exception as _rid_exc:         # pragma: no cover
+        job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
+
+    # ---- chain.mode：默认 none，行为与改动前一致 ----
+    # 它只决定**怎么执行**（经典两阶段 vs 融合执行组），不影响功能开关。
+    try:
+        if not params.get("chain_mode"):
+            _cfg_chain = config.get("chain") or {}
+            params["chain_mode"] = str(
+                (args.get("chain") if isinstance(args, dict)
+                 else getattr(args, "chain", None))
+                or _cfg_chain.get("mode") or "none").strip().lower()
+        # ---- vs.deterministic：VapourSynth 渲染确定性（默认关）----
+        # 打开后 stage1/stage6 会在 vpy 里写 `core.num_threads = 1`，
+        # 输出逐像素可复现，代价是渲染慢约 4.78 倍。
+        # 不打开时两次跑批的差异本底为 Y~48.7 / U~51.5 / V~39.6（min 42.07），
+        # 任何低于这个量级的"差异"都不能作为不等价的证据。
+        if "vs_deterministic" not in params:
+            _cfg_vs = config.get("vs") or {}
+            if not isinstance(_cfg_vs, dict):
+                _cfg_vs = {}
+            params["vs_deterministic"] = bool(
+                _cfg_vs.get("deterministic", False))
+            if params["vs_deterministic"]:
+                job_logger.warning(
+                    "VS_DETERMINISTIC_ON",
+                    "VapourSynth rendering is forced to a single thread so "
+                    "outputs are pixel-reproducible. This is about 4.78x "
+                    "slower; use it for acceptance runs, not bulk production.")
+
+        job_logger.info("CHAIN_MODE", "Effective execution-group mode",
+                        chain_mode=params.get("chain_mode"))
+    except Exception as _cm_exc:          # pragma: no cover
+        job_logger.warning("CHAIN_MODE_FAIL", str(_cm_exc))
+        params["chain_mode"] = "none"
+
     # Determine stage order
     stages = [
         (0, "stage0_audio_extract.py"),
@@ -1679,55 +1740,6 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # ID-04：本 job 内"每个 stage 本次真正产出的路径"，供下游精确消费
     _last_produced: Dict[int, List[str]] = {}
 
-    # ---- R17-01：把"本次 run 的身份"随 params 传给 stage ----
-    # 审核要求：marker 不能只比对"当前 verify 与当前媒体彼此一致" —— 只要
-    # B 把媒体和报告一起换掉，两者仍然自洽，A 无法察觉这份报告已不是自己那代。
-    # 做法：main 把自己算出的**输入身份 + 参数身份**塞进 params，stage7 原样
-    # 回写进 verify.json。B 换代时会覆盖成 B 的身份，A 一比就知道不是自己的。
-    # 成本为零（不额外读素材），且两边用的是同一份数值，不会各算各的。
-    # 注意：`_` 前缀会被 `_identity_semantics()` 跳过，因此不会改变
-    # params 身份摘要，也不会影响 CORE_QUALITY_PARAMS 的缓存判定。
-    try:
-        params["_run_identity"] = {
-            "input": build_input_identity(job.get("input_path", "")),
-            "params": build_params_identity(config, job, job_logger,
-                                            params=params),
-        }
-    except Exception as _rid_exc:         # pragma: no cover
-        job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
-
-    # ---- chain.mode：默认 none，行为与改动前一致 ----
-    # 它只决定**怎么执行**（经典两阶段 vs 融合执行组），不影响功能开关。
-    try:
-        if not params.get("chain_mode"):
-            _cfg_chain = config.get("chain") or {}
-            params["chain_mode"] = str(
-                (args.get("chain") if isinstance(args, dict)
-                 else getattr(args, "chain", None))
-                or _cfg_chain.get("mode") or "none").strip().lower()
-        # ---- vs.deterministic：VapourSynth 渲染确定性（默认关）----
-        # 打开后 stage1/stage6 会在 vpy 里写 `core.num_threads = 1`，
-        # 输出逐像素可复现，代价是渲染慢约 4.78 倍。
-        # 不打开时两次跑批的差异本底为 Y~48.7 / U~51.5 / V~39.6（min 42.07），
-        # 任何低于这个量级的"差异"都不能作为不等价的证据。
-        if "vs_deterministic" not in params:
-            _cfg_vs = config.get("vs") or {}
-            if not isinstance(_cfg_vs, dict):
-                _cfg_vs = {}
-            params["vs_deterministic"] = bool(
-                _cfg_vs.get("deterministic", False))
-            if params["vs_deterministic"]:
-                job_logger.warning(
-                    "VS_DETERMINISTIC_ON",
-                    "VapourSynth rendering is forced to a single thread so "
-                    "outputs are pixel-reproducible. This is about 4.78x "
-                    "slower; use it for acceptance runs, not bulk production.")
-
-        job_logger.info("CHAIN_MODE", "Effective execution-group mode",
-                        chain_mode=params.get("chain_mode"))
-    except Exception as _cm_exc:          # pragma: no cover
-        job_logger.warning("CHAIN_MODE_FAIL", str(_cm_exc))
-        params["chain_mode"] = "none"
 
     for stage_num, script_name in stages:
         # ---- G34：stage3 已经把 stage4 一起做完了吗 ----

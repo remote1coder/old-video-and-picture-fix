@@ -63,15 +63,22 @@ STAGE_NAMES: Dict[int, str] = {
 _STAGE_KEYS: Dict[int, Set[str]] = {
     0: {"audio_extract_codec", "audio_extract_enabled"},
     1: {"target_fps", "target_resolution", "vs_bit_depth",
-        "frame_rate_mode", "progressive_threshold"},
+        "frame_rate_mode", "progressive_threshold",
+        # R18-A04：确定性渲染只改变 stage1（TemporalDegrain / Stab）
+        # 与 stage6（GrainFactory3）的输出，不该让其他阶段失效。
+        "vs_deterministic"},
     2: {"deblock", "deblock_alt", "psf_handling", "psf_handling_alt",
         "traditional_strength", "degrain_enabled"},
     3: {"ai_enabled", "ai_force_allow_banned_upscale",
+        # R18-A04：执行组模式只改变 stage3+4 的**执行方式**（是否融合），
+        # 不影响其他阶段。改它不该让 stage0/1/2 重算。
+        "chain_mode",
         "upscale_model", "upscale_scale", "model_dir", "max_scale",
         "lanczos_target", "ban_intermediate_pixels",
         "ban_original_input_pixels", "force_allow_banned_upscale",
         "gpu_memory_fallback", "gpu_priority", "force_traditional_first"},
     4: {"unsharp_enabled", "unsharp_strength", "gblur_enabled",
+        "chain_mode",
         "gblur_sigma", "eq_enabled", "eq_contrast", "eq_saturation",
         "eq_brightness", "sharpen_enabled"},
     5: {"ai_enabled", "face_restore", "face_detect_threshold",
@@ -79,7 +86,7 @@ _STAGE_KEYS: Dict[int, Set[str]] = {
         "face_detect_lowres_max_dimension", "static_segment_duration",
         "gfpgan_model", "codeformer_fidelity"},
     6: {"grain_strength", "grain_factory3", "grain_enabled",
-        "grain_seed"},
+        "grain_seed", "vs_deterministic"},
     7: {"crf", "preset", "encoder", "video_encoder", "pix_fmt",
         "color_range",
         "svt_tile_cols", "svt_tile_rows", "preset_max_quality",
@@ -157,6 +164,14 @@ def param_affects_stage(key: str, stage: int) -> bool:
     —— 本该只重跑 stage7，却从 stage1 全链重来。
     """
     k = _norm_key(key)
+    # ---- 内部/回执键不是内容语义 ----
+    # 审核 R18-A04：视频链**缺少**这条跳过规则，而照片链
+    # （`photo_param_affects_stage`）本来就有。后果：
+    # `_run_identity` / `_shake_probe` / `_stabilize_effective` 这些纯内部键
+    # 落到下面的"无人认领 → 保守 True"分支，**污染每一个 stage 的身份**。
+    # 于是仅改 CRF 也会让 stage1 身份变化 → 全链重算。
+    if k.startswith("_"):
+        return False
     if k in NON_SEMANTIC_PARAMS:
         return False
     if k in GLOBAL_PARAMS:
