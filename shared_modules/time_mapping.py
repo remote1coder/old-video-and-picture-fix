@@ -36,6 +36,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -104,23 +106,39 @@ def transform_from_params(params: Optional[Dict[str, Any]]) -> Transform:
 
 
 def expected_pts(source_pts: Sequence[float],
-                 transform: Transform) -> List[float]:
+                 transform: Transform,
+                 last_duration: Optional[float] = None) -> List[float]:
     """按变换算出**期望的**逐帧 PTS（秒）。
 
+    Args:
+        source_pts: 源逐帧 PTS（秒，严格递增）。
+        transform: 变换描述。
+        last_duration: 源**末帧的持续时间**（秒）。只有"源不足两帧、
+            无法从相邻帧推断间隔"时才需要；不给就拒绝，不能凭空猜时刻。
+
     Raises:
-        ValueError: 变换描述非法，或源时间轴不足两帧（无法推断间隔）。
+        ValueError: 变换非法、源为空、时间戳非有限、或缺少必需的 duration。
+
+    Note:
+        `decimate` 是**理想模型**（假设每 cycle 丢最后一帧），
+        不代表真实 `VDecimate` 的内容选择；`describe_mapping()` 会把它
+        标成 ``model="idealised"``，下游不得据此断言等价。
     """
     t = transform.normalized()
     src = [float(x) for x in source_pts]
-    if len(src) < 2:
-        raise ValueError("need at least two source timestamps")
+    if not src:
+        raise ValueError("source timeline is empty")
+    for i, p in enumerate(src):
+        if not math.isfinite(p):
+            # NaN 会让后续所有比较恒为 False（表现为"通过"），必须在入口挡住
+            raise ValueError(f"source timestamp #{i} is not finite: {p!r}")
     base = src[0]
 
     if t.kind == "identity":
+        # 保时：单帧也合法，不需要间隔
         return list(src)
 
     if t.kind == "speed":
-        # 保持帧数，整体时间轴按倍数压缩/拉伸（音频由上层 atempo 对齐）
         return [base + (p - base) / t.value for p in src]
 
     if t.kind == "fps_reinterpret":
@@ -128,13 +146,42 @@ def expected_pts(source_pts: Sequence[float],
         return [base + i * step for i in range(len(src))]
 
     if t.kind == "double":
-        # 每帧复制一份：原间隔减半，帧数翻倍
-        out: List[float] = []
-        for i, p in enumerate(src):
-            out.append(p)
-            if i + 1 < len(src):
-                out.append(base + (p - base) + (src[i + 1] - p) / 2.0)
-        return out
+        # ---- 倍帧：每个输入帧产生**两个**输出时刻（不是 2N−1）----
+        # 审核 R18-A05：
+        #   > `double` 对 N 帧只产生 2N−1 个 PTS：3 帧得到 5 帧，
+        #   > 最后一个场没有表达。新增测试直接断言 3→5，固化了缺陷。
+        # 物理含义：每帧的两场各占半个源间隔；末帧的第二场同样占半个间隔，
+        # 所以 3 帧 @0.04 → 0, .02, .04, .06, .08, .10（6 个）。
+        if len(src) >= 2:
+            out: List[float] = []
+            for i, p in enumerate(src):
+                out.append(p)
+                if i + 1 < len(src):
+                    half = (src[i + 1] - p) / 2.0
+                else:
+                    # 末帧：用**前一间隔**推断第二场。对 CFR 源是准确的；
+                    # 对 VFR 源这是一次推断，会写进 describe_mapping 的
+                    # last_duration_basis，报告能看出它的来源。
+                    half = (p - src[i - 1]) / 2.0
+                if not math.isfinite(half) or half <= 0:
+                    raise ValueError(
+                        "source timestamps must be strictly increasing to "
+                        f"derive a half-interval (at index {i})")
+                out.append(p + half)
+            return out
+
+        # 单帧：必须有显式末帧 duration
+        if last_duration is None:
+            raise ValueError(
+                "doubling a single-frame clip requires an explicit "
+                "last_duration (frame duration in seconds); refusing to "
+                "invent a timestamp")
+        d = float(last_duration)
+        if not math.isfinite(d) or d <= 0:
+            raise ValueError(
+                "last_duration must be a positive finite number, got "
+                f"{last_duration!r}")
+        return [base, base + d / 2.0]
 
     if t.kind == "decimate":
         cycle = int(round(t.value))
@@ -146,13 +193,37 @@ def expected_pts(source_pts: Sequence[float],
 
 
 def describe_mapping(source_pts: Sequence[float],
-                     transform: Transform) -> Dict[str, Any]:
-    """生成可直接写进报告/身份摘要的映射描述。"""
+                     transform: Transform,
+                     last_duration: Optional[float] = None) -> Dict[str, Any]:
+    """生成可直接写进报告/身份摘要的映射描述。
+
+    ``model`` 字段区分：
+
+    - ``exact``：`identity` / `speed` / `fps_reinterpret` / `double` ——
+      给定源时间轴就能算出确定的期望值。
+    - ``idealised``：`decimate` —— 这里假设"每 cycle 丢最后一帧"，
+      而真实 `VDecimate` 的选择由**内容**决定（哪帧更像重复场）。
+      只能做粗检，**不能用来断言等价**（审核 R18-A05）。
+
+    ``last_duration_basis`` 记录 `double` 末帧第二场的时刻是怎么来的：
+    ``inferred_from_previous_interval``（推断）或 ``given``（调用方显式给）。
+    """
     t = transform.normalized()
-    exp = expected_pts(source_pts, t)
+    exp = expected_pts(source_pts, t, last_duration=last_duration)
     intervals = [b - a for a, b in zip(exp, exp[1:])]
+
+    if t.kind == "double":
+        if len(source_pts) < 2:
+            basis = "given" if last_duration is not None else "unknown"
+        else:
+            basis = "inferred_from_previous_interval"
+    else:
+        basis = None
+
     return {
         "transform": {"kind": t.kind, "value": t.value},
+        "model": "idealised" if t.kind == "decimate" else "exact",
+        "last_duration_basis": basis,
         "source_frames": len(source_pts),
         "expected_frames": len(exp),
         "first_pts": round(exp[0], 6) if exp else None,
@@ -165,15 +236,29 @@ def describe_mapping(source_pts: Sequence[float],
 
 def check_against_expected(actual_pts: Sequence[float],
                            expected: Sequence[float],
-                           interval_tolerance: float = INTERVAL_TOLERANCE_S,
-                           last_tolerance: float = LAST_TOLERANCE_S
+                           interval_tolerance: Optional[float] = None,
+                           last_tolerance: Optional[float] = None,
+                           time_base: Optional[float] = None,
+                           allow_origin_shift: bool = False
                            ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """把候选实测时间轴与**期望**时间轴对照。
 
     检查项（缺一不可）：
-    1. 帧数一致；
-    2. 逐帧间隔的最大偏差 ≤ ``interval_tolerance``（**不能用末帧掩盖中间错**）；
-    3. 末帧相对首帧的跨度偏差 ≤ ``last_tolerance``。
+
+    1. 两侧都是**有限**数值 —— NaN 会让 ``err > tol`` 恒为 False，静默通过；
+    2. 两侧都**严格递增** —— 不单调的时间轴不是时间轴；
+    3. 帧数一致；
+    4. 起始原点一致（除非显式 ``allow_origin_shift=True``）；
+    5. 逐帧间隔最大偏差 ≤ 间隔容差；
+    6. 末帧相对首帧的跨度偏差 ≤ 跨度容差。
+
+    容差来源（审核 R18-A05："按容器量化、采样时基与明确规则计算"）：
+
+    - 给 ``time_base``（容器时间基，秒）：
+      ``interval_tolerance = 2 × time_base``；
+      ``last_tolerance = (N−1) × interval_tolerance``（跨度是逐帧误差的累积）。
+    - 没给：退回固定默认值，并在 metrics 标 ``default_fixed``，
+      让报告能看出这不是从时间基推出来的。
 
     Returns:
         ``(ok, problems, metrics)``
@@ -183,6 +268,7 @@ def check_against_expected(actual_pts: Sequence[float],
         "actual_frames": len(actual_pts),
         "expected_frames": len(expected),
     }
+
     if not expected:
         return False, ["expected mapping is empty"], metrics
     if len(actual_pts) != len(expected):
@@ -193,15 +279,74 @@ def check_against_expected(actual_pts: Sequence[float],
 
     a = [float(x) for x in actual_pts]
     e = [float(x) for x in expected]
+
+    # ---- 1) 有限性 ----
+    for name, seq in (("actual", a), ("expected", e)):
+        bad = [i for i, v in enumerate(seq) if not math.isfinite(v)]
+        if bad:
+            problems.append(
+                f"{name} has non-finite timestamps at index {bad[:5]} "
+                f"(count={len(bad)})")
+    if problems:
+        return False, problems, metrics
+
+    # ---- 2) 严格递增 ----
+    for name, seq in (("actual", a), ("expected", e)):
+        for i in range(1, len(seq)):
+            if seq[i] <= seq[i - 1]:
+                problems.append(
+                    f"{name} timestamps are not strictly increasing at index "
+                    f"{i} ({seq[i - 1]!r} -> {seq[i]!r}); a non-monotonic in "
+                    f"time order cannot be accepted")
+                break
+    if problems:
+        return False, problems, metrics
+
+    # ---- 3) 容差来源 ----
+    if interval_tolerance is None:
+        if time_base is not None:
+            tb = abs(float(time_base))
+            if not math.isfinite(tb) or tb <= 0:
+                return False, [f"time_base must be positive and finite: "
+                               f"{time_base!r}"], metrics
+            interval_tolerance = 2.0 * tb
+            tol_source = "derived_from_time_base"
+        else:
+            interval_tolerance = INTERVAL_TOLERANCE_S
+            tol_source = "default_fixed"
+    else:
+        tol_source = "explicit"
+    metrics["interval_tolerance_s"] = interval_tolerance
+    metrics["interval_tolerance_source"] = tol_source
+
+    if last_tolerance is None:
+        if time_base is not None:
+            last_tolerance = max(2.0 * abs(float(time_base)),
+                                 (len(e) - 1) * interval_tolerance)
+        else:
+            last_tolerance = LAST_TOLERANCE_S
+    metrics["last_tolerance_s"] = last_tolerance
+
+    # ---- 4) 原点 ----
+    shift = a[0] - e[0]
+    metrics["origin_shift_s"] = round(shift, 9)
+    if abs(shift) > last_tolerance and not allow_origin_shift:
+        problems.append(
+            f"timeline origin differs by {shift:.6f}s; pass "
+            f"allow_origin_shift=True only when an explicit shared A/V "
+            f"origin contract exists")
+
+    # ---- 5) 跨度与逐帧间隔（用相对量，抵消原点）----
     a_span = a[-1] - a[0]
     e_span = e[-1] - e[0]
     span_err = abs(a_span - e_span)
-    metrics.update(actual_last=round(a[-1], 6), expected_last=round(e[-1], 6),
+    metrics.update(actual_last=round(a[-1], 6),
+                   expected_last=round(e[-1], 6),
                    duration_error=round(span_err, 6))
-
     if span_err > last_tolerance:
         problems.append(
-            f"duration off by {span_err:.3f}s (tolerance {last_tolerance:.3f}s)")
+            f"duration off by {span_err:.6f}s "
+            f"(tolerance {last_tolerance:.6f}s)")
 
     a_int = [b - x for x, b in zip(a, a[1:])]
     e_int = [b - x for x, b in zip(e, e[1:])]
@@ -209,7 +354,7 @@ def check_against_expected(actual_pts: Sequence[float],
     metrics["max_interval_error"] = round(max_err, 6)
     if max_err > interval_tolerance:
         problems.append(
-            f"per-frame intervals off by {max_err:.3f}s "
-            f"(tolerance {interval_tolerance:.3f}s)")
+            f"per-frame intervals off by {max_err:.6f}s "
+            f"(tolerance {interval_tolerance:.6f}s)")
 
     return (not problems), problems, metrics

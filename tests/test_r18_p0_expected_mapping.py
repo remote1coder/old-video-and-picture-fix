@@ -57,11 +57,20 @@ def test_fps_reinterpret_keeps_count_and_respaces():
 
 
 def test_double_doubles_frames_and_halves_intervals():
-    """倍帧（QTGMC 50i→50p）：帧数翻倍、间隔减半。"""
+    """倍帧（QTGMC 50i→50p）：帧数翻倍、间隔减半。
+
+    **2026-11-09 修正**：这里原来断言 ``len(out) == 5``，把 2N−1 的缺陷
+    固化成了规格（审核 R18-A05 原文："新增测试直接断言 3→5，固化了缺陷"）。
+
+    正确的倍帧是每帧两个场，N 帧得 **2N** 个时刻；
+    末帧的第二场由前一间隔推断（`last_duration_basis` 会记录来源）。
+    3 帧 @0.04s → 0, .02, .04, .06, .08, .10（6 个）。
+    """
     src = [0.0, 0.04, 0.08]
     out = tm.expected_pts(src, tm.Transform("double"))
-    assert len(out) == 5, out
+    assert len(out) == 6, out
     assert out[1] - out[0] == pytest.approx(0.02, abs=1e-9)
+    assert out[-1] == pytest.approx(0.10, abs=1e-9)
 
 
 def test_decimate_drops_one_frame_per_cycle():
@@ -77,9 +86,22 @@ def test_unknown_kind_raises():
         tm.expected_pts(SRC, tm.Transform("warp", 1.0))
 
 
-def test_single_frame_source_raises():
-    with pytest.raises(ValueError):
-        tm.expected_pts([0.0], tm.Transform("identity"))
+def test_single_frame_is_rejected_only_when_the_transform_needs_an_interval():
+    """单帧不再一律拒绝（审核 R18-A05 修正）。
+
+    原断言是"单帧一律 raise"，等于把"不足两帧就什么都不支持"写成了规格。
+    审核要求：单帧按**明确 duration** 处理，缺 duration 才记录未知。
+
+    - `identity`：合法，返回原时间轴；
+    - `double`：需要显式 `last_duration`，缺了就拒绝并说明缺什么。
+    """
+    assert tm.expected_pts([0.0], tm.Transform("identity")) == [0.0]
+    with pytest.raises(ValueError) as ei:
+        tm.expected_pts([0.0], tm.Transform("double"))
+    assert "duration" in str(ei.value).lower()
+    # 给了 duration 就应当能做
+    assert len(tm.expected_pts([0.0], tm.Transform("double"),
+                               last_duration=0.04)) == 2
 
 
 # ------------------------------------------------ 从 params 推断
@@ -116,14 +138,24 @@ def test_check_accepts_quantisation_level_error():
 
 
 def test_check_blocks_middle_interval_error_even_if_last_matches():
-    """T13：末点相同、中间错 40ms —— 必须失败。"""
-    exp = tm.expected_pts(SRC_1S, tm.Transform("identity"))
-    bad = list(exp)
-    bad[10:] = [p + 0.04 for p in bad[10:]]
-    bad[-1] = exp[-1]
-    ok, problems, metrics = tm.check_against_expected(bad, exp)
-    assert ok is False, "中间间隔错 40ms 不能被末帧掩盖"
-    assert metrics["max_interval_error"] > tm.INTERVAL_TOLERANCE_S
+    """末点相同、中间间隔错 —— 必须失败。
+
+    **2026-11-09 修正**：原构造是
+    ``bad[10:] = [p + 0.04 ...]; bad[-1] = exp[-1]``，这在**等间隔**源上
+    必然造成非单调（总和必须相等，补回来就会出现 ≤0 的间隔）。
+    新的严格单调检查会先拒绝它 —— 那本身是正确行为，但会让这个用例
+    测不到"间隔判据"。
+
+    这里换成**单调且末点相同**的构造，单独验证间隔判据：
+    前两个间隔拉长、后两个压短，总和不变。
+    """
+    exp = [0.0, 0.04, 0.08, 0.12, 0.16, 0.20]
+    actual = [0.0, 0.06, 0.12, 0.16, 0.18, 0.20]
+
+    ok, problems, metrics = tm.check_against_expected(
+        actual, exp, time_base=0.001)
+    assert ok is False, f"中间间隔错 20ms 必须失败，实际 {problems}"
+    assert metrics["max_interval_error"] > metrics["interval_tolerance_s"], metrics
 
 
 def test_check_accepts_a_correctly_speed_changed_candidate():
