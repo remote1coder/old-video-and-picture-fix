@@ -69,17 +69,51 @@ def sh(cmd, **kw):
 
 
 def probe(path):
+    """探测媒体参数。
+
+    审核 R19-B07 指出三个误判来源，这里逐一堵住：
+
+    1. **ffprobe 返回非零但 stdout 留有可解析 JSON** —— 旧实现只看 JSON，
+       返回码被丢弃。现在 rc != 0 直接返回 ``{"error": ...}``。
+    2. **两份探测结果都缺 width/height/pix_fmt，缺值彼此相等** —— 旧实现
+       把这些字段原样放进 dict，``None == None`` 就算"格式一致"。
+       现在缺失/非法直接 error。
+    3. 帧数必须**可证明**（正整数），不能拿 None 当 0 用。
+
+    Returns:
+        dict：成功时含已校验的字段；失败时只有 ``{"error": str}``。
+    """
     r = sh(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
             "-show_entries",
             "stream=nb_read_frames,width,height,pix_fmt,r_frame_rate,time_base",
             "-of", "json", path])
+    if r.returncode != 0:
+        return {"error": f"ffprobe rc={r.returncode}: "
+                         f"{(r.stderr or '')[-300:]}"}
     try:
-        s = (json.loads(r.stdout or "{}").get("streams") or [{}])[0]
-    except Exception:
-        s = {}
-    return {k: s.get(k) for k in
+        streams = json.loads(r.stdout or "{}").get("streams") or []
+    except Exception as exc:
+        return {"error": f"ffprobe stdout is not JSON: {exc}"}
+    if not streams:
+        return {"error": "ffprobe returned no video stream"}
+
+    s = streams[0]
+    info = {k: s.get(k) for k in
             ("width", "height", "pix_fmt", "nb_read_frames", "r_frame_rate",
              "time_base")}
+
+    for k in ("width", "height", "nb_read_frames"):
+        try:
+            v = int(info[k])
+        except (TypeError, ValueError):
+            return {"error": f"{k} missing or not an integer: {info[k]!r}"}
+        if v <= 0:
+            return {"error": f"{k} must be positive, got {v}"}
+        info[k] = v
+
+    if not info.get("pix_fmt") or not isinstance(info["pix_fmt"], str):
+        return {"error": f"pix_fmt missing/invalid: {info.get('pix_fmt')!r}"}
+    return info
 
 
 def make_clip(dst_dir, frames):
@@ -97,13 +131,52 @@ def make_clip(dst_dir, frames):
             "-frames:v", str(frames), clip])
     if r.returncode != 0:
         raise SystemExit("造片失败: " + (r.stderr or "")[-300:])
-    return clip
+    info = probe(clip)
+    if "error" in info:
+        raise SystemExit(f"合成片探测失败：{info['error']}")
+    if info["nb_read_frames"] != frames:
+        raise SystemExit(
+            f"合成片帧数不符：期望 {frames}，实际 {info['nb_read_frames']}")
+    return clip, info
 
 
-def write_manifest(work, clip, frames):
+def _fps_of(info):
+    """从 probe 结果算 fps（失败给 None）。"""
+    raw = str(info.get("r_frame_rate") or "")
+    if "/" in raw:
+        try:
+            n, d = raw.split("/", 1)
+            n, d = float(n), float(d)
+            return n / d if d > 0 else None
+        except Exception:
+            return None
+    try:
+        return float(raw) or None
+    except Exception:
+        return None
+
+
+def write_manifest(work, clip, frames, info=None):
+    """写 manifest。
+
+    审核 R19-B08：
+    > `--input` 没有实际裁到 `--frames`，manifest 却写死 1920×1080、
+    > 30000/1001、progressive 和 `frames/30` 时长。
+
+    现在所有媒体字段都来自 ``probe(clip)`` 的**实测**结果；
+    ``info`` 缺失时直接拒绝（不允许用假元数据凑合）。
+    """
     import yaml
+    if not info or "error" in info:
+        raise SystemExit("write_manifest 需要真实的 probe 结果，"
+                         f"拒绝写死元数据：{info!r}")
+
     for sub in ("temp", "out", "logs"):
         os.makedirs(os.path.join(work, sub), exist_ok=True)
+
+    _fps = _fps_of(info)
+    _dur = (frames / _fps) if (_fps and _fps > 0) else 0.0
+
     job = {
         "job_id": "g34", "input_path": clip,
         "detected_class": "HDV_AVCHD", "confidence": 0.98,
@@ -113,13 +186,14 @@ def write_manifest(work, clip, frames):
         "user_overrides": {
             "ai_stream_raw": True,
             "force_allow_banned_upscale": True,
-            "original_fps": "30000/1001",
+            "original_fps": str(info.get("r_frame_rate") or ""),
             "cleanup_intermediates": False,
             # 确定性模式：不开的话 stage1 的抖动会盖住真实差异
             "vs_deterministic": True,
         },
-        "duration": frames / 30.0, "original_width": 1920,
-        "original_height": 1080,
+        "duration": _dur,
+        "original_width": int(info["width"]),
+        "original_height": int(info["height"]),
         "file_size": os.path.getsize(clip), "file_mtime": 0.0,
         "file_hash_prefix": "", "run_generation": 1,
         "temp_dir": os.path.join(work, "temp"),
@@ -137,10 +211,42 @@ def write_manifest(work, clip, frames):
     return path
 
 
-def run_mode(repo, work, clip, frames, mode):
+def trim_to_frames(src, dst_dir, frames):
+    """把外部素材**真裁**到 ``frames`` 帧，返回 (路径, probe)。
+
+    审核 R19-B08：
+    > `--frames` 必须实际限制所处理样本或拒绝不匹配输入。
+
+    做法：先 probe 源（拿真实尺寸/fps/pix_fmt），再用 ``-frames:v N``
+    精确裁帧并重编码到 mp4（避免长 GOP 首帧依赖）。
+    裁出来的片子仍按**实测**结果写 manifest。
+    """
+    info_src = probe(src)
+    if "error" in info_src:
+        raise SystemExit(f"--input 无法探测：{info_src['error']}")
+
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, f"trim_{frames}f.mp4")
+    r = sh(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+            "-i", src, "-frames:v", str(frames),
+            "-an", "-c:v", "libx264", "-crf", "14",
+            "-pix_fmt", "yuv420p", dst])
+    if r.returncode != 0 or not os.path.exists(dst):
+        raise SystemExit("裁帧失败：" + (r.stderr or "")[-300:])
+
+    info = probe(dst)
+    if "error" in info:
+        raise SystemExit(f"裁出的样本无法探测：{info['error']}")
+    if info["nb_read_frames"] != frames:
+        raise SystemExit(
+            f"裁帧结果帧数不符：期望 {frames}，实际 {info['nb_read_frames']}")
+    return dst, info
+
+
+def run_mode(repo, work, clip, frames, mode, info=None):
     """跑一次；`work` 必须是**调用方已创建好的**新目录。"""
     os.makedirs(work, exist_ok=True)
-    man = write_manifest(work, clip, frames)
+    man = write_manifest(work, clip, frames, info=info)
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([
         os.path.join(repo, "tools_r4"),
@@ -182,20 +288,74 @@ def compare(a, b):
             rows.append(dict(x.split(":", 1) for x in ln.split() if ":" in x))
     summary = [l.strip()[:120] for l in (r.stderr or "").splitlines()
                if "PSNR" in l]
+
+    # 审核 R19-B07：比较日志重复同一帧序号、行数凑够目标数也会被判通过。
+    # 这里显式核对 n: 序列必须是 1..N 的严格连续整数。
+    seq = []
+    for d in rows:
+        try:
+            seq.append(int(d.get("n")))
+        except (TypeError, ValueError):
+            seq.append(None)
+    dup = sorted({x for x in seq if seq.count(x) > 1})
+    noncontig = (seq != list(range(1, len(seq) + 1)))
+
     return {"returncode": r.returncode, "frames": len(rows),
             "rows": rows, "summary": summary,
+            "seq": seq, "dup": dup[:5], "noncontiguous": bool(noncontig),
             "stderr_tail": (r.stderr or "").splitlines()[-3:]}
 
 
-def _plane(rows, key):
+#: 只接受这些字面量作为 "完全相同"。审核 R19-B07：
+#: 「拒绝随便以 inf 开头的坏值」—— ``startswith("inf")`` 会放过 ``infinity_bad``。
+_INF_TOKENS = frozenset({"inf", "+inf", "-inf", "infinity", "+infinity",
+                         "-infinity"})
+
+
+def _plane(rows, key, total=None):
+    """某个平面在**每一行**都必须有合法值。
+
+    审核 R19-B07 的第一个误判：
+    > 20 行比较数据，仅第 1 行有 V 平面，另外 19 行缺 V —— 旧实现
+    > ``if v is not None`` 跳过缺失行，``present`` 仍为 True。
+
+    现在要求：缺失行数 == 0、非法值行数 == 0、有效值个数 == ``total``。
+
+    Args:
+        rows: psnr 逐帧行（dict）。
+        key: ``psnr_y`` / ``psnr_u`` / ``psnr_v``。
+        total: 期望行数；``None`` 时用 ``len(rows)``。
+
+    Returns:
+        dict：``present`` / ``n`` / ``n_missing`` / ``missing_rows`` /
+        ``bad_rows`` / ``n_inf`` / ``min`` / ``total``。
+    """
+    total = len(rows) if total is None else int(total)
     vals = []
-    for d in rows:
+    missing_idx = []
+    bad_idx = []
+    for i, d in enumerate(rows):
         v = d.get(key)
-        if v is not None:
-            vals.append(None if v.startswith("inf") else float(v))
+        if v is None:
+            missing_idx.append(i + 1)
+            continue
+        tok = v.strip().lower()
+        if tok in _INF_TOKENS:
+            vals.append(None)
+            continue
+        try:
+            vals.append(float(tok))
+        except ValueError:
+            bad_idx.append(i + 1)
+
+    ok = (not missing_idx) and (not bad_idx) and len(vals) == total and total > 0
     return {
-        "present": bool(vals),
+        "present": ok,
         "n": len(vals),
+        "total": total,
+        "n_missing": len(missing_idx),
+        "missing_rows": missing_idx[:5],
+        "bad_rows": bad_idx[:5],
         "n_inf": sum(1 for x in vals if x is None),
         "min": min((x for x in vals if x is not None), default=None),
     }
@@ -236,15 +396,32 @@ def evaluate(classic, fused, info_c, info_f, cmp_result, frames):
     if frames and n_c != frames:
         reasons.append(f"classic frame count {n_c} != requested {frames}")
 
-    # ---- 4) 尺寸与像素格式 ----
-    for k in ("width", "height", "pix_fmt"):
-        if info_c.get(k) != info_f.get(k):
-            reasons.append(f"{k} differs: {info_c.get(k)} vs {info_f.get(k)}")
+    # ---- 4) 尺寸与像素格式（先拒绝 error，再比真值）----
+    for tag, info in (("classic", info_c), ("fused", info_f)):
+        if "error" in info:
+            reasons.append(f"{tag} probe failed: {info['error']}")
+    if "error" not in info_c and "error" not in info_f:
+        for k in ("width", "height", "pix_fmt"):
+            # 审核 R19-B07：缺值彼此相等不能算"格式一致"
+            if info_c.get(k) is None or info_f.get(k) is None:
+                reasons.append(
+                    f"{k} unproven on one side: "
+                    f"classic={info_c.get(k)!r} fused={info_f.get(k)!r}")
+            elif info_c.get(k) != info_f.get(k):
+                reasons.append(
+                    f"{k} differs: {info_c.get(k)} vs {info_f.get(k)}")
 
     # ---- 5) 比较本身必须成功且覆盖全部帧 ----
     if cmp_result.get("returncode") != 0:
         reasons.append(f"psnr comparison rc={cmp_result.get('returncode')}")
     got = cmp_result.get("frames", 0)
+    if cmp_result.get("dup"):
+        reasons.append(
+            f"psnr log repeats frame numbers: {cmp_result['dup']}")
+    if cmp_result.get("noncontiguous"):
+        reasons.append(
+            "psnr log frame numbers are not 1..N contiguous "
+            "(padding/duplicate rows are not evidence)")
     if got <= 0:
         reasons.append("psnr comparison produced no frames")
     elif n_c and got != n_c:
@@ -253,7 +430,8 @@ def evaluate(classic, fused, info_c, info_f, cmp_result, frames):
             f"is not evidence")
 
     # ---- 6) 三个平面都要有数据，且全部 inf ----
-    planes = {k: _plane(cmp_result.get("rows") or [], f"psnr_{k}")
+    _rows = cmp_result.get("rows") or []
+    planes = {k: _plane(_rows, f"psnr_{k}", total=got)
               for k in ("y", "u", "v")}
     missing = [k for k, v in planes.items() if not v["present"]]
     if missing:
@@ -309,15 +487,18 @@ def main():
         if not os.path.isfile(clip):
             print("  [错误] --input 不存在：%s" % clip)
             return 2
-        print("  input   : %s（外部素材）" % clip)
+        print("  input   : %s（外部素材，按 --frames 实测裁剪）" % clip)
+        clip, info = trim_to_frames(clip, os.path.join(work_root, "in"),
+                                    args.frames)
+        print("  trimmed : %s" % clip)
     else:
-        clip = make_clip(os.path.join(work_root, "in"), args.frames)
+        clip, info = make_clip(os.path.join(work_root, "in"), args.frames)
         print("  input   : %s（本轮生成）" % clip)
 
     classic = run_mode(repo, os.path.join(work_root, "classic"), clip,
-                       args.frames, "none")
+                       args.frames, "none", info=info)
     fused = run_mode(repo, os.path.join(work_root, "fused"), clip,
-                     args.frames, "stage34")
+                     args.frames, "stage34", info=info)
     print("  classic rc=%d step3=%s" % (classic["rc"],
                                         bool(classic["step3"])))
     print("  fused   rc=%d step3=%s receipts=%s"
