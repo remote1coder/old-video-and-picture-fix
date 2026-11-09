@@ -153,11 +153,25 @@ def expected_pts(source_pts: Sequence[float],
         # 物理含义：每帧的两场各占半个源间隔；末帧的第二场同样占半个间隔，
         # 所以 3 帧 @0.04 → 0, .02, .04, .06, .08, .10（6 个）。
         if len(src) >= 2:
+            # 显式 last_duration 的校验（与单帧分支同一口径）
+            _ld = None
+            if last_duration is not None:
+                _ld = float(last_duration)
+                if not math.isfinite(_ld) or _ld <= 0:
+                    raise ValueError(
+                        "last_duration must be a positive finite number, got "
+                        f"{last_duration!r}")
+
             out: List[float] = []
             for i, p in enumerate(src):
                 out.append(p)
                 if i + 1 < len(src):
                     half = (src[i + 1] - p) / 2.0
+                elif _ld is not None:
+                    # 审核 R19-B05：**显式源 last_duration 优先于推断**。
+                    # 反例：3 帧 [0,.04,.08] + last_duration=.2 →
+                    # 末场应为 .08+.1=.18，而不是按前一间隔得到的 .10。
+                    half = _ld / 2.0
                 else:
                     # 末帧：用**前一间隔**推断第二场。对 CFR 源是准确的；
                     # 对 VFR 源这是一次推断，会写进 describe_mapping 的
@@ -316,21 +330,31 @@ def check_against_expected(actual_pts: Sequence[float],
             tol_source = "default_fixed"
     else:
         tol_source = "explicit"
+
+    # 审核 R19-B05：显式容差本身必须有限且非负，否则一切都能通过
+    for _name, _v in (("interval_tolerance", interval_tolerance),
+                      ("last_tolerance", last_tolerance)):
+        if _v is not None:
+            try:
+                _f = float(_v)
+            except (TypeError, ValueError):
+                return False, [f"{_name} is not a number: {_v!r}"], metrics
+            if not math.isfinite(_f) or _f < 0:
+                return False, [f"{_name} must be finite and >= 0: {_v!r}"], metrics
     metrics["interval_tolerance_s"] = interval_tolerance
     metrics["interval_tolerance_source"] = tol_source
 
     if last_tolerance is None:
-        if time_base is not None:
-            last_tolerance = max(2.0 * abs(float(time_base)),
-                                 (len(e) - 1) * interval_tolerance)
-        else:
-            last_tolerance = LAST_TOLERANCE_S
+        # 审核 R19-B05：**不能**用 (N−1)×interval 让容差随片长膨胀。
+        # 末帧/跨度的误差不是一个"每帧误差累加"的量 —— 若每帧都准，跨度自然准。
+        # 给 2 倍逐点容差，覆盖末帧 duration 与量化边界的不确定性。
+        last_tolerance = 2.0 * interval_tolerance
     metrics["last_tolerance_s"] = last_tolerance
 
     # ---- 4) 原点 ----
     shift = a[0] - e[0]
     metrics["origin_shift_s"] = round(shift, 9)
-    if abs(shift) > last_tolerance and not allow_origin_shift:
+    if abs(shift) > interval_tolerance and not allow_origin_shift:
         problems.append(
             f"timeline origin differs by {shift:.6f}s; pass "
             f"allow_origin_shift=True only when an explicit shared A/V "

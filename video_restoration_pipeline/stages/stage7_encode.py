@@ -2812,7 +2812,8 @@ def main():
             try:
                 from vfr_timecodes import (
                     find_mkvmerge as _find_mkv, is_variable as _is_var,
-                    probe_pts as _probe_pts, retime_to_source_pts as _retime)
+                    probe_pts as _probe_pts, retime_to_source_pts as _retime,
+                    probe_time_base as _probe_tb)
                 _rp_paths = (params.get("_run_plan") or {}).get("paths") or {}
                 _orig_src = ((_rp_paths.get("input_path") or {}).get("resolved")
                              or (params.get("_run_plan") or {}).get("input_path"))
@@ -2887,7 +2888,12 @@ def main():
                         if _tsrc and len(_tsrc) >= 2 and _tt.kind != "identity":
                             _exp = _exp_pts(_tsrc, _tt)
                             _act = _probe_pts(_publish_tmp)
-                            _m_ok, _m_problems, _m_metrics = _check_map(_act, _exp)
+                            # 审核 R20-B05：容差必须来自**实际** time_base。
+                            # 拿不到（探测失败）就让函数走 "default_fixed" 并在
+                            # metrics 里留痕，**不假装**用了精确步长。
+                            _tb_pub = _probe_tb(_publish_tmp)
+                            _m_ok, _m_problems, _m_metrics = _check_map(
+                                _act, _exp, time_base=_tb_pub)
                             _retime_info.update({
                                 "expected_mapping": _desc_map(_tsrc, _tt),
                                 "mapping_ok": bool(_m_ok),

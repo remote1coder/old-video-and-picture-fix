@@ -88,6 +88,51 @@ def find_mkvmerge(project_root: Optional[str] = None) -> Optional[str]:
     return which("mkvmerge")
 
 
+def probe_time_base(video: str, timeout: int = 30) -> "Optional[float]":
+    """探测首条视频流的**实际** ``time_base``（秒）。
+
+    审核 R20-B05：
+    > 实际时间基、重封装量化规则和测量精度决定容差。
+    > 不要硬编码"所有容器均 1ms"，也不要把量化误差按帧数累加成数秒。
+
+    1ms 只是 **mkvmerge 的默认时间刻度**，不是所有容器的量化步长。
+    调用方（stage7）应当把本函数的结果传给 ``check_against_expected``，
+    而不是让它退化到 20/50 ms 的兜底常量。
+
+    Args:
+        video: 媒体路径。
+        timeout: ffprobe 超时（秒）。
+
+    Returns:
+        时间基秒数（如 ``1/30000`` → 3.33e-05）；探测失败或值非法返回 ``None``。
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=time_base", "-of", "csv=p=0", video],
+            capture_output=True, text=True, errors="replace",
+            timeout=timeout, shell=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    for line in (r.stdout or "").splitlines():
+        v = line.strip().rstrip(",")
+        if "/" not in v:
+            continue
+        try:
+            num, den = v.split("/", 1)
+            n, d = float(num), float(den)
+        except ValueError:
+            continue
+        if d <= 0:
+            continue
+        tb = abs(n) / d
+        if tb > 0:
+            return tb
+    return None
+
+
 def probe_pts(video: str, timeout: int = 120) -> List[float]:
     """读出每一帧的 ``pts_time``（秒）。读不到返回空列表。"""
     try:
