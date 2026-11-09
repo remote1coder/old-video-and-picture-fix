@@ -84,14 +84,15 @@ def test_partial_start_reaps_the_first_process(tmp_path):
     ffmpeg_cmd = [str(tmp_path / "no-such-ffmpeg-binary"), "-f", "null", "-"]
 
     log = _Log()
-    status, detail = s6._run_grain_pipeline(
+    res = s6._run_grain_pipeline(
         "clip = None", str(vs_path), vspipe_cmd, ffmpeg_cmd,
         str(out), log)
 
-    assert status != 0, f"启动失败必须返回非 0，实际 {status!r} {detail!r}"
+    assert not res.ok, f"启动失败必须返回 not ok，实际 {res!r}"
     # detail 必须指出**失败发生在哪一步**：这里是第二步 ffmpeg，
     # 说明第一步 vspipe 已经起来了 —— 所以紧接着的回收断言才有意义。
-    assert "at ffmpeg" in detail, f"失败步骤未标注清楚：{detail!r}"
+    assert res.failed_stage == "ffmpeg", (
+        f"失败阶段应标为 ffmpeg，实际 {res.failed_stage!r}；detail={res.detail!r}")
 
     # 等到 marker 本该出现的时刻之后，断言它不存在
     # （旧实现不回收第一个进程 → 它 sleep 完会写出 marker）
@@ -130,13 +131,15 @@ def test_producer_failure_is_not_reported_as_success(tmp_path):
         "sys.exit(0)\n")
 
     log = _Log()
-    status, detail = s6._run_grain_pipeline(
+    res = s6._run_grain_pipeline(
         "clip = None", str(vs_path), vspipe_cmd, ffmpeg_cmd,
         str(out), log)
 
-    assert status != 0, (
-        f"生产者 rc=9 却报了成功：status={status!r} detail={detail!r}")
-    assert "9" in str(detail) or "producer" in str(detail).lower(), detail
+    assert not res.ok, (
+        f"生产者 rc=9 却报了成功：ok={res.ok!r} detail={res.detail!r}")
+    assert res.vspipe_rc == 9, f"vspipe_rc 应为 9，实际 {res.vspipe_rc!r}"
+    assert res.failed_stage == "vspipe", res.failed_stage
+    assert "9" in res.detail or "producer" in res.detail.lower(), res.detail
     # 下游那个"成功"的文件是半成品，不该留下
     assert not out.exists(), "失败时不得留下半成品"
 
@@ -154,10 +157,10 @@ def test_clean_run_returns_zero(tmp_path):
         f"pathlib.Path(r'{out}').write_bytes(data)\n")
 
     log = _Log()
-    status, detail = s6._run_grain_pipeline(
+    res = s6._run_grain_pipeline(
         "clip = None", str(vs_path), vspipe_cmd, ffmpeg_cmd,
         str(out), log)
-    assert status == 0, (status, detail)
+    assert res.ok, (res.ok, res.detail)
     assert out.exists() and out.stat().st_size == 4096
 
 
