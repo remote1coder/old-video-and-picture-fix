@@ -20,6 +20,7 @@ import os
 import json
 import subprocess
 from pathlib import Path
+from typing import Optional
 import glob
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
@@ -120,6 +121,138 @@ def _build_vs_script(input_source: str, vs_format: str,
     return script
 
 
+class _TailLog:
+    """边排空边落盘的**有界**日志容器。
+
+    审核 R18-A07：
+    > stderr 虽被并发排空，却持续保存在列表，长任务的日志内存没有上限。
+
+    旧实现 `_sinks = {"enc": [], "vs": []}` 把子进程的**全部** stderr
+    留在内存里；4K 长片 + 详细日志可以到几百 MB。
+
+    现在：字节流直接写进本 attempt 的日志文件（**不丢**），
+    内存只保留最后 ``limit`` 字节（用于错误提示）。
+    """
+
+    __slots__ = ("path", "limit", "total", "_tail", "_fh")
+
+    def __init__(self, path: Optional[str] = None, limit: int = 65536) -> None:
+        self.path = path
+        self.limit = int(limit)
+        self.total = 0
+        self._tail = bytearray()
+        self._fh = None
+        if path:
+            try:
+                self._fh = open(path, "ab")
+            except OSError:
+                self._fh = None
+
+    def write(self, chunk) -> None:
+        if not chunk:
+            return
+        self.total += len(chunk)
+        if self._fh is not None:
+            try:
+                self._fh.write(chunk)
+                self._fh.flush()
+            except OSError:
+                self._fh = None        # 落盘失败不该拖垮管道
+        self._tail.extend(chunk)
+        over = len(self._tail) - self.limit
+        if over > 0:
+            del self._tail[:over]
+
+    def tail_bytes(self) -> bytes:
+        return bytes(self._tail)
+
+    def tail_text(self) -> str:
+        return self.tail_bytes().decode("utf-8", errors="replace")
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+
+
+def _reap_pipeline(procs, threads, logger=None, label: str = "stage6") -> None:
+    """收尾一组**可能部分启动**的进程。本函数不抛异常。
+
+    顺序很重要（反了会出问题）：
+
+    1. **先 join 排空线程** —— 否则关句柄时 `read()` 还阻塞在管道上；
+    2. terminate → 有界 wait → kill 残留 → 再 wait；
+    3. 关 stdout/stderr/stdin 句柄；
+    4. 解取消守卫登记 —— 必须先停进程再注销，否则会遗留写入者。
+
+    Raises:
+        不抛。收尾阶段抛异常只会掩盖真正的原因。
+    """
+    for t in threads or []:
+        try:
+            t.join(timeout=10)
+        except BaseException:
+            pass
+
+    live = []
+    for p in procs or []:
+        try:
+            if p is not None and p.poll() is None:
+                live.append(p)
+        except BaseException:
+            continue
+
+    for p in live:
+        try:
+            p.terminate()
+        except BaseException:
+            pass
+    for p in live:
+        try:
+            p.wait(timeout=10)
+        except BaseException:
+            try:
+                p.kill()
+            except BaseException:
+                pass
+            try:
+                p.wait(timeout=5)
+            except BaseException:
+                if logger:
+                    try:
+                        logger.warning(
+                            "STAGE6_REAP_INCOMPLETE",
+                            "A pipeline process did not exit even after kill",
+                            pid=getattr(p, "pid", None), label=label)
+                    except BaseException:
+                        pass
+
+    for p in procs or []:
+        if p is None:
+            continue
+        for attr in ("stdout", "stderr", "stdin"):
+            h = getattr(p, attr, None)
+            if h is None:
+                continue
+            try:
+                if not h.closed:
+                    h.close()
+            except BaseException:
+                pass
+
+    if _cancel_guard is not None:
+        for p in procs or []:
+            if p is None:
+                continue
+            try:
+                _cancel_guard.unwatch_process(p)
+            except BaseException:
+                pass
+
+
 def _run_grain_pipeline(vs_script_str: str, vs_path: str,
                         vspipe_cmd: list, ffmpeg_cmd: list,
                         output_path: str, logger,
@@ -128,34 +261,63 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
     """Run grain synthesis pipeline (vspipe → ffmpeg FFV1).
 
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
-    Returns (status_code_or_str, detail_str) per BUG-036.
+
+    Returns:
+        ``(status, detail)``；``status == 0`` 表示成功。
+
+    R19 重写要点（审核 R18-A07）：
+
+    1. **每创建一个进程就立刻放进 `procs`** —— 第二个 Popen 失败时，
+       第一个也一定会被收尾（旧实现直接 return，vspipe 变孤儿，
+       继续把半截数据写回 output_path）。
+    2. **统一 finally** 覆盖"启动 / 等待 / 取消 / 异常"四条路径。
+    3. **检查每一个进程的状态**，不只看 ffmpeg
+       （旧实现：生产者 rc=9 + 编码器 rc=0 → 返回 `(0, '')` 假成功）。
+    4. 失败时**清掉半成品** —— 下游不该看到半截 mkv。
+    5. stderr 落盘 + 内存只留有界尾部（:class:`_TailLog`）。
     """
     with open(vs_path, "w", encoding="utf-8") as f:
         f.write(vs_script_str)
+
+    procs: list = []            # 已创建的**全部**进程（含部分启动）
+    threads: list = []
+    vspipe_proc = None
+    ffmpeg_proc = None
+    status = None
+    detail = ""
+    #: 当前正在启动/等待哪一步。失败时写进 detail，
+    #: 让调用方（和测试）能区分"第一步就起不来"与"第二步失败但第一步要回收"。
+    _step = "vspipe"
+
+    _base = output_path or "stage6"
+    enc_log = _TailLog(_base + ".enc.log")
+    vs_log = _TailLog(_base + ".vs.log")
+
     try:
+        # ---- ① 第一个进程：创建后**立刻**纳入管理 ----
         vspipe_proc = subprocess.Popen(
             vspipe_cmd, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, shell=False)
+        procs.append(vspipe_proc)
+
+        # ---- ② 第二个进程：失败时 vspipe 已在 procs 里，finally 会回收 ----
+        _step = "ffmpeg"
         ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd, stdin=vspipe_proc.stdout,
             stderr=subprocess.PIPE, shell=False)
+        procs.append(ffmpeg_proc)
         vspipe_proc.stdout.close()
-        # NEW-V-06/RV-12: 两个子进程都必须登记——取消时只杀 Python stage
+        _step = "wait"
+
+        # NEW-V-06/RV-12：两个子进程都必须登记——取消时只杀 Python stage
         # 的话，vspipe/ffmpeg 会继续把半截数据写回 output_path（守卫刚删掉
         # 的文件被孤儿进程重新创建，取消就白做了）。
         if _cancel_guard is not None:
             _cancel_guard.watch_process(vspipe_proc)
             _cancel_guard.watch_process(ffmpeg_proc)
-        # ---- 按**心跳**等，不按总时长；同时必须并发排空 stderr ----
-        # 原来是 `ffmpeg_proc.communicate(timeout=3600)`：4K 长片一次颗粒合成
-        # 远超 1 小时，会被硬砍（审核 R17-05 点名 stage6 仍是绝对超时）。
-        #
-        # 但直接换成 wait 会引入**新死锁**：communicate() 内部是并发排空管道的，
-        # 而 ffmpeg/vspipe 都挂了 stderr=PIPE，没人读的话写满 64KB 缓冲区就会
-        # 把子进程卡住。所以先起排空线程，再按心跳等。
-        import threading
 
-        _sinks = {"enc": [], "vs": []}
+        # ---- ③ 并发排空（同时落盘，内存有界）----
+        import threading
 
         def _pump(pipe, sink):
             if pipe is None:
@@ -165,61 +327,90 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
                     chunk = pipe.read(65536)
                     if not chunk:
                         break
-                    sink.append(chunk)
+                    sink.write(chunk)
             except BaseException:
                 pass
 
-        _threads = []
-        for _pipe, _key in ((getattr(ffmpeg_proc, "stderr", None), "enc"),
-                            (getattr(vspipe_proc, "stderr", None), "vs")):
-            _t = threading.Thread(target=_pump, args=(_pipe, _sinks[_key]),
+        for _pipe, _sink in ((getattr(ffmpeg_proc, "stderr", None), enc_log),
+                             (getattr(vspipe_proc, "stderr", None), vs_log)):
+            _t = threading.Thread(target=_pump, args=(_pipe, _sink),
                                  daemon=True)
             _t.start()
-            _threads.append(_t)
+            threads.append(_t)
 
+        # ---- ④ 按心跳等（不设总时长）----
+        _hb = (lambda: (os.path.getsize(output_path)
+                        if output_path and os.path.exists(output_path)
+                        else 0))
+        if _cancel_guard is not None and hasattr(_cancel_guard,
+                                                 "wait_with_heartbeat"):
+            _cancel_guard.wait_with_heartbeat(
+                [ffmpeg_proc, vspipe_proc], heartbeat=_hb,
+                inactivity_timeout=inactivity_s,
+                logger=logger, label="stage6-grain")
+        else:  # pragma: no cover - 守卫缺失时退回有界等待
+            ffmpeg_proc.wait(timeout=inactivity_s)
+            vspipe_proc.wait(timeout=inactivity_s)
+    except BaseException as exc:
+        # 不在这里 return：交给 finally 统一收尾，再在下面判状态
+        status = 84
+        detail = (f"grain pipeline failed at {_step}: "
+                  f"{type(exc).__name__}: {exc}")
+        if logger:
+            try:
+                logger.error("STAGE6_PIPELINE_ERROR", detail,
+                             stage6_error_type=type(exc).__name__)
+            except BaseException:
+                pass
+    finally:
+        _reap_pipeline(procs, threads, logger=logger, label="stage6-grain")
+        enc_log.close()
+        vs_log.close()
+
+    # ---- ⑤ 判定：检查**每一个**参与进程 ----
+    if status is None:
+        vs_rc = None if vspipe_proc is None else vspipe_proc.returncode
+        enc_rc = None if ffmpeg_proc is None else ffmpeg_proc.returncode
+        if vspipe_proc is None or ffmpeg_proc is None:
+            status = 84
+            detail = ("grain pipeline did not start: "
+                      f"vspipe={'ok' if vspipe_proc else 'missing'}, "
+                      f"ffmpeg={'ok' if ffmpeg_proc else 'missing'}")
+        elif vs_rc != 0:
+            status = 84
+            detail = (f"producer (vspipe) failed rc={vs_rc}: "
+                      f"{vs_log.tail_text()[-800:]}")
+        elif enc_rc != 0:
+            status = 84
+            detail = (f"encoder (ffmpeg) failed rc={enc_rc}: "
+                      f"{enc_log.tail_text()[-800:]}")
+        else:
+            status = 0
+            detail = ""
+
+    # ---- ⑥ 失败时清掉半成品 ----
+    if status != 0 and output_path:
         try:
-            _hb = (lambda: (os.path.getsize(output_path)
-                            if os.path.exists(output_path) else 0))
-            if _cancel_guard is not None and hasattr(_cancel_guard,
-                                                     "wait_with_heartbeat"):
-                _cancel_guard.wait_with_heartbeat(
-                    [ffmpeg_proc, vspipe_proc], heartbeat=_hb,
-                    inactivity_timeout=inactivity_s,
-                    logger=logger, label="stage6-grain")
-            else:  # pragma: no cover - 守卫缺失时退回有界等待
-                ffmpeg_proc.wait(timeout=inactivity_s)
-                vspipe_proc.wait(timeout=inactivity_s)
-        finally:
-            # 排空线程先收尾（否则 read 还在阻塞时关句柄会报错）
-            for _t in _threads:
-                _t.join(timeout=10)
-            # 取消守卫的登记必须解掉：否则后续 stage 的取消会误伤已完成的进程
-            if _cancel_guard is not None:
-                _cancel_guard.unwatch_process(vspipe_proc)
-                _cancel_guard.unwatch_process(ffmpeg_proc)
-        stderr = b"".join(_sinks["enc"])
-        vspipe_stderr = b"".join(_sinks["vs"])
-        stdout = b""
-        if ffmpeg_proc.returncode == 0:
-            if fallback_label:
-                logger.info("STAGE6_DONE",
-                            f"Grain synthesis complete ({fallback_label})",
-                            output=output_path)
-            else:
-                logger.info("STAGE6_DONE", "Grain synthesis complete",
-                            output=output_path)
-            return (0, "")
-        err = stderr.decode("utf-8", errors="replace") if stderr else ""
-        v_err_bytes = vspipe_stderr
-        v_err_str = (v_err_bytes.decode("utf-8", errors="replace")
-                     if isinstance(v_err_bytes, bytes) else str(v_err_bytes))
-        return (err, v_err_str)
-    except subprocess.TimeoutExpired:
-        vspipe_proc.kill()
-        ffmpeg_proc.kill()
-        return ("TIMEOUT", "")
-    except Exception as e:
-        return (str(e), "")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except OSError:
+            pass
+
+    if status == 0:
+        if logger:
+            try:
+                if fallback_label:
+                    logger.info("STAGE6_DONE",
+                                f"Grain synthesis complete ({fallback_label})",
+                                output=output_path)
+                else:
+                    logger.info("STAGE6_DONE", "Grain synthesis complete",
+                                output=output_path)
+            except BaseException:
+                pass
+        return (0, "")
+
+    return (status, detail)
 
 
 def get_video_dimensions(input_source: str) -> tuple:
