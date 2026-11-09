@@ -507,11 +507,44 @@ def _now_str() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
-def _cleanup_backups(snapshot: Dict[str, Dict[str, Any]], logger) -> None:
+def _cleanup_backups(snapshot: Dict[str, Dict[str, Any]], logger,
+                     backup_dir: Optional[str] = None,
+                     attempt_id: Optional[str] = None,
+                     backup_suffix: str = BACKUP_SUFFIX) -> None:
+    """删除本事务的备份文件。
+
+    审核 R18-A02：journal 里的 ``backup`` 是**磁盘数据，不是可信指令**。
+    受控探针把它指向一个无关文件，旧实现就直接 ``os.remove`` 了它。
+
+    所以：**恢复路径必须**传 ``backup_dir`` + ``attempt_id``，此时删除前校验
+
+    - 备份确实落在 ``backup_dir`` 内（解析链接/junction 后判断）；
+    - basename 等于 ``{target_basename}{suffix}-{attempt_id}``
+      （与 :func:`_backup_path` 的命名规则一致）。
+
+    任一条不满足 → 只记 ``PUBLISH_BACKUP_CLEANUP_REFUSED``，**不删**。
+    """
+    strict = bool(backup_dir) and bool(attempt_id)
     for _fin, snap in (snapshot or {}).items():
         bk = snap.get("backup")
         if not bk:
             continue
+        if strict:
+            expect = (os.path.basename(str(_fin)) + str(backup_suffix)
+                      + "-" + str(attempt_id))
+            try:
+                from publish_journal import _is_within as _within
+                in_dir = _within(bk, backup_dir)
+            except Exception:          # pragma: no cover - 极端情况保守拒绝
+                in_dir = False
+            if not in_dir or os.path.basename(bk) != expect:
+                if logger:
+                    logger.warning(
+                        "PUBLISH_BACKUP_CLEANUP_REFUSED",
+                        "Refusing to delete a backup that does not provably "
+                        "belong to this transaction",
+                        backup=bk, expected_name=expect, target=_fin)
+                continue
         try:
             os.remove(bk)
         except OSError:
@@ -715,7 +748,9 @@ def recover(journal_path: str, backup_dir: str, attempt_id: str,
 
 
 def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
-                    logger=None) -> Optional[Dict[str, Any]]:
+                    logger=None,
+                    allowed_roots: Optional[List[str]] = None
+                    ) -> Optional[Dict[str, Any]]:
     """锁内版本的恢复（``publish`` 与 ``recover`` 共用）。
 
     **R16-01**：恢复不再"看到未解决就要求备份存在"，而是先按**磁盘事实**
@@ -747,11 +782,22 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
     # 恢复就会对"目标集合之外"的路径执行删除/回滚计划 ——
     # 等于让 journal 自行扩张它的作用域（审核受控探针复现）。
     # 结构不成立时按"未知"处理：一个路径都不碰。
+    # ---- 校验器自身出错也必须失败，不能"problems=[] 后放行" ----
+    # 审核 R18-A02：原来 `except Exception: _struct_problems = []`
+    # 会把"校验器没跑成"变成"没有问题"，是典型的失败后放行。
     try:
         from publish_journal import validate_journal_structure as _vjs
         _struct_problems = _vjs(doc)
-    except Exception:                     # pragma: no cover
-        _struct_problems = []
+    except Exception as _vexc:
+        if logger:
+            logger.error(
+                "PUBLISH_JOURNAL_VALIDATOR_ERROR",
+                "The journal structure validator itself failed; refusing to "
+                "act on any record", journal_path=journal_path,
+                error=f"{type(_vexc).__name__}: {_vexc}")
+        return {"ok": False, "journal_path": journal_path,
+                "reason": ("journal structure validator failed: "
+                           f"{type(_vexc).__name__}: {_vexc}")}
     if _struct_problems:
         if logger:
             logger.error(
@@ -762,6 +808,37 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
         return {"ok": False, "journal_path": journal_path,
                 "reason": ("journal structure is inconsistent: "
                            + "; ".join(_struct_problems[:3]))}
+
+    # ---- 归属校验：路径必须在本次事务的授权范围内 ----
+    # journal 的自摘要只能证明"内容没被改动"，**不能授予访问权限**。
+    # 默认允许根 = backup_dir 的父目录（生产中 backup_dir 通常是
+    # `{output_dir}/publish_backup`，targets 就在 `{output_dir}` 内）。
+    try:
+        from publish_journal import validate_journal_ownership as _vjo
+        _roots = list(allowed_roots or [])
+        if not _roots:
+            _roots = [os.path.dirname(os.path.abspath(backup_dir))]
+        _own_problems = _vjo(doc, backup_dir, _roots, BACKUP_SUFFIX)
+    except Exception as _oexc:
+        if logger:
+            logger.error(
+                "PUBLISH_JOURNAL_OWNERSHIP_VALIDATOR_ERROR",
+                "The journal ownership validator itself failed; refusing to "
+                "act on any record", journal_path=journal_path,
+                error=f"{type(_oexc).__name__}: {_oexc}")
+        return {"ok": False, "journal_path": journal_path,
+                "reason": ("journal ownership validator failed: "
+                           f"{type(_oexc).__name__}: {_oexc}")}
+    if _own_problems:
+        if logger:
+            logger.error(
+                "PUBLISH_JOURNAL_OWNERSHIP_INVALID",
+                "Refusing to touch any path: the journal names something "
+                "that does not belong to this transaction",
+                journal_path=journal_path, problems=_own_problems[:5])
+        return {"ok": False, "journal_path": journal_path,
+                "reason": ("journal ownership is not provable: "
+                           + "; ".join(_own_problems[:3]))}
 
     records = doc.get("records") or {}
     phase = doc.get("phase")
@@ -807,7 +884,8 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
         if write_journal(journal_path,
                          dict(doc, phase=PHASE_ROLLED_BACK, generation=gen,
                               resolved=True)):
-            _cleanup_backups(snapshot, logger)
+            _cleanup_backups(snapshot, logger, backup_dir,
+                             doc.get("attempt_id"))
             if logger:
                 logger.warning(
                     "PUBLISH_RECOVERY_CONFIRMED_ROLLED_BACK",
@@ -826,7 +904,8 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
                          dict(doc, phase=PHASE_COMMITTED, generation=gen,
                               reason="recorded by recovery: the group matches "
                                      "the prepared new digests")):
-            _cleanup_backups(snapshot, logger)
+            _cleanup_backups(snapshot, logger, backup_dir,
+                             doc.get("attempt_id"))
             if logger:
                 logger.warning(
                     "PUBLISH_RECOVERY_RECORDED_COMMITTED",
@@ -845,7 +924,8 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
         if write_journal(journal_path,
                          dict(doc, phase=PHASE_ROLLED_BACK,
                               rollback=rec_report, resolved=True)):
-            _cleanup_backups(snapshot, logger)
+            _cleanup_backups(snapshot, logger, backup_dir,
+                             doc.get("attempt_id"))
             if logger:
                 logger.warning(
                     "PUBLISH_RECOVERED",

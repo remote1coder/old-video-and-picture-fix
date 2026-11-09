@@ -288,25 +288,74 @@ def _is_within(child: str, parent: str) -> bool:
     return os.path.normcase(c).startswith(os.path.normcase(p) + os.sep)
 
 
+#: 已知的 phase 取值。未知 phase 必须拒绝 ——
+#: 只检查"是字符串"会让 `phase="WHATEVER"` 一路通过。
+KNOWN_PHASES = (
+    PHASE_PREPARED,
+    PHASE_COMMITTING,
+    PHASE_COMMITTED,
+    PHASE_RECOVERY_REQUIRED,
+    PHASE_ROLLED_BACK,
+)
+
+
+def _norm_path(path: Any) -> Optional[str]:
+    """规范化成可比较的键；失败返回 None（不抛）。"""
+    try:
+        return os.path.normcase(os.path.abspath(str(path)))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def validate_journal_structure(doc: Dict[str, Any]) -> List[str]:
-    """校验 journal 的**结构完整性**（与路径越界校验分开）。
+    """校验 journal 的**结构完整性**（与路径越界、归属分开）。
 
-    审核 R17-02 指出：`validate_journal_paths` 只管"路径在不在授权根内"，
-    没有校验 `targets` 与 `records` 的**对应关系**。受控探针构造了
-    "records 里有未列入 targets 的对象"的 journal，恢复逻辑仍然对它执行了
-    删除计划 —— 等于让 journal 自行扩张它的作用域。
+    审核 R18-A02 指出的缺口：
 
-    返回违规说明列表（空列表 = 通过）。检查项：
-    - `records` 必须是非空 dict；
-    - `targets` 必须是非空字符串列表；
-    - **每个 record 的键都必须在 targets 里**（records 不能超出目标集合）；
-    - `phase` 若存在必须是字符串。
+    - 原实现只要求 ``records 的键 ⊆ targets``，于是
+      ``targets=[媒体, 必需报告]``、``records={媒体}`` **能通过** ——
+      遗漏的报告根本没被检查。
+    - **非 dict 的 record 值**没被拒绝（后面 ``rec.get(...)`` 会直接崩）。
+    - targets 里的**重复路径**没被拒绝。
+    - ``phase`` 只检查"是字符串"，未知值也能通过。
+    - ``attempt_id`` 完全没检查。
+
+    现在要求（缺一不可）：
+
+    1. ``attempt_id`` 必须是非空字符串；
+    2. ``phase`` 必须是 :data:`KNOWN_PHASES` 之一；
+    3. ``targets`` 必须是非空字符串列表，规范化后**无重复**；
+    4. ``records`` 必须是非空 dict，键为字符串、**值为 dict**，
+       规范化后**无重复**；
+    5. **``targets`` 与 ``records`` 规范化后必须一一对应**
+       （缺项、多项都报）。
+
+    Returns:
+        违规说明列表；空列表表示通过。
     """
     problems: List[str] = []
     if not isinstance(doc, dict):
         return ["journal document is not an object"]
 
+    # ---- attempt_id ----
+    attempt = doc.get("attempt_id")
+    if not isinstance(attempt, str) or not attempt.strip():
+        problems.append("attempt_id is missing or empty")
+
+    # ---- phase ----
+    phase = doc.get("phase")
+    if phase is None:
+        problems.append("phase is missing")
+    elif not isinstance(phase, str):
+        problems.append(f"phase is not a string: {phase!r}")
+    elif phase not in KNOWN_PHASES:
+        problems.append(
+            f"phase is not a known value: {phase!r} "
+            f"(known: {list(KNOWN_PHASES)})")
+
+    # ---- targets ----
     targets = doc.get("targets")
+    tkeys: List[str] = []
     if not isinstance(targets, (list, tuple)) or not targets:
         problems.append("targets is missing or empty")
         targets = []
@@ -314,23 +363,125 @@ def validate_journal_structure(doc: Dict[str, Any]) -> List[str]:
         for t in targets:
             if not isinstance(t, str) or not t.strip():
                 problems.append(f"targets contains a non-string entry: {t!r}")
-    _tset = {str(t) for t in targets if isinstance(t, str)}
+                continue
+            n = _norm_path(t)
+            if n is None:
+                problems.append(f"targets path cannot be normalised: {t!r}")
+                continue
+            tkeys.append(n)
+    if len(set(tkeys)) != len(tkeys):
+        problems.append("targets contains duplicate paths after normalisation")
 
+    # ---- records ----
     records = doc.get("records")
+    rkeys: List[str] = []
     if not isinstance(records, dict) or not records:
         problems.append("records is missing or empty")
     else:
-        for key in records:
+        for key, val in records.items():
             if not isinstance(key, str):
                 problems.append(f"records has a non-string key: {key!r}")
                 continue
-            if _tset and key not in _tset:
+            n = _norm_path(key)
+            if n is None:
+                problems.append(f"records key cannot be normalised: {key!r}")
+                continue
+            rkeys.append(n)
+            if not isinstance(val, dict):
                 problems.append(
-                    f"records contains a path that is not in targets: {key}")
+                    f"records[{key!r}] is not an object "
+                    f"(got {type(val).__name__})")
+        if len(set(rkeys)) != len(rkeys):
+            problems.append(
+                "records contains duplicate paths after normalisation")
 
-    phase = doc.get("phase")
-    if phase is not None and not isinstance(phase, str):
-        problems.append(f"phase is not a string: {phase!r}")
+    # ---- 完整对应（双向）----
+    if tkeys and rkeys:
+        tset, rset = set(tkeys), set(rkeys)
+        missing = sorted(tset - rset)
+        extra = sorted(rset - tset)
+        if missing:
+            problems.append(
+                f"{len(missing)} target(s) have no record — journal is "
+                f"incomplete: {missing[:3]}")
+        if extra:
+            problems.append(
+                f"{len(extra)} record(s) are not declared in targets: "
+                f"{extra[:3]}")
+
+    return problems
+
+
+def validate_journal_ownership(doc: Dict[str, Any],
+                               backup_dir: str,
+                               allowed_roots: Sequence[str],
+                               backup_suffix: str = ".pubbak"
+                               ) -> List[str]:
+    """校验 journal 里提到的路径**确实属于本事务**。
+
+    为什么需要单独一层
+    ------------------
+    journal 是**磁盘上的数据，不是可信指令**。受控探针把 ``backup`` 指向
+    一个无关文件，恢复收尾的 ``_cleanup_backups`` 就直接
+    ``os.remove`` 了它 —— 审核 R18-A02 明确记录了这个后果。
+
+    ``validate_journal_paths`` 只回答"在不在允许根内"，
+    回答不了"这个备份是不是**这一次尝试**造的"。本函数补上：
+
+    1. 每个 target 必须落在 ``allowed_roots`` 内；
+    2. 每个非空的 ``backup`` 必须落在 ``backup_dir`` 内；
+    3. ``backup`` 的 basename 必须**等于** ``{target_basename}{suffix}-{attempt_id}``
+       （与 ``publisher._backup_path()`` 的命名规则一致）——
+       journal 自摘要只能证明内容没被改，**不能授予访问权限**。
+
+    Returns:
+        违规说明列表；空列表表示通过。
+    """
+    problems: List[str] = []
+    if not isinstance(doc, dict):
+        return ["journal document is not an object"]
+
+    roots = [r for r in (allowed_roots or []) if isinstance(r, str) and r]
+    if not roots:
+        return ["no allowed_roots given; refusing to trust any journal path"]
+
+    bdir = _norm_path(backup_dir) if backup_dir else None
+    if not bdir:
+        problems.append("backup_dir is missing; cannot prove backup ownership")
+
+    attempt = doc.get("attempt_id")
+    if not isinstance(attempt, str) or not attempt.strip():
+        # 结构校验会报；这里直接返回，避免用空 attempt 去比对文件名
+        return problems + ["attempt_id is missing; cannot prove ownership"]
+
+    records = doc.get("records")
+    if not isinstance(records, dict):
+        return problems + ["records is not an object"]
+
+    for target, rec in records.items():
+        if not isinstance(target, str) or not isinstance(rec, dict):
+            continue                      # 结构校验已经报过
+
+        if not any(_is_within(target, r) for r in roots):
+            problems.append(
+                f"target is outside every allowed root: {target}")
+
+        bk = rec.get("backup")
+        if not bk:
+            continue                      # 没有备份（新建文件），跳过
+        if not isinstance(bk, str):
+            problems.append(f"backup is not a string: {bk!r}")
+            continue
+        if bdir and not _is_within(bk, bdir):
+            problems.append(f"backup is outside backup_dir: {bk}")
+            continue
+        expect = (os.path.basename(target) + str(backup_suffix)
+                  + "-" + str(attempt))
+        actual = os.path.basename(bk)
+        if actual != expect:
+            problems.append(
+                f"backup does not belong to this transaction "
+                f"(expected name {expect!r}, got {actual!r}): {bk}")
 
     return problems
 

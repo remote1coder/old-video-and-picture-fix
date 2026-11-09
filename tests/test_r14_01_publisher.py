@@ -217,11 +217,16 @@ def test_p03_crash_mid_commit_rolls_back_on_recover(tmp_path):
     bdir = _backup_dir(tmp_path)
     os.makedirs(bdir, exist_ok=True)
     import shutil
-    bk_media = os.path.join(bdir, "media.pubbak")
+    # 备份**必须**用生产函数生成的名字。
+    # 旧版手写 "media.pubbak"（没有 `-{attempt_id}`），与
+    # `publisher._backup_path()` 的规则不符。R19 的归属校验会拒绝对
+    # "不属于本事务"的备份做任何动作 —— 于是这条测试会失败。
+    # 根因是**测试构造不真实**，不是校验过严。
+    bk_media = pub._backup_path(bdir, media, "att-mid")
     shutil.copyfile(media, bk_media)
-    bk_verify = os.path.join(bdir, "verify.pubbak")
+    bk_verify = pub._backup_path(bdir, verify, "att-mid")
     shutil.copyfile(verify, bk_verify)
-    bk_full = os.path.join(bdir, "full.pubbak")
+    bk_full = pub._backup_path(bdir, full, "att-mid")
     shutil.copyfile(full, bk_full)
 
     old_m, old_v, old_f = _read(media), _read(verify), _read(full)
