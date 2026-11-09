@@ -204,7 +204,8 @@ def _decision_allows(decision: Optional[Dict[str, Any]]) -> Optional[str]:
 def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
             attempt_id: str, decision: Optional[Dict[str, Any]] = None,
             logger=None, lock_timeout: float = 30.0,
-            keep_backups: bool = False) -> PublishResult:
+            keep_backups: bool = False,
+            allowed_output_roots: Optional[List[str]] = None) -> PublishResult:
     """把一组候选件作为一个事务提交到各自的最终路径。
 
     Args:
@@ -272,7 +273,8 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                                   logger=logger):
             # ---- 3. 先处理上一次未完成的事务 ----
             _prior = _recover_locked(journal_path, backup_dir, attempt_id,
-                                     logger)
+                                     logger=logger,
+                                     allowed_roots=allowed_output_roots)
             if _prior is not None and not _prior.get("ok", True):
                 res.failed_at = "recover_prior"
                 res.recovery = _prior
@@ -713,7 +715,9 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
 
 
 def recover(journal_path: str, backup_dir: str, attempt_id: str,
-            logger=None) -> Optional[Dict[str, Any]]:
+            logger=None,
+            allowed_output_roots: Optional[List[str]] = None
+            ) -> Optional[Dict[str, Any]]:
     """按 journal 收拾上次未完成的事务（供启动/重试入口调用）。
 
     Returns:
@@ -741,7 +745,8 @@ def recover(journal_path: str, backup_dir: str, attempt_id: str,
     try:
         with acquire_target_locks(targets, timeout=30, logger=logger):
             return _recover_locked(journal_path, backup_dir, attempt_id,
-                                   logger)
+                                   logger=logger,
+                                   allowed_roots=allowed_output_roots)
     except TargetLockTimeout as exc:
         return {"ok": False, "reason": f"lock timeout: {exc}",
                 "journal_path": journal_path}
@@ -817,7 +822,24 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
         from publish_journal import validate_journal_ownership as _vjo
         _roots = list(allowed_roots or [])
         if not _roots:
+            # 兼容老调用方：退回"backup_dir 的父目录"。
+            # 审核 R19-B01 的**真实反例**正是这个猜测失效：
+            # 生产里 backup_dir = {temp_dir}/publish_backup，
+            # 而正式成果在另一个 output 目录 → target 不在推断根内 → 二次发布被拒。
+            # 所以这里不再静默：凡是走到推断分支都留一条 WARNING，
+            # 让"谁没传 allowed_output_roots"在日志里可见。
             _roots = [os.path.dirname(os.path.abspath(backup_dir))]
+            if logger:
+                try:
+                    logger.warning(
+                        "PUBLISH_ALLOWED_ROOTS_INFERRED",
+                        "allowed_output_roots was not supplied; falling back to "
+                        "dirname(backup_dir). This breaks layouts where the "
+                        "backup dir and the final outputs live under different "
+                        "parents. Pass allowed_output_roots explicitly.",
+                        inferred_root=_roots[0], backup_dir=backup_dir)
+                except BaseException:
+                    pass
         _own_problems = _vjo(doc, backup_dir, _roots, BACKUP_SUFFIX)
     except Exception as _oexc:
         if logger:

@@ -3435,6 +3435,9 @@ def main():
                 journal_path=f"{output_path}.journal.json",
                 backup_dir=os.path.join(str(temp_dir), "publish_backup"),
                 attempt_id=_attempt_id,
+                # 审核 R19-B01：成果目录与 backup 目录不同父，必须显式授权
+                allowed_output_roots=[os.path.dirname(
+                    os.path.abspath(output_path))],
                 decision=_dec,
                 logger=logger)
 
@@ -3522,6 +3525,8 @@ def main():
                     journal_path=f"{original_output_path}.journal.json",
                     backup_dir=os.path.join(str(temp_dir),
                                             "publish_backup_wsl"),
+                    allowed_output_roots=[os.path.dirname(
+                        os.path.abspath(output_path))],
                     attempt_id=f"{_attempt_id}-wsl",
                     decision=_dec,
                     logger=logger)
