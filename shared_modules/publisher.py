@@ -272,9 +272,37 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
         with acquire_target_locks(targets, timeout=lock_timeout,
                                   logger=logger):
             # ---- 3. 先处理上一次未完成的事务 ----
+            # R20-B03：本次只锁了 `targets`。如果旧 journal 记录的是**另一组**
+            # 目标，`_recover_locked` 就会在"只锁了本次集合"的临界区里去动
+            # 未被锁住的对象 —— 正是审核说的"持 A 的锁操作 B"。
+            # 先读一次旧 journal，确认它的 targets **被本次锁覆盖**；
+            # 覆盖不了就拒绝，要求先显式 recover。
+            _prior_doc = None
+            if os.path.isfile(journal_path):
+                _prior_doc = read_journal(journal_path)
+            if _prior_doc is not None:
+                from publish_journal import _norm_path as _np2
+                _locked = {_np2(t) for t in targets} - {None}
+                _prior_t = {_np2(t) for t in (_prior_doc.get("targets") or [])}
+                _prior_t.discard(None)
+                _uncovered = sorted(_prior_t - _locked)
+                if _uncovered:
+                    res.failed_at = "recover_prior"
+                    res.errors.append(
+                        "a previous transaction touches targets outside this "
+                        f"publish's lock set ({len(_uncovered)} path(s)); "
+                        "run recover() explicitly before publishing")
+                    if logger:
+                        logger.error(
+                            "PUBLISH_PRIOR_OUTSIDE_LOCK",
+                            res.errors[-1], attempt_id=attempt_id,
+                            uncovered=_uncovered[:5])
+                    return res
+
             _prior = _recover_locked(journal_path, backup_dir, attempt_id,
                                      logger=logger,
-                                     allowed_roots=allowed_output_roots)
+                                     allowed_roots=allowed_output_roots,
+                                     expected_doc=_prior_doc)
             if _prior is not None and not _prior.get("ok", True):
                 res.failed_at = "recover_prior"
                 res.recovery = _prior
@@ -746,63 +774,116 @@ def recover(journal_path: str, backup_dir: str, attempt_id: str,
         return {"ok": False,
                 "reason": "journal path exists but is not a regular file",
                 "journal_path": journal_path}
-    doc = read_journal(journal_path)
-    if doc is None:
-        return {"ok": False, "reason": "journal unreadable",
-                "journal_path": journal_path}
-    # R16-01 / B07：**不能**在这里提前返回。
-    # 原来看到 phase==COMMITTED 就直接认可，于是"journal 说已提交但磁盘上
-    # 有一份报告是坏的"也会被当成完整 —— 复核全组摘要的逻辑在
-    # `_recover_locked` 里，必须让它跑到。
-    targets = doc.get("targets") or []
-    try:
-        with acquire_target_locks(targets, timeout=30, logger=logger):
-            return _recover_locked(journal_path, backup_dir, attempt_id,
-                                   logger=logger,
-                                   allowed_roots=allowed_output_roots)
-    except TargetLockTimeout as exc:
-        return {"ok": False, "reason": f"lock timeout: {exc}",
-                "journal_path": journal_path}
+    # R16-01 / B07：**不能**因为 phase==COMMITTED 就提前返回 ——
+    # "journal 说已提交但磁盘上有一份报告是坏的"也要被查到，
+    # 复核全组摘要的逻辑在 `_recover_locked` 里，必须让它跑到。
+    #
+    # ---- R20-B03：只读预检 → 取锁 → 锁内重读比对 ----
+    # 旧实现是"先读 journal，直接拿它的 targets 取锁，锁内才校验"：
+    #   * 锁实现会 **建目录 + 开锁文件**，所以"只是先取锁"已有磁盘副作用；
+    #   * 首次读到 A、锁内重读到 B 时，结果是**锁了 A 却检查 B**。
+    # 现在拆成三步，集合变了就释放锁重来（有界 3 次），绝不持 A 的锁操作 B。
+    last_reason = None
+    for _try in range(3):
+        # ---- ① 只读：读 + 结构 + 归属（不建任何文件）----
+        doc0 = read_journal(journal_path)
+        if doc0 is None:
+            return {"ok": False, "reason": "journal unreadable",
+                    "journal_path": journal_path}
+        _pre = _precheck_doc(doc0, backup_dir, allowed_output_roots,
+                             journal_path, logger)
+        if _pre is not None:
+            return _pre
+        fp0 = _txn_fingerprint(doc0)
+        targets0 = _norm_target_set(doc0)
+        if not targets0:
+            return {"ok": False, "journal_path": journal_path,
+                    "reason": "journal declares no usable targets"}
+
+        # ---- ② 锁可信目标集合 ----
+        try:
+            with acquire_target_locks(targets0, timeout=30, logger=logger):
+                # ---- ③ 锁内重读并比对事务指纹 ----
+                doc1 = read_journal(journal_path)
+                if doc1 is None:
+                    return {"ok": False, "journal_path": journal_path,
+                            "reason": "journal disappeared while taking "
+                                      "the lock"}
+                if _txn_fingerprint(doc1) != fp0:
+                    last_reason = ("journal changed between the read-only "
+                                   "precheck and acquiring the lock "
+                                   "(attempt/targets/records differ)")
+                    if logger:
+                        try:
+                            logger.warning(
+                                "PUBLISH_JOURNAL_CHANGED_UNDER_LOCK",
+                                "The journal was rewritten between the "
+                                "read-only precheck and acquiring the lock; "
+                                "releasing and retrying so we never operate on "
+                                "a target set we did not lock.",
+                                journal_path=journal_path, attempt=_try + 1)
+                        except BaseException:
+                            pass
+                    continue            # 退出 with → 下一轮重新取锁
+                return _recover_locked(journal_path, backup_dir, attempt_id,
+                                       logger=logger,
+                                       allowed_roots=allowed_output_roots,
+                                       expected_doc=doc1)
+        except TargetLockTimeout as exc:
+            return {"ok": False, "reason": f"lock timeout: {exc}",
+                    "journal_path": journal_path}
+
+    return {"ok": False, "journal_path": journal_path,
+            "reason": ("journal kept changing under the lock after 3 "
+                       f"attempts: {last_reason}")}
 
 
-def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
-                    logger=None,
-                    allowed_roots: Optional[List[str]] = None
-                    ) -> Optional[Dict[str, Any]]:
-    """锁内版本的恢复（``publish`` 与 ``recover`` 共用）。
+def _norm_target_set(doc: Dict[str, Any]) -> List[str]:
+    """规范化 journal 的 targets（排序去重），用于"集合是否一致"的比较。"""
+    from publish_journal import _norm_path as _np
+    out = set()
+    for t in (doc.get("targets") or []):
+        n = _np(t)
+        if n is not None:
+            out.add(n)
+    return sorted(out)
 
-    **R16-01**：恢复不再"看到未解决就要求备份存在"，而是先按**磁盘事实**
-    判定这一组处于哪一代，再决定动作：
 
-    - ``all_old``  磁盘已是完整旧代 → 只补记 ROLLED_BACK 终态，不动文件
-    - ``all_new``  新代已完整落地但没记录 → 按协议补记 COMMITTED
-    - ``mixed`` / ``unknown`` → 用备份回滚；回滚成功写 ROLLED_BACK
+def _txn_fingerprint(doc: Dict[str, Any]) -> str:
+    """事务指纹：attempt + 目标集合 + records 键集合。
 
-    同样不能只凭 ``phase`` 字段认可完整：COMMITTED / ROLLED_BACK 都要复核
-    全组摘要（审核 B07）。
+    审核 R19-B03 的反例是"首次 journal 指向 A，取锁后重读指向 B"。
+    只比 `attempt_id` 不够 —— 同一个 attempt 也可能被改成不同的 targets。
+    把三者一起摘要是最省事且够用的判据。
     """
-    # ---- "存在但不是普通文件" ≠ "没有事务" ----
-    # 原来用 `not os.path.isfile(...)` 一并吞掉：journal 路径上是**目录**
-    # （或被替换成设备/链接）时返回 None，调用方会当成"无事务"直接继续发布，
-    # 把一份未知状态当成干净起点。审核要求：目录/不可访问是**未知或错误**。
-    if not os.path.exists(journal_path):
-        return None                     # 真的没有事务
-    if not os.path.isfile(journal_path):
-        return {"ok": False,
-                "reason": "journal path exists but is not a regular file",
-                "journal_path": journal_path}
-    doc = read_journal(journal_path)
-    if doc is None:
-        return {"ok": False, "reason": "journal unreadable"}
+    import hashlib
+    import json as _json
+    payload = {
+        "attempt": str(doc.get("attempt_id") or ""),
+        "phase": str(doc.get("phase") or ""),
+        "targets": _norm_target_set(doc),
+        "record_keys": sorted(
+            x for x in ((doc.get("records") or {}).keys()) if isinstance(x, str)),
+    }
+    blob = _json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
-    # ---- R17-02：先校验**结构**，再做任何基于 records 的动作 ----
-    # 恢复是按 records 迭代的。如果 records 里有**未列入 targets** 的对象，
-    # 恢复就会对"目标集合之外"的路径执行删除/回滚计划 ——
-    # 等于让 journal 自行扩张它的作用域（审核受控探针复现）。
-    # 结构不成立时按"未知"处理：一个路径都不碰。
-    # ---- 校验器自身出错也必须失败，不能"problems=[] 后放行" ----
-    # 审核 R18-A02：原来 `except Exception: _struct_problems = []`
-    # 会把"校验器没跑成"变成"没有问题"，是典型的失败后放行。
+
+def _precheck_doc(doc: Dict[str, Any], backup_dir: str,
+                  allowed_roots: Optional[List[str]],
+                  journal_path: str, logger=None
+                  ) -> Optional[Dict[str, Any]]:
+    """**只读**预检：结构 + 归属。不创建、不修改任何文件。
+
+    审核 R19-B03：
+    > 先只读校验授权与结构；锁住可信目标集合；锁内重读后再比对事务身份、
+    > 对象集合及快照。集合变化时有界重试或拒绝，不能持 A 的锁操作 B。
+
+    Returns:
+        ``None`` 表示通过；否则是错误报告 dict（调用方直接返回）。
+    """
+    # ---- 结构 ----
+    # 校验器自身出错也必须失败，不能"problems=[] 后放行"（R18-A02）。
     try:
         from publish_journal import validate_journal_structure as _vjs
         _struct_problems = _vjs(doc)
@@ -827,20 +908,11 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
                 "reason": ("journal structure is inconsistent: "
                            + "; ".join(_struct_problems[:3]))}
 
-    # ---- 归属校验：路径必须在本次事务的授权范围内 ----
-    # journal 的自摘要只能证明"内容没被改动"，**不能授予访问权限**。
-    # 默认允许根 = backup_dir 的父目录（生产中 backup_dir 通常是
-    # `{output_dir}/publish_backup`，targets 就在 `{output_dir}` 内）。
+    # ---- 归属 ----
     try:
         from publish_journal import validate_journal_ownership as _vjo
         _roots = list(allowed_roots or [])
         if not _roots:
-            # 兼容老调用方：退回"backup_dir 的父目录"。
-            # 审核 R19-B01 的**真实反例**正是这个猜测失效：
-            # 生产里 backup_dir = {temp_dir}/publish_backup，
-            # 而正式成果在另一个 output 目录 → target 不在推断根内 → 二次发布被拒。
-            # 所以这里不再静默：凡是走到推断分支都留一条 WARNING，
-            # 让"谁没传 allowed_output_roots"在日志里可见。
             _roots = [os.path.dirname(os.path.abspath(backup_dir))]
             if logger:
                 try:
@@ -874,6 +946,57 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
         return {"ok": False, "journal_path": journal_path,
                 "reason": ("journal ownership is not provable: "
                            + "; ".join(_own_problems[:3]))}
+    return None
+
+
+def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
+                    logger=None,
+                    allowed_roots: Optional[List[str]] = None,
+                    expected_doc: Optional[Dict[str, Any]] = None
+                    ) -> Optional[Dict[str, Any]]:
+    """锁内版本的恢复（``publish`` 与 ``recover`` 共用）。
+
+    **R16-01**：恢复不再"看到未解决就要求备份存在"，而是先按**磁盘事实**
+    判定这一组处于哪一代，再决定动作：
+
+    - ``all_old``  磁盘已是完整旧代 → 只补记 ROLLED_BACK 终态，不动文件
+    - ``all_new``  新代已完整落地但没记录 → 按协议补记 COMMITTED
+    - ``mixed`` / ``unknown`` → 用备份回滚；回滚成功写 ROLLED_BACK
+
+    同样不能只凭 ``phase`` 字段认可完整：COMMITTED / ROLLED_BACK 都要复核
+    全组摘要（审核 B07）。
+    """
+    # ---- "存在但不是普通文件" ≠ "没有事务" ----
+    # 原来用 `not os.path.isfile(...)` 一并吞掉：journal 路径上是**目录**
+    # （或被替换成设备/链接）时返回 None，调用方会当成"无事务"直接继续发布，
+    # 把一份未知状态当成干净起点。审核要求：目录/不可访问是**未知或错误**。
+    if not os.path.exists(journal_path):
+        return None                     # 真的没有事务
+    if not os.path.isfile(journal_path):
+        return {"ok": False,
+                "reason": "journal path exists but is not a regular file",
+                "journal_path": journal_path}
+    # R20-B03：调用方（`recover`）可能已经在**同一把锁内**读过并比对过指纹。
+    # 给了 `expected_doc` 就直接用它，避免再读一次时 journal 又被换掉 ——
+    # 那样会出现"校验的是 A、操作的是 B"的同一个漏洞。
+    doc = expected_doc if expected_doc is not None else read_journal(journal_path)
+    if doc is None:
+        return {"ok": False, "reason": "journal unreadable"}
+
+    # ---- R17-02：先校验**结构**，再做任何基于 records 的动作 ----
+    # 恢复是按 records 迭代的。如果 records 里有**未列入 targets** 的对象，
+    # 恢复就会对"目标集合之外"的路径执行删除/回滚计划 ——
+    # 等于让 journal 自行扩张它的作用域（审核受控探针复现）。
+    # 结构不成立时按"未知"处理：一个路径都不碰。
+    # ---- 校验器自身出错也必须失败，不能"problems=[] 后放行" ----
+    # 审核 R18-A02：原来 `except Exception: _struct_problems = []`
+    # 会把"校验器没跑成"变成"没有问题"，是典型的失败后放行。
+    # ---- 只读预检：结构 + 归属（R20-B03 抽成独立函数）----
+    # 抽出来的目的：`recover` 必须在**取锁之前**就拒绝坏 journal ——
+    # 锁实现会建目录、开锁文件，那已经是磁盘副作用了。
+    _pre = _precheck_doc(doc, backup_dir, allowed_roots, journal_path, logger)
+    if _pre is not None:
+        return _pre
 
     records = doc.get("records") or {}
     phase = doc.get("phase")
