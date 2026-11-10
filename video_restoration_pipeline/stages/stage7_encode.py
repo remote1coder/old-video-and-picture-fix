@@ -895,6 +895,79 @@ def _zscale_has_option(option_expr: str) -> bool:
     return available
 
 
+def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
+    """按**声明的变换**核对候选的时间轴（R20-A06 抽成独立函数）。
+
+    审核 R19-A06：
+    > 纯时间检查独立于 mkvmerge。工具是否存在只决定能否执行该重封装方案，
+    > 不能决定是否检查时间。
+
+    旧实现把这段校验**嵌在 `_has_timing_transform` 分支里**：
+    - 没声明变换 → 根本不校验；
+    - 没装 mkvmerge → 走 `elif not _mkv` 分支，**也不校验**。
+
+    现在它是一个独立函数，两条分支都调用。
+
+    Returns:
+        ``(ok, info)``。``ok`` 为 False 表示"已知时间轴不对"；
+        ``info`` 进 ``_retime_info`` 供报告与排查。
+    """
+    info = {}
+    try:
+        # 注意：`_probe_pts` / `_probe_time_base` 在调用方是**局部 import** 的名字，
+        # 模块级函数拿不到 —— 这里自己 import（R20-A06 抽函数时踩过）。
+        from vfr_timecodes import (probe_pts as _probe_pts,
+                                   probe_time_base as _probe_time_base)
+        from time_mapping import (
+            transform_from_params as _tfp,
+            expected_pts as _exp_pts,
+            check_against_expected as _check_map,
+            describe_mapping as _desc_map)
+
+        _tsrc = _probe_pts(orig_src)
+        _tt = _tfp(params)
+        if not (_tsrc and len(_tsrc) >= 2 and _tt.kind != "identity"):
+            info["mapping_ok"] = None
+            info["mapping_reason"] = (
+                "no declared transform, or source PTS unusable")
+            return True, info
+
+        _exp = _exp_pts(_tsrc, _tt)
+        _act = _probe_pts(candidate)
+        _tb_pub = _probe_time_base(candidate)
+        _m_ok, _m_problems, _m_metrics = _check_map(
+            _act, _exp, time_base=_tb_pub)
+        info.update({
+            "expected_mapping": _desc_map(_tsrc, _tt),
+            "mapping_ok": bool(_m_ok),
+            "mapping_problems": _m_problems[:4],
+            "mapping_metrics": _m_metrics,
+        })
+        if _m_ok:
+            if logger:
+                logger.info(
+                    "STAGE7_EXPECTED_MAPPING_OK",
+                    "The candidate matches the expected output mapping for the "
+                    "declared transform",
+                    transform=_tt.kind, value=_tt.value)
+            return True, info
+        if logger:
+            logger.error(
+                "STAGE7_EXPECTED_MAPPING_FAIL",
+                "The candidate does not match the expected output mapping for "
+                "the declared transform. Refusing to publish a timeline that "
+                "is known to be wrong.",
+                transform=_tt.kind, value=_tt.value,
+                problems=_m_problems[:4], metrics=_m_metrics)
+        return False, info
+    except Exception as _mexc:              # pragma: no cover
+        if logger:
+            logger.warning("STAGE7_EXPECTED_MAPPING_ERROR", str(_mexc))
+        info["mapping_ok"] = None
+        info["mapping_error"] = str(_mexc)
+        return True, info
+
+
 def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
     """Return the 16→10 bit filter chain that this ffmpeg can actually run."""
     filters: List[str] = ["format=yuv444p16"]
@@ -2848,6 +2921,21 @@ def main():
                         "so the timeline is expected to be constant anyway.",
                         plan_timeline=_plan_tl)
                     _retime_info = {"action": "unavailable", "reason": "no mkvmerge"}
+                    # ---- R20-A06：mkvmerge 缺失**不能**跳过时间检查 ----
+                    # 工具只决定"能不能执行该重封装方案"，不决定"要不要校验"。
+                    _map_ok, _map_info = check_declared_timeline_mapping(
+                        params, _orig_src, _publish_tmp, logger)
+                    _retime_info.update(_map_info)
+                    if not _map_ok:
+                        if params.get("timeline_mapping_strict", True):
+                            _discard_attempt_tmp(_publish_tmp, logger)
+                            return 86
+                        logger.critical(
+                            "STAGE7_EXPECTED_MAPPING_FAIL_NONSTRICT",
+                            "The candidate does not match the declared transform "
+                            "but timeline_mapping_strict=false; this generation is "
+                            "marked unverified, not 'verified'.",
+                            problems=(_map_info.get("mapping_problems") or [])[:4])
                 elif _has_timing_transform(params):
                     # 用户/上游声明了**时间变换**（变速、重解释帧率、倍帧/抽帧）。
                     # 此时按"源 PTS"回填是错的：
@@ -2872,62 +2960,22 @@ def main():
                         declared_tempo=params.get("expected_tempo"),
                         fps_interpret=params.get("fps_interpret"))
 
-                    # ---- P0-C：按**声明的变换**核对候选，而不是与源比 ----
-                    # 不回填 ≠ 不校验。原来这里直接放过，于是"交付了一个时间轴
-                    # 不对的候选"没有任何判据能发现（审核 T12 的另一半）。
-                    # 现在算出期望的逐帧 PTS，与候选实测对照；帧数、末帧跨度、
-                    # 逐帧间隔三项都参与判定。
-                    try:
-                        from time_mapping import (
-                            transform_from_params as _tfp,
-                            expected_pts as _exp_pts,
-                            check_against_expected as _check_map,
-                            describe_mapping as _desc_map)
-                        _tsrc = _probe_pts(_orig_src)
-                        _tt = _tfp(params)
-                        if _tsrc and len(_tsrc) >= 2 and _tt.kind != "identity":
-                            _exp = _exp_pts(_tsrc, _tt)
-                            _act = _probe_pts(_publish_tmp)
-                            # 审核 R20-B05：容差必须来自**实际** time_base。
-                            # 拿不到（探测失败）就让函数走 "default_fixed" 并在
-                            # metrics 里留痕，**不假装**用了精确步长。
-                            _tb_pub = _probe_tb(_publish_tmp)
-                            _m_ok, _m_problems, _m_metrics = _check_map(
-                                _act, _exp, time_base=_tb_pub)
-                            _retime_info.update({
-                                "expected_mapping": _desc_map(_tsrc, _tt),
-                                "mapping_ok": bool(_m_ok),
-                                "mapping_problems": _m_problems[:4],
-                                "mapping_metrics": _m_metrics,
-                            })
-                            if _m_ok:
-                                logger.info(
-                                    "STAGE7_EXPECTED_MAPPING_OK",
-                                    "The candidate matches the expected output "
-                                    "mapping for the declared transform",
-                                    transform=_tt.kind, value=_tt.value)
-                            else:
-                                logger.error(
-                                    "STAGE7_EXPECTED_MAPPING_FAIL",
-                                    "The candidate does not match the expected "
-                                    "output mapping for the declared transform. "
-                                    "Refusing to publish a timeline that is known "
-                                    "to be wrong.",
-                                    transform=_tt.kind, value=_tt.value,
-                                    problems=_m_problems[:4],
-                                    metrics=_m_metrics)
-                                if params.get("timeline_mapping_strict", True):
-                                    _discard_attempt_tmp(_publish_tmp, logger)
-                                    return 86
-                        else:
-                            _retime_info["mapping_ok"] = None
-                            _retime_info["mapping_reason"] = (
-                                "no declared transform, or source PTS unusable")
-                    except Exception as _mexc:      # pragma: no cover
-                        logger.warning("STAGE7_EXPECTED_MAPPING_ERROR",
-                                       str(_mexc))
-                        _retime_info["mapping_ok"] = None
-                        _retime_info["mapping_error"] = str(_mexc)
+                    # ---- P0-C / R20-A06：按声明的变换核对候选 ----
+                    # 已抽成 `check_declared_timeline_mapping()`：
+                    # **mkvmerge 缺失时也照样校验**（见上面 `elif not _mkv`）。
+                    _map_ok, _map_info = check_declared_timeline_mapping(
+                        params, _orig_src, _publish_tmp, logger)
+                    _retime_info.update(_map_info)
+                    if not _map_ok:
+                        if params.get("timeline_mapping_strict", True):
+                            _discard_attempt_tmp(_publish_tmp, logger)
+                            return 86
+                        logger.critical(
+                            "STAGE7_EXPECTED_MAPPING_FAIL_NONSTRICT",
+                            "The candidate does not match the declared transform "
+                            "but timeline_mapping_strict=false; this generation is "
+                            "marked unverified, not 'verified'.",
+                            problems=(_map_info.get("mapping_problems") or [])[:4])
                 elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
                     _ok_r, _retime_info = _retime(_orig_src, _publish_tmp, _mkv,
                                                   work_dir=str(temp_dir), logger=logger)
