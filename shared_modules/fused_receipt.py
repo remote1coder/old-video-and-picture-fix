@@ -41,17 +41,6 @@ import os
 from typing import Any, Dict, Optional, Tuple
 
 
-def _current_digest(src_path: str, params: Dict[str, Any]) -> Optional[str]:
-    """现算"源 + 参数"的身份摘要；算不出返回 None。"""
-    if not src_path:
-        return None
-    try:
-        from checkpoint import compute_param_hash
-        return compute_param_hash(str(src_path), params or {})
-    except Exception:
-        return None
-
-
 def source_digest(src_path: str) -> Optional[str]:
     """**只含源文件身份**的摘要（名 / 大小 / mtime / xxhash 前缀）。
 
