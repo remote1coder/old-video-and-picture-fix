@@ -774,6 +774,252 @@ def _get_stream_duration(path: str, stream_type: str = "v") -> float:
     return _probe_packet_span(path, stream_type)
 
 
+def _probe_container_duration(path: str, stream_type: str = "v") -> Tuple[float, str]:
+    """**不扫全片**就能拿到的时长：`stream=duration` → `format=duration`。
+
+    R20-A06 用它给"最终候选"兜底。不用 `_get_stream_duration()`：它的第 2 级
+    是 packet 全扫，而这里已经可能因为全扫失败才走到这一步，不该再扫一遍。
+
+    Returns:
+        ``(duration, source)``；取不到时返回 ``(0.0, "")``。
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+             "-show_entries", "stream=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, errors="replace", timeout=30,
+            shell=False)
+        if r.returncode == 0:
+            s = r.stdout.strip()
+            if s and s != "N/A":
+                return float(s), "stream-duration"
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, errors="replace", timeout=30,
+            shell=False)
+        if r.returncode == 0:
+            s = r.stdout.strip()
+            if s and s != "N/A":
+                return float(s), "container-duration"
+    except Exception:
+        pass
+    return 0.0, ""
+
+
+def _probe_final_timeline(path: str, stream_type: str = "v",
+                          timeout: int = 900) -> Dict[str, Any]:
+    """**一次** demux 扫出最终候选的跨度 / 帧数 / 是否变帧率。
+
+    只读包头、不解码。为什么不复用 `_probe_packet_span()`：那边只回跨度，
+    帧数与逐帧间隔还得再扫一遍；4K 16 位中间件单件可达 250 GB，多扫一次
+    是分钟级代价。
+
+    ``ok=False`` 表示这次探测**没拿到**可用时间信息 —— 调用方必须当成"未知"，
+    不得沿用它之前缓存的值冒充已验证。
+    """
+    out: Dict[str, Any] = {
+        "ok": False, "span": 0.0, "frames": 0,
+        "first_pts": None, "last_pts": None, "varies": None,
+        "median_interval": 0.0, "min_interval": 0.0, "max_interval": 0.0,
+        "problem": "",
+    }
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
+             "-show_entries", "packet=pts_time,duration_time",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, errors="replace",
+            timeout=timeout, shell=False)
+        if r.returncode != 0:
+            out["problem"] = f"ffprobe rc={r.returncode}"
+            return out
+    except Exception as exc:
+        out["problem"] = f"ffprobe failed: {exc}"
+        return out
+
+    starts: List[float] = []
+    end: Optional[float] = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        try:
+            pts = float(parts[0])
+        except (TypeError, ValueError):
+            continue
+        dur = 0.0
+        if len(parts) > 1:
+            try:
+                dur = float(parts[1])
+            except (TypeError, ValueError):
+                dur = 0.0
+        starts.append(pts)
+        e = pts + (dur if dur > 0 else 0.0)
+        if end is None or e > end:
+            end = e
+
+    if not starts:
+        out["problem"] = "no packet timestamps"
+        return out
+    starts.sort()
+    first = starts[0]
+    if end is None or end <= first:
+        # 没有 packet duration 时退回"末帧 PTS"，此时跨度少算最后一帧，
+        # 明确标注，别当成完整跨度。
+        end = starts[-1]
+        out["problem"] = "packet durations missing (span excludes the last frame)"
+    out.update(first_pts=round(first, 6), last_pts=round(starts[-1], 6),
+               frames=len(starts))
+    out["span"] = round(end - first, 6)
+    out["ok"] = out["span"] > 0
+
+    if len(starts) >= 3:
+        d = [b - a for a, b in zip(starts, starts[1:]) if b > a]
+        if d:
+            ds = sorted(d)
+            med = ds[len(ds) // 2]
+            out["median_interval"] = round(med, 6)
+            out["min_interval"] = round(ds[0], 6)
+            out["max_interval"] = round(ds[-1], 6)
+            if med > 0:
+                # 复用 vfr_timecodes 的**单一**容差实现（含毫秒量化下限），
+                # 不在这里另写一套阈值。
+                try:
+                    from vfr_timecodes import is_variable as _is_var
+                    out["varies"] = bool(_is_var(starts))
+                except Exception:
+                    _tol = max(0.002, 0.02 * med)
+                    out["varies"] = max(abs(x - med) for x in d) > _tol
+    return out
+
+
+def measure_final_candidate(candidate: str, logger=None,
+                            previous_duration: float = 0.0,
+                            previous_basis: str = "",
+                            retime_info: Optional[Dict[str, Any]] = None,
+                            relation_tolerance: float = 0.05) -> Dict[str, Any]:
+    """对**最后一次 mux 之后**的最终候选重新实测时间轴（R20-A06）。
+
+    为什么必须重测：``processed_duration`` / ``_timing_basis`` 是在**编码之前**
+    用中间产物 ``input_source`` 算出来的。``retime_to_source_pts()`` 之后会
+    ``os.replace`` 掉候选文件，新容器的时间轴**按设计就是要变的**。
+    报告与"变换是否执行"的裁定若沿用编码前的数字，描述的是一个**已经不存在
+    的文件** —— 这正是审核指出的"最后一次 mux 后没有重新测量"。
+
+    取值顺序（前一级成功就不做下一级，避免重复全扫）：
+
+    1. ``retime_info["out_last"]`` —— 重定时助手**刚**实测过，且核过帧数与
+       逐帧间隔，最可信；但它不含最后一帧的时长（少算约一帧）。
+    2. ``stream=duration`` / ``format=duration`` —— 瞬时读头，语义与
+       ``_probe_packet_span()`` 的 [首帧, 末帧+其时长) 一致。
+    3. packet 全扫 —— 前两级都取不到时才付这个代价。
+
+    Args:
+        candidate: 最终候选（mux 之后、发布之前的暂存文件）。
+        previous_duration: 编码前算出的值，仅用于记录偏差。
+        previous_basis: 编码前的依据，仅用于记录。
+        retime_info: ``_retime_info``，用于取用重定时助手的实测值。
+        relation_tolerance: 判定"时长变了"的相对阈值，默认 5%。
+
+    Returns:
+        ``measured`` / ``duration`` / ``basis`` / ``frames`` / ``varies`` /
+        ``previous_duration`` / ``previous_basis`` / ``delta_ms`` /
+        ``changed`` / ``attempts`` / ``problems``。
+    """
+    prev = float(previous_duration or 0.0)
+    info: Dict[str, Any] = {
+        "measured": False,
+        "duration": 0.0,
+        "basis": "unknown",
+        "frames": 0,
+        "varies": None,
+        "previous_duration": round(prev, 6),
+        "previous_basis": previous_basis or "",
+        "delta_ms": 0.0,
+        "changed": False,
+        "attempts": [],
+        "problems": [],
+    }
+
+    # ---- ① 重定时助手刚测过（同一进程、同一批字节）----
+    # 注意：判定用**局部标志**，不能用 `info["measured"]` —— 那个字段要到
+    # 函数末尾才赋值，中途拿它当条件会让后面每一级都白跑一遍（还会被覆盖）。
+    _got = False
+    _rt = retime_info if isinstance(retime_info, dict) else {}
+    if _rt.get("action") == "retimed":
+        _ol = _rt.get("out_last")
+        if isinstance(_ol, (int, float)) and _ol > 0:
+            info.update(duration=float(_ol),
+                        basis="packet-span (retime; excludes the last frame)",
+                        frames=int(_rt.get("frames") or 0))
+            info["attempts"].append({"source": "retime_out_last",
+                                     "duration": float(_ol)})
+            _got = True
+
+    # ---- ② 容器/流时长（瞬时）----
+    if not _got:
+        _d, _src = _probe_container_duration(candidate)
+        if _d > 0:
+            info.update(duration=float(_d), basis=_src)
+            info["attempts"].append({"source": _src, "duration": float(_d)})
+            _got = True
+
+    # ---- ③ packet 全扫（代价大，只在前两级都失败时做）----
+    if not _got:
+        _tl = _probe_final_timeline(candidate)
+        info["attempts"].append({
+            "source": "packet-scan", "ok": bool(_tl.get("ok")),
+            "duration": _tl.get("span"), "problem": _tl.get("problem") or ""})
+        if _tl.get("ok"):
+            info.update(duration=float(_tl["span"]), basis="packet-span",
+                        frames=int(_tl.get("frames") or 0),
+                        varies=_tl.get("varies"))
+            _got = True
+            if _tl.get("problem"):
+                info["problems"].append(_tl["problem"])
+        else:
+            info["problems"].append(
+                _tl.get("problem") or "packet timestamps unavailable")
+
+    if not info["frames"]:
+        try:
+            info["frames"] = int(_count_frames_quietly(candidate, logger) or 0)
+        except Exception:
+            info["frames"] = 0
+
+    info["measured"] = info["duration"] > 0
+    if info["measured"] and prev > 0:
+        info["delta_ms"] = round((info["duration"] - prev) * 1000.0, 3)
+        info["changed"] = (abs(info["duration"] - prev) / prev) > relation_tolerance
+
+    if logger:
+        if info["measured"]:
+            logger.info(
+                "STAGE7_FINAL_TIMELINE_REMEASURED",
+                "Re-measured the final candidate after the last mux; the "
+                "pre-encode duration is no longer used for the report",
+                duration=round(info["duration"], 4), basis=info["basis"],
+                frames=info["frames"], varies=info["varies"],
+                previous_duration=info["previous_duration"],
+                previous_basis=info["previous_basis"],
+                delta_ms=info["delta_ms"], changed=info["changed"])
+        else:
+            logger.error(
+                "STAGE7_FINAL_TIMELINE_UNMEASURABLE",
+                "Could not measure the final candidate's timeline after the "
+                "last mux. The pre-encode value is NOT reused as if verified.",
+                previous_duration=info["previous_duration"],
+                previous_basis=info["previous_basis"],
+                problems=info["problems"][:3])
+    return info
+
+
 def _detect_black_bars_stage7(video_path: str, logger=None) -> dict:
     """Detect black bars on the stage7 input for crop/restore around color
     conversion per v7.32 §3.10.3 ("色域转换前应先自动检测并裁剪黑边,转换完成后
@@ -3187,6 +3433,69 @@ def main():
                 _discard_attempt_tmp(_publish_tmp, logger)
                 return 86
 
+            # ---- R20-A06：最后一次 mux 之后**重新实测**----
+            # 到这里 `_publish_tmp` 已经冻结（摘要在上一行算完，之后不再改写），
+            # 所以这次测量描述的就是**将要发布的那些字节**。
+            # 编码前算出的 processed_duration 描述的是中间产物；VFR 重定时按设计
+            # 就会改时间轴，沿用它等于拿一个已经不存在的文件的数字去出报告。
+            _pre_encode_timing = {
+                "duration": round(float(processed_duration or 0.0), 6),
+                "basis": _timing_basis,
+            }
+            try:
+                _final_tl = measure_final_candidate(
+                    _publish_tmp, logger,
+                    previous_duration=processed_duration,
+                    previous_basis=_timing_basis,
+                    retime_info=_retime_info)
+            except Exception as _ftl_exc:      # 探测异常 = 没测到，不是"没问题"
+                logger.error(
+                    "STAGE7_FINAL_TIMELINE_PROBE_ERROR",
+                    "Measuring the final candidate raised; treating the "
+                    "timeline as UNMEASURED (the pre-encode value is discarded).",
+                    attempt_id=_attempt_id, error=str(_ftl_exc))
+                _final_tl = {"measured": False, "duration": 0.0,
+                             "basis": "unknown", "frames": 0, "varies": None,
+                             "delta_ms": 0.0, "changed": False, "attempts": [],
+                             "problems": [f"probe raised: {_ftl_exc}"]}
+            _timing_measure_point = "pre-encode"
+            if _final_tl.get("measured"):
+                processed_duration = float(_final_tl["duration"])
+                # `_timing_basis` 从这一刻起描述的是**最终候选**的测量来源
+                # （"packet-span (retime; …)" 比容器时长少一帧，依据写清楚，
+                #   别让读报告的人以为两者是同一个量）。
+                _timing_basis = str(_final_tl.get("basis") or "unknown")
+                _timing_measure_point = "post-mux"
+                if _final_tl.get("changed"):
+                    logger.warning(
+                        "STAGE7_FINAL_TIMELINE_CHANGED_BY_MUX",
+                        "The final candidate's duration differs from the "
+                        "pre-encode value by more than the tolerance. The "
+                        "report uses the post-mux measurement.",
+                        pre_encode_duration=_pre_encode_timing["duration"],
+                        pre_encode_basis=_pre_encode_timing["basis"],
+                        final_duration=round(processed_duration, 4),
+                        final_basis=_timing_basis,
+                        delta_ms=_final_tl.get("delta_ms"))
+            else:
+                # **旧缓存失效**：不能拿编码前的数字冒充"输出已测得"。
+                # 置 0 让下游裁定如实落到 UNVERIFIED，而不是"有个数就算通过"。
+                processed_duration = 0.0
+                _timing_basis = "unverified (post-mux probe failed)"
+                _timing_measure_point = "post-mux (failed)"
+            _prechecks["final_timeline"] = {
+                "measure_point": _timing_measure_point,
+                "measured": bool(_final_tl.get("measured")),
+                "basis": _final_tl.get("basis"),
+                "frames": _final_tl.get("frames"),
+                "varies": _final_tl.get("varies"),
+                "delta_ms": _final_tl.get("delta_ms"),
+                "changed_by_mux": bool(_final_tl.get("changed")),
+                "pre_encode": _pre_encode_timing,
+                "attempts": _final_tl.get("attempts") or [],
+                "problems": _final_tl.get("problems") or [],
+            }
+
             _ver_doc = dict(_pre)
             if _prechecks:
                 _ver_doc.setdefault("prechecks", {}).update(_prechecks)
@@ -3224,7 +3533,10 @@ def main():
                     processed_duration=processed_duration,
                     timing_state=_timing_state,
                     tempo_applied=tempo_ratio,
-                    timing_basis=_timing_basis)
+                    timing_basis=_timing_basis,
+                    # R20-A06：测量有效性由**本次实测结论**给出，
+                    # 不再靠 `timing_basis == "packet-span"` 这种字符串相等。
+                    measurement_valid=bool(_final_tl.get("measured")))
                 if _tv["status"] == "FAIL":
                     logger.error(
                         "STAGE7_TRANSFORM_NOT_APPLIED",
@@ -3241,7 +3553,7 @@ def main():
                                 verdict=_tv)
                 if isinstance(_tl_plan, dict):
                     _src_verified = bool(_tl_plan.get("source_verified"))
-                    _out_measured = (_timing_basis == "packet-span")
+                    _out_measured = bool(_final_tl.get("measured"))
                     _ver_doc["timeline"] = {
                         "source_timeline": _tl_plan.get("source_timeline"),
                         "source_verified": _src_verified,
@@ -3251,6 +3563,21 @@ def main():
                         "fps": _tl_plan.get("fps"),
                         "pts_coverage": _tl_plan.get("pts_coverage"),
                         "output_measured": _out_measured,
+                        "output_measure_point": _timing_measure_point,
+                        "pre_encode_timing": _pre_encode_timing,
+                        "final_measure": {
+                            "duration": (round(processed_duration, 6)
+                                         if _out_measured else None),
+                            "basis": _final_tl.get("basis"),
+                            "frames": _final_tl.get("frames"),
+                            "varies": _final_tl.get("varies"),
+                            "delta_ms": _final_tl.get("delta_ms"),
+                            "changed_by_mux": bool(_final_tl.get("changed")),
+                            "attempts": _final_tl.get("attempts") or [],
+                            "problems": _final_tl.get("problems") or [],
+                        },
+                        # `timing_basis` 从 R20 起描述的是**最终候选**的测量
+                        # 来源；编码前的依据在 pre_encode_timing 里留档。
                         "timing_state": _timing_state,
                         "timing_basis": _timing_basis,
                         # 只有"源已验证"且"本次判定为 verified"才敢说源时序成立
@@ -3272,7 +3599,20 @@ def main():
                 else:
                     _ver_doc["timeline"] = {
                         "source_verified": None,
-                        "output_measured": (_timing_basis == "packet-span"),
+                        "output_measured": bool(_final_tl.get("measured")),
+                        "output_measure_point": _timing_measure_point,
+                        "pre_encode_timing": _pre_encode_timing,
+                        "final_measure": {
+                            "duration": (round(processed_duration, 6)
+                                         if _final_tl.get("measured") else None),
+                            "basis": _final_tl.get("basis"),
+                            "frames": _final_tl.get("frames"),
+                            "varies": _final_tl.get("varies"),
+                            "delta_ms": _final_tl.get("delta_ms"),
+                            "changed_by_mux": bool(_final_tl.get("changed")),
+                            "attempts": _final_tl.get("attempts") or [],
+                            "problems": _final_tl.get("problems") or [],
+                        },
                         "timing_state": _timing_state,
                         "timing_basis": _timing_basis,
                         "source_timing_claimed_verified": False,
@@ -3322,6 +3662,39 @@ def main():
                                           if _tvs == "FAIL" else None),
                             "evidence": _tv,
                         }
+
+                # ---- R20-A06：最终候选的时间轴测量也进决策门 ----
+                # 以前 `probe` 异常 / 空 PTS / 时长未知 只落成一条**问题列表**，
+                # `timeline_mapping_strict=false` 时仅打 CRITICAL 就放行 ——
+                # "测不出来"于是等于"没问题"。这里把它变成一条正式检查：
+                #   PASS       → 确实从最终字节测到了时长
+                #   UNVERIFIED → 测不到，必须显式强制才能发布（verified=false）
+                _ftl_problems = _final_tl.get("problems") or []
+                if _final_tl.get("measured"):
+                    _checks["final_timeline"] = {
+                        "name": "final_timeline",
+                        "status": "PASS",
+                        "reason": (f"final candidate measured after the last "
+                                   f"mux via {_final_tl.get('basis')}"
+                                   + (f" ({len(_ftl_problems)} note(s))"
+                                      if _ftl_problems else "")),
+                        "method": "stage7.measure_final_candidate",
+                        "severity": "info",
+                        "evidence": _prechecks.get("final_timeline"),
+                    }
+                else:
+                    _checks["final_timeline"] = {
+                        "name": "final_timeline",
+                        "status": "UNVERIFIED",
+                        "reason": ("the final candidate's duration could not be "
+                                   "measured after the last mux; the pre-encode "
+                                   "value is not evidence for the published file"),
+                        "method": "stage7.measure_final_candidate",
+                        "severity": "warning",
+                        # 与 transform 用同一把钥匙：允许"明知未验证仍要发"
+                        "force_key": "allow_verify_fail_publish",
+                        "evidence": _prechecks.get("final_timeline"),
+                    }
 
                 _rows = []
                 for _d in _checks.values():

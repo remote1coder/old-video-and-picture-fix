@@ -123,6 +123,7 @@ def build_transform_verdict(declared_speed=None, declared_tempo=None,
                             tempo_applied: float = 1.0,
                             tolerance: float = 0.01,
                             timing_basis: Optional[str] = None,
+                            measurement_valid: Optional[bool] = None,
                             ) -> Dict[str, Any]:
     """裁定"用户请求的变换是否真的执行了"（结论 ②）。
 
@@ -137,8 +138,14 @@ def build_transform_verdict(declared_speed=None, declared_tempo=None,
             （``verified`` / ``adjusted`` / ``unverified`` / ``unexplained``）。
         tempo_applied: 实际施加的 atempo（1.0 = 没改音频）。
         tolerance: 相对容差。
-        timing_basis: 时长证据的来源。``"packet-span"`` 表示**实测**；
-            估算或缺失都算"测量不足"。
+        timing_basis: 时长证据的来源，仅用于**记录**。``"packet-span"``
+            在 ``measurement_valid`` 未给出时仍按"实测"处理（向后兼容）。
+        measurement_valid: 时长是否**真的测自最终成品的字节**。
+            R20-A06 新增：以前"有没有测到"被压缩成
+            ``timing_basis == "packet-span"`` 这个**字符串相等**判断，
+            换一种同样可信的测量方式（容器时长、重定时助手实测）就会被
+            误判成"没测"。调用方现在显式传结论，字符串只负责说明来源。
+            为 None 时退回旧的字符串判断。
 
     Returns:
         dict，``status`` ∈ ``NOT_APPLICABLE`` / ``PASS`` / ``FAIL`` / ``UNVERIFIED``。
@@ -209,7 +216,8 @@ def build_transform_verdict(declared_speed=None, declared_tempo=None,
     # 旧实现据此返回 UNVERIFIED —— 但**实测已经在手**（比值 1.0），
     # 与声明 2 倍明显不符，那就该是 **FAIL**。
     # `timing_state` 是**音频**决策（是否改 atempo），不是"测量是否有效"。
-    _measured = (timing_basis == "packet-span")
+    _measured = (timing_basis == "packet-span"
+                 if measurement_valid is None else bool(measurement_valid))
     if out["observed_ratio"] is None or not _measured:
         out["status"] = "UNVERIFIED"
         out["reason"] = (

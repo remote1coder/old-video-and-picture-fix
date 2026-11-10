@@ -157,8 +157,24 @@ def probe_pts(video: str, timeout: int = 120) -> List[float]:
     return out
 
 
+#: 逐帧间隔判定的**绝对下限**（秒）。
+#:
+#: ffprobe 的 `pts_time` 在 MKV 里是毫秒量化（timebase 1/1000），30fps 的
+#: 33.333 ms 会被舍成 33/34 交替 —— 相对偏差约 3%。若容差只有"中位间隔的
+#: 2%"（30fps 下 ≈0.67 ms），**比量化步长还小**，CFR 素材会被判成 VFR，
+#: 于是 stage7 白跑一次全片重封装（4K 16 位中间件单件可达 250 GB）。
+#: 这与 R19 已修的 `_classify_timeline` 是同一病族：
+#: **容差必须大于被比较量的量化步长**。
+INTERVAL_ABS_FLOOR_S = 0.002
+
+
 def is_variable(pts: List[float], tolerance: float = 0.02) -> bool:
-    """逐帧间隔是否**明显不齐**（相对中位间隔偏差超过 tolerance）。"""
+    """逐帧间隔是否**明显不齐**（相对中位间隔偏差超过 tolerance）。
+
+    R20-A06：容差取 ``max(INTERVAL_ABS_FLOOR_S, tolerance × 中位间隔)``。
+    纯相对容差在毫秒量化的时间轴上会小于量化步长，把 CFR 判成 VFR
+    （见 ``INTERVAL_ABS_FLOOR_S`` 的说明）。
+    """
     if len(pts) < 3:
         return False
     d = [b - a for a, b in zip(pts, pts[1:]) if b > a]
@@ -168,7 +184,8 @@ def is_variable(pts: List[float], tolerance: float = 0.02) -> bool:
     med = d_sorted[len(d_sorted) // 2]
     if med <= 0:
         return False
-    return max(abs(x - med) / med for x in d) > tolerance
+    _tol = max(INTERVAL_ABS_FLOOR_S, tolerance * med)
+    return max(abs(x - med) for x in d) > _tol
 
 
 def write_timecodes_v2(pts: List[float], path: str,
