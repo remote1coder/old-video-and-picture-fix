@@ -1397,115 +1397,43 @@ def _chain_mode_on(params) -> bool:
 def _fused_step34(params, job, logger=None):
     """找 stage3 留下的 G34 融合回执，返回被融合产出的 step4 路径或 None。
 
-    判据不只看"回执文件在"——还要确认它指向的产物**确实存在且尺寸一致**，
-    否则回执过期（产物被清理）时会误跳过 stage4，最终成品缺一段处理。
+    判定逻辑**全部**在 `shared_modules/fused_receipt.py` —— 与 `stage5`
+    共用同一个验证器（审核 R19-A03：main/stage5 通过共享验证器消费）。
+
+    历史：这里曾自己实现过一遍（attempt → input_digest → output/size），
+    stage5 也实现过一遍。两份会漂移，一处收紧另一处照旧就等于没修。
     """
     try:
-        import glob as _glob
-        import json as _json
         temp_dir = (params or {}).get("temp_dir") or "."
         stem = Path(job.get("input_path", "")).stem
         job_id = job.get("job_id", "")
-        pattern = os.path.join(temp_dir,
-                               f"{job_id}_{stem}_step4_postprocess*"
-                               f".fused_stage34.json")
-        hits = sorted(_glob.glob(pattern))
-        if not hits:
-            return None
 
-        # ---- R20-A03：只认**本 attempt** 的回执 ----
-        # 审核：旧实现取 `sorted(glob)[-1]` —— 上一轮残留的回执字典序更大
-        # 就会被选中，于是本轮"以为 stage4 已经融合过"而跳过它。
-        # 现在要求回执里的 `attempt_id` 等于本次执行的 attempt；
-        # 没有 attempt 字段（旧回执）或 attempt 不符 → 一律不采信。
-        _want = str((params or {}).get("attempt_id") or "")
-        _picked = None
-        _rejected = []
-        for _h in hits:
-            try:
-                with open(_h, "r", encoding="utf-8") as _fh:
-                    _r = _json.load(_fh) or {}
-            except (OSError, ValueError):
-                _rejected.append((_h, "unreadable"))
-                continue
-            _got = str(_r.get("attempt_id") or "")
-            if _want and _got == _want:
-                _picked = (_h, _r)
-                break
-            _rejected.append((_h, "attempt=%r" % (_got or "(legacy)")))
-
-        if _picked is None:
+        from fused_receipt import find_and_verify as _fav
+        _rcpt, _path, _why = _fav(
+            str(temp_dir), str(job_id), stem, params or {},
+            expected_attempt=str((params or {}).get("attempt_id") or ""),
+            src_path=str(job.get("input_path") or ""))
+        if _rcpt is None:
             if logger:
+                # 保留细分事件名：统一成一个 `_REJECTED` 会丢掉"为什么拒"的
+                # 可检索性（值班时要能 grep 出"是产物没了还是尺寸变了"）。
+                _w = str(_why or "")
+                if "output is gone" in _w:
+                    _ev = "STAGE4_FUSED_RECEIPT_STALE"
+                elif "size changed" in _w:
+                    _ev = "STAGE4_FUSED_RECEIPT_SIZE_MISMATCH"
+                elif "source/params changed" in _w:
+                    _ev = "STAGE4_FUSED_RECEIPT_INPUT_CHANGED"
+                elif "no input_digest" in _w or "no attempt_id" in _w:
+                    _ev = "STAGE4_FUSED_RECEIPT_LEGACY"
+                else:
+                    _ev = "STAGE4_FUSED_RECEIPT_REJECTED"
                 logger.warning(
-                    "STAGE4_FUSED_RECEIPT_OTHER_ATTEMPT",
-                    "G34 receipts exist but none belongs to this attempt; "
-                    "running stage4 the classic way instead of trusting a "
-                    "stale one.", want_attempt=_want or "(none)",
-                    rejected=[r[1] for r in _rejected[:5]])
+                    _ev,
+                    "No usable G34 receipt for this attempt/source; running "
+                    "stage4 the classic way instead.", reason=_w)
             return None
-        with open(_picked[0], "r", encoding="utf-8") as fh:
-            rcpt = _picked[1]
-        out = rcpt.get("output")
-        if not out or not os.path.exists(out):
-            if logger:
-                logger.warning(
-                    "STAGE4_FUSED_RECEIPT_STALE",
-                    "A G34 receipt exists but its output is gone; running "
-                    "stage4 the classic way instead", receipt=hits[-1],
-                    output=out)
-            return None
-        if rcpt.get("output_size") and                 os.path.getsize(out) != int(rcpt["output_size"]):
-            if logger:
-                logger.warning(
-                    "STAGE4_FUSED_RECEIPT_SIZE_MISMATCH",
-                    "The fused step4 changed size after the receipt was "
-                    "written; treating the receipt as stale",
-                    receipt=hits[-1], recorded=rcpt.get("output_size"),
-                    actual=os.path.getsize(out))
-            return None
-        # ---- R20-A03：回执必须绑定**本次的源内容 + 有效参数** ----
-        # 旧回执只有 output/output_size —— "换了源或改了参数、回执还在"时
-        # 无法识别，消费方会把上一轮的融合产物当成这次 stage4 已跑过。
-        # `input_digest` 由 `compute_param_hash(源, params)` 得来，
-        # 同时含文件身份（size/mtime/xxhash 前缀）与质量参数。
-        _rec_dig = str(rcpt.get("input_digest") or "")
-        if not _rec_dig:
-            if logger:
-                logger.warning(
-                    "STAGE4_FUSED_RECEIPT_NO_INPUT_DIGEST",
-                    "A G34 receipt exists but carries no input_digest (legacy); "
-                    "cannot prove it belongs to this source/params. Running "
-                    "stage4 the classic way instead.", receipt=_picked[0])
-            return None
-        _input_path = str(job.get("input_path") or "")
-        if not _input_path:
-            # 没有输入路径就算不出源身份 —— 不能凭空相信回执
-            if logger:
-                logger.warning(
-                    "STAGE4_FUSED_RECEIPT_NO_INPUT",
-                    "Job has no input_path; cannot verify the G34 receipt "
-                    "belongs to this source. Running stage4 the classic way.")
-            return None
-        try:
-            from checkpoint import compute_param_hash as _cph
-            _cur_dig = _cph(_input_path, params)
-        except Exception as _dge:         # pragma: no cover
-            if logger:
-                logger.warning(
-                    "STAGE4_FUSED_RECEIPT_DIGEST_ERROR",
-                    "Could not recompute the current input digest; treating the "
-                    "receipt as unproven.", error=str(_dge))
-            return None
-        if _cur_dig and _rec_dig != _cur_dig:
-            if logger:
-                logger.warning(
-                    "STAGE4_FUSED_RECEIPT_INPUT_CHANGED",
-                    "The G34 receipt was produced for a different source or "
-                    "different params; running stage4 the classic way instead.",
-                    receipt=_picked[0],
-                    recorded=_rec_dig[:16], current=str(_cur_dig)[:16])
-            return None
-        return out
+        return _rcpt.get("output")
     except Exception as exc:              # pragma: no cover
         if logger:
             logger.warning("STAGE4_FUSED_RECEIPT_ERROR", str(exc))
