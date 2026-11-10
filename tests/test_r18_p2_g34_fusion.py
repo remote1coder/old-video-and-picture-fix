@@ -57,16 +57,21 @@ def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT,
         f.write(b"X" * (size if size is not None else 100))
     rcpt = os.path.join(str(temp_dir), name + ".fused_stage34.json")
     with open(rcpt, "w", encoding="utf-8") as f:
-        # R20-A03：回执必须带 input_digest（= compute_param_hash(源, params)），
-        # 消费方用它证明"这份回执属于本次源与参数"。
+        # R20-A03：回执必须绑定"源"与"参数" —— 但两者**分开存**。
+        # 用 `compute_param_hash(源, params)` 当一个字段会随 stage 变化
+        # （实测同一源 stage1 07363d3b… / stage3 1b93756b…），消费方重算
+        # 必然误判成"变了"。所以：源身份用空 params 的摘要，参数用冻结值。
         _dig = ""
         try:
-            from checkpoint import compute_param_hash as _cph
-            _dig = _cph(str(job.get("input_path") or ""), params or {})
+            from fused_receipt import source_digest as _sd
+            _dig = _sd(str(job.get("input_path") or "")) or ""
         except Exception:
             pass
         json.dump({"attempt_id": attempt,
                    "input_digest": _dig,
+                   "input_digest_kind": "source-only",
+                   "param_digest": str((params or {}).get(
+                       "_frozen_param_digest") or ""),
                    "chain_mode": "stage34", "output": out,
                    "output_size": os.path.getsize(out),
                    "logical_stages": ["stage3", "stage4"],
@@ -195,18 +200,40 @@ def test_fused_step34_rejects_a_receipt_without_color_evidence(tmp_path):
     assert "STAGE4_FUSED_RECEIPT_UNPROVEN" in log.ev, log.ev
 
 
-def test_fused_step34_rejects_a_receipt_with_incomplete_color(tmp_path):
-    """字段未知 ≠ 颜色错了，但同样不足以支撑"这次转换是对的"。"""
+def test_fused_step34_rejects_a_receipt_that_lost_a_colour_tag(tmp_path):
+    """**相对**判据：产物字段不全本身不算问题（源可能本来就没标签），
+    但"源有、产物没有"就是丢标签，必须拒。"""
     job = _job(tmp_path / "clip.mp4")
 
-    def _drop_matrix(d):
+    def _lose_matrix(d):
         d["color"]["matrix"] = None
         d["color"]["complete"] = False
         d["color"]["unknown_fields"] = ["matrix"]
+        d["color_lost_tags"] = ["matrix"]
 
-    _mutated_receipt(tmp_path, job, _drop_matrix)
+    _mutated_receipt(tmp_path, job, _lose_matrix)
+    log = _L()
     assert vmain._fused_step34(
-        {"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, _L()) is None
+        {"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, log) is None
+    assert "STAGE4_FUSED_RECEIPT_UNPROVEN" in log.ev, log.ev
+
+
+def test_fused_step34_accepts_an_untagged_output_when_the_source_is_untagged(tmp_path):
+    """合成素材/无标签源：两边都缺 matrix 是**正确**的，不该因此拒绝。"""
+    job = _job(tmp_path / "clip.mp4")
+
+    def _both_untagged(d):
+        for key in ("color", "color_source"):
+            d[key] = {"pix_fmt": "yuv420p16le", "range": "limited",
+                      "matrix": None, "primaries": None, "transfer": None,
+                      "probed": True, "complete": False,
+                      "unknown_fields": ["matrix", "primaries", "transfer"]}
+        d["color_lost_tags"] = []
+
+    out, _ = _mutated_receipt(tmp_path, job, _both_untagged)
+    got = vmain._fused_step34(
+        {"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, _L())
+    assert got is not None and os.path.basename(got) == os.path.basename(out)
 
 
 def test_fused_step34_rejects_a_receipt_whose_bounds_were_never_checked(tmp_path):
@@ -243,6 +270,21 @@ def test_stage3_fused_path_runs_the_boundary_check():
     i_rcpt = src.find('".fused_stage34.json"')
     assert 0 < i_check < i_rcpt, (i_check, i_rcpt)
     assert "STAGE3_FUSE34_BOUNDS_BROKEN" in src
+
+
+def test_stage5_fused_branch_uses_a_name_that_exists_in_scope():
+    """结构守卫：融合分支的日志参数必须是**本作用域**存在的变量。
+
+    2026-11-10 实测（N20 第三轮）：这里曾写 `receipt=_r` —— `_r` 是上一个
+    `try` 里的局部变量。因为融合回执在此之前 **100% 被拒**，这条 INFO
+    分支从没执行过，NameError 一直藏着；回执一修好，它立刻变成 rc=1。
+    **分支从未被执行 = 语法正确不代表能跑。**
+    """
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage5_ai_face.py"),
+               encoding="utf-8", errors="replace").read()
+    i = src.index("STAGE5_ORDER_OK_FUSED")
+    assert "receipt=_p5" in src[i:i + 900]
 
 
 # ------------------------------------------------ 结构守卫

@@ -1496,12 +1496,14 @@ def _fused_step34(params, job, logger=None):
                     _ev = "STAGE4_FUSED_RECEIPT_STALE"
                 elif "size changed" in _w:
                     _ev = "STAGE4_FUSED_RECEIPT_SIZE_MISMATCH"
-                elif "source/params changed" in _w:
+                elif ("source changed" in _w or "quality params changed" in _w
+                      or "frozen" in _w):
                     _ev = "STAGE4_FUSED_RECEIPT_INPUT_CHANGED"
-                elif "no input_digest" in _w or "no attempt_id" in _w:
+                elif ("no input_digest" in _w or "no attempt_id" in _w
+                      or "source-only input_digest" in _w):
                     _ev = "STAGE4_FUSED_RECEIPT_LEGACY"
                 elif ("no color evidence" in _w or "color was never probed" in _w
-                      or "color fields unknown" in _w
+                      or "colour tags lost" in _w
                       or "bounds check" in _w):
                     # R20-A03：回执在、身份也对，但**证据块不全**。
                     # 这和"过期"是两件事：过期是"这不是本次的"，
@@ -1555,6 +1557,25 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     if not params.get("attempt_id"):
         import uuid as _uuid
         params["attempt_id"] = _uuid.uuid4().hex[:16]
+
+    # ---- R20-A03（修正）：**在计划阶段冻结**质量参数摘要 ----
+    # 实测反例（2026-11-10 N20）：融合回执用
+    # `compute_param_hash(源, params)` 当 `input_digest`，而同一源在 stage1
+    # 算出 `07363d3b…`、在 stage3 算出 `1b93756b…` —— 因为 params 会随后续
+    # stage 注入而变化。消费方（main/stage5）**重新计算**再比对，
+    # 于是**每一次**都判成"源/参数变了"，融合回执永远不可用，
+    # stage4 静默回落到 step2（1080p 未超分），整条融合路线名存实亡。
+    # 修法：摘要只在**这里**算一次，随 params 下传，谁都不再自己重算。
+    try:
+        from checkpoint import compute_param_hash as _cph_frozen
+        params["_frozen_param_digest"] = _cph_frozen(
+            str(job.get("input_path") or ""), params)
+    except Exception as _fz:               # pragma: no cover - 身份算不出
+        params["_frozen_param_digest"] = ""
+        _pre_log.warning("FROZEN_PARAM_DIGEST_FAIL",
+                         "Cannot freeze the quality-param digest; fused "
+                         "receipts will not be able to prove 'same params'",
+                         error=str(_fz))
 
     # ---- R20-A01：给 stage7 一个 **attempt 私有** 的结果路径 ----
     # 审核 §3.2 第 1 步："main 冻结身份并给 stage7 明确的 attempt 私有结果路径。

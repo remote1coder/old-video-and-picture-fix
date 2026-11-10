@@ -2912,6 +2912,17 @@ def main():
                                     probed=_c.get("pix_fmt"))
                             try:
                                 import json as _json
+                                # 源身份：**只含文件身份**（空 params），
+                                # 与消费方的 `source_digest()` 同源同值。
+                                try:
+                                    from fused_receipt import (
+                                        source_digest as _src_digest)
+                                    _rsrc_dig = _src_digest(str(
+                                        params.get("input_path")
+                                        or params.get("_input_path")
+                                        or args.input or ""))
+                                except Exception:
+                                    _rsrc_dig = None
                                 _rcpt = {
                                     # R20-A03：回执必须标明是**哪一次执行**产出的，
                                     # 否则消费者只能靠 glob+字典序猜（会用上一轮的）。
@@ -2929,13 +2940,23 @@ def main():
                                     },
                                     "job_id": job_id,
                                     "param_hash": param_hash,
-                                    # R20-A03：回执必须绑定**源内容**与**有效参数**。
-                                    # 只有 output + size 时，"换了源但回执还在"
-                                    # 无法被识别 —— 消费方会把上一轮的融合结果
-                                    # 当成这次 stage4 已经跑过。
-                                    # `compute_param_hash(源, params)` 同时含
-                                    # 文件身份（size/mtime/xxhash 前缀）与质量参数。
-                                    "input_digest": (param_hash or ""),
+                                    # ---- R20-A03（2026-11-10 修正）----
+                                    # 回执必须绑定"源"与"参数"，但这两件事
+                                    # **不能**塞进同一个 `compute_param_hash(源,
+                                    # params)`：那个值会随后续 stage 注入的
+                                    # params 变化（实测同一源：stage1
+                                    # `07363d3b…`、stage3 `1b93756b…`），
+                                    # 消费方重算再比对必然误判成"变了"。
+                                    # 所以拆成两个：
+                                    #   input_digest  —— **只含源文件身份**
+                                    #                    （`source_digest()`，空
+                                    #                    params，跨 stage 稳定）
+                                    #   param_digest  —— main 在计划阶段算一次的
+                                    #                    冻结值，谁都不重算
+                                    "input_digest": (_rsrc_dig or ""),
+                                    "input_digest_kind": "source-only",
+                                    "param_digest": str(
+                                        params.get("_frozen_param_digest") or ""),
                                     "output": str(_s_out),
                                     "output_size": os.path.getsize(_s_out),
                                     "frames": _s_n,

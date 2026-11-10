@@ -108,15 +108,39 @@ def bounds_report(src: str, out: str, stage: str, params: Optional[Dict[str, Any
     return res
 
 
+def _lost_tags(src_color: Dict[str, Any],
+               out_color: Dict[str, Any]) -> list:
+    """源**有**标签、产物**丢了**的字段列表。
+
+    这才是真正的问题。反例（2026-11-10 N20 实测）：合成素材本身没有
+    matrix/primaries/transfer 标签（`STAGE1_COLOR_RANGE_UNKNOWN`），
+    融合产物同样没有 —— 这是**正确**的。若要求"字段必须齐全"，
+    就等于逼实现去**编造**一个矩阵，正好违反 COL-04
+    "unknown 不等于 known，绝不填默认值"。
+
+    所以判据是**相对**的：只在"源说得出、产物说不出"时才算缺陷。
+    """
+    lost = []
+    for k in ("pix_fmt", "range", "matrix", "primaries", "transfer"):
+        if src_color.get(k) and not out_color.get(k):
+            lost.append(k)
+    return lost
+
+
 def collect(src: str, out: str, stage: str,
             params: Optional[Dict[str, Any]] = None,
             logger=None) -> Dict[str, Any]:
     """一次拿齐两类证据，直接塞进回执。
 
     Returns:
-        ``{"color": {...}, "bounds": {...}}``。
+        ``{"color": {...}, "color_source": {...}, "color_lost_tags": [...],
+        "bounds": {...}}``。
     """
-    return {"color": color_group(out),
+    oc = color_group(out)
+    sc = color_group(src)
+    return {"color": oc,
+            "color_source": sc,
+            "color_lost_tags": _lost_tags(sc, oc),
             "bounds": bounds_report(src, out, stage, params, logger)}
 
 
@@ -125,6 +149,9 @@ def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
 
     返回问题列表（空 = 可以采信）。消费方（``fused_receipt``）用它把
     "证据不全"和"证据说不对"分开处理，但两者都**不能**当通过。
+
+    颜色判据是**相对**的（见 `_lost_tags`）：产物字段不全本身不是问题，
+    "源有、产物没有"才是。
     """
     problems = []
     color = (rcpt or {}).get("color")
@@ -133,9 +160,10 @@ def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
     else:
         if not color.get("probed"):
             problems.append("color was never probed")
-        elif not color.get("complete"):
-            problems.append("color fields unknown: "
-                            + ",".join(color.get("unknown_fields") or []))
+        lost = (rcpt or {}).get("color_lost_tags")
+        if isinstance(lost, list) and lost:
+            problems.append("colour tags lost between input and output: "
+                            + ",".join(lost))
     bounds = (rcpt or {}).get("bounds")
     if not isinstance(bounds, dict):
         problems.append("no bounds evidence (legacy receipt)")

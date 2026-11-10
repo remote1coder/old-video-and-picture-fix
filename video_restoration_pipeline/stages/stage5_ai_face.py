@@ -2178,7 +2178,11 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                     "No standalone step3 exists because stage3 and stage4 ran "
                     "as one execution group (G34); the fusion receipt and its "
                     "step4 output prove the AI upscale ran",
-                    receipt=_r)
+                    # 2026-11-10 修：这里原来写的是 `_r` —— 那是**上一个 try**
+                    # 里的局部变量，本分支里根本不存在。因为融合回执在此之前
+                    # **100% 被拒**，这条 INFO 分支从没执行过，NameError 一直
+                    # 藏着；N20 修好回执之后它立刻变成 rc=1。
+                    receipt=_p5)
             else:
                 logger.error("STAGE5_ORDER_ERROR",
                              "AI upscale enabled but no stage3 output found. "

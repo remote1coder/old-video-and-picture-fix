@@ -222,6 +222,29 @@ def main():
         pattern2 = f"{job_id}_{Path(input_name).stem}_step2_traditional*"
         candidates2 = select_media_candidates(
             Path(temp_dir).glob(pattern2))
+        # ---- R20（N20 实测发现）：融合模式下**禁止**这个回退 ----
+        # `chain.mode: stage34` 时 stage3 与 stage4 是一组，**本来就不会有
+        # step3 文件**。此时"找不到 step3 就退到 step2"会把一次**未超分**的
+        # 2K 处理当成 stage4 的产物：
+        #   实测（2026-11-10，N20）：classic 输出 3840x2160，fused 路线
+        #   stage4 退回 step2 → 1920x1080，且该产物随后被**身份缓存**复用，
+        #   下一轮 stage4 直接 STAGE_SKIP，降级被固化下来。
+        # 缺融合回执 = 融合没跑成 = 必须停，不能静默降级。
+        _cm = str(params.get("chain_mode") or "").strip().lower()
+        _ai = params.get("ai_enabled")
+        _ai_on = (_ai is True or str(_ai).strip().lower() in
+                  ("1", "true", "yes", "on"))
+        if _cm in ("stage34", "both") and _ai_on:
+            logger.error(
+                "STAGE4_FUSED_INPUT_MISSING",
+                "chain_mode=" + _cm + " implies stage3+stage4 ran as one "
+                "group, so a missing step3 is EXPECTED — but without a usable "
+                "fusion receipt there is nothing to post-process. Refusing to "
+                "silently fall back to the stage2 output (that would publish "
+                "a non-upscaled result).",
+                temp_dir=str(temp_dir),
+                fallback_candidates=[str(p) for p in (candidates2 or [])][:3])
+            return 82
         if candidates2:
             stage3_output = str(candidates2[0])
             logger.info("STAGE4_FALLBACK",
