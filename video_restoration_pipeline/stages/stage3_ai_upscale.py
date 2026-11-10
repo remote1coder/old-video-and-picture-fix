@@ -2098,6 +2098,55 @@ def _load_params(args):
     return json.loads(args.params) if args.params else {}
 
 
+def write_job_timeline_plan(params, source_timeline=None, fps_value=None,
+                            fps_source=None, pts_usable=0,
+                            expected_frames=0, logger=None):
+    """把 job 级时间轴计划落盘（R20-A06）。
+
+    审核：**每个成功出口**都要写/继承 `TimelinePlan`。
+    `write_plan()` 此前零生产调用点，导致 `stage7` 的 `read_plan()` 永远
+    读到 None，"源 VFR 且无 mkvmerge 就拒绝发布"这条保护静默失效。
+
+    本函数是**唯一的写入入口**，各出口（AI-off / 流式 / PNG / 原样返回）
+    都调它：没有检测数据时写 ``unknown`` 并留 assumption，
+    **不冒充已验证**。
+
+    Returns:
+        写入路径；失败返回 None（只告警，不阻断 —— 门禁在 stage7）。
+    """
+    try:
+        from timeline_plan import (build_plan as _bp, write_plan as _wp,
+                                   build_identity as _bid)
+        _tl = (source_timeline or "unknown").strip().lower()
+        if _tl not in ("cfr", "vfr", "unknown"):
+            _tl = "unknown"
+        _doc = _bp(
+            job_id=str(params.get("job_id") or params.get("_job_id") or "job"),
+            source_timeline=_tl,
+            fps_value=fps_value,
+            fps_source=fps_source,
+            pts_usable=int(pts_usable or 0),
+            expected_frames=int(expected_frames or 0),
+            assumptions=(None if _tl != "unknown"
+                         else ["stage3 exited before probing the timeline"]),
+            identity=_bid(params),
+        )
+        _path = _wp(str(params.get("temp_dir") or "."), _doc)
+        if logger:
+            logger.info("STAGE3_TIMELINE_PLAN_WRITTEN",
+                        "Recorded the job-level timeline plan; stage7 gates "
+                        "on it.", path=_path, source_timeline=_tl,
+                        fps_source=fps_source)
+        return _path
+    except Exception as _tpx:              # pragma: no cover
+        if logger:
+            logger.warning("STAGE3_TIMELINE_PLAN_WRITE_FAIL",
+                           "Could not persist the timeline plan; stage7 will "
+                           "treat the source timeline as unknown.",
+                           error=str(_tpx))
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -2120,6 +2169,11 @@ def main():
     ai_enabled = params.get("ai_enabled", False)
     if not ai_enabled:
         logger.info("STAGE3_SKIP", "AI not enabled")
+        # R20-A06：AI 关闭也是**一个出口**。这里还没 probe，所以写 unknown
+        # 并留 assumption —— 但**必须写**，否则 stage7 连"未知"都读不到，
+        # 会把整条时间门当成"无需检查"。
+        write_job_timeline_plan(params, source_timeline="unknown",
+                                logger=logger)
         return 3
 
     scale = params.get("upscale_scale", 2)
@@ -2563,40 +2617,15 @@ def main():
                 return 86
 
     # ---- R20-A06：把本次**已确定**的时间轴落成 job 级计划 ----
-    # 审核：`timeline_plan.write_plan()` 存在但**从来没有生产调用点**
-    # （`build_plan` 也一样），而 `stage7` 却在读 `read_plan()` ——
-    # 于是 `_plan_tl` 永远是 None，"源是 VFR 且没装 mkvmerge 就拒绝发布"
-    # 这条保护**从来没生效过**。
-    #
-    # 这里是 fps 与 source_timeline 都已有结论的位置（probe / pts-derived /
-    # user-assumed 三条分支之后），写一次；失败只告警，不阻断（它是**证据**，
-    # 不是门禁 —— 门禁在 stage7）。
-    try:
-        from timeline_plan import (
-            build_plan as _bp, write_plan as _wp,
-            build_identity as _bid)
-        _tl_final = locals().get("_tl_probe") or "unknown"
-        if _tl_final not in ("cfr", "vfr", "unknown"):
-            _tl_final = "unknown"
-        _plan_doc = _bp(
-            job_id=str(params.get("job_id") or Path(args.input).stem),
-            source_timeline=_tl_final,
-            fps_value=(_fps_raw_str if "_fps_raw_str" in dir() else None),
-            fps_source=_fps_source,
-            pts_usable=len(all_pts_map or {}),
-            expected_frames=total_frames,
-            identity=_bid(params),
-        )
-        _wp(str(params.get("temp_dir") or Path(args.input).parent),
-            _plan_doc)
-        logger.info("STAGE3_TIMELINE_PLAN_WRITTEN",
-                    "Recorded the job-level timeline plan (source_timeline / "
-                    "fps and its provenance); stage7 gates on it.",
-                    source_timeline=_tl_final, fps_source=_fps_source)
-    except Exception as _tpx:              # pragma: no cover
-        logger.warning("STAGE3_TIMELINE_PLAN_WRITE_FAIL",
-                       "Could not persist the timeline plan; stage7 will treat "
-                       "the source timeline as unknown.", error=str(_tpx))
+    # 统一走 `write_job_timeline_plan()`（AI-off 分支也调它），避免两份实现。
+    write_job_timeline_plan(
+        params,
+        source_timeline=locals().get("_tl_probe"),
+        fps_value=locals().get("_fps_raw_str"),
+        fps_source=_fps_source,
+        pts_usable=len(all_pts_map or {}),
+        expected_frames=total_frames,
+        logger=logger)
 
     # ---- R16-05：用户**明确要求重解释时间轴**时，优先于 probe ----
     # 审核确认：`_manual_spec` 只在"probe 失败"分支里用，有效 probe 优先，
