@@ -2874,6 +2874,13 @@ def main():
                                     },
                                     "job_id": job_id,
                                     "param_hash": param_hash,
+                                    # R20-A03：回执必须绑定**源内容**与**有效参数**。
+                                    # 只有 output + size 时，"换了源但回执还在"
+                                    # 无法被识别 —— 消费方会把上一轮的融合结果
+                                    # 当成这次 stage4 已经跑过。
+                                    # `compute_param_hash(源, params)` 同时含
+                                    # 文件身份（size/mtime/xxhash 前缀）与质量参数。
+                                    "input_digest": (param_hash or ""),
                                     "output": str(_s_out),
                                     "output_size": os.path.getsize(_s_out),
                                     "frames": _s_n,

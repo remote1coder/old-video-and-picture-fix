@@ -43,8 +43,13 @@ def _job(inp, jid="j1"):
 #: 测试统一使用的 attempt 标识（R20-A03 起回执必须带它）
 _ATT = "att-test"
 
+#: 与各测试传给 `_fused_step34` 的 params 保持一致。
+#: `compute_param_hash` 只用输入路径 + 质量参数，temp_dir 不参与摘要。
+_P = {"attempt_id": _ATT}
 
-def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT):
+
+def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT,
+                   params=None):
     stem = os.path.splitext(os.path.basename(str(job["input_path"])))[0]
     name = f"{jid or job['job_id']}_{stem}_step4_postprocess_pabc.mkv"
     out = os.path.join(str(temp_dir), name)
@@ -52,7 +57,16 @@ def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT):
         f.write(b"X" * (size if size is not None else 100))
     rcpt = os.path.join(str(temp_dir), name + ".fused_stage34.json")
     with open(rcpt, "w", encoding="utf-8") as f:
+        # R20-A03：回执必须带 input_digest（= compute_param_hash(源, params)），
+        # 消费方用它证明"这份回执属于本次源与参数"。
+        _dig = ""
+        try:
+            from checkpoint import compute_param_hash as _cph
+            _dig = _cph(str(job.get("input_path") or ""), params or {})
+        except Exception:
+            pass
         json.dump({"attempt_id": attempt,
+                   "input_digest": _dig,
                    "chain_mode": "stage34", "output": out,
                    "output_size": os.path.getsize(out),
                    "logical_stages": ["stage3", "stage4"],
@@ -81,7 +95,7 @@ def test_chain_mode_stage67_alone_does_not_enable_stage34():
 
 def test_fused_step34_finds_a_valid_receipt(tmp_path):
     job = _job(tmp_path / "clip.mp4")
-    out, _ = _write_receipt(tmp_path, job)
+    out, _ = _write_receipt(tmp_path, job, params=_P)
     got = vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job)
     assert got == os.path.abspath(out) or os.path.normcase(got) == \
         os.path.normcase(out), got
@@ -95,7 +109,7 @@ def test_fused_step34_returns_none_without_receipt(tmp_path):
 def test_fused_step34_rejects_a_receipt_whose_output_is_gone(tmp_path):
     """**关键**：回执在、产物没了 → 必须走经典 stage4，不能跳过。"""
     job = _job(tmp_path / "clip.mp4")
-    out, _ = _write_receipt(tmp_path, job)
+    out, _ = _write_receipt(tmp_path, job, params=_P)
     os.unlink(out)
 
     class L:
@@ -115,7 +129,7 @@ def test_fused_step34_rejects_a_receipt_whose_output_is_gone(tmp_path):
 def test_fused_step34_rejects_a_receipt_whose_size_changed(tmp_path):
     """产物被改过（尺寸不符）→ 回执视为过期。"""
     job = _job(tmp_path / "clip.mp4")
-    out, _ = _write_receipt(tmp_path, job, size=100)
+    out, _ = _write_receipt(tmp_path, job, size=100, params=_P)
     with open(out, "ab") as f:
         f.write(b"Y" * 50)
 
@@ -136,7 +150,7 @@ def test_fused_step34_rejects_a_receipt_whose_size_changed(tmp_path):
 def test_fused_step34_ignores_a_receipt_for_another_job(tmp_path):
     """别的 job 的回执不能被当成本 job 的。"""
     job = _job(tmp_path / "clip.mp4", jid="j1")
-    _write_receipt(tmp_path, job, jid="j2")
+    _write_receipt(tmp_path, job, jid="j2", params=_P)
     assert vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job) is None
 
 

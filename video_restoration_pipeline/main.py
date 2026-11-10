@@ -1463,6 +1463,48 @@ def _fused_step34(params, job, logger=None):
                     receipt=hits[-1], recorded=rcpt.get("output_size"),
                     actual=os.path.getsize(out))
             return None
+        # ---- R20-A03：回执必须绑定**本次的源内容 + 有效参数** ----
+        # 旧回执只有 output/output_size —— "换了源或改了参数、回执还在"时
+        # 无法识别，消费方会把上一轮的融合产物当成这次 stage4 已跑过。
+        # `input_digest` 由 `compute_param_hash(源, params)` 得来，
+        # 同时含文件身份（size/mtime/xxhash 前缀）与质量参数。
+        _rec_dig = str(rcpt.get("input_digest") or "")
+        if not _rec_dig:
+            if logger:
+                logger.warning(
+                    "STAGE4_FUSED_RECEIPT_NO_INPUT_DIGEST",
+                    "A G34 receipt exists but carries no input_digest (legacy); "
+                    "cannot prove it belongs to this source/params. Running "
+                    "stage4 the classic way instead.", receipt=_picked[0])
+            return None
+        _input_path = str(job.get("input_path") or "")
+        if not _input_path:
+            # 没有输入路径就算不出源身份 —— 不能凭空相信回执
+            if logger:
+                logger.warning(
+                    "STAGE4_FUSED_RECEIPT_NO_INPUT",
+                    "Job has no input_path; cannot verify the G34 receipt "
+                    "belongs to this source. Running stage4 the classic way.")
+            return None
+        try:
+            from checkpoint import compute_param_hash as _cph
+            _cur_dig = _cph(_input_path, params)
+        except Exception as _dge:         # pragma: no cover
+            if logger:
+                logger.warning(
+                    "STAGE4_FUSED_RECEIPT_DIGEST_ERROR",
+                    "Could not recompute the current input digest; treating the "
+                    "receipt as unproven.", error=str(_dge))
+            return None
+        if _cur_dig and _rec_dig != _cur_dig:
+            if logger:
+                logger.warning(
+                    "STAGE4_FUSED_RECEIPT_INPUT_CHANGED",
+                    "The G34 receipt was produced for a different source or "
+                    "different params; running stage4 the classic way instead.",
+                    receipt=_picked[0],
+                    recorded=_rec_dig[:16], current=str(_cur_dig)[:16])
+            return None
         return out
     except Exception as exc:              # pragma: no cover
         if logger:
