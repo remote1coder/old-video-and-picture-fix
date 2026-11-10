@@ -2562,6 +2562,42 @@ def main():
                     expected_frames=total_frames)
                 return 86
 
+    # ---- R20-A06：把本次**已确定**的时间轴落成 job 级计划 ----
+    # 审核：`timeline_plan.write_plan()` 存在但**从来没有生产调用点**
+    # （`build_plan` 也一样），而 `stage7` 却在读 `read_plan()` ——
+    # 于是 `_plan_tl` 永远是 None，"源是 VFR 且没装 mkvmerge 就拒绝发布"
+    # 这条保护**从来没生效过**。
+    #
+    # 这里是 fps 与 source_timeline 都已有结论的位置（probe / pts-derived /
+    # user-assumed 三条分支之后），写一次；失败只告警，不阻断（它是**证据**，
+    # 不是门禁 —— 门禁在 stage7）。
+    try:
+        from timeline_plan import (
+            build_plan as _bp, write_plan as _wp,
+            build_identity as _bid)
+        _tl_final = locals().get("_tl_probe") or "unknown"
+        if _tl_final not in ("cfr", "vfr", "unknown"):
+            _tl_final = "unknown"
+        _plan_doc = _bp(
+            job_id=str(params.get("job_id") or Path(args.input).stem),
+            source_timeline=_tl_final,
+            fps_value=(_fps_raw_str if "_fps_raw_str" in dir() else None),
+            fps_source=_fps_source,
+            pts_usable=len(all_pts_map or {}),
+            expected_frames=total_frames,
+            identity=_bid(params),
+        )
+        _wp(str(params.get("temp_dir") or Path(args.input).parent),
+            _plan_doc)
+        logger.info("STAGE3_TIMELINE_PLAN_WRITTEN",
+                    "Recorded the job-level timeline plan (source_timeline / "
+                    "fps and its provenance); stage7 gates on it.",
+                    source_timeline=_tl_final, fps_source=_fps_source)
+    except Exception as _tpx:              # pragma: no cover
+        logger.warning("STAGE3_TIMELINE_PLAN_WRITE_FAIL",
+                       "Could not persist the timeline plan; stage7 will treat "
+                       "the source timeline as unknown.", error=str(_tpx))
+
     # ---- R16-05：用户**明确要求重解释时间轴**时，优先于 probe ----
     # 审核确认：`_manual_spec` 只在"probe 失败"分支里用，有效 probe 优先，
     # 于是用户真要按 25fps 重解释时请求被静默忽略。这里补一条独立入口。
