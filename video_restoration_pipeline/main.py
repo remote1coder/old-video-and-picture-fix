@@ -1500,6 +1500,13 @@ def _fused_step34(params, job, logger=None):
                     _ev = "STAGE4_FUSED_RECEIPT_INPUT_CHANGED"
                 elif "no input_digest" in _w or "no attempt_id" in _w:
                     _ev = "STAGE4_FUSED_RECEIPT_LEGACY"
+                elif ("no color evidence" in _w or "color was never probed" in _w
+                      or "color fields unknown" in _w
+                      or "bounds check" in _w):
+                    # R20-A03：回执在、身份也对，但**证据块不全**。
+                    # 这和"过期"是两件事：过期是"这不是本次的"，
+                    # 未证明是"是本次的，但没人证明它对"。
+                    _ev = "STAGE4_FUSED_RECEIPT_UNPROVEN"
                 else:
                     _ev = "STAGE4_FUSED_RECEIPT_REJECTED"
                 logger.warning(

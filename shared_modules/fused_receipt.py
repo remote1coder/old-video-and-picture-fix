@@ -18,6 +18,10 @@
 2. 带 `input_digest`（= `compute_param_hash(源, params)`），
    且与**现算**的一致（源内容或参数变了 → 过期）
 3. `output` 非空、存在、且 `output_size` 与记录一致（产物被换过 → 过期）
+4. **证据块**齐备且结论为真（R20-A03）：
+   `color` 成组可查（matrix/range/primaries/transfer）、`bounds` 的帧数/
+   时长守恒核对**确实执行且通过**。缺任一项都按"未证明"处理 ——
+   尤其是 `bounds.performed=False`：**没查过 ≠ 查过了没问题**。
 
 任何一步不满足都返回 ``(False, reason)``，调用方**走经典路线**而不是报错
 ——融合是优化，不是必须；用它换来的误判才是真损失。
@@ -98,6 +102,16 @@ def verify_fused_receipt(rcpt_path: str, params: Dict[str, Any],
                 return False, "receipt output size changed", rcpt
         except (OSError, TypeError, ValueError):
             return False, "receipt output size unreadable", rcpt
+
+    # ---- 4) 颜色与边界的证据块（R20-A03）----
+    # 「没查过」和「查过了没问题」必须分开：前者是未证明，后者才是通过。
+    try:
+        from generation_evidence import receipt_evidence_problems as _ev_problems
+    except Exception as exc:                      # pragma: no cover - 部署异常
+        return False, f"evidence helpers unavailable: {exc}", rcpt
+    problems = _ev_problems(rcpt)
+    if problems:
+        return False, "; ".join(problems[:3]), rcpt
 
     return True, "", rcpt
 

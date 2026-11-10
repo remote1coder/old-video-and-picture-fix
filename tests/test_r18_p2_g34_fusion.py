@@ -70,6 +70,14 @@ def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT,
                    "chain_mode": "stage34", "output": out,
                    "output_size": os.path.getsize(out),
                    "logical_stages": ["stage3", "stage4"],
+                   # R20-A03：回执必须带**证据块**。没有它们，
+                   # 消费方无法区分"这次转换是对的"和"没人检查过"。
+                   "color": {"pix_fmt": "yuv420p16le", "range": "limited",
+                             "matrix": "bt709", "primaries": "bt709",
+                             "transfer": "bt709", "probed": True,
+                             "complete": True, "unknown_fields": []},
+                   "bounds": {"ok": True, "performed": True, "reason": "",
+                              "report": {"stage": "stage34"}},
                    "frames": 10}, f)
     return out, rcpt
 
@@ -152,6 +160,89 @@ def test_fused_step34_ignores_a_receipt_for_another_job(tmp_path):
     job = _job(tmp_path / "clip.mp4", jid="j1")
     _write_receipt(tmp_path, job, jid="j2", params=_P)
     assert vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job) is None
+
+
+# ------------------------------------------------ 证据块（R20-A03）
+
+class _L:
+    def __init__(self):
+        self.ev = []
+
+    def warning(self, e, *a, **k):
+        self.ev.append(e)
+
+    info = error = warning
+
+
+def _mutated_receipt(tmp_path, job, mutate):
+    out, rcpt = _write_receipt(tmp_path, job, params=_P)
+    with open(rcpt, encoding="utf-8") as f:
+        doc = json.load(f)
+    mutate(doc)
+    with open(rcpt, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    return out, rcpt
+
+
+def test_fused_step34_rejects_a_receipt_without_color_evidence(tmp_path):
+    """只有 pix_fmt 一个字段的时代结束了：颜色必须**成组**可查。"""
+    job = _job(tmp_path / "clip.mp4")
+    _mutated_receipt(tmp_path, job, lambda d: d.pop("color", None))
+    log = _L()
+    assert vmain._fused_step34(
+        {"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, log) is None
+    # "过期"是"这不是本次的"，"未证明"是"是本次的，但没人证明它对"。
+    assert "STAGE4_FUSED_RECEIPT_UNPROVEN" in log.ev, log.ev
+
+
+def test_fused_step34_rejects_a_receipt_with_incomplete_color(tmp_path):
+    """字段未知 ≠ 颜色错了，但同样不足以支撑"这次转换是对的"。"""
+    job = _job(tmp_path / "clip.mp4")
+
+    def _drop_matrix(d):
+        d["color"]["matrix"] = None
+        d["color"]["complete"] = False
+        d["color"]["unknown_fields"] = ["matrix"]
+
+    _mutated_receipt(tmp_path, job, _drop_matrix)
+    assert vmain._fused_step34(
+        {"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, _L()) is None
+
+
+def test_fused_step34_rejects_a_receipt_whose_bounds_were_never_checked(tmp_path):
+    """**没查过 ≠ 查过了没问题**：performed=False 必须当"未证明"。"""
+    job = _job(tmp_path / "clip.mp4")
+
+    def _skip(d):
+        d["bounds"] = {"ok": False, "performed": False,
+                       "reason": "helpers unavailable"}
+
+    _mutated_receipt(tmp_path, job, _skip)
+    assert vmain._fused_step34(
+        {"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, _L()) is None
+
+
+def test_fused_step34_rejects_a_receipt_whose_bounds_failed(tmp_path):
+    job = _job(tmp_path / "clip.mp4")
+
+    def _fail(d):
+        d["bounds"] = {"ok": False, "performed": True,
+                       "reason": "r_frame_rate changed 24 -> 25"}
+
+    _mutated_receipt(tmp_path, job, _fail)
+    assert vmain._fused_step34(
+        {"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, _L()) is None
+
+
+def test_stage3_fused_path_runs_the_boundary_check():
+    """结构守卫：融合路径必须在**写回执之前**跑经典 stage4 那道边界门。"""
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage3_ai_upscale.py"),
+               encoding="utf-8", errors="replace").read()
+    i_check = src.find("from generation_evidence import collect")
+    i_rcpt = src.find('".fused_stage34.json"')
+    assert 0 < i_check < i_rcpt, (i_check, i_rcpt)
+    assert "STAGE3_FUSE34_BOUNDS_BROKEN" in src
 
 
 # ------------------------------------------------ 结构守卫

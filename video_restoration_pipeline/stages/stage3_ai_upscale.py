@@ -2855,6 +2855,61 @@ def main():
                             # step3 输入 → NO_INPUT，把一次成功的融合判成失败。
                             # 回执与产物同名同目录，按 glob 也能找到；
                             # 内容足够证明"是这一次、这一份参数、这一张图"。
+                            #
+                            # ---- R20-A03：经典 stage4 的边界门必须在这里补上 ----
+                            # 经典路线由 `stage4_postprocess.py` 自己调
+                            # `frame_conservation.check_conservation()` 做帧数/
+                            # 时长守恒自查；融合路线把 stage4 吞进 stage3 之后
+                            # **这一步从来没跑过** —— 优化路径绕过了唯一的边界门。
+                            # 现在两条路线共用 `generation_evidence`，回执里也带上
+                            # 颜色成组描述（matrix/range/primaries/transfer）。
+                            try:
+                                from generation_evidence import collect as _ev_collect
+                                _ev = _ev_collect(stage2_output, _s_out,
+                                                  "stage34", params, logger)
+                            except Exception as _ee:   # pragma: no cover
+                                _ev = {
+                                    "color": {"probed": False, "complete": False,
+                                              "error": str(_ee)},
+                                    "bounds": {"ok": False, "performed": False,
+                                               "reason": str(_ee)},
+                                }
+                            _b_ok = bool((_ev.get("bounds") or {}).get("ok"))
+                            _b_done = bool((_ev.get("bounds") or {}).get("performed"))
+                            if not _b_ok and _b_done:
+                                # 与经典 stage4 同一策略：边界已知被破坏就停，
+                                # 并且**删掉半成品**（否则下游 exists()>0 的
+                                # 缓存检查会把它当成功产物复用）。
+                                logger.error(
+                                    "STAGE3_FUSE34_BOUNDS_BROKEN",
+                                    "The fused stage3+4 output does not conserve "
+                                    "the frame count/duration; refusing to hand "
+                                    "it downstream.",
+                                    output=_s_out,
+                                    reasons=(_ev.get("bounds") or {}).get("reason"))
+                                try:
+                                    os.remove(_s_out)
+                                except OSError:
+                                    pass
+                                return 86
+                            if not _b_done:
+                                logger.warning(
+                                    "STAGE3_FUSE34_BOUNDS_SKIP",
+                                    "The boundary check could not be performed; "
+                                    "the receipt will say so and the consumer "
+                                    "must not treat this generation as verified.",
+                                    output=_s_out,
+                                    reason=(_ev.get("bounds") or {}).get("reason"))
+                            _c = _ev.get("color") or {}
+                            if _c.get("probed") and _c.get("pix_fmt") \
+                                    and _s_pix_fmt \
+                                    and str(_c["pix_fmt"]) != str(_s_pix_fmt):
+                                logger.warning(
+                                    "STAGE3_FUSE34_PIXFMT_MISMATCH",
+                                    "The declared output pixel format differs "
+                                    "from what the file actually carries.",
+                                    declared=_s_pix_fmt,
+                                    probed=_c.get("pix_fmt"))
                             try:
                                 import json as _json
                                 _rcpt = {
@@ -2886,6 +2941,12 @@ def main():
                                     "frames": _s_n,
                                     "filter_chain_sha256": _sha256_text(_s_chain or ""),
                                     "out_pix_fmt": _s_pix_fmt,
+                                    # R20-A03：颜色是**一组**属性，单看 pix_fmt
+                                    # 既不能证明没被改色、也不能证明改对了色。
+                                    "color": _ev.get("color") or {},
+                                    # R20-A03：帧数/时长/尺寸的**判定结论**
+                                    # （经典路线由 stage4 自己做，融合路线在此补上）。
+                                    "bounds": _ev.get("bounds") or {},
                                     "written_at": __import__("datetime").datetime.now().astimezone().isoformat(),
                                 }
                                 with open(str(_s_out) + ".fused_stage34.json",
