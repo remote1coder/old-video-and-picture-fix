@@ -2949,6 +2949,13 @@ def main():
                         logger.info("STAGE3_DONE",
                                     "AI upscaling complete (streaming)",
                                     total_frames=_s_n, output_path=_s_out)
+                        # R20-A06：**每个成功出口**都写一次 plan（幂等：同 job 覆盖同一文件）。
+                        write_job_timeline_plan(
+                        params, source_timeline=locals().get("_tl_probe"),
+                        fps_value=locals().get("_fps_raw_str"),
+                        fps_source=_fps_source,
+                        pts_usable=len(all_pts_map or {}),
+                        expected_frames=total_frames, logger=logger)
                         return 0
                     logger.warning("STAGE3_STREAM_FALLBACK",
                                    "raw-pipe path failed; falling back to PNG path",
@@ -3576,6 +3583,13 @@ def main():
     # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
     if _cancel_guard is not None:
         _cancel_guard.release_outputs()
+    # R20-A06：**每个成功出口**都写一次 plan（幂等：同 job 覆盖同一文件）。
+    write_job_timeline_plan(
+    params, source_timeline=locals().get("_tl_probe"),
+    fps_value=locals().get("_fps_raw_str"),
+    fps_source=_fps_source,
+    pts_usable=len(all_pts_map or {}),
+    expected_frames=total_frames, logger=logger)
     return 0
 
 
