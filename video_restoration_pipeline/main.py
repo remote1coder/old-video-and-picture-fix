@@ -1412,8 +1412,39 @@ def _fused_step34(params, job, logger=None):
         hits = sorted(_glob.glob(pattern))
         if not hits:
             return None
-        with open(hits[-1], "r", encoding="utf-8") as fh:
-            rcpt = _json.load(fh) or {}
+
+        # ---- R20-A03：只认**本 attempt** 的回执 ----
+        # 审核：旧实现取 `sorted(glob)[-1]` —— 上一轮残留的回执字典序更大
+        # 就会被选中，于是本轮"以为 stage4 已经融合过"而跳过它。
+        # 现在要求回执里的 `attempt_id` 等于本次执行的 attempt；
+        # 没有 attempt 字段（旧回执）或 attempt 不符 → 一律不采信。
+        _want = str((params or {}).get("attempt_id") or "")
+        _picked = None
+        _rejected = []
+        for _h in hits:
+            try:
+                with open(_h, "r", encoding="utf-8") as _fh:
+                    _r = _json.load(_fh) or {}
+            except (OSError, ValueError):
+                _rejected.append((_h, "unreadable"))
+                continue
+            _got = str(_r.get("attempt_id") or "")
+            if _want and _got == _want:
+                _picked = (_h, _r)
+                break
+            _rejected.append((_h, "attempt=%r" % (_got or "(legacy)")))
+
+        if _picked is None:
+            if logger:
+                logger.warning(
+                    "STAGE4_FUSED_RECEIPT_OTHER_ATTEMPT",
+                    "G34 receipts exist but none belongs to this attempt; "
+                    "running stage4 the classic way instead of trusting a "
+                    "stale one.", want_attempt=_want or "(none)",
+                    rejected=[r[1] for r in _rejected[:5]])
+            return None
+        with open(_picked[0], "r", encoding="utf-8") as fh:
+            rcpt = _picked[1]
         out = rcpt.get("output")
         if not out or not os.path.exists(out):
             if logger:
@@ -1463,6 +1494,16 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # Merge params
     params = merge_params(job, config, cli_overrides, _pre_log)
     params["output_path"] = job.get("output_path", "")
+
+    # ---- R20-A03：给本次执行一个**可核对的 attempt 标识** ----
+    # 审核：融合回执"按 job+stem glob、字典序最后一个"决定 stage4 是否完成，
+    # 于是上一轮残留的回执会让本轮误判。修法是让每个回执带 attempt，
+    # 消费方只认**本 attempt** 的那一份。
+    # 这里生成一次，随 params 传给所有 stage（`attempt_id` 在
+    # `_IDENTITY_POSITIONAL_KEYS` 里，不参与内容身份摘要）。
+    if not params.get("attempt_id"):
+        import uuid as _uuid
+        params["attempt_id"] = _uuid.uuid4().hex[:16]
 
     # ---- R14-06：有效路径预检，必须先于**首次落盘** ----
     # 原来 `--output` 只换 output_dir，而最终媒体仍取 job.output_path，

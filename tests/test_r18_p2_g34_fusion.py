@@ -40,7 +40,11 @@ def _job(inp, jid="j1"):
     return {"job_id": jid, "input_path": str(inp)}
 
 
-def _write_receipt(temp_dir, job, size=None, jid=None):
+#: 测试统一使用的 attempt 标识（R20-A03 起回执必须带它）
+_ATT = "att-test"
+
+
+def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT):
     stem = os.path.splitext(os.path.basename(str(job["input_path"])))[0]
     name = f"{jid or job['job_id']}_{stem}_step4_postprocess_pabc.mkv"
     out = os.path.join(str(temp_dir), name)
@@ -48,7 +52,8 @@ def _write_receipt(temp_dir, job, size=None, jid=None):
         f.write(b"X" * (size if size is not None else 100))
     rcpt = os.path.join(str(temp_dir), name + ".fused_stage34.json")
     with open(rcpt, "w", encoding="utf-8") as f:
-        json.dump({"chain_mode": "stage34", "output": out,
+        json.dump({"attempt_id": attempt,
+                   "chain_mode": "stage34", "output": out,
                    "output_size": os.path.getsize(out),
                    "logical_stages": ["stage3", "stage4"],
                    "frames": 10}, f)
@@ -77,14 +82,14 @@ def test_chain_mode_stage67_alone_does_not_enable_stage34():
 def test_fused_step34_finds_a_valid_receipt(tmp_path):
     job = _job(tmp_path / "clip.mp4")
     out, _ = _write_receipt(tmp_path, job)
-    got = vmain._fused_step34({"temp_dir": str(tmp_path)}, job)
+    got = vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job)
     assert got == os.path.abspath(out) or os.path.normcase(got) == \
         os.path.normcase(out), got
 
 
 def test_fused_step34_returns_none_without_receipt(tmp_path):
     job = _job(tmp_path / "clip.mp4")
-    assert vmain._fused_step34({"temp_dir": str(tmp_path)}, job) is None
+    assert vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job) is None
 
 
 def test_fused_step34_rejects_a_receipt_whose_output_is_gone(tmp_path):
@@ -103,7 +108,7 @@ def test_fused_step34_rejects_a_receipt_whose_output_is_gone(tmp_path):
         info = error = warning
 
     log = L()
-    assert vmain._fused_step34({"temp_dir": str(tmp_path)}, job, log) is None
+    assert vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, log) is None
     assert "STAGE4_FUSED_RECEIPT_STALE" in log.ev, log.ev
 
 
@@ -124,7 +129,7 @@ def test_fused_step34_rejects_a_receipt_whose_size_changed(tmp_path):
         info = error = warning
 
     log = L()
-    assert vmain._fused_step34({"temp_dir": str(tmp_path)}, job, log) is None
+    assert vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job, log) is None
     assert "STAGE4_FUSED_RECEIPT_SIZE_MISMATCH" in log.ev, log.ev
 
 
@@ -132,7 +137,7 @@ def test_fused_step34_ignores_a_receipt_for_another_job(tmp_path):
     """别的 job 的回执不能被当成本 job 的。"""
     job = _job(tmp_path / "clip.mp4", jid="j1")
     _write_receipt(tmp_path, job, jid="j2")
-    assert vmain._fused_step34({"temp_dir": str(tmp_path)}, job) is None
+    assert vmain._fused_step34({"temp_dir": str(tmp_path), "attempt_id": _ATT}, job) is None
 
 
 # ------------------------------------------------ 结构守卫

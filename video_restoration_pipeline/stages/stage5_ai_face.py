@@ -2159,11 +2159,17 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                 temp_dir, f"{job_id}_{_stem}_step4_postprocess*"
                           f".fused_stage34.json"))
             _fused_ok = False
+            # R20-A03：只认**本 attempt** 的回执（与 main._fused_step34 同口径）。
+            # 旧实现遍历 sorted(glob) 取第一个产物存在的 —— 上一轮残留也能过。
+            _want_att = str(params.get("attempt_id") or "")
             for _r in sorted(_fused_rcpt):
                 try:
                     import json as _json
                     with open(_r, "r", encoding="utf-8") as _rf:
                         _rd = _json.load(_rf) or {}
+                    _got_att = str(_rd.get("attempt_id") or "")
+                    if _want_att and _got_att != _want_att:
+                        continue        # 别的 attempt 的回执，不采信
                     _out = _rd.get("output")
                     if _out and os.path.exists(_out):
                         _fused_ok = True

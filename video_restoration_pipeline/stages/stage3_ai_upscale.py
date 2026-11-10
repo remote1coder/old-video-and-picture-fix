@@ -2793,6 +2793,10 @@ def main():
                             try:
                                 import json as _json
                                 _rcpt = {
+                                    # R20-A03：回执必须标明是**哪一次执行**产出的，
+                                    # 否则消费者只能靠 glob+字典序猜（会用上一轮的）。
+                                    "attempt_id": str(
+                                        params.get("attempt_id") or ""),
                                     "chain_mode": _chain_mode(params),
                                     "logical_stages": ["stage3", "stage4"],
                                     # 不为一个字符串去 import main（会带来
