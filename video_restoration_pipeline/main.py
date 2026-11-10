@@ -977,13 +977,87 @@ def completion_marker_path(final_path: str) -> str:
 
 
 def write_completion_marker(final_path: str, job: Dict[str, Any],
-                            config: Dict[str, Any], logger=None) -> bool:
+                            config: Dict[str, Any], logger=None,
+                            params: Optional[Dict[str, Any]] = None) -> bool:
     """RV-09: record *what* this artifact is, next to the artifact itself.
 
     Without it, resume can only check "a file with this name exists and
     decodes" — which is satisfied by a different input, a different config or
     a different job that happens to share the basename.
     """
+    # ---- R20-A01：先看 stage7 有没有写**本 attempt 私有**的结果 ----
+    # 审核 §3.2 第 6 步："main 读取该确切结果，核对 attempt 与 RunIdentity，
+    # 再使用同一个整代验证入口确认当前发布对象。"
+    # 这一步比下面从 `verify.json` 反推更强：那份回执是 stage7 在
+    # **同一个进程、同一把锁内**写下的，不是事后猜的。
+    _res_p = str((params or {}).get("_stage7_result_path") or "")
+    if _res_p:
+        try:
+            with open(_res_p, "r", encoding="utf-8") as _rf:
+                _res = json.load(_rf) or {}
+        except (OSError, ValueError) as _re:
+            if logger:
+                logger.error(
+                    "COMPLETION_MARKER_NO_RESULT_JSON",
+                    "stage7 was expected to write an attempt-private result but "
+                    "it is missing/unreadable; cannot prove which generation "
+                    "this artifact is. Refusing to write a marker.",
+                    result_path=_res_p, error=str(_re))
+            return False
+
+        _res_att = str(_res.get("attempt_id") or "")
+        _want_att = str((params or {}).get("attempt_id") or "")
+        if _want_att and _res_att != _want_att:
+            if logger:
+                logger.error(
+                    "COMPLETION_MARKER_RESULT_ATTEMPT_MISMATCH",
+                    "The attempt-private result belongs to a different attempt; "
+                    "refusing to bind this artifact to it.",
+                    result_path=_res_p, expected=_want_att, found=_res_att)
+            return False
+
+        if _res.get("terminal_pending"):
+            if logger:
+                logger.error(
+                    "COMPLETION_MARKER_TERMINAL_PENDING",
+                    "The generation is live but its terminal state was never "
+                    "persisted (terminal_pending). This is not a reliable "
+                    "completion; refusing to write a marker.",
+                    result_path=_res_p)
+            return False
+
+        if not _res.get("ok"):
+            if logger:
+                logger.error(
+                    "COMPLETION_MARKER_RESULT_NOT_OK",
+                    "The attempt-private result reports a failed publish; "
+                    "refusing to write a marker.", result_path=_res_p)
+            return False
+
+        _gr = _res.get("generation_receipt")
+        if isinstance(_gr, dict):
+            try:
+                from receipts import load_receipt as _lr, \
+                    GenerationReceipt as _GR
+                _obj = _lr(dict(_gr, kind="GenerationReceipt"))
+                if isinstance(_obj, _GR):
+                    _ok_gr, _why_gr = _obj.is_complete()
+                    if not _ok_gr:
+                        if logger:
+                            logger.error(
+                                "COMPLETION_MARKER_RECEIPT_INCOMPLETE",
+                                "The generation receipt exists but does not "
+                                "prove a complete generation; refusing to write "
+                                "a marker.", reason=_why_gr)
+                        return False
+            except Exception as _gre:      # pragma: no cover
+                if logger:
+                    logger.warning(
+                        "COMPLETION_MARKER_RECEIPT_UNPROVEN",
+                        "Could not validate the generation receipt; treating "
+                        "the marker as unproven.", error=str(_gre))
+                return False
+
     # ---- R16-03：标记必须绑定**同一代**，不能在锁外重读共享正式文件 ----
     # 审核确认的交错：A 发布完，B 替换了正式媒体，A 这时再读
     # `final_path` 写 `.done.json`，就把 A 的输入身份绑到 B 的结果上。
@@ -1474,6 +1548,19 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     if not params.get("attempt_id"):
         import uuid as _uuid
         params["attempt_id"] = _uuid.uuid4().hex[:16]
+
+    # ---- R20-A01：给 stage7 一个 **attempt 私有** 的结果路径 ----
+    # 审核 §3.2 第 1 步："main 冻结身份并给 stage7 明确的 attempt 私有结果路径。
+    # stage7 通过参数传递接收，不用 glob 猜。"
+    # main 从这条**确定路径**读回执，而不是从共享文件名/最新 mtime 反推。
+    try:
+        _td = str(params.get("temp_dir") or ".")
+        _stem0 = Path(str(job.get("input_path") or "in")).stem
+        params["_stage7_result_path"] = str(
+            Path(_td) / f"{job.get('job_id','job')}_{_stem0}"
+                        f".attempt-{params['attempt_id']}.result.json")
+    except Exception:                      # pragma: no cover
+        params["_stage7_result_path"] = ""
 
     # ---- R14-06：有效路径预检，必须先于**首次落盘** ----
     # 原来 `--output` 只换 output_dir，而最终媒体仍取 job.output_path，
@@ -2108,7 +2195,8 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                                    plan=params.get("_run_plan_obj"))
         for cand in finals:
             if os.path.exists(cand) and os.path.getsize(cand) > 0:
-                write_completion_marker(cand, job, config, job_logger)
+                write_completion_marker(cand, job, config, job_logger,
+                                           params=params)
                 break
     except Exception as e:
         job_logger.warning("COMPLETION_MARKER_SKIP",

@@ -3518,6 +3518,46 @@ def main():
             # 审核：`terminal_pending=True` 即使媒体已落地，**也不能 JOB_DONE**。
             # 这里并进 `_generation_incomplete`，走同一条 `return 82` 出口 ——
             # stage7 非零 → main 不会写完成标记。
+            # ---- R20-A01：把整代回执原子写到 **attempt 私有** 路径 ----
+            # 审核 §3.2 第 5 步："publisher 返回冻结回执。stage7 将其原子写到
+            # 指定 attempt 私有 result JSON；禁止 main 通过共享文件名、
+            # 最新 mtime 或 stdout 混合日志重建回执。"
+            # 写失败 → 同样算"这一代不可靠"（与 terminal_pending 一条出口）。
+            _res_path = str(params.get("_stage7_result_path") or "")
+            if _res_path:
+                try:
+                    _tmp_res = _res_path + ".tmp"
+                    _payload = {
+                        "schema": 1,
+                        "attempt_id": _attempt_id,
+                        "ok": bool(_pres.ok),
+                        "terminal_pending": bool(
+                            getattr(_pres, "terminal_pending", False)),
+                        "journal_phase": getattr(_pres, "phase", None),
+                        "journal_path": getattr(_pres, "journal_path", None),
+                        "generation_receipt": (
+                            _pres.generation_receipt.to_dict()
+                            if getattr(_pres, "generation_receipt", None)
+                            else None),
+                        "publish_result": _pres.as_dict(),
+                    }
+                    os.makedirs(os.path.dirname(_res_path) or ".",
+                                exist_ok=True)
+                    with open(_tmp_res, "w", encoding="utf-8") as _rf:
+                        json.dump(_payload, _rf, ensure_ascii=False, indent=2)
+                    os.replace(_tmp_res, _res_path)
+                    logger.info("STAGE7_RESULT_JSON_WRITTEN",
+                                "Wrote the attempt-private publish result for "
+                                "main to read back.", path=_res_path)
+                except Exception as _rje:      # pragma: no cover
+                    _generation_incomplete = True
+                    logger.error(
+                        "STAGE7_RESULT_JSON_FAIL",
+                        "The generation was published but its attempt-private "
+                        "result JSON could not be written; main cannot prove "
+                        "which generation this is, so the job must not be "
+                        "marked done.", path=_res_path, error=str(_rje))
+
             if getattr(_pres, "terminal_pending", False):
                 _generation_incomplete = True
                 logger.error(
