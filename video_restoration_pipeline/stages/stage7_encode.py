@@ -3510,6 +3510,24 @@ def main():
                         pass
                 return 82
 
+            # ---- R20-A01：媒体已晋升 ≠ 任务已可靠完成 ----
+            # `publish` 在 COMMITTED 写失败时**仍返回 ok=True**，只是把
+            # `terminal_pending` 置真（并保留备份）。此时：
+            #   * 媒体确实已在正式路径（有产物价值）；
+            #   * 但 journal 停在 COMMITTING，下一次 recover 要靠备份才定态。
+            # 审核：`terminal_pending=True` 即使媒体已落地，**也不能 JOB_DONE**。
+            # 这里并进 `_generation_incomplete`，走同一条 `return 82` 出口 ——
+            # stage7 非零 → main 不会写完成标记。
+            if getattr(_pres, "terminal_pending", False):
+                _generation_incomplete = True
+                logger.error(
+                    "STAGE7_TERMINAL_NOT_PERSISTED",
+                    "All artifacts were replaced but the COMMITTED terminal "
+                    "state could not be persisted. This generation is live but "
+                    "NOT reliably complete; backups are kept and the exit code "
+                    "is non-zero so callers do not mark the job done.",
+                    attempt_id=_attempt_id, journal=_pres.journal_path)
+
             # 事务成功：候选件已被消费，两个待转正的报告也已就位
             _side_tmp = None
             _fc_pending = None
