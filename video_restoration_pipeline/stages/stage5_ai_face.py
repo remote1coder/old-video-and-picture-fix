@@ -2170,6 +2170,23 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
                     _got_att = str(_rd.get("attempt_id") or "")
                     if _want_att and _got_att != _want_att:
                         continue        # 别的 attempt 的回执，不采信
+                    # R20-A03：还要核对**源内容与参数未变**（与 main 同口径）。
+                    # 只比 attempt 不够：同一个 attempt 也可能被换源/改参数重跑。
+                    _rec_dig = str(_rd.get("input_digest") or "")
+                    if not _rec_dig:
+                        continue        # 旧回执，证据不足
+                    _src_for_dig = (params.get("input_path")
+                                    or params.get("_input_path")
+                                    or _rd.get("input_path") or "")
+                    if not _src_for_dig:
+                        continue        # 算不出源身份，不能凭回执放行
+                    try:
+                        from checkpoint import compute_param_hash as _cph5
+                        _cur_dig5 = _cph5(str(_src_for_dig), params)
+                    except Exception:
+                        continue
+                    if _cur_dig5 and _rec_dig != _cur_dig5:
+                        continue        # 源或参数变了，回执过期
                     _out = _rd.get("output")
                     if _out and os.path.exists(_out):
                         _fused_ok = True
