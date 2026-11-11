@@ -157,14 +157,20 @@ def test_id02_identity_semantics_strips_internal_keys(tmp_path):
 # ID-03：成品内容摘要
 # ---------------------------------------------------------------------------
 
-def _complete_generation(final_path):
-    """补齐"一整代"的其它成员：fullchain 报告 + 未决 journal 的终态。
+def _complete_generation(final_path, job=None, config=None):
+    """补齐"一整代"：verify + fullchain + COMMITTED journal + **事务 marker**。
 
-    R21-C02 起 `resume_artifact_matches()` 复用**同一个**整代验证器：
-    媒体 + 必需报告 + COMMITTED journal 缺一不可。只造"媒体 + marker"的
-    夹具不再代表完整代，会让"身份没问题的样本"被判成不完整。
+    R21-C02：resume 复用同一个整代验证器，只造"媒体 + marker"不算完整代。
+    R22-A01：marker **只能由生产者生成**（`build_marker_candidate`）——
+    手写的旧格式 marker 现在一律判 legacy/unproven，这是审核要求的收紧。
     """
     import publish_journal as _pj
+    _vstages = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "video_restoration_pipeline", "stages")
+    if _vstages not in sys.path:
+        sys.path.insert(0, _vstages)
+    import stage7_encode as _s7
+
     p = str(final_path)
     with open(p + ".verify.json", "w", encoding="utf-8") as f:
         json.dump({"media_sha256": M._plain_sha256(p)}, f)
@@ -172,7 +178,28 @@ def _complete_generation(final_path):
         json.dump({"ok": True}, f)
     _pj.write_journal(p + ".journal.json",
                       {"phase": "COMMITTED", "job_id": "jobT",
-                       "targets": [p], "records": {}})
+                       "targets": [p, p + ".verify.json",
+                                   p + ".fullchain.json"],
+                       "records": {}})
+    objects = [("media", p, M._plain_sha256(p)),
+               ("verify", p + ".verify.json",
+                M._plain_sha256(p + ".verify.json")),
+               ("fullchain", p + ".fullchain.json",
+                M._plain_sha256(p + ".fullchain.json"))]
+    _job = job or {"job_id": "jobT", "input_path": ""}
+    _seed = {
+        "impl": M.VIDEO_IMPL_VERSION,
+        "job_id": _job.get("job_id", "jobT"),
+        "input_path": _job.get("input_path", ""),
+        "input_identity": M.build_input_identity(_job.get("input_path", "")),
+        # R22-A01：marker 必须有 params identity，且与验证端可重算
+        "params_identity": M.build_params_identity(config or {}, _job, None),
+    }
+    _mk, _stage, _dig, _pm = _s7.build_marker_candidate(
+        seed=_seed, pub_digests=objects, attempt_id="att1", job_id="jobT",
+        output_path=p, media_digest=objects[0][2],
+        media_size=os.path.getsize(p))
+    os.replace(_stage, M.completion_marker_path(p))
 
 
 def test_id03_equal_length_replacement_is_detected(tmp_path):
@@ -184,14 +211,15 @@ def test_id03_equal_length_replacement_is_detected(tmp_path):
                   params_identity=M.build_params_identity(_config(), job, None),
                   output_size=4,
                   output_sha256=M._chunked_sha256(str(out)))
-    _complete_generation(out)
-    ok, _ = M.resume_artifact_matches(str(out), job, _config(), None)
-    assert ok is True
+    _complete_generation(out, job, _config())
+    ok, why = M.resume_artifact_matches(str(out), job, _config(), None)
+    assert ok is True, why
 
     out.write_bytes(b"BBBB")      # 等长替换
     ok2, why2 = M.resume_artifact_matches(str(out), job, _config(), None)
     assert ok2 is False
-    assert "content differs" in why2
+    # R22-A01：拒绝点前移到 marker payload 的摘要比对（更早、更精确）
+    assert "changed since it was published" in why2, why2
 
 
 def test_id03_legacy_marker_without_digest_is_not_auto_reused(tmp_path):
@@ -204,7 +232,7 @@ def test_id03_legacy_marker_without_digest_is_not_auto_reused(tmp_path):
                   output_size=out.stat().st_size)   # 无 output_sha256
     ok, why = M.resume_artifact_matches(str(out), job, _config(), None)
     assert ok is False
-    assert "legacy/unproven" in why
+    assert "legacy" in why, why
 
 
 # ---------------------------------------------------------------------------

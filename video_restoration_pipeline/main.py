@@ -981,6 +981,57 @@ def build_params_identity(config: Dict[str, Any], job: Dict[str, Any],
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _impl_fingerprint(params: Optional[Dict[str, Any]] = None) -> str:
+    """实现 / 模型 / 工具指纹（R22-A02）。
+
+    审核指出：main 只给 `_run_identity.input/params`，stage7 却去取
+    `.digest`，实际传空串。回执类严格要求身份，生产调用却没按它需要的
+    形状提供 —— 这里补上"实现"这一维。
+
+    只吃**稳定的**东西：实现版本、Python 主次版本、模型名、人脸后端。
+    时间戳、路径、随机数一律不进（否则每次运行身份都不同）。
+    """
+    parts = [str(VIDEO_IMPL_VERSION), "py" + sys.version.split()[0]]
+    if isinstance(params, dict):
+        parts.append(str(params.get("upscale_model") or ""))
+        parts.append(str(params.get("face_restore") or ""))
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def build_run_identity(config: Dict[str, Any], job: Dict[str, Any],
+                       logger=None,
+                       params: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Any]:
+    """构造**可重算**的 RunIdentity（R22-A02）。
+
+    审核：`main` 生成的是 ``{input, params}``，没有 ``digest``；
+    stage7 两处 publish 读 ``.get("digest")`` → 恒为空串；回执因此拿不到
+    有效身份。这里给出固定四字段并从中导出摘要：
+
+    - ``schema``
+    - ``input_digest``（内容身份）
+    - ``plan_digest``（规范化有效计划身份）
+    - ``impl_fingerprint``（实现/模型/工具）
+
+    摘要只由这四项算出（`_recompute_run_identity_digest`），
+    人读用的 ``input`` 副本**不参与** —— 否则加一个字段就换身份。
+
+    Returns:
+        dict；``digest`` 一定非空。
+    """
+    _in = build_input_identity(job.get("input_path", ""))
+    ri: Dict[str, Any] = {
+        "schema": "run-identity/1",
+        "input_digest": str((_in or {}).get("digest") or ""),
+        "plan_digest": build_params_identity(config, job, logger,
+                                             params=params),
+        "impl_fingerprint": _impl_fingerprint(params),
+        "input": _in,
+    }
+    ri["digest"] = _recompute_run_identity_digest(ri)
+    return ri
+
+
 def completion_marker_path(final_path: str) -> str:
     return str(final_path) + ".done.json"
 
@@ -988,211 +1039,46 @@ def completion_marker_path(final_path: str) -> str:
 def write_completion_marker(final_path: str, job: Dict[str, Any],
                             config: Dict[str, Any], logger=None,
                             params: Optional[Dict[str, Any]] = None) -> bool:
-    """RV-09: record *what* this artifact is, next to the artifact itself.
+    """验证本代是否可判"完成"（R22-A01 起**只验证，不再写标记**）。
 
-    Without it, resume can only check "a file with this name exists and
-    decodes" — which is satisfied by a different input, a different config or
-    a different job that happens to share the basename.
+    名字没改，是因为调用点和既有测试都用它；但**行为**变了。
+
+    旧实现在 `verify_published_marker` 成功后就 `return True`，于是：
+
+    * 私有 result / attempt / terminal_pending 全部被跳过；
+    * journal 终态根本没查；
+    * 没有 marker 时还会"写一份新的"，等于事后补证据。
+
+    审核用真实小文件复现：PREPARED 的 journal + 错 attempt + 不存在的
+    result，这个函数仍返回 True 并让 `finish_job_completion` 记 JOB_DONE；
+    而同一个对象上 `verify_generation_objects` 明确报
+    "publish journal is not COMMITTED"。同一个合同两次判断不一致，
+    这条路径本身就是缺陷。
+
+    现在只做一件事：调 `verify_generation_completion()`（唯一入口）。
+    标记只能由 stage7 在发布事务里生成；main 不再写、也不再覆盖。
+
+    Returns:
+        True 仅当：私有 result 一致 + marker payload 完整 + 整代磁盘事实成立。
     """
-    # ---- R21-C02：优先验证**随事务发布**的 marker ----
-    # stage7 现在把 marker 作为发布事务的成员一起落位（引用冻结的
-    # payload manifest）。验证通过就不必再写 —— 写的动作本身也会破坏
-    # "marker 与媒体在同一事务里"这个性质。
-    _pub_ok, _pub_why = verify_published_marker(final_path, job, config,
-                                               params, logger)
-    if _pub_ok:
+    _expect = str((params or {}).get("attempt_id") or "")
+    ok, why = verify_generation_completion(
+        final_path, job, config, params, logger, expect_attempt=_expect)
+    if ok:
         if logger:
-            logger.info("COMPLETION_MARKER_VERIFIED_PUBLISHED",
-                        "The completion marker was published in the same "
-                        "transaction as the media and its payload manifest "
-                        "checks out", output_path=str(final_path))
+            logger.info(
+                "COMPLETION_VERIFIED",
+                "This generation is proven complete: the attempt-private "
+                "result, the published marker payload and the on-disk "
+                "objects all agree.",
+                output_path=str(final_path))
         return True
-
-    # 有 marker 但**验证不过** → 不能退回去重写一份（那等于覆盖证据）。
-    if os.path.exists(completion_marker_path(final_path)):
-        if logger:
-            logger.error("COMPLETION_MARKER_PUBLISHED_INVALID",
-                         "A published marker exists but does not verify; "
-                         "refusing to overwrite it with a freshly written one.",
-                         output_path=str(final_path), reason=_pub_why)
-        return False
-
-    # ---- 以下是"没有随事务发布 marker"的兼容路径（手工跑 stage7 / 旧流程）----
-    # R20-A01：先看 stage7 有没有写**本 attempt 私有**的结果 ----
-    # 审核 §3.2 第 6 步："main 读取该确切结果，核对 attempt 与 RunIdentity，
-    # 再使用同一个整代验证入口确认当前发布对象。"
-    # 这一步比下面从 `verify.json` 反推更强：那份回执是 stage7 在
-    # **同一个进程、同一把锁内**写下的，不是事后猜的。
-    _res_p = str((params or {}).get("_stage7_result_path") or "")
-    if _res_p:
-        try:
-            with open(_res_p, "r", encoding="utf-8") as _rf:
-                _res = json.load(_rf) or {}
-        except (OSError, ValueError) as _re:
-            if logger:
-                logger.error(
-                    "COMPLETION_MARKER_NO_RESULT_JSON",
-                    "stage7 was expected to write an attempt-private result but "
-                    "it is missing/unreadable; cannot prove which generation "
-                    "this artifact is. Refusing to write a marker.",
-                    result_path=_res_p, error=str(_re))
-            return False
-
-        _res_att = str(_res.get("attempt_id") or "")
-        _want_att = str((params or {}).get("attempt_id") or "")
-        if _want_att and _res_att != _want_att:
-            if logger:
-                logger.error(
-                    "COMPLETION_MARKER_RESULT_ATTEMPT_MISMATCH",
-                    "The attempt-private result belongs to a different attempt; "
-                    "refusing to bind this artifact to it.",
-                    result_path=_res_p, expected=_want_att, found=_res_att)
-            return False
-
-        if _res.get("terminal_pending"):
-            if logger:
-                logger.error(
-                    "COMPLETION_MARKER_TERMINAL_PENDING",
-                    "The generation is live but its terminal state was never "
-                    "persisted (terminal_pending). This is not a reliable "
-                    "completion; refusing to write a marker.",
-                    result_path=_res_p)
-            return False
-
-        if not _res.get("ok"):
-            if logger:
-                logger.error(
-                    "COMPLETION_MARKER_RESULT_NOT_OK",
-                    "The attempt-private result reports a failed publish; "
-                    "refusing to write a marker.", result_path=_res_p)
-            return False
-
-        _gr = _res.get("generation_receipt")
-        if isinstance(_gr, dict):
-            try:
-                from receipts import load_receipt as _lr, \
-                    GenerationReceipt as _GR
-                _obj = _lr(dict(_gr, kind="GenerationReceipt"))
-                if isinstance(_obj, _GR):
-                    _ok_gr, _why_gr = _obj.is_complete()
-                    if not _ok_gr:
-                        if logger:
-                            logger.error(
-                                "COMPLETION_MARKER_RECEIPT_INCOMPLETE",
-                                "The generation receipt exists but does not "
-                                "prove a complete generation; refusing to write "
-                                "a marker.", reason=_why_gr)
-                        return False
-            except Exception as _gre:      # pragma: no cover
-                if logger:
-                    logger.warning(
-                        "COMPLETION_MARKER_RECEIPT_UNPROVEN",
-                        "Could not validate the generation receipt; treating "
-                        "the marker as unproven.", error=str(_gre))
-                return False
-
-    # ---- R16-03：标记必须绑定**同一代**，不能在锁外重读共享正式文件 ----
-    # 审核确认的交错：A 发布完，B 替换了正式媒体，A 这时再读
-    # `final_path` 写 `.done.json`，就把 A 的输入身份绑到 B 的结果上。
-    # 做法：目标锁内把当前媒体摘要与 verify.json 的 `media_sha256` 核对；
-    # 不一致就**拒绝写标记**（宁可没有标记，也不写错归属）。
-    _gen_digest = None
-    # ---- 锁必须真正进入（enter），不能只拿到上下文管理器 ----
-    # 原实现 `_lock = _acq(...)` 之后**从未 __enter__**，只在 finally 里调了
-    # `__exit__`。而 acquire_target_locks 是 **generator 型**上下文管理器：
-    # 不 next() 就一行都不执行 —— 于是
-    #   ① 核验**在无锁状态下**进行（审核探针确认"核验 verify 时未持锁"）；
-    #   ② finally 里的 __exit__ 反而把生成器启动，锁被获取后永不释放
-    #      （contextlib 在"生成器没停"时抛 RuntimeError，又被 except 吞掉）。
-    # 现在改成标准的 with 用法：进入即在锁内，退出必释放。
-    try:
-        from publish_lock import acquire_target_locks as _acq
-        _lock_ctx = _acq([final_path], timeout=60, logger=logger)
-    except Exception:                      # pragma: no cover
-        from contextlib import nullcontext as _nullcontext
-        _lock_ctx = _nullcontext()
-
-    with _lock_ctx:
-        _receipt = None
-        try:
-            with open(str(final_path) + ".verify.json", "r",
-                      encoding="utf-8") as _vf:
-                _report = json.load(_vf) or {}
-            _receipt = _report.get("run_identity")
-            _recorded = _report.get("media_sha256")
-        except (OSError, ValueError):
-            _recorded = None
-
-        # ---- R17-01：核对"这份报告是不是本 job 这一代写的" ----
-        # 只比对 media_sha256 与当前文件是不够的：B 把两者一起换掉后它们
-        # 仍然彼此自洽。这里改看 stage7 回写的 run_identity。
-        try:
-            _own_in = build_input_identity(job.get("input_path", ""))
-        except Exception:                 # pragma: no cover
-            _own_in = {}
-        _got_in = ((_receipt or {}).get("input") or {})
-        if not _receipt:
-            if logger:
-                logger.error(
-                    "COMPLETION_MARKER_NO_RECEIPT",
-                    "verify.json carries no run_identity; cannot prove this "
-                    "artifact belongs to this job's generation. Refusing to "
-                    "write a marker.",
-                    output_path=str(final_path))
-            return False
-        if (_got_in.get("digest") and _own_in.get("digest")
-                and _got_in.get("digest") != _own_in.get("digest")):
-            if logger:
-                logger.error(
-                    "COMPLETION_MARKER_FOREIGN_GENERATION",
-                    "The published artifact was produced from a different "
-                    "input than this job's; refusing to bind them.",
-                    output_path=str(final_path),
-                    expected=str(_own_in.get("digest") or "")[:16],
-                    found=str(_got_in.get("digest") or "")[:16])
-            return False
-        # 与报告同口径（纯内容）。`output_sha256` 仍用 _chunked_sha256 ——
-        # resume 的比对端也是它，两边自洽，不能单边改。
-        _actual = (_plain_sha256(final_path)
-                   if os.path.exists(final_path) else None)
-        if _recorded and _actual and _recorded != _actual:
-            if logger:
-                logger.error(
-                    "COMPLETION_MARKER_GENERATION_CHANGED",
-                    "The media at this path is no longer the one this "
-                    "job published (digest differs from verify.json). "
-                    "Refusing to bind this job to another generation.",
-                    output_path=str(final_path),
-                    recorded=_recorded[:16], actual=_actual[:16])
-            return False
-        _gen_digest = None
-
-    payload = {
-        "impl": VIDEO_IMPL_VERSION,
-        "job_id": job.get("job_id", ""),
-        "input_path": job.get("input_path", ""),
-        "input_identity": build_input_identity(job.get("input_path", "")),
-        "params_identity": build_params_identity(config, job, logger),
-        "output_path": str(final_path),
-        "output_size": (os.path.getsize(final_path)
-                        if os.path.exists(final_path) else None),
-        # ID-03（第七轮）：成品**内容摘要**。旧实现只有 size —— 等长替换、
-        # 重新编码、拷错文件都骗得过它；而"能解码"更不能当身份。
-        "output_sha256": _gen_digest or _chunked_sha256(final_path),
-        "completed_at": datetime.now().astimezone().isoformat(),
-    }
-    try:
-        # R16-03：`<final>.done.json.tmp` 是共享名，两个进程会互相踩 → 私有化。
-        tmp = (f"{completion_marker_path(final_path)}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, sort_keys=True, indent=2)
-        os.replace(tmp, completion_marker_path(final_path))
-        return True
-    except Exception as e:
-        if logger:
-            logger.warning("COMPLETION_MARKER_FAIL",
-                           f"Could not record completion marker: {e}")
-        return False
+    if logger:
+        logger.error(
+            "COMPLETION_UNPROVEN",
+            "Refusing to treat this artifact as complete.",
+            output_path=str(final_path), reason=why)
+    return False
 
 
 def required_generation_reports(final_path: str) -> List[str]:
@@ -1206,18 +1092,327 @@ def required_generation_reports(final_path: str) -> List[str]:
             str(final_path) + ".fullchain.json"]
 
 
+#: payload manifest 的三态（R22-A01）。旧格式**不能**当作"通过"。
+MANIFEST_OK = "ok"
+MANIFEST_LEGACY = "legacy"
+MANIFEST_BAD = "bad"
+
+#: 允许出现在 payload manifest 里的对象角色。
+_MANIFEST_ROLES = ("media", "verify", "fullchain", "marker")
+
+
+def check_payload_manifest(marker: Dict[str, Any], final_path: str,
+                           logger=None) -> Tuple[str, str, list]:
+    """核对 marker 引用的 payload manifest，返回**三态**（R22-A01）。
+
+    R21 的实现有两个洞（本轮审核用真实小文件复现）：
+
+    1. 没有 payload 的旧 marker 直接 ``return True`` —— "没有可核对的内容"
+       被当成了"核对通过"；配合同大小替换媒体，验证器仍然通过。
+    2. 只要求存在一个叫 ``media`` 的条目，**不问它的路径是不是当前成品** ——
+       拿别的路径上正确的文件也能冒充。
+
+    现在改成三态 + 结构校验：
+
+    - ``MANIFEST_OK``：清单自洽、角色齐全、**media 路径等于 final_path**、
+      每个对象摘要与磁盘一致
+    - ``MANIFEST_LEGACY``：没有 payload —— 显式降为 unproven，调用方必须拒绝
+    - ``MANIFEST_BAD``：有 payload 但对不上
+
+    Returns:
+        ``(state, reason, objects)``；``objects`` 为
+        ``[(name, path, digest), ...]``（只有 ``MANIFEST_OK`` 时有意义）。
+    """
+    pm = marker.get("payload_manifest")
+    if not isinstance(pm, dict):
+        return (MANIFEST_LEGACY,
+                "marker has no payload manifest (legacy format); it cannot "
+                "prove which generation these bytes belong to", [])
+
+    recorded = str(marker.get("payload_manifest_digest") or "")
+    if not recorded:
+        return MANIFEST_BAD, "marker has a payload manifest but no digest", []
+    text = json.dumps(pm, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+    if _plain_sha256_text(text) != recorded:
+        return (MANIFEST_BAD,
+                "payload manifest does not match the digest in the marker", [])
+
+    objs = pm.get("objects")
+    if not isinstance(objs, list) or not objs:
+        return MANIFEST_BAD, "payload manifest lists no objects", []
+
+    seen = {}
+    out = []
+    for row in objs:
+        if not isinstance(row, dict):
+            return MANIFEST_BAD, "payload manifest has a malformed entry", []
+        name = str(row.get("name") or "")
+        path = str(row.get("path") or "")
+        want = str(row.get("sha256") or "")
+        if not name or not path or not want:
+            return MANIFEST_BAD, f"manifest entry {name!r} is incomplete", []
+        if name not in _MANIFEST_ROLES:
+            return MANIFEST_BAD, f"manifest entry has unknown role {name!r}", []
+        if name in seen:
+            return MANIFEST_BAD, f"manifest lists role {name!r} twice", []
+        seen[name] = (path, want)
+        got = _plain_sha256(path) if os.path.exists(path) else None
+        if got is None:
+            return MANIFEST_BAD, f"object {name!r} is missing: {path}", []
+        if got != want:
+            return (MANIFEST_BAD,
+                    f"object {name!r} changed since it was published "
+                    f"(recorded {want[:16]}, now {got[:16]})", [])
+        out.append((name, path, want))
+
+    # ---- 角色必须覆盖 media，且**必须就是当前成品** ----
+    # 旧实现只检查"存在一个叫 media 的条目"，于是拿别的路径上正确的文件
+    # 也能通过 —— 那不是"当前这一代已发布"的证明。
+    if "media" not in seen:
+        return MANIFEST_BAD, "manifest has no media entry", []
+    media_path, media_dig = seen["media"]
+    if os.path.abspath(media_path) != os.path.abspath(str(final_path)):
+        return (MANIFEST_BAD,
+                f"manifest media path is not the artifact under test "
+                f"({media_path} != {final_path})", [])
+    if str(marker.get("output_sha256") or "") != media_dig:
+        return MANIFEST_BAD, "marker output_sha256 does not match the media", []
+
+    return MANIFEST_OK, "payload manifest matches the published bytes", out
+
+
+def _acq_final(final_path: str, logger=None):
+    """目标锁上下文（R22-A01：整个完成验证在对应锁集合内进行）。
+
+    锁模块不可用时返回 nullcontext，但**记一条 error** —— 静默降级等于
+    "以为持锁实际没持"，那正是这条要求要防的情况。
+    """
+    try:
+        from publish_lock import acquire_target_locks as _acq
+        return _acq([str(final_path)], timeout=120, logger=logger)
+    except Exception as exc:                # pragma: no cover - 部署异常
+        if logger:
+            logger.error(
+                "COMPLETION_LOCK_UNAVAILABLE",
+                "Could not acquire the target lock for completion "
+                "verification; the check runs WITHOUT the lock. Treat the "
+                "result as weaker than a locked check.",
+                output_path=str(final_path), error=str(exc))
+        from contextlib import nullcontext
+        return nullcontext()
+
+
+def load_private_result(final_path: str, expect_attempt: str,
+                        params: Optional[Dict[str, Any]], logger=None
+                        ) -> Tuple[bool, str, Dict[str, Any]]:
+    """读取并严格核对 **attempt 私有发布结果**（R22-A01）。
+
+    审核复现的绕过路径正是"有 marker 就不看 result"。这里把 result 变成
+    正常收尾的**必经步骤**，任何一项不成立都返回 False：
+
+    - 路径必须由调用方给出（不猜、不 glob）
+    - 必须是 JSON 对象，``schema`` 必须是 1
+    - ``attempt_id`` 必须等于本次 attempt
+    - ``final_output_path`` 必须等于当前成品
+    - 不得是 ``terminal_pending``，``ok`` 必须为真
+    - ``run_identity`` 必须存在且摘要可重算（R22-A02）
+
+    Returns:
+        ``(ok, reason, data)``。
+    """
+    rp = str((params or {}).get("_stage7_result_path") or "")
+    if not rp:
+        return False, "no attempt-private result path was provided", {}
+    if not os.path.exists(rp):
+        return False, f"attempt-private result is missing: {rp}", {}
+    try:
+        with open(rp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        return False, f"attempt-private result is unreadable: {exc}", {}
+    if not isinstance(data, dict):
+        return False, "attempt-private result is not an object", {}
+
+    if data.get("schema") != 1:
+        return False, (f"result schema is {data.get('schema')!r}, expected 1"), {}
+    got_att = str(data.get("attempt_id") or "")
+    if got_att != str(expect_attempt):
+        return (False,
+                f"result belongs to attempt {got_att!r}, not {expect_attempt!r}",
+                {})
+    fin = str(data.get("final_output_path") or "")
+    if os.path.abspath(fin) != os.path.abspath(str(final_path)):
+        return (False,
+                f"result describes {fin!r}, not the artifact under test "
+                f"{final_path!r}", {})
+    if data.get("terminal_pending"):
+        return False, ("result says the terminal state was not persisted "
+                       "(terminal_pending)"), {}
+    if not data.get("ok"):
+        return False, "result reports a failed publish (ok is false)", {}
+
+    # ---- RunIdentity：必须是可重算的结构，不是"看起来像摘要"的字符串 ----
+    ri = data.get("run_identity")
+    if not isinstance(ri, dict):
+        return False, "result carries no run_identity object", {}
+    want = str(ri.get("digest") or "")
+    if not want:
+        return False, "run_identity has no digest", {}
+    _re = _recompute_run_identity_digest(ri)
+    if _re != want:
+        return (False,
+                f"run_identity digest cannot be reproduced "
+                f"(recorded {want[:16]}, recomputed {str(_re)[:16]})", {})
+    return True, "private result is consistent with this attempt", data
+
+
+def _recompute_run_identity_digest(ri: Dict[str, Any]) -> str:
+    """从 RunIdentity 的**固定四字段**重算摘要（R22-A02）。
+
+    只吃 schema / input_digest / plan_digest / impl_fingerprint ——
+    不把整个 dict 塞进去，否则加一个便于人读的字段就会改变身份。
+    """
+    core = {
+        "schema": str(ri.get("schema") or ""),
+        "input_digest": str(ri.get("input_digest") or ""),
+        "plan_digest": str(ri.get("plan_digest") or ""),
+        "impl_fingerprint": str(ri.get("impl_fingerprint") or ""),
+    }
+    return _plain_sha256_text(
+        json.dumps(core, sort_keys=True, ensure_ascii=False,
+                   separators=(",", ":")))
+
+
+def verify_generation_completion(final_path: str, job: Dict[str, Any],
+                                 config: Dict[str, Any],
+                                 params: Optional[Dict[str, Any]] = None,
+                                 logger=None,
+                                 expect_attempt: Optional[str] = None
+                                 ) -> Tuple[bool, str]:
+    """**唯一**的整代完成证明入口（R22-A01）。
+
+    审核把 R21 的问题总结得很准："同一个对象的字段、来源和消费条件不一致"。
+    表现就是 ``write_completion_marker`` 里 `verify_published_marker` 成功
+    就 `return True`，而它只核对 marker 的部分身份，**不看**私有 result、
+    attempt、journal 终态 —— 与 ``resume`` 的判据不是同一套。
+
+    这里的顺序固定，**没有任何"提前返回 True"的分支**：
+
+    1. 目标锁集合内（锁不可用会记 error，结果按较弱处理）
+    2. 正常收尾（``expect_attempt`` 非空）→ 必须读 attempt 私有 result，
+       核对 schema / attempt / 最终路径 / RunIdentity / 终态
+    3. marker 必须存在，payload 必须是 ``MANIFEST_OK``（旧格式 = unproven）
+    4. 按 marker 的对象集合核对整代磁盘事实（媒体 + 计划确定的报告 +
+       journal COMMITTED）
+
+    Args:
+        final_path: 当前成品路径。
+        job: 作业（用于 job_id / input_path）。
+        config: 有效配置（用于重算身份）。
+        params: 有效参数（含 ``_stage7_result_path`` / ``attempt_id``）。
+        logger: 可选。
+        expect_attempt: 正常收尾传本次 attempt；resume 传 None（允许跨 attempt）。
+
+    Returns:
+        ``(ok, reason)``。
+    """
+    p = str(final_path)
+    if expect_attempt is not None and not str(expect_attempt).strip():
+        return False, "completion requires a non-empty attempt id"
+
+    with _acq_final(p, logger):
+        # ---- 1) 私有 result（正常收尾必须）----
+        if expect_attempt is not None:
+            ok, why, _res = load_private_result(p, str(expect_attempt),
+                                                params, logger)
+            if not ok:
+                return False, why
+
+        # ---- 2) marker + payload ----
+        mp = completion_marker_path(p)
+        if not os.path.exists(mp):
+            return False, ("no published completion marker; this generation "
+                           "cannot be proven (re-run rather than trusting it)")
+        try:
+            with open(mp, "r", encoding="utf-8") as f:
+                mdata = json.load(f) or {}
+        except (OSError, ValueError) as exc:
+            return False, f"completion marker is unreadable: {exc}"
+        if not isinstance(mdata, dict):
+            return False, "completion marker is not an object"
+
+        _st = _input_identity_status(mdata.get("input_identity") or {},
+                                     build_input_identity(
+                                         job.get("input_path", "")))
+        if _st == "changed":
+            return False, "input content changed since this generation"
+        if _st == "unproven":
+            return False, "input identity cannot be verified"
+        if str(mdata.get("job_id") or "") != str(job.get("job_id") or ""):
+            return (False,
+                    f"marker belongs to job {mdata.get('job_id')!r}, "
+                    f"not {job.get('job_id')!r}")
+        if str(mdata.get("impl") or "") != VIDEO_IMPL_VERSION:
+            return (False,
+                    f"marker was produced by {mdata.get('impl')!r}, "
+                    f"current is {VIDEO_IMPL_VERSION!r}")
+
+        # ---- 参数身份：当前有效参数必须与发布时一致 ----
+        # resume 也走这里，所以"参数变了就不复用"用的是同一套判据。
+        _rec_params = str(mdata.get("params_identity") or "")
+        if not _rec_params:
+            return False, "marker has no params identity"
+        _cur_params = str((params or {}).get("_frozen_params_identity") or "")
+        if not _cur_params:
+            _cur_params = build_params_identity(config, job, logger,
+                                                params=params)
+        if _rec_params != _cur_params:
+            _rec_view = mdata.get("params_semantics") or {}
+            _cur_view = (_identity_semantics(params)
+                         if isinstance(params, dict) else {})
+            if _rec_view and _cur_view and logger:
+                _diff = [(k, _rec_view.get(k), _cur_view.get(k))
+                         for k in sorted(set(_rec_view) | set(_cur_view))
+                         if _rec_view.get(k) != _cur_view.get(k)]
+                if _diff:
+                    logger.error(
+                        "COMPLETION_PARAMS_DIFF",
+                        "The marker records a different effective-parameter "
+                        "set; showing the first differences",
+                        differences=_diff[:6])
+            return False, "effective parameters changed since this generation"
+
+        state, why, objects = check_payload_manifest(mdata, p, logger)
+        if state == MANIFEST_LEGACY:
+            return False, f"legacy marker cannot prove this generation: {why}"
+        if state != MANIFEST_OK:
+            return False, why
+
+        # ---- 3) 整代磁盘事实（用**同一个**集合适配器）----
+        return verify_generation_objects(p, job, logger,
+                                         expected_objects=objects,
+                                         marker=mdata,
+                                         config=config, params=params)
+
 def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = None,
-                              logger=None) -> Tuple[bool, str]:
-    """核对**磁盘上这一代**是否完整：媒体 + 必需报告 + journal 终态。
+                              logger=None, expected_objects=None,
+                              marker: Optional[Dict[str, Any]] = None,
+                              config=None, params=None) -> Tuple[bool, str]:
+    """核对**磁盘上这一代**是否完整。
 
-    R21-C02：审核指出完成判定有两条互不相干的路径 ——
-    新任务只看私有结果，resume 只看 `.done.json` 与媒体。
-    两条路会漂移（一条认"文件在"，另一条认"marker 在"），
-    于是"报告被删掉的一代"在 resume 眼里仍然是完整的。
+    R22-A01 重构：必需集合**由计划决定**，不再硬编码"两份报告"。
 
-    这里把"整代在不在"抽成**唯一**判定，新任务收尾与 resume 都调它。
-    它只回答磁盘事实，不回答"是不是本 job 的" —— 后者由 marker /
-    run_identity 负责。
+    审核指出的矛盾：`full_chain_verify=false` 时 stage7 允许不提交 fullchain，
+    而这里无条件要求两份 —— 一端可选、一端固定，合法关闭的报告被当成缺陷。
+
+    集合来源按优先级：
+
+    1. ``expected_objects``（来自 marker payload，即**发布时冻结的那一份**）
+    2. 没有时退回 ``required_generation_reports()``（老调用兜底）
+
+    摘要比对在锁内的 `check_payload_manifest` 里已经做过；这里补的是
+    "路径仍在、报告与媒体同代、journal 覆盖同一集合"。
 
     Returns:
         ``(ok, reason)``。
@@ -1231,38 +1426,52 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
     except OSError as exc:
         return False, f"media is unreadable: {exc}"
 
-    verify_p, full_p = required_generation_reports(p)
-    media_digest = _plain_sha256(p)
-    recorded = None
+    # ---- 期望集合 ----
+    if expected_objects:
+        objs = [(str(n), str(pp), str(d)) for (n, pp, d) in expected_objects]
+    else:
+        media_digest = _plain_sha256(p)
+        if not media_digest:
+            return False, "media is unreadable"
+        objs = [("media", p, media_digest)]
+        # 兜底路径没有 marker payload，按**角色**补上计划默认的报告。
+        # 这里必须用 "verify"/"fullchain" 这两个**角色名**，不能用 basename ——
+        # 否则后面的 `o[0] == "verify"` 找不到（R22 第一次改就栽在这）。
+        _roles = ("verify", "fullchain")
+        for _role, rp in zip(_roles, required_generation_reports(p)):
+            d = _plain_sha256(rp)
+            if d is None:
+                return False, ("required report is missing: "
+                               f"{os.path.basename(rp)}")
+            objs.append((_role, rp, d))
+
+    media = [o for o in objs if o[0] == "media"]
+    if len(media) != 1:
+        return False, "the expected object set has no unique media entry"
+    media_digest = media[0][2]
+
+    for name, path, _d in objs:
+        if not os.path.exists(path):
+            return False, f"object {name!r} is missing: {path}"
+
+    # ---- verify 报告必须描述**当前**媒体（防止报告串代）----
+    verify_rows = [o for o in objs if o[0] == "verify"]
+    if not verify_rows:
+        return False, "the required object set has no verify report"
     try:
-        with open(verify_p, "r", encoding="utf-8") as f:
+        with open(verify_rows[0][1], "r", encoding="utf-8") as f:
             _v = json.load(f) or {}
-        if not isinstance(_v, dict):
-            return False, "verify report is not an object"
-        recorded = _v.get("media_sha256")
-        # 报告本身必须能说明"它描述的是哪一份媒体"
-        if recorded and media_digest and recorded != media_digest:
-            return False, ("verify report describes different media bytes "
-                           f"(recorded {str(recorded)[:16]}, "
-                           f"actual {media_digest[:16]})")
-    except FileNotFoundError:
-        return False, "required report is missing: verify.json"
     except (OSError, ValueError) as exc:
         return False, f"verify report is unreadable: {exc}"
-
-    try:
-        with open(full_p, "r", encoding="utf-8") as f:
-            _fc = json.load(f)
-        if not isinstance(_fc, (dict, list)):
-            return False, "fullchain report is not structured"
-    except FileNotFoundError:
-        return False, "required report is missing: fullchain.json"
-    except (OSError, ValueError) as exc:
-        return False, f"fullchain report is unreadable: {exc}"
+    if not isinstance(_v, dict):
+        return False, "verify report is not an object"
+    recorded = _v.get("media_sha256")
+    if recorded and media_digest and str(recorded) != str(media_digest):
+        return False, ("verify report describes different media bytes "
+                       f"(recorded {str(recorded)[:16]}, "
+                       f"actual {str(media_digest)[:16]})")
 
     # ---- journal 终态 ----
-    # 没有 journal = 这一代来自 R14 之前的实现，无法证明发布事务已收尾。
-    # 判"未经验证"而不是"通过"（旧产物仍保留，只是不自动复用）。
     try:
         from publish_journal import read_journal as _rj
         try:
@@ -1278,7 +1487,7 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
             return False, "publish journal is unreadable"
         phase = str(_doc.get("phase") or "")
         if phase != "COMMITTED":
-            return False, (f"publish journal is not COMMITTED (phase={phase!r})")
+            return False, f"publish journal is not COMMITTED (phase={phase!r})"
         if _doc.get("resolved") is False:
             return False, "publish journal is marked unresolved"
         if job is not None:
@@ -1287,63 +1496,37 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
             if _want and _got and _want != _got:
                 return False, (f"journal belongs to job {_got!r}, "
                                f"not {_want!r}")
+        # ---- journal 必须覆盖**同一个**对象集合 ----
+        _targets = {os.path.abspath(str(x))
+                    for x in (_doc.get("targets") or [])}
+        if _targets:
+            _need = {os.path.abspath(x[1]) for x in objs}
+            _missing = sorted(_need - _targets)
+            if _missing:
+                return False, ("publish journal does not cover object(s): "
+                               f"{[os.path.basename(x) for x in _missing[:3]]}")
     except Exception as exc:                # pragma: no cover - 部署异常
         return False, f"cannot verify the publish journal: {exc}"
 
-    return True, "media + required reports + COMMITTED journal"
+    return True, ("media + planned reports + COMMITTED journal "
+                  f"({len(objs)} objects)")
 
 
 def verify_payload_manifest(marker: Dict[str, Any], logger=None
                             ) -> Tuple[bool, str]:
-    """核对 marker 引用的 **payload manifest** 与磁盘现状（R21-C02）。
+    """`check_payload_manifest` 的**布尔包装**（R22-A01 起语义收紧）。
 
-    marker 是随发布事务一起落位的，它引用的是**发布前冻结**的清单
-    （不含 marker 自身，避免摘要自引用）。这里做三件事：
+    保留这个函数是为了既有的两态调用点；但行为变了：
+    旧格式（无 payload）现在返回 **False**，不再是"没有可核对的内容 = 通过"。
+    审核用"旧格式 marker + 同大小替换媒体"复现过这条绕过。
 
-    1. 用清单原文重算摘要，必须等于 marker 里记的 `payload_manifest_digest`
-       —— 防止"清单被改过、marker 却没变"；
-    2. 清单里每个对象的路径与摘要必须与磁盘一致
-       —— 防止"清单没变、文件被换了"；
-    3. 清单里必须有 `media` 一项，且与 marker 的 `output_sha256` 一致。
-
-    没有 payload manifest 的 marker 属于旧格式（R21 之前），
-    由调用方按 legacy 处理 —— 这里返回 True 表示"没有可核对的东西"。
+    Returns:
+        ``(ok, reason)``。需要区分 legacy / bad 的调用方请直接用
+        `check_payload_manifest()`。
     """
-    pm = marker.get("payload_manifest")
-    if not isinstance(pm, dict):
-        return True, "no payload manifest (legacy marker)"
-    recorded = str(marker.get("payload_manifest_digest") or "")
-    if not recorded:
-        return False, "marker has a payload manifest but no digest for it"
-    text = json.dumps(pm, sort_keys=True, ensure_ascii=False,
-                      separators=(",", ":"))
-    if _plain_sha256_text(text) != recorded:
-        return False, "payload manifest does not match the digest in the marker"
-    objs = pm.get("objects")
-    if not isinstance(objs, list) or not objs:
-        return False, "payload manifest lists no objects"
-    seen_media = None
-    for row in objs:
-        if not isinstance(row, dict):
-            return False, "payload manifest has a malformed object entry"
-        path = str(row.get("path") or "")
-        want = str(row.get("sha256") or "")
-        name = str(row.get("name") or "")
-        if not path or not want:
-            return False, f"payload manifest entry {name!r} is incomplete"
-        got = _plain_sha256(path) if os.path.exists(path) else None
-        if got is None:
-            return False, f"object {name!r} is missing: {path}"
-        if got != want:
-            return False, (f"object {name!r} changed since it was published "
-                           f"(recorded {want[:16]}, now {got[:16]})")
-        if name == "media":
-            seen_media = want
-    if not seen_media:
-        return False, "payload manifest has no media entry"
-    if str(marker.get("output_sha256") or "") != seen_media:
-        return False, "marker output_sha256 does not match the published media"
-    return True, "payload manifest matches the published bytes"
+    final_path = str(marker.get("output_path") or "")
+    state, why, _objs = check_payload_manifest(marker, final_path, logger)
+    return state == MANIFEST_OK, why
 
 
 def _plain_sha256_text(text: str) -> str:
@@ -1355,158 +1538,41 @@ def verify_published_marker(final_path: str, job: Dict[str, Any],
                             config: Dict[str, Any],
                             params: Optional[Dict[str, Any]] = None,
                             logger=None) -> Tuple[bool, str]:
-    """验证**随发布事务落位**的完成标记。
+    """验证"已发布的这一代"（R22-A01：与 resume 走同一条核心路径）。
 
-    与"main 事后写 marker"的区别：这份 marker 是 publisher 在锁内与媒体
-    一起落位的，内容引用冻结的 payload manifest。因此只要能验证它，
-    就不再需要猜"这份 marker 属于哪一代"。
+    历史上这个函数只核对 marker 的身份字段与 payload，**不看** journal
+    终态和整代对象 —— 于是它成了绕过完整检查的快捷入口。现在它只是
+    `verify_generation_completion(expect_attempt=None)` 的别名：
+
+    * 不要求本 attempt 的私有 result（这是它与正常收尾的唯一区别）
+    * marker payload、整代磁盘事实、journal COMMITTED 全部照查
+
+    Returns:
+        ``(ok, reason)``。
     """
-    p = completion_marker_path(final_path)
-    if not os.path.exists(p):
-        return False, "no published marker"
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-    except (OSError, ValueError) as exc:
-        return False, f"published marker is unreadable: {exc}"
-    if not isinstance(data, dict):
-        return False, "published marker is not an object"
-
-    if str(data.get("impl") or "") != VIDEO_IMPL_VERSION:
-        return False, (f"marker was produced by {data.get('impl')!r}, "
-                       f"current is {VIDEO_IMPL_VERSION!r}")
-    if str(data.get("job_id") or "") != str(job.get("job_id") or ""):
-        return False, (f"marker belongs to job {data.get('job_id')!r}, "
-                       f"not {job.get('job_id')!r}")
-    _st = _input_identity_status(data.get("input_identity") or {},
-                                 build_input_identity(job.get("input_path", "")))
-    if _st == "changed":
-        return False, "input content changed since this generation"
-    if _st == "unproven":
-        return False, "input identity cannot be verified"
-    rec_params = str(data.get("params_identity") or "")
-    if not rec_params:
-        return False, "marker has no params identity"
-    if config is not None:
-        try:
-            # 同进程内直接用冻结值；resume（新进程）才重算
-            cur = (str((params or {}).get("_frozen_params_identity") or "")
-                   or build_params_identity(config, job, logger))
-        except Exception as exc:            # pragma: no cover
-            return False, f"cannot compute the current params identity: {exc}"
-        if rec_params != cur:
-            # 身份对不上时把**语义视图的差异**打出来 —— 只报"参数变了"
-            # 无法定位是哪一项（本轮 N20 就是靠这条定位到 chain_mode 的）。
-            _rec_view = data.get("params_semantics") or {}
-            _cur_view = (_identity_semantics(params)
-                         if isinstance(params, dict) else {})
-            if _rec_view and _cur_view:
-                _diff = [(k, _rec_view.get(k), _cur_view.get(k))
-                         for k in sorted(set(_rec_view) | set(_cur_view))
-                         if _rec_view.get(k) != _cur_view.get(k)]
-                if logger:
-                    logger.error(
-                        "COMPLETION_MARKER_PARAMS_DIFF",
-                        "The marker records a different effective-parameter "
-                        "set; showing the first differences",
-                        differences=_diff[:6])
-            return False, "effective parameters changed since this generation"
-
-    ok, why = verify_payload_manifest(data, logger)
-    if not ok:
-        return False, why
-    return True, "published marker verified"
+    return verify_generation_completion(
+        final_path, job, config, params, logger, expect_attempt=None)
 
 
 def resume_artifact_matches(final_path: str, job: Dict[str, Any],
-                            config: Dict[str, Any],
-                            logger=None) -> Tuple[bool, str]:
-    """RV-09: decide whether `final_path` really belongs to *this* job."""
-    marker = completion_marker_path(final_path)
-    if not os.path.exists(marker):
-        return False, ("no completion marker; the artifact cannot be bound to "
-                       "this job's input/params")
-    try:
-        with open(marker, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        return False, f"unreadable completion marker: {e}"
-    if str(data.get("impl", "")) != VIDEO_IMPL_VERSION:
-        return False, (f"produced by implementation {data.get('impl')!r}, "
-                       f"current is {VIDEO_IMPL_VERSION!r}")
-    if str(data.get("job_id", "")) != str(job.get("job_id", "")):
-        return False, (f"belongs to job {data.get('job_id')!r}, "
-                       f"not {job.get('job_id')!r}")
-    recorded = data.get("input_identity") or {}
-    current = build_input_identity(job.get("input_path", ""))
-    # R2-07：身份"拿不到"与"对不上"都要拒绝，不能因为缺摘要就放行。
-    status = _input_identity_status(recorded, current)
-    if status == "changed":
-        return False, "input content changed since the artifact was produced"
-    if status == "unproven":
-        return False, ("input identity cannot be verified (missing/unreadable "
-                       "on one side); refusing to reuse the artifact")
-    recorded_params_id = str(data.get("params_identity", "") or "")
-    if not recorded_params_id.strip():
-        # ID-01（第七轮）：旧实现是
-        #     if data.get("params_identity") and data["params_identity"] != ...
-        # —— 空串直接短路，等于**没有身份也放行**。缺身份必须拒绝复用
-        # （但不删文件：它可能是用户还想要的结果，只是无法证明归属）。
-        return False, ("completion marker has no params identity; cannot "
-                       "prove this artifact matches the current parameters "
-                       "(file kept, not deleted)")
-    current_params_id = build_params_identity(config, job, logger)
-    if recorded_params_id != current_params_id:
-        return False, "effective parameters changed since it was produced"
+                            config: Dict[str, Any], logger=None,
+                            params: Optional[Dict[str, Any]] = None
+                            ) -> Tuple[bool, str]:
+    """RV-09 / R22-A01：resume 是否可以把这份产物当"已完成"。
 
-    # ID-03（第七轮）：核对**成品内容摘要**。
-    # 旧实现连 output_size 都没比 —— 等长替换、截断重写、拷错文件都能
-    # 冒充"这个 job 的成品"。"能解码"更不能当身份。
-    recorded_sha = data.get("output_sha256")
-    if recorded_sha:
-        # ---- R21-C02：新格式用**纯内容**摘要 ----
-        # `_chunked_sha256()` 在内容之后又拼了 size 字符串，与 publisher /
-        # journal / verify 报告用的 `file_digest`（纯内容）**不是同一套算法**。
-        # 带 payload manifest 的 marker 由 stage7 生成，记的是纯内容摘要
-        # （与 manifest 里 media 的 sha256 同值），所以按纯内容比。
-        # 旧 marker（无 manifest）仍按老算法比，保住既有产物的可复用性。
-        _plain_marker = bool(isinstance(data, dict)
-                             and data.get("payload_manifest"))
-        current_sha = (_plain_sha256(final_path) if _plain_marker
-                       else _chunked_sha256(final_path))
-        if current_sha is None:
-            return False, "artifact unreadable while verifying its digest"
-        if current_sha != recorded_sha:
-            return False, ("artifact content differs from what was recorded "
-                           "at completion (file was replaced or modified)")
-    else:
-        # 旧标记没有摘要（第七轮之前产出）→ 视为 legacy/unproven，
-        # 不自动当作 verified 复用。
-        return False, ("completion marker predates content digests; "
-                       "artifact is legacy/unproven and is not auto-reused")
+    与正常收尾**共用同一个核心验证器**（`verify_generation_completion`），
+    唯一区别是允许跨 attempt（`expect_attempt=None`，不要求本 attempt 的
+    私有 result）。这正是审核要求的"两者不要混成同一宽松条件"：
+    核心（marker payload + 整代磁盘事实 + journal 终态 + 参数身份）相同，
+    只有"要不要当前 attempt 的结果"这一项不同。
 
-    # ---- R21-C02：marker 只能证明"这份媒体是谁的"，不能证明"整代都在" ----
-    # 审核：resume 检查"仍主要围绕 .done.json 和媒体；受控路径没有读取所需
-    # 报告和 journal，不能证明缺失报告的一代可继续被当作完整完成"。
-    # 这里复用**同一个**整代验证器，新任务收尾与 resume 不再各判一套。
-    # 另外：若 marker 带 payload manifest（R21 起），必须核对清单与磁盘一致 ——
-    # 否则"清单没变、文件被换"仍会被放过。
-    _mdata: Dict[str, Any] = {}
-    try:
-        with open(marker, "r", encoding="utf-8") as _mf:
-            _mdata = json.load(_mf) or {}
-    except (OSError, ValueError):
-        _mdata = {}
-    if isinstance(_mdata, dict) and _mdata.get("payload_manifest"):
-        _pm_ok, _pm_why = verify_payload_manifest(_mdata, logger)
-        if not _pm_ok:
-            return False, f"payload manifest mismatch: {_pm_why}"
-
-    _gen_ok, _gen_why = verify_generation_objects(final_path, job, logger)
-    if not _gen_ok:
-        return False, f"generation is not complete: {_gen_why}"
-
-    return True, "identity-match"
+    Args:
+        params: 有效参数。**应当传**（resume 也要用当前 CLI 覆盖重算参数
+            身份）；不传时退回 `build_params_identity` 的兜底合并，
+            可能与发布时不一致 —— 那时会拒绝复用，这是保守方向。
+    """
+    return verify_generation_completion(
+        final_path, job, config, params, logger, expect_attempt=None)
 
 
 def find_final_output(job: Dict[str, Any], config: Dict[str, Any],
@@ -2056,11 +2122,13 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # 顺序必须是：chain_mode / vs_deterministic 落定 → 再算 _run_identity，
     # 否则身份摘要里记录的是"模式未知"的 params，与实际执行模式不符。
     try:
-        params["_run_identity"] = {
-            "input": build_input_identity(job.get("input_path", "")),
-            "params": build_params_identity(config, job, job_logger,
-                                            params=params),
-        }
+        # R22-A02：必须给出**可重算**的 RunIdentity（含非空 digest）。
+        # 旧写法只有 {input, params}，stage7 取 `.digest` 恒为空串，
+        # 回执里的 run_identity 一直是空的。
+        params["_run_identity"] = build_run_identity(
+            config, job, job_logger, params=params)
+        if not params["_run_identity"].get("digest"):
+            raise ValueError("run identity digest is empty")
     except Exception as _rid_exc:         # pragma: no cover
         job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
 

@@ -22,7 +22,9 @@ import pytest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _p in (_ROOT, os.path.join(_ROOT, "shared_modules"),
-           os.path.join(_ROOT, "video_restoration_pipeline")):
+           os.path.join(_ROOT, "video_restoration_pipeline"),
+           # R22-A01：夹具改用真实生产者 `build_marker_candidate`（在 stages/ 下）
+           os.path.join(_ROOT, "video_restoration_pipeline", "stages")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -39,95 +41,131 @@ def _job(inp):
             "recommended_params": {}, "user_overrides": {}}
 
 
+def _publish_full(tmp_path, *, media=b"GENUINE", attempt="att1",
+                  input_bytes=b"src"):
+    """用生产函数发布一整代，返回 ``(media_path, params)``（R22-A01）。"""
+    import publisher as _P
+    import stage7_encode as _s7
+
+    out = str(tmp_path / "clip_restored.mkv")
+    stage = str(tmp_path / "staging")
+    inp = str(tmp_path / "in.mp4")
+    if not os.path.exists(inp):
+        with open(inp, "wb") as f:
+            f.write(input_bytes)
+    job = _job(inp)
+
+    os.makedirs(stage, exist_ok=True)
+    with open(os.path.join(stage, "media.bin"), "wb") as f:
+        f.write(media)
+    with open(os.path.join(stage, "verify.json"), "w", encoding="utf-8") as f:
+        json.dump({"media_sha256": vmain._plain_sha256(
+            os.path.join(stage, "media.bin"))}, f)
+    with open(os.path.join(stage, "fullchain.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"ok": True}, f)
+
+    arts = [
+        _P.Artifact("media", os.path.join(stage, "media.bin"), out),
+        _P.Artifact("verify", os.path.join(stage, "verify.json"),
+                    out + ".verify.json"),
+        _P.Artifact("fullchain", os.path.join(stage, "fullchain.json"),
+                    out + ".fullchain.json"),
+    ]
+    digests = [(a.name, a.final, vmain._plain_sha256(a.staging)) for a in arts]
+    eff = vmain.merge_params(job, {}, {}, None)
+    eff["attempt_id"] = attempt
+    seed = {
+        "impl": vmain.VIDEO_IMPL_VERSION,
+        "job_id": job["job_id"],
+        "input_path": inp,
+        "input_identity": vmain.build_input_identity(inp),
+        "params_identity": vmain.build_params_identity({}, job, None,
+                                                       params=eff),
+    }
+    _mk, mk_stage, mk_dig, _pm = _s7.build_marker_candidate(
+        seed=seed, pub_digests=digests, attempt_id=attempt,
+        job_id=job["job_id"], output_path=out, media_digest=digests[0][2],
+        media_size=os.path.getsize(arts[0].staging))
+    arts.append(_P.Artifact("marker", mk_stage, out + ".done.json"))
+    res = _P.publish(arts, out + ".journal.json", str(tmp_path / "backup"),
+                     attempt_id=attempt, decision={"publish": True},
+                     allowed_output_roots=[str(tmp_path)],
+                     required_objects=[a.final for a in arts],
+                     marker_digest=mk_dig)
+    assert res.ok, res.errors
+
+    rp = str(tmp_path / "stage7_result.json")
+    eff["_stage7_result_path"] = rp
+    with open(rp, "w", encoding="utf-8") as f:
+        json.dump({
+            "schema": 1, "attempt_id": attempt, "ok": True,
+            "terminal_pending": False, "journal_phase": "COMMITTED",
+            "journal_path": out + ".journal.json",
+            "generation_receipt": (res.generation_receipt.to_dict()
+                                   if res.generation_receipt else None),
+            "final_output_path": out,
+            "publish_result": res.as_dict(),
+            "run_identity": vmain.build_run_identity({}, job, None,
+                                                     params=eff),
+        }, f, ensure_ascii=False, default=str)
+    return out, eff
+
+
+class _L:
+    def __init__(self):
+        self.events = []
+
+    def _rec(self, e, m="", **k):
+        self.events.append(e)
+
+    info = warning = error = critical = _rec
+
+
 def test_marker_refuses_when_media_changed_after_publish(tmp_path):
-    """媒体被下一代替换后，**不许**把本 job 的身份写进标记。
+    """媒体被换 → 验证必须拒绝（R22-A01：拒绝点在 payload 摘要）。
 
-    这是审核第 2 条的直接反例：锁外重读会读到别人的结果。
+    旧版断言的是"不写标记 + COMPLETION_MARKER_GENERATION_CHANGED"；
+    现在 main 不写标记，判据由 `verify_generation_completion` 给出，
+    事件统一为 `COMPLETION_UNPROVEN`（附具体原因）。
     """
-    media = tmp_path / "clip_restored.mkv"
-    media.write_bytes(b"GENERATION-B")
-    inp = tmp_path / "in.mp4"
-    inp.write_bytes(b"src")
+    media, params = _publish_full(tmp_path)
+    with open(media, "wb") as f:
+        f.write(b"OTHER-BYTES")      # 与 GENUINE 同为 8 字节
 
-    # verify.json 记录的是**本代**发布时的摘要（A 代）
-    other = tmp_path / "other.bin"
-    other.write_bytes(b"GENERATION-A")
-    # 报告里的 media_sha256 是**纯内容** SHA-256（stage7 的口径），
-    # 这里必须用同一套算法，否则"挡下来"的原因是算法不同而不是媒体换了。
-    # R17-01：报告必须带 run_identity（本 job 这一代的输入身份），
-    # 否则 marker 会因"无法证明归属"而拒写 —— 见 COMPLETION_MARKER_NO_RECEIPT。
-    _inp_early = tmp_path / "in.mp4"
-    _inp_early.write_bytes(b"src")
-    (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": vmain._plain_sha256(str(other)),
-                    "run_identity": {
-                        "input": vmain.build_input_identity(str(_inp_early))}}),
-        encoding="utf-8")
-
-    class L:
-        def __init__(self):
-            self.events = []
-
-        def info(self, e, m="", **k):
-            self.events.append(e)
-
-        def warning(self, e, m="", **k):
-            self.events.append(e)
-
-        def error(self, e, m="", **k):
-            self.events.append(e)
-
-    log = L()
-    ok = vmain.write_completion_marker(str(media), _job(str(inp)), {}, log)
-
-    assert ok is False, "媒体已换代，标记必须拒绝写入"
-    assert "COMPLETION_MARKER_GENERATION_CHANGED" in log.events, log.events
-    # 关键：不能留下一个把 A 的身份绑到 B 的标记
-    assert not os.path.exists(vmain.completion_marker_path(str(media)))
+    log = _L()
+    ok = vmain.write_completion_marker(str(media), _job(str(tmp_path / "in.mp4")),
+                                       {}, params=params, logger=log)
+    assert ok is False
+    assert "COMPLETION_UNPROVEN" in log.events, log.events
 
 
-def test_marker_written_when_digest_matches(tmp_path):
-    """摘要一致时标记正常写入，并记录**已核对**的摘要。"""
-    media = tmp_path / "clip_restored.mkv"
-    media.write_bytes(b"GENERATION-A")
-    # 报告记的是**纯内容**摘要（stage7 口径）
-    dig = vmain._plain_sha256(str(media))
-    inp = tmp_path / "in.mp4"
-    inp.write_bytes(b"src")
-    (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": dig,
-                    "run_identity": {
-                        "input": vmain.build_input_identity(str(inp))}}),
-        encoding="utf-8")
-
-    class L:
-        def info(self, *a, **k):
-            pass
-        warning = error = info
-
-    assert vmain.write_completion_marker(str(media), _job(str(inp)),
-                                         {}, L()) is True
-    marker = json.load(open(vmain.completion_marker_path(str(media)),
-                            encoding="utf-8"))
-    # 标记自己的 output_sha256 仍是"内容 + size"口径 —— resume 的比对端
-    # （`resume_artifact_matches`）也是它，两边必须自洽。
-    assert marker["output_sha256"] == vmain._chunked_sha256(str(media))
-    assert marker["output_sha256"] != dig, \
-        "两种口径必须不同，否则说明混用了"
-    assert marker["job_id"] == "j1"
+def test_marker_is_verified_when_everything_matches(tmp_path):
+    """摘要一致、journal 已提交、私有 result 齐全 → 验证通过。"""
+    media, params = _publish_full(tmp_path)
+    log = _L()
+    ok = vmain.write_completion_marker(str(media), _job(str(tmp_path / "in.mp4")),
+                                       {}, params=params, logger=log)
+    assert ok is True, log.events
+    assert "COMPLETION_VERIFIED" in log.events, log.events
+    # marker 是生产者在事务里写的，验证不该重写它
+    assert os.path.exists(vmain.completion_marker_path(str(media)))
 
 
-def test_marker_tmp_name_is_private():
-    """`.done.json.tmp` 是共享名，并发会互相踩 → 必须带 pid/随机后缀。"""
-    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
+def test_marker_staging_name_is_attempt_private():
+    """暂存名必须带 attempt —— 两个 process 不会同名（R22 迁移）。
+
+    写入已从 `main` 移到 `stage7.build_marker_candidate()`，
+    所以守卫对象也跟着移过去。
+    """
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage7_encode.py"),
                encoding="utf-8", errors="replace").read()
-    assert ("completion_marker_path(final_path)}.tmp-{os.getpid()}"
-            in src), "标记的临时文件名必须私有化"
-    assert 'completion_marker_path(final_path) + ".tmp"' not in src, \
-        "不得再用共享的 `<final>.done.json.tmp`"
+    i = src.index("staging = f\"{marker_final}.staging-{attempt_id}\"")
+    assert i > 0, "找不到 marker 的私有暂存名"
+    # 旧写法（共享 .tmp）必须彻底消失
+    assert ".done.json.tmp" not in src
 
-
-# ------------------------------------------------ WSL 回拷：冻结语义
 
 def test_wsl_copyback_uses_frozen_digests_and_full_set():
     """WSL 回拷必须在源锁内、按发布前冻结的摘要复制，且集合与发布一致。
@@ -185,59 +223,81 @@ print("OK" if ok else "REFUSED")
 """
 
 
-def test_b09_two_processes_do_not_corrupt_the_marker(tmp_path):
-    """两个进程同时写同一个标记：只能留一份合法 JSON，不留临时文件。
+def test_two_attempts_do_not_corrupt_the_marker(tmp_path):
+    """两次**独立发布**同一个目标：后一次成功，且 marker 仍可验证。
 
-    原来临时名是共享的 `<final>.done.json.tmp` —— 两进程互相踩，
-    可能写出半个 JSON，使 resume 永远判定"标记不可读"。
+    旧版是"两个 Python 进程同时写 marker"；R22 起 marker 由事务发布，
+    所以改成"两次 attempt 的事务先后落位"，核对的仍是"不能写出坏 marker"。
     """
-    final = tmp_path / "clip_restored.mkv"
-    final.write_bytes(b"GEN")
-    # 报告口径是纯内容 SHA-256（stage7 写的就是它）
-    inp = tmp_path / "in.mp4"
-    inp.write_bytes(b"src")
-    # R17-01：带 run_identity，否则 marker 会以 NO_RECEIPT 拒写
-    (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": vmain._plain_sha256(str(final)),
-                    "run_identity": {
-                        "input": vmain.build_input_identity(str(inp))}}),
-        encoding="utf-8")
+    import publisher as _P
+    import stage7_encode as _s7
 
-    root = str(_ROOT)
-    shared = os.path.join(_ROOT, "shared_modules")
-    procs = []
-    for jid in ("j1", "j2"):
-        code = _WRITER.format(root=root, shared=shared,
-                              pipe=os.path.join(root, "video_restoration_pipeline"),
-                              final=str(final), jid=jid, inp=str(inp))
-        procs.append(subprocess.Popen(
-            [_sys.executable, "-c", code],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+    out = str(tmp_path / "clip_restored.mkv")
+    stage = str(tmp_path / "staging")
+    inp = str(tmp_path / "in.mp4")
+    with open(inp, "wb") as f:
+        f.write(b"src")
+    job = _job(inp)
+    os.makedirs(stage, exist_ok=True)
 
-    outs = [p.communicate(timeout=180) for p in procs]
-    for (o, e), p in zip(outs, procs):
-        assert p.returncode == 0, e[-400:]
+    markers = []
+    for attempt in ("attA", "attB"):
+        with open(os.path.join(stage, "media.bin"), "wb") as f:
+            f.write(b"GEN-" + attempt.encode())
+        with open(os.path.join(stage, "verify.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"media_sha256": vmain._plain_sha256(
+                os.path.join(stage, "media.bin"))}, f)
+        with open(os.path.join(stage, "fullchain.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"ok": True}, f)
+        arts = [
+            _P.Artifact("media", os.path.join(stage, "media.bin"), out),
+            _P.Artifact("verify", os.path.join(stage, "verify.json"),
+                        out + ".verify.json"),
+            _P.Artifact("fullchain", os.path.join(stage, "fullchain.json"),
+                        out + ".fullchain.json"),
+        ]
+        dig = [(a.name, a.final, vmain._plain_sha256(a.staging)) for a in arts]
+        seed = {
+            "impl": vmain.VIDEO_IMPL_VERSION,
+            "job_id": job["job_id"],
+            "input_path": inp,
+            "input_identity": vmain.build_input_identity(inp),
+            "params_identity": vmain.build_params_identity({}, job, None),
+        }
+        _mk, mk_stage, mk_dig, _pm = _s7.build_marker_candidate(
+            seed=seed, pub_digests=dig, attempt_id=attempt,
+            job_id=job["job_id"], output_path=out,
+            media_digest=dig[0][2],
+            media_size=os.path.getsize(arts[0].staging))
+        markers.append(mk_stage)
+        arts.append(_P.Artifact("marker", mk_stage, out + ".done.json"))
+        res = _P.publish(arts, out + ".journal.json",
+                         str(tmp_path / "backup"), attempt_id=attempt,
+                         decision={"publish": True},
+                         allowed_output_roots=[str(tmp_path)],
+                         required_objects=[a.final for a in arts],
+                         marker_digest=mk_dig)
+        assert res.ok, res.errors
 
-    marker = vmain.completion_marker_path(str(final))
-    assert os.path.exists(marker), "标记必须写出来（至少一个进程成功）"
-    # 必须是一份**完整可读**的 JSON
-    doc = json.load(open(marker, encoding="utf-8"))
-    assert doc["job_id"] in ("j1", "j2"), doc
-    assert doc["output_sha256"], doc
-
-    # 不能留下临时文件
-    leftovers = [n for n in os.listdir(str(tmp_path)) if ".done.json.tmp" in n]
-    assert not leftovers, f"临时文件没清理：{leftovers}"
+    # 两次的暂存名不同（不会互相覆盖）
+    assert len(set(markers)) == 2
+    # 最终 markert 是完整、可解析的 JSON
+    with open(vmain.completion_marker_path(out), "r",
+              encoding="utf-8") as f:
+        doc = json.load(f)
+    assert doc.get("payload_manifest"), "最终 marker 必须带 payload"
+    assert doc.get("attempt_id") in ("attA", "attB")
 
 
-def test_b09_marker_tmp_is_unique_per_process():
-    """源码守卫：临时名必须带 pid（两进程不会同名）。"""
-    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
+def test_b09_marker_staging_is_unique_per_attempt():
+    """源码守卫：暂存名带 attempt（等价于"带 pid"的私有性）。"""
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage7_encode.py"),
                encoding="utf-8", errors="replace").read()
-    assert "tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}" in src
+    assert ".staging-{attempt_id}" in src, "marker 暂存名必须带 attempt"
 
-
-# ------------------------------------------------ 摘要口径（R16-03 后修）
 
 def test_plain_and_chunked_digests_differ_by_construction(tmp_path):
     """`_plain_sha256` 与 `_chunked_sha256` **必然不同**（后者拼了 size）。
@@ -255,40 +315,15 @@ def test_plain_and_chunked_digests_differ_by_construction(tmp_path):
 
 
 def test_guard_compares_like_with_like(tmp_path):
-    """报告写纯内容摘要 → 标记**必须**写得出来（原来会被误拒）。
+    """报告写纯内容摘要 → 验证必须通过（原来会被误拒）。
 
     实测反例：同一份成品 `3f1fbf3c…`（纯内容）vs `bb52754f…`（内容+size），
-    守卫拿后者比前者的记录值，**每个视频 job 都被拒**。
+    旧守卫拿后者比前面记录的值，**每个视频 job 都被拒**。
     """
-    media = tmp_path / "clip_restored.mkv"
-    media.write_bytes(b"GENUINE")
-    plain = vmain._plain_sha256(str(media))
-    inp = tmp_path / "in.mp4"
-    inp.write_bytes(b"src")
-    (tmp_path / "clip_restored.mkv.verify.json").write_text(
-        json.dumps({"media_sha256": plain,
-                    "run_identity": {
-                        "input": vmain.build_input_identity(str(inp))}}),
-        encoding="utf-8")
+    media, params = _publish_full(tmp_path)
+    log = _L()
+    assert vmain.write_completion_marker(
+        str(media), _job(str(tmp_path / "in.mp4")), {},
+        params=params, logger=log) is True, log.events
 
-    class L:
-        def __init__(self):
-            self.ev = []
 
-        def info(self, e, *a, **k):
-            self.ev.append(e)
-
-        def warning(self, e, *a, **k):
-            self.ev.append(e)
-
-        def error(self, e, *a, **k):
-            self.ev.append(e)
-
-    log = L()
-    ok = vmain.write_completion_marker(str(media),
-                                       {"job_id": "j1", "input_path": str(inp),
-                                        "detected_class": "HDV_AVCHD",
-                                        "recommended_params": {},
-                                        "user_overrides": {}}, {}, log)
-    assert ok is True, log.ev
-    assert "COMPLETION_MARKER_GENERATION_CHANGED" not in log.ev, log.ev

@@ -30,7 +30,10 @@ import conftest  # noqa: F401
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _p in (_ROOT,
            os.path.join(_ROOT, "shared_modules"),
-           os.path.join(_ROOT, "video_restoration_pipeline")):
+           os.path.join(_ROOT, "video_restoration_pipeline"),
+           # R22-A01：夹具改用**真实生产者** build_marker_candidate，
+           # 它在 stages/ 下
+           os.path.join(_ROOT, "video_restoration_pipeline", "stages")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -68,9 +71,15 @@ def _gen(tmp_path, *, with_reports=True, with_journal=True,
                json.dumps({"media_sha256": vmain._plain_sha256(final)}))
         _write(final + ".fullchain.json", json.dumps({"ok": True}))
     if with_journal:
+        # R22-A01：journal 的 targets 必须覆盖**同一代**的全部对象。
+        # 真实 publisher 就是 `sorted(set(finals))`；旧夹具只写媒体，
+        # 于是新加的"targets 必须覆盖对象集合"检查会（正确地）拒绝它。
+        _targets = [final]
+        if with_reports:
+            _targets += [final + ".verify.json", final + ".fullchain.json"]
         J.write_journal(final + ".journal.json",
                         {"phase": journal_phase, "job_id": "j1",
-                         "targets": [final], "records": {},
+                         "targets": _targets, "records": {},
                          "resolved": resolved})
     return final
 
@@ -195,20 +204,34 @@ def test_missing_media_is_rejected(tmp_path):
 
 # ------------------------------------------------ resume 复用同一验证器
 
-def _make_marker(final, job, config, log):
-    payload = {
+def _make_marker(final, job, config, log, objects=None):
+    """用**真实生产者**造一份带 payload 的 marker（R22-A01 起唯一合法形状）。
+
+    旧版这里手写 marker JSON（无 payload），R21 时 `verify_payload_manifest`
+    对"没有 payload"直接返回 True，于是"同大小替换媒体"也能过。
+    现在旧格式一律判 legacy/unproven，所以夹具必须走生产函数。
+    """
+    import stage7_encode as s7
+    if objects is None:
+        objects = []
+        for role, path in (("media", final),
+                           ("verify", final + ".verify.json"),
+                           ("fullchain", final + ".fullchain.json")):
+            if os.path.exists(path):
+                objects.append((role, path, vmain._plain_sha256(path)))
+    seed = {
         "impl": vmain.VIDEO_IMPL_VERSION,
         "job_id": job.get("job_id", ""),
         "input_path": job.get("input_path", ""),
         "input_identity": vmain.build_input_identity(job.get("input_path", "")),
         "params_identity": vmain.build_params_identity(config, job, log),
-        "output_path": final,
-        "output_size": os.path.getsize(final),
-        "output_sha256": vmain._chunked_sha256(final),
     }
-    _write(vmain.completion_marker_path(final),
-           json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return payload
+    _mk, _stage, _dig, _pm = s7.build_marker_candidate(
+        seed=seed, pub_digests=objects, attempt_id="att1",
+        job_id=job.get("job_id", "j1"), output_path=final,
+        media_digest=objects[0][2], media_size=os.path.getsize(final))
+    os.replace(_stage, vmain.completion_marker_path(final))
+    return _mk
 
 
 def test_resume_accepts_a_fully_proven_generation(tmp_path):
@@ -232,7 +255,7 @@ def test_resume_refuses_when_a_required_report_is_gone(tmp_path):
 
     ok, why = vmain.resume_artifact_matches(final, job, {"global": {}}, log)
     assert ok is False, why
-    assert "generation is not complete" in why, why
+    assert "missing" in why and "fullchain" in why, why
 
 
 def test_resume_refuses_when_the_journal_is_unresolved(tmp_path):
@@ -244,7 +267,7 @@ def test_resume_refuses_when_the_journal_is_unresolved(tmp_path):
 
     ok, why = vmain.resume_artifact_matches(final, job, {"global": {}}, log)
     assert ok is False, why
-    assert "not complete" in why
+    assert "COMMITTED" in why and "PREPARED" in why, why
 
 
 # ------------------------------------------------ 回执强类型（C02 第三点）

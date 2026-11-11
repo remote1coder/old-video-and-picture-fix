@@ -1344,6 +1344,9 @@ def build_marker_candidate(seed: Dict[str, Any],
         "output_sha256": str(media_digest),
         "payload_manifest": payload_manifest,
         "payload_manifest_digest": _pm_digest,
+        # R22-A01：marker 顶层也要有 attempt —— 否则"这份 marker 属于哪个
+        # attempt"只能翻 payload_manifest 才知道，诊断与跨 attempt 判断都别扭。
+        "attempt_id": attempt_id,
         "completed_at": (completed_at
                          or datetime.datetime.now().astimezone().isoformat()),
     })
@@ -4411,30 +4414,35 @@ def main():
             if _res_path:
                 try:
                     _tmp_res = _res_path + ".tmp"
+                    # R22-A02：**顶层一律是最终代**。
+                    # 原来 `journal_phase` / `journal_path` /
+                    # `generation_receipt` 取 `_pres`（中转代），只有
+                    # `final_publish_result` 取最终代 —— 消费者得猜该读哪一份。
+                    # 现在中转代只出现在 `redirected_publish_result`（诊断用）。
+                    _final_pres = _wres if original_output_path else _pres
                     _payload = {
                         "schema": 1,
                         "attempt_id": _attempt_id,
-                        "ok": bool(_pres.ok) and bool(_wres.ok
-                                                     if original_output_path
-                                                     else True),
-                        "terminal_pending": bool(
-                            getattr(_pres, "terminal_pending", False)),
-                        "journal_phase": getattr(_pres, "phase", None),
-                        "journal_path": getattr(_pres, "journal_path", None),
-                        "generation_receipt": (
-                            _pres.generation_receipt.to_dict()
-                            if getattr(_pres, "generation_receipt", None)
-                            else None),
-                        # 最终目标侧的事务结果（无回拷时即 _pres）
-                        "final_output_path": _final_target,
-                        "final_publish_result": (
-                            _wres.as_dict() if original_output_path
-                            else _pres.as_dict()),
+                        "ok": bool(_pres.ok) and (
+                            bool(_wres.ok) if original_output_path else True),
                         "terminal_pending": bool(
                             getattr(_pres, "terminal_pending", False)
                             or (getattr(_wres, "terminal_pending", False)
                                 if original_output_path else False)),
-                        "publish_result": _pres.as_dict(),
+                        "journal_phase": getattr(_final_pres, "phase", None),
+                        "journal_path": getattr(_final_pres, "journal_path",
+                                                None),
+                        "generation_receipt": (
+                            _final_pres.generation_receipt.to_dict()
+                            if getattr(_final_pres, "generation_receipt", None)
+                            else None),
+                        "final_output_path": _final_target,
+                        "publish_result": _final_pres.as_dict(),
+                        # 中转代：只作诊断
+                        "redirected_publish_result": (
+                            _pres.as_dict() if original_output_path else None),
+                        # R22-A02：RunIdentity 随结果落盘，消费者要**重算**校验
+                        "run_identity": dict(params.get("_run_identity") or {}),
                     }
                     os.makedirs(os.path.dirname(_res_path) or ".",
                                 exist_ok=True)

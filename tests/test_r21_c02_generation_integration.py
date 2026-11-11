@@ -92,13 +92,21 @@ def _publish_generation(tmp_path, job, *, media=b"NEW-MEDIA-BYTES",
     ]
     pub_digests = [(a.name, a.final, _digest(a.staging)) for a in arts]
 
+    # R22-A01：`params` 必须是**有效参数**（merge 之后的那一份）。
+    # `build_params_identity` 会按 `_identity_semantics` 过滤，
+    # 而 `params=None` 时它退回 merge —— 两边必须是同一视图，
+    # 否则 marker 的 params_identity 与验证时重算的永远对不上。
+    _eff = vmain.merge_params(job, {}, {}, None)
+    _eff["attempt_id"] = "att1"
+
     if seed is None:
         seed = {
             "impl": vmain.VIDEO_IMPL_VERSION,
             "job_id": job["job_id"],
             "input_path": job["input_path"],
             "input_identity": vmain.build_input_identity(job["input_path"]),
-            "params_identity": vmain.build_params_identity({}, job, None),
+            "params_identity": vmain.build_params_identity(
+                {}, job, None, params=_eff),
         }
     marker, staging, mdig, pmdig = s7.build_marker_candidate(
         seed=seed, pub_digests=pub_digests, attempt_id="att1",
@@ -112,8 +120,29 @@ def _publish_generation(tmp_path, job, *, media=b"NEW-MEDIA-BYTES",
                     allowed_output_roots=[str(tmp_path / "out")],
                     required_objects=[a.final for a in arts],
                     marker_digest=mdig)
+
+    # ---- R22-A01：正常收尾必须消费 **attempt 私有 result** ----
+    # 审核的绕过路径正是"有 marker 就不看 result"。这里按 stage7 的真实形状
+    # 写一份：schema/attempt/最终路径/终态/RunIdentity 全在。
+    result_path = str(tmp_path / "stage7_result.json")
+    _eff["_stage7_result_path"] = result_path
+    _w(result_path, json.dumps({
+        "schema": 1,
+        "attempt_id": "att1",
+        "ok": True,
+        "terminal_pending": False,
+        "journal_phase": "COMMITTED",
+        "journal_path": out + ".journal.json",
+        "generation_receipt": (res.generation_receipt.to_dict()
+                               if res.generation_receipt else None),
+        "final_output_path": out,
+        "publish_result": res.as_dict(),
+        # R22-A02：可重算的 RunIdentity（与 marker 用同一份有效参数）
+        "run_identity": vmain.build_run_identity({}, job, None, params=_eff),
+    }, ensure_ascii=False, default=str))
     return {"out": out, "res": res, "marker": marker, "mdigest": mdig,
-            "pm_digest": pmdig, "arts": arts}
+            "pm_digest": pmdig, "arts": arts, "result_path": result_path,
+            "params": _eff}
 
 
 # ------------------------------------------------ 正常路径
@@ -143,9 +172,11 @@ def test_main_verifies_the_published_marker_without_rewriting_it(tmp_path):
     before = (_digest(marker_path), os.path.getmtime(marker_path))
 
     log = _Log()
-    ok = vmain.write_completion_marker(ctx["out"], job, {}, log)
+    # R22-A01：正常收尾要带 attempt 与私有 result 路径
+    ok = vmain.write_completion_marker(ctx["out"], job, {}, log,
+                                       params=ctx["params"])
     assert ok is True
-    assert "COMPLETION_MARKER_VERIFIED_PUBLISHED" in log.names()
+    assert "COMPLETION_VERIFIED" in log.names()
     after = (_digest(marker_path), os.path.getmtime(marker_path))
     assert after == before, "验证通过的 marker 不该被重写"
 
@@ -214,5 +245,8 @@ def test_marker_from_another_job_is_rejected(tmp_path):
                                       {}, other, None),
                               })
     ok, why = vmain.verify_published_marker(ctx["out"], job, {}, None, None)
-    assert ok is False
-    assert "belongs to job" in why, why
+    assert ok is False, why
+    # R22-A01：现在的验证顺序是 input identity → job → impl → params → payload，
+    # 别的 job 的 marker 会先在 input identity 上被拦（更早、更直接）。
+    # 断言按"确实被拒 + 理由具体"来写，不锁死某一句话。
+    assert why and ("job" in why or "input" in why), why

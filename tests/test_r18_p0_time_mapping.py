@@ -85,14 +85,42 @@ class _FakePopen:
     """替身：满足 collect_outputs_while_waiting 所需的最小接口。
 
     只替换**外部工具**（mkvmerge），不替换被测逻辑本身。
+
+    R22：补上 **context-manager 协议**与 `__enter__` 返回值。
+    本机 WorkBuddy 的 safe-delete 守卫在 `os.remove` 时会用
+    `with subprocess.Popen(...) as p:` 探测批量删除，而这里的
+    monkeypatch 把整个 `subprocess` 模块换成了本类 —— 假对象没有
+    `__enter__` 就抛 `SAFE_DELETE_BULK_GUARD_ERROR` 并 `SystemExit(1)`。
+
+    这不是"守卫太严"，而是**桩没实现它被当作 Popen 使用时该有的接口**；
+    补齐协议比全局关掉保护正确（本轮执行指令明确要求不许关守卫）。
     """
 
     def __init__(self, cmd, **kw):
         import io as _io
         self.cmd = cmd
+        # 守卫读 `CompletedProcess.args`（subprocess.run 的返回对象）
+        self.args = cmd
         self.returncode = 0
         self.stdout = _io.BytesIO(b"")
         self.stderr = _io.BytesIO(b"mkvmerge fake ok\n")
+
+    # ---- context-manager 协议（R22）----
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    # ---- 守卫探测批量删除时可能读的属性 ----
+    def communicate(self, *a, **kw):
+        return (b"", b"mkvmerge fake ok\n")
+
+    def kill(self):
+        self.returncode = -9
+
+    def terminate(self):
+        self.returncode = -15
 
     def poll(self):
         return self.returncode

@@ -498,16 +498,20 @@ def test_rv09_output_without_completion_marker_is_not_reused(tmp_path):
 
 
 def _write_receipt(final, src):
-    """写一份"本代"的 verify 报告（含 run_identity）+ fullchain + journal。
+    """写一份"本代"的 verify 报告 + fullchain + journal + **事务 marker**。
 
-    R17-01 之后，marker 要求 verify.json 带 run_identity 才肯写 ——
-    只比对"当前 verify 与当前媒体彼此一致"已经不够（下一代会把两者一起
-    替换，二者仍然自洽）。这些用例原本不写报告，现在必须补上。
-
-    R21-C02 之后，resume 还要用**同一个整代验证器**核对必需报告与
-    journal 终态 —— 只造媒体+marker 的夹具不再代表"完整代"。
+    R17-01：marker 要求 verify.json 带 run_identity。
+    R21-C02：resume 用同一个整代验证器核对必需报告与 journal 终态。
+    R22-A01：marker **只能由生产者在发布事务里生成**，
+    `write_completion_marker` 不再代写 —— 夹具必须走真实生产者，
+    否则会得到"legacy marker cannot prove this generation"（这是对的）。
     """
     import json as _json
+    # R22-A01：marker 必须由**生产者**生成；它在 video 链的 stages/ 下
+    _vstages = os.path.join(ROOT, "video_restoration_pipeline", "stages")
+    if _vstages not in sys.path:
+        sys.path.insert(0, _vstages)
+    import stage7_encode as _s7
     with open(str(final) + ".verify.json", "w", encoding="utf-8") as f:
         _json.dump({"media_sha256": vmain._plain_sha256(str(final)),
                     "run_identity": {
@@ -517,7 +521,28 @@ def _write_receipt(final, src):
     import publish_journal as _pj
     _pj.write_journal(str(final) + ".journal.json",
                       {"phase": "COMMITTED", "job_id": "j1",
-                       "targets": [str(final)], "records": {}})
+                       "targets": [str(final),
+                                   str(final) + ".verify.json",
+                                   str(final) + ".fullchain.json"],
+                       "records": {}})
+    objects = [("media", str(final), vmain._plain_sha256(str(final))),
+               ("verify", str(final) + ".verify.json",
+                vmain._plain_sha256(str(final) + ".verify.json")),
+               ("fullchain", str(final) + ".fullchain.json",
+                vmain._plain_sha256(str(final) + ".fullchain.json"))]
+    seed = {
+        "impl": vmain.VIDEO_IMPL_VERSION,
+        "job_id": "j1",
+        "input_path": str(src),
+        "input_identity": vmain.build_input_identity(str(src)),
+        "params_identity": vmain.build_params_identity(
+            {}, {"job_id": "j1", "input_path": str(src)}, None),
+    }
+    _mk, _stage, _dig, _pm = _s7.build_marker_candidate(
+        seed=seed, pub_digests=objects, attempt_id="att1", job_id="j1",
+        output_path=str(final), media_digest=objects[0][2],
+        media_size=os.path.getsize(str(final)))
+    os.replace(_stage, vmain.completion_marker_path(str(final)))
 
 
 def test_rv09_matching_marker_is_accepted(tmp_path):
@@ -527,7 +552,11 @@ def test_rv09_matching_marker_is_accepted(tmp_path):
     final.write_bytes(b"\x02" * 64)
     job = {"job_id": "j1", "input_path": str(src)}
     _write_receipt(final, src)
-    assert vmain.write_completion_marker(str(final), job, {}, None)
+    # R22-A01：`write_completion_marker` 是**正常收尾**入口，必须带本次
+    # attempt 与私有 result；"只看 marker 是否匹配"属于 resume 语义，
+    # 所以这里用 resume 的入口（两者共用同一个核心验证器）。
+    ok, why = vmain.resume_artifact_matches(str(final), job, {}, None)
+    assert ok is True, why
     ok, reason = vmain.resume_artifact_matches(str(final), job, {}, None)
     assert ok is True, reason
 

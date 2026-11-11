@@ -157,7 +157,9 @@ def test_run_identity_is_frozen_after_execution_mode():
     """
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "main.py"),
                encoding="utf-8", errors="replace").read()
-    i_ident = src.find('params["_run_identity"] = {')
+    # R22-A02：`_run_identity` 现在是 `build_run_identity(...)` 的返回值，
+    # 不再是一个 dict 字面量。断言只认"赋值发生的位置"，不锁右值形态。
+    i_ident = src.find('params["_run_identity"] = ')
     i_mode = min((k for k in (src.find('params["chain_mode"] = str('),
                               src.find('params["chain_mode"] = _raw_mode'))
                   if k >= 0), default=-1)
