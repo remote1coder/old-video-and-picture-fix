@@ -939,6 +939,15 @@ def recover(journal_path: str, backup_dir: str, attempt_id: str,
                     return {"ok": False, "journal_path": journal_path,
                             "reason": "journal disappeared while taking "
                                       "the lock"}
+                # ---- R22-A09：锁内重读的 journal 要**重新验证** ----
+                # 审核："锁内重读的新 journal 必须重新验证；同 targets 但
+                # old/new 摘要、backup 或状态变更不能继续使用旧恢复计划。"
+                # 指纹能发现"变了"，但发现不了"变成结构非法" ——
+                # 所以先跑一遍只读预检（结构 + 归属 + 授权根），再比指纹。
+                _pre1 = _precheck_doc(doc1, backup_dir, allowed_output_roots,
+                                      journal_path, logger)
+                if _pre1 is not None:
+                    return _pre1
                 if _txn_fingerprint(doc1) != fp0:
                     last_reason = ("journal changed between the read-only "
                                    "precheck and acquiring the lock "
@@ -980,20 +989,41 @@ def _norm_target_set(doc: Dict[str, Any]) -> List[str]:
 
 
 def _txn_fingerprint(doc: Dict[str, Any]) -> str:
-    """事务指纹：attempt + 目标集合 + records 键集合。
+    """事务指纹：**影响恢复语义**的全部内容（R22-A09 扩充）。
 
-    审核 R19-B03 的反例是"首次 journal 指向 A，取锁后重读指向 B"。
-    只比 `attempt_id` 不够 —— 同一个 attempt 也可能被改成不同的 targets。
-    把三者一起摘要是最省事且够用的判据。
+    R19-B03 的反例是"首次 journal 指向 A，取锁后重读指向 B"。
+    R21 只摘要了 `attempt + phase + targets + record 键集合` ——
+    审核指出：**records 里的 old/new 摘要与 backup 改变不会改变指纹**。
+    于是"同一批 targets、但某一行换了备份路径或新摘要"的 journal
+    会被当成同一个事务，恢复计划沿用旧的，可能回滚到错误的字节。
+
+    现在把每一行也纳入：
+
+    - ``existed``（真布尔）
+    - ``old_digest`` / ``new_digest``（新旧内容身份）
+    - ``backup`` / ``backup_digest``（备份位置与内容）
+
+    不纳入 `started_at` 之类的观测字段 —— 那些不影响恢复动作。
     """
     import hashlib
     import json as _json
+    rows = {}
+    for fin, rec in (doc.get("records") or {}).items():
+        if not isinstance(fin, str) or not isinstance(rec, dict):
+            continue
+        rows[fin] = {
+            "existed": rec.get("existed") if isinstance(
+                rec.get("existed"), bool) else None,
+            "old_digest": rec.get("old_digest"),
+            "new_digest": rec.get("new_digest"),
+            "backup": rec.get("backup"),
+            "backup_digest": rec.get("backup_digest"),
+        }
     payload = {
         "attempt": str(doc.get("attempt_id") or ""),
         "phase": str(doc.get("phase") or ""),
         "targets": _norm_target_set(doc),
-        "record_keys": sorted(
-            x for x in ((doc.get("records") or {}).keys()) if isinstance(x, str)),
+        "records": rows,
     }
     blob = _json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -1216,6 +1246,22 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
                 "persisted; backups are kept"}
 
     # ---- 混合 / 未知：用备份回滚 ----
+    # R22-A09：**破坏性动作前最后一次核对 journal**。
+    # 上面那次指纹比对发生在"刚拿到锁"的时刻；如果恢复计划构造期间
+    # （读磁盘、算分类）journal 被同协议的另一方改写，旧计划就不再适用。
+    # 这里把"检查 → 动手"的间隔缩到最小（只差一次 read_journal）。
+    try:
+        _doc_now = read_journal(journal_path)
+    except Exception:                       # pragma: no cover - 部署异常
+        _doc_now = None
+    if _doc_now is None:
+        return {"ok": False, "generation": gen, "journal_path": journal_path,
+                "reason": "journal became unreadable before the rollback "
+                          "started"}
+    if _txn_fingerprint(_doc_now) != _txn_fingerprint(doc):
+        return {"ok": False, "generation": gen, "journal_path": journal_path,
+                "reason": "journal changed before the rollback started; "
+                          "refusing to apply a stale recovery plan"}
     rec_report = _restore_locked(snapshot, attempt_id, logger)
     if rec_report.get("fully_restored"):
         if write_journal(journal_path,

@@ -128,6 +128,16 @@ def test_bounds_report_marks_a_missing_helper_as_not_performed(monkeypatch):
 
 # ------------------------------------------------ 证据齐全性判定
 
+def _lose_matrix(d):
+    """源有 matrix、产物丢了 —— 自报列表与字段**同时**反映这件事。"""
+    d["color_source"]["matrix"] = "bt709"
+    d["color_source"]["complete"] = True
+    d["color"]["matrix"] = None
+    d["color"]["complete"] = False
+    d["color"]["unknown_fields"] = ["matrix"]
+    d["color_lost_tags"] = ["matrix"]
+
+
 def _good_receipt():
     return {
         "color": {"pix_fmt": "yuv420p16le", "range": "limited",
@@ -184,7 +194,9 @@ def test_lost_tags_is_relative_to_the_source():
     (lambda d: d.pop("color"), "no color evidence"),
     (lambda d: d.pop("bounds"), "no bounds evidence"),
     (lambda d: d["color"].update(probed=False), "never probed"),
-    (lambda d: d.update(color_lost_tags=["matrix"]), "colour tags lost"),
+    # R22-A05：关系改由**字段**推导，只改自报列表不再算"丢标签"
+    # （那会被判成"回执与自己的字段不符"）。要真的丢，字段也得丢。
+    (_lose_matrix, "colour tags lost"),
     (lambda d: d["bounds"].update(performed=False, ok=False),
      "was not performed"),
     (lambda d: d["bounds"].update(performed=True, ok=False), "bounds check failed"),

@@ -163,6 +163,39 @@ def collect(src: str, out: str, stage: str,
             "bounds": bounds_report(src, out, stage, params, logger)}
 
 
+#: 参与"颜色关系"判定的字段（顺序固定，便于比对）。
+_COLOR_FIELDS = ("range", "matrix", "primaries", "transfer")
+
+
+def derive_color_relations(src_color: Dict[str, Any],
+                           out_color: Dict[str, Any]) -> tuple:
+    """从源/输出字段**独立推导** lost / changed（R22-A05）。
+
+    审核：消费者"没有根据源/输出与声明转换重新推导 lost/changed 关系"，
+    于是回执只要把这两个列表写成空数组就能通过 —— 自报的结论不能当证据。
+
+    推导规则（只看**双方都有值**的字段）：
+
+    - 源有值、输出无值 → ``lost``（标签丢了）
+    - 两边都有值但不同 → ``changed``（改了标签或真做了转换，必须解释）
+    - 源无值 → 无从谈起（"源本来就没有"不是丢）
+
+    Returns:
+        ``(lost_fields, changed_rows)``；``changed_rows`` 每项
+        ``{"field", "source", "output"}``。
+    """
+    lost = []
+    changed = []
+    for k in _COLOR_FIELDS:
+        a = (src_color or {}).get(k)
+        b = (out_color or {}).get(k)
+        if a and not b:
+            lost.append(k)
+        elif a and b and str(a) != str(b):
+            changed.append({"field": k, "source": a, "output": b})
+    return lost, changed
+
+
 def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
     """回执里的证据块是否足以支撑"这一次转换是对的"。
 
@@ -174,22 +207,60 @@ def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
     """
     problems = []
     color = (rcpt or {}).get("color")
+    src_color = (rcpt or {}).get("color_source")
     if not isinstance(color, dict):
         problems.append("no color evidence (legacy receipt)")
     else:
         if not color.get("probed"):
             problems.append("color was never probed")
-        lost = (rcpt or {}).get("color_lost_tags")
-        if isinstance(lost, list) and lost:
-            problems.append("colour tags lost between input and output: "
-                            + ",".join(lost))
-        changed = (rcpt or {}).get("color_changed_tags")
-        if isinstance(changed, list) and changed:
+        # ---- R22-A05：源状态必须**探测成功** ----
+        # 审核反例：`color_source.probed=False` 时旧实现无问题通过。
+        # 源探测失败 = 未证明（不是"源本来没标签"）；后者只能是 probed=True
+        # 但字段为空。
+        if not isinstance(src_color, dict):
+            problems.append("no source color evidence (legacy receipt)")
+        elif not src_color.get("probed"):
+            problems.append("the source colour state was never probed "
+                            "(unverified, not 'no tags')")
+
+        # ---- 关系由**字段**重新推导，不信任回执自报的列表 ----
+        d_lost, d_changed = derive_color_relations(src_color or {}, color)
+        r_lost = (rcpt or {}).get("color_lost_tags")
+        r_changed = (rcpt or {}).get("color_changed_tags")
+        if isinstance(r_lost, list) and sorted(map(str, r_lost)) != sorted(d_lost):
             problems.append(
-                "colour tags changed between input and output without a "
-                "declared conversion: "
-                + ",".join(f"{c.get('field')}={c.get('source')}->{c.get('output')}"
-                           for c in changed if isinstance(c, dict)))
+                "the receipt's colour_lost_tags disagrees with its own "
+                f"fields: said {r_lost}, fields imply {d_lost}")
+        if isinstance(r_changed, list):
+            _said = sorted(str(x.get("field")) for x in r_changed
+                           if isinstance(x, dict))
+            _derived = sorted(x["field"] for x in d_changed)
+            if _said != _derived:
+                problems.append(
+                    "the receipt's colour_changed_tags disagrees with its own "
+                    f"fields: said {_said}, fields imply {_derived}")
+
+        if d_lost:
+            problems.append("colour tags lost between input and output: "
+                            + ",".join(d_lost))
+
+        # ---- 合法的"变了"要由**声明过的转换**支撑 ----
+        # 审核：不能所有 changed 都拒（合法 BT.601→BT.709 由转换合同验证），
+        # 也不能"只改标签"就通过 —— 必须声明 applied 与 contract。
+        if d_changed:
+            _conv = (rcpt or {}).get("color_conversion") or {}
+            _applied = set(str(x) for x in (_conv.get("applied") or []))
+            _contract = str(_conv.get("contract") or "").strip()
+            _unexplained = [c for c in d_changed if c["field"] not in _applied]
+            if _unexplained:
+                problems.append(
+                    "colour fields changed without a declared conversion: "
+                    + ",".join(f"{c['field']}={c['source']}->{c['output']}"
+                               for c in _unexplained))
+            elif not _contract:
+                problems.append(
+                    "colour conversion was applied but no conversion contract "
+                    "is recorded; re-labelling alone is not a conversion")
     bounds = (rcpt or {}).get("bounds")
     if not isinstance(bounds, dict):
         problems.append("no bounds evidence (legacy receipt)")

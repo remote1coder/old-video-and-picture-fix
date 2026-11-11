@@ -92,6 +92,16 @@ def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT,
                              "matrix": "bt709", "primaries": "bt709",
                              "transfer": "bt709", "probed": True,
                              "complete": True, "unknown_fields": []},
+                   # R22-A05：**源侧证据**也必须写进回执。
+                   # 旧模板只有输出侧 —— 消费方无法推导 lost/changed，
+                   # 只能相信回执自报的空列表（审核指出的两个洞之一）。
+                   "color_source": {"pix_fmt": "yuv420p16le",
+                                    "range": "limited", "matrix": "bt709",
+                                    "primaries": "bt709", "transfer": "bt709",
+                                    "probed": True, "complete": True,
+                                    "unknown_fields": []},
+                   "color_lost_tags": [],
+                   "color_changed_tags": [],
                    "bounds": {"ok": True, "performed": True, "reason": "",
                               "report": {"stage": "stage34"}},
                    "frames": 10}, f)
