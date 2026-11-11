@@ -33,6 +33,97 @@
 """
 
 
+def build_fixed_frame_script(frame_dir, in_w, in_h, out_w, out_h):
+    """生成"**冻结帧源**"子进程脚本：忽略模型，按顺序吐出预置帧。
+
+    R22 §5.1 的①②两组实验需要"同一份固定帧源送进两条后半链"。
+    把它做成一个与 AI 脚本**接口完全一致**的替身：
+
+    - 从 stdin 读 `in_w*in_h*3*2` 字节/帧（消费掉，维持背压）；
+    - 从 stdout 写 `out_w*out_h*3*2` 字节/帧（内容来自 `frame_dir/*.raw`）。
+
+    这样 stage3 的调用方**不需要知道**帧是 AI 产的还是预置的，
+    经典物化与融合串流吃的是同一串字节。
+
+    数据契约（与 AI 模板一致的三条里最重要的一条）：
+    **stdout 必须是纯二进制** —— 先把 fd 1 复制成数据通道，
+    再把文本 stdout 指向 stderr。这个替身脚本也会被 import 到
+    realesrgan 吗？不会，但保持同一形状能让"换回真 AI"零改动。
+
+    Args:
+        frame_dir: 预置帧目录；按文件名排序取 `*.raw`。
+        in_w / in_h: 输入帧尺寸（用于算每帧输入字节数）。
+        out_w / out_h: 输出帧尺寸（必须与预置帧的实际字节数一致）。
+
+    Returns:
+        str: 可直接交给 python 执行的脚本文本。
+
+    Raises:
+        ValueError: 尺寸非法。
+    """
+    NL = chr(10)
+    in_bytes = int(in_w) * int(in_h) * 3 * 2
+    out_bytes = int(out_w) * int(out_h) * 3 * 2
+    if in_bytes <= 0 or out_bytes <= 0:
+        raise ValueError("fixed-frame script needs positive dimensions")
+
+    lines = [
+        "import os, sys",
+        # 与 AI 模板同一条铁律：先抢下真正的 stdout，再把文本层指到 stderr
+        "_data = os.fdopen(os.dup(1), 'wb', buffering=0)",
+        "os.dup2(2, 1)",
+        "",
+        "import pathlib",
+        f"FRAME_DIR = pathlib.Path({frame_dir!r})",
+        f"IN_BYTES = {in_bytes}",
+        f"OUT_BYTES = {out_bytes}",
+        "",
+        "frames = sorted(FRAME_DIR.glob('*.raw'))",
+        "if not frames:",
+        "    sys.stderr.write('FIXED_FRAME: no *.raw in %s' % FRAME_DIR)",
+        "    sys.stderr.flush()",
+        "    raise SystemExit(84)",
+        "",
+        "stdin = sys.stdin.buffer",
+        "i = 0",
+        "while True:",
+        "    chunk = stdin.read(IN_BYTES)",
+        "    if not chunk:",
+        "        break",
+        "    if len(chunk) != IN_BYTES:",
+        "        sys.stderr.write(",
+        "            'FIXED_FRAME: short read %d != %d' % (len(chunk), IN_BYTES))",
+        "        sys.stderr.flush()",
+        "        raise SystemExit(84)",
+        "    if i >= len(frames):",
+        "        # 输入还有帧、预置帧却用完了 —— 帧数不匹配，必须大声失败",
+        "        sys.stderr.write(",
+        "            'FIXED_FRAME: input has more frames than the frozen set '",
+        "            '(%d); refusing to truncate' % len(frames))",
+        "        sys.stderr.flush()",
+        "        raise SystemExit(84)",
+        "    payload = frames[i].read_bytes()",
+        "    if len(payload) != OUT_BYTES:",
+        "        sys.stderr.write(",
+        "            'FIXED_FRAME: %s is %d bytes, expected %d'",
+        "            % (frames[i].name, len(payload), OUT_BYTES))",
+        "        sys.stderr.flush()",
+        "        raise SystemExit(84)",
+        "    _data.write(payload)",
+        "    i += 1",
+        "",
+        "if i != len(frames):",
+        "    sys.stderr.write(",
+        "        'FIXED_FRAME: used %d of %d frozen frames' % (i, len(frames)))",
+        "    sys.stderr.flush()",
+        "    raise SystemExit(84)",
+        "sys.stderr.write('FIXED_FRAME: wrote %d frames' % i)",
+        "sys.stderr.flush()",
+        "",
+    ]
+    return NL.join(lines)
+
+
 def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
                            gpu_id=0):
     """生成 AI 子进程脚本：stdin 读 raw 帧 -> 超分 -> stdout 写 raw 帧。

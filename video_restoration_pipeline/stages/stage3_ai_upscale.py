@@ -495,8 +495,18 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 # 内部 LANCZOS4 缩放（与官方 inference 脚本一致）
                 f"    upsampler = RealESRGANer(scale={native_scale}, "
                 "model_path=model_path, model=arch, pre_pad=10, half=use_half)\n"
-                "    for fp in sorted(glob.glob("
-                "os.path.join(input_path, '*.png'))):\n"
+                # R22：**0 个输入帧不能算成功**。
+                # 实测踩到：把 `input_path` 传成单个文件（它的语义是**目录**）
+                # 时 glob 匹配 0 个，循环一次都不跑，脚本 rc=0，
+                # 调用方收到 True —— 没产出却报成功。
+                "    _inputs = sorted(glob.glob("
+                "os.path.join(input_path, '*.png')))\n"
+                "    if not _inputs:\n"
+                "        sys.stderr.write(\n"
+                "            'STAGE3_AI_NO_INPUT: no *.png under %s' % input_path)\n"
+                "        sys.stderr.flush()\n"
+                "        sys.exit(84)\n"
+                "    for fp in _inputs:\n"
                 "        # COL-01（第七轮）：RealESRGANer 的官方约定是"
                 "**输入 BGR、输出 BGR**——内部开头即 "
                 "cv2.cvtColor(img, COLOR_BGR2RGB)，结尾用 "
@@ -578,73 +588,29 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
         # 现在：走 run_managed（可取消、超时会 kill+reap 子进程），
         # 超时按**窗口总帧数**动态给（每帧 30 秒的保守上限，最少 300 秒），
         # 并在超时时写明确日志与 stderr 尾部。
-        _total_frames = 0
-        for _fd, _od in window_dirs:
-            try:
-                _total_frames += len([n for n in os.listdir(_fd)
-                                      if n.endswith(".png")])
-            except OSError:
-                pass
-        # ---- 用**心跳**判卡死，不再给"按帧数猜出来的总时长" ----
-        # 原来 `max(300, min(CAP, frames*30))`：既是一个猜出来的总时长，
-        # 又要为每个新素材重新调。正确的证据是**产出还在不在增长** ——
-        # PNG 路径里 AI 逐帧写进 `window_dirs` 的输出目录，所以
-        # 心跳 = 这些目录的总字节数。素材再长、机器再慢，只要还在写就不杀。
-        _ai_timeout = None
-        _ai_inactivity = float(params.get("stage_inactivity_timeout", 1800.0))
-
-        def _ai_out_bytes():
-            """心跳：本窗口所有输出目录的字节数（AI 逐帧写 PNG）。"""
-            total = 0
-            for _fd, _od in window_dirs:
-                try:
-                    for _n in os.listdir(_od):
-                        try:
-                            total += os.path.getsize(os.path.join(_od, _n))
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
-            return total
-
-        if logger:
-            logger.info("STAGE3_AI_SUBPROC_START",
-                        "Launching AI subprocess under cancel-guard",
-                        frames=_total_frames,
-                        inactivity_timeout_s=_ai_inactivity,
-                        interpreter=ai_py)
+        # ---- 单张接口：不挂取消守卫、不做心跳（R22 修）----
+        # 这段原来是从 `run_realesrgan_batch()` 复制过来的残留，引用了
+        # `window_dirs` / `params` / `logger` / `_cancel_guard` / `_trace_fh`
+        # 五个**在本函数里根本不存在**的名字 —— 任何单张调用都会 NameError。
+        # 生产链自 P1-11 起统一走批量接口，所以这条路一直没被执行到，
+        # 又一次"语法通过 ≠ 能跑"。
+        #
+        # 按单张接口的**真实能力**重写，不假装它有取消/心跳：
+        # 一次 subprocess.run + 有界超时 + 失败留 stderr 尾部。
         try:
-            if _cancel_guard is not None:
-                r = _cancel_guard.run_managed(
-                    cmd, capture_output=True, text=True, timeout=_ai_timeout,
-                    progress_watch=_ai_out_bytes,
-                    inactivity_timeout=_ai_inactivity,
-                    shell=False, env=env, logger=logger)
-            else:
-                r = subprocess.run(cmd, capture_output=True, text=True,
-                                   errors="replace", shell=False, env=env)
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               errors="replace", timeout=3600,
+                               shell=False, env=env)
         except subprocess.TimeoutExpired as _te:
-            if logger:
-                logger.error(
-                    "STAGE3_AI_SUBPROC_TIMEOUT",
-                    f"AI subprocess exceeded {_ai_timeout}s "
-                    f"({_total_frames} frames). This is NOT a silent hang: "
-                    "the child was killed and reaped. Common causes: CUDA "
-                    "init deadlock (several processes sharing one GPU), "
-                    "driver hang, or a model that is far slower than "
-                    "expected.",
-                    frames=_total_frames, timeout_s=_ai_timeout,
-                    stdout_tail=str(getattr(_te, "stdout", "") or "")[-800:],
-                    stderr_tail=str(getattr(_te, "stderr", "") or "")[-800:])
-            if _trace_fh is not None:
-                try:
-                    _trace_fh.close()
-                except Exception:
-                    pass
+            try:
+                Path(script_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            sys.stderr.write(
+                "STAGE3_AI_SUBPROC_TIMEOUT single-image path (>3600s); "
+                "stderr=%s" % str(getattr(_te, "stderr", "") or "")[-800:])
+            sys.stderr.flush()
             return False
-        # FIX-R6-03: 失败必须留证据。原实现无条件删脚本 + 只返回 False，
-        # 子进程真实 traceback（参数非法/架构不匹配/import 失败）全部丢失
-        # —— 2026-10-18 实测因此多绕两圈才定位到 prepad kwarg。
         if r.returncode == 83:
             try:
                 Path(script_path).unlink(missing_ok=True)
@@ -652,21 +618,21 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
                 pass
             return "OOM"
         if r.returncode != 0:
-            if logger:
-                logger.error("STAGE3_AI_SUBPROC_FAIL",
-                             f"AI subprocess exited {r.returncode}; "
-                             f"script kept at {script_path}",
-                             stderr_tail=(r.stderr or "")[-1500:])
+            # FIX-R6-03：失败必须留证据 —— 保留脚本 + 打 stderr 尾部
+            sys.stderr.write(
+                "STAGE3_AI_SUBPROC_FAIL rc=%d script=%s stderr=%s"
+                % (r.returncode, script_path, (r.stderr or "")[-1500:]))
+            sys.stderr.flush()
             return False
         try:
-            # FIX-P8-10: Use Path.unlink instead of os.unlink
             Path(script_path).unlink(missing_ok=True)
         except Exception:
             pass
         return True
     except Exception as e:
-        if logger:
-            logger.error("STAGE3_AI_LAUNCH_FAIL", str(e))
+        sys.stderr.write("STAGE3_AI_LAUNCH_FAIL %s" % e)
+        sys.stderr.flush()
+        return False
         return False
 
 
@@ -892,7 +858,7 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          timeout_s=None, inactivity_s=1800,
                          logger=None, cancel_guard=None,
                          color_opts=None, post_filter_chain=None,
-                         out_pix_fmt=None):
+                         out_pix_fmt=None, frame_source_dir=None):
     """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
 
     为什么这样做
@@ -936,9 +902,25 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 模板在 shared_modules/stream_ai_template.py —— 不能内联在这里。
     # DEP_CHECK 会静态扫描 stages/*.py 原文找"顶层可执行代码"，
     # 它分不清三引号字符串内外，内联模板会判 spawn 违规 → 全批 exit 80。
-    from stream_ai_template import build_stream_ai_script
-    script = build_stream_ai_script(
-        in_w, in_h, scale, model_path, model, gpu_id)
+    # ---- R22 §5.1：可注入的**冻结帧源**（内部实验用，不暴露用户 CLI）----
+    # 给了 `frame_source_dir` 就绕过模型，用一个接口完全一致的替身脚本
+    # 按顺序吐出预置帧。这样"经典物化"与"融合串流"吃的是**同一串字节**，
+    # 才能把"融合本身的差异"和"两次 AI 推理的差异"分开。
+    from stream_ai_template import (build_stream_ai_script,
+                                    build_fixed_frame_script)
+    if frame_source_dir:
+        script = build_fixed_frame_script(
+            frame_source_dir, in_w, in_h, out_w, out_h)
+        if logger:
+            logger.warning(
+                "STAGE3_FIXED_FRAME_SOURCE",
+                "Using an INJECTED frozen frame source instead of the model; "
+                "this is an internal experiment path, not a normal run",
+                frame_dir=str(frame_source_dir),
+                shape=f"{in_w}x{in_h}->{out_w}x{out_h}")
+    else:
+        script = build_stream_ai_script(
+            in_w, in_h, scale, model_path, model, gpu_id)
     tmpd = None
     try:
         tmpd = tempfile.mkdtemp(prefix="stream3_")
@@ -2887,6 +2869,8 @@ def main():
                         inactivity_s=float(params.get(
                             "stage_inactivity_timeout", 1800.0)),
                         logger=logger, cancel_guard=_cancel_guard,
+                        # R22 §5.1：内部注入的冻结帧源（正常运行为 None）
+                        frame_source_dir=params.get("_frame_source_dir"),
                         color_opts=_s_copts)
                     if _s_ok and os.path.exists(_s_out) and os.path.getsize(_s_out) > 0:
                         if _cancel_guard is not None:
