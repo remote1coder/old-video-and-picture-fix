@@ -92,12 +92,26 @@ def test_missing_combo_is_invalid(c):
 
 # ------------------------------------------------ 444 无操作必须精确
 
-def test_444_with_nonzero_mse_invalidates_the_probe(c):
-    row = _combo(chroma="444", mse=0.5)
+def test_444_roundtrip_over_budget_invalidates_the_probe(c):
+    """444 往返**超出误差预算**才算探针有问题。
+
+    R22-A08：旧判据要求 444 往返"逐像素完全相同"—— 可它经过矩阵、范围、
+    量化和舍入，精确相等只是可选结果，不是唯一正确答案。现在给明确预算
+    （8-bit RMSE ≤ 1.0），超了才判无效。
+    """
+    row = _combo(chroma="444", mse=4.0)      # RMSE = 2.0 > 1.0
     verdict, reasons = c.evaluate({"roundtrip": [row, _combo()]},
                                   expected_combos=2)
     assert verdict == "INVALID"
-    assert any("probe itself is wrong" in r for r in reasons), reasons
+    assert any("error budget" in r for r in reasons), reasons
+
+
+def test_444_roundtrip_within_budget_is_acceptable(c):
+    """小误差（RMSE ≈ 0.7）在预算内 → 不判无效。"""
+    row = _combo(chroma="444", mse=0.5)
+    verdict, reasons = c.evaluate({"roundtrip": [row, _combo()]},
+                                  expected_combos=2)
+    assert verdict == "OK", reasons
 
 
 def test_444_with_zero_mse_is_fine(c):

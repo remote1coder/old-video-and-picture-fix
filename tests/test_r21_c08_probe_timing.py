@@ -46,7 +46,10 @@ def _sides(frames=20, **info_over):
     info = {"width": 3840, "height": 2160, "pix_fmt": "yuv420p16le",
             "nb_read_frames": frames, "frames": frames,
             "first_pts": 0.0, "last_pts": 0.033 * (frames - 1),
-            "last_end": 0.033 * frames, "median_interval": 0.033}
+            "last_end": 0.033 * frames, "median_interval": 0.033,
+            # R22-A07：判据逐帧比 PTS，合法样本必须给出逐帧证据
+            "pts": [round(i * 0.033, 6) for i in range(frames)],
+            "durations": [0.033] * frames}
     info.update(info_over)
     return classic, fused, info, dict(info)
 

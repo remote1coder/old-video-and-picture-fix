@@ -175,21 +175,46 @@ def psnr_rgb(a, b, expected_frames=None):
             "seq": seq, "problems": problems}
 
 
-def _num(tok):
-    """解析统计值：``inf`` → None（表示零误差）；非法 → ``"bad"``。"""
+def _num(tok, *, zero_means=None):
+    """解析统计值。
+
+    R22-A08：**MSE 与 PSNR 不能共用 inf 语义**。审核的反例是
+    `mse_r: inf` 被按"PSNR 正无穷 = 零误差"的规则转成 None，再转 0，
+    最后判 OK —— 一个明显异常的数值变成了"完美"。
+
+    Args:
+        tok: 文本值。
+        zero_means: ``None`` 表示"这个字段的正无穷 = 0"（只有 PSNR 这样）；
+            ``"bad"`` 表示"正无穷是非法值"（MSE 就是这样）。
+
+    Returns:
+        float / ``None``（表示零误差）/ ``"bad"``。
+    """
     t = str(tok or "").strip().lower()
     if t in ("inf", "+inf", "infinity", "+infinity"):
-        return None
+        return None if zero_means is None else "bad"
     if t in ("-inf", "-infinity"):
         return "bad"
     try:
         v = float(t)
     except (TypeError, ValueError):
         return "bad"
-    # `float("nan")` 能解析成功但它会污染整批均值；非有限一律判非法
     if not math.isfinite(v) or v < 0:
         return "bad"
     return v
+
+
+def _mse_from_psnr(psnr):
+    """由 PSNR(8-bit 满量程) 反推 MSE —— 显示精度丢掉的小值靠这一步找回。
+
+    审核的真实反例：两张 64×64 PPM 只差一个像素 R 100→101，
+    正确 MSE = 1/4096 ≈ 0.000244；ffmpeg 日志写的是 `mse_r:0.00`
+    （只有 2 位小数）、`psnr_r:84.25`。把 "0.00" 当精确零就会得出
+    PSNR=inf —— 抹掉真实差异。用 psnr 反推：255²/10^(84.25/10) ≈ 0.000244。
+    """
+    if psnr is None:
+        return 0.0
+    return (255.0 ** 2) / (10.0 ** (float(psnr) / 10.0))
 
 
 def aggregate(res):
@@ -197,6 +222,14 @@ def aggregate(res):
 
     为什么不能先平均 dB：dB 是对数域，平均 dB 再反推 RMSE 相当于对 MSE
     作几何平均；动态素材里个别极差帧会被系统性低估。
+
+    R22-A08 增加三件事：
+
+    1. MSE 字段的正无穷判**非法**（不是零误差）；
+    2. 当 MSE 显示为 0 但 PSNR 有限时，**用 PSNR 反推 MSE** ——
+       显示精度下的 "0.00" 不能当精确零；
+    3. 输出 `exact_zero`：只有**每一帧** PSNR 都是 inf 才为真。
+       "精确相等"只能由它来判，不能由汇总出的 mse==0 反推。
     """
     out = {"frames": res.get("frames", 0), "planes": {},
            "problems": list(res.get("problems") or [])}
@@ -204,26 +237,45 @@ def aggregate(res):
     for p in ("r", "g", "b"):
         mses = []
         bad = 0
+        exact = True
+        reconstructed = 0
         for row in rows:
-            m = _num(row.get(f"mse_{p}"))
-            if m == "bad":
+            m = _num(row.get(f"mse_{p}"), zero_means="bad")
+            ps = _num(row.get(f"psnr_{p}"))
+            if m == "bad" or ps == "bad":
                 bad += 1
+                exact = False
                 continue
-            if m is None:            # psnr=inf ⇒ mse=0
-                m = 0.0
-            mses.append(float(m))
+            if ps is None:
+                # PSNR=inf ⇒ 该帧**确实**零误差
+                mses.append(0.0)
+                continue
+            exact = False
+            if m is None or float(m) == 0.0:
+                # MSE 显示成 0（或缺失）但 PSNR 有限 → 用 PSNR 反推
+                mses.append(_mse_from_psnr(ps))
+                reconstructed += 1
+            else:
+                mses.append(float(m))
         if bad or not mses:
             out["problems"].append(
-                f"plane {p}: {bad} unparsable mse value(s), {len(mses)} usable")
+                f"plane {p}: {bad} unparsable/illegal value(s), "
+                f"{len(mses)} usable")
             out["planes"][p] = {"mse": None, "rmse": None, "psnr": None,
-                                "frames": len(mses)}
+                                "frames": len(mses), "exact_zero": False}
             continue
         mse = sum(mses) / len(mses)          # 每帧像素数相同 → 样本均值
         rmse = mse ** 0.5
         psnr = ("inf" if mse == 0
-                else round(10.0 * __import__("math").log10((255.0 ** 2) / mse), 4))
-        out["planes"][p] = {"mse": round(mse, 6), "rmse": round(rmse, 4),
-                            "psnr": psnr, "frames": len(mses)}
+                else round(10.0 * math.log10((255.0 ** 2) / mse), 4))
+        out["planes"][p] = {
+            "mse": round(mse, 9), "rmse": round(rmse, 4),
+            "psnr": psnr, "frames": len(mses),
+            # 只有全部帧 PSNR=inf 才是"精确相等"
+            "exact_zero": bool(exact),
+            # 有多少帧的 MSE 是靠 PSNR 反推回来的（显示精度不够）
+            "mse_from_psnr_frames": reconstructed,
+        }
     return out
 
 
@@ -250,15 +302,26 @@ def evaluate(results, expected_frames=None, expected_combos=None):
         reasons.append(f"only {len(rt)} of {expected_combos} combos ran")
         return "INVALID", reasons
 
-    # 444 无操作往返必须**逐像素相同**（同表示、同参数）
+    # ---- 444 往返：按**误差预算**判，不是"必须精确相等" ----
+    # R22-A08：审核指出旧判据把所有 RGB→YUV444→RGB 往返都当成"同表示无操作"。
+    # 它们实际经过矩阵、范围、量化和舍入 —— 精确相等是**可选的更好结果**，
+    # 不是唯一正确答案。这里给一个明确预算（8-bit 码值 RMSE ≤ 1.0），
+    # 超出才说明转换链路不对。
+    _RT_BUDGET_RMSE = 1.0
     for row in rt:
         if row.get("chroma") != "444":
             continue
         for p in ("r", "g", "b"):
-            if row["planes"][p]["mse"] != 0:
+            _pl = row["planes"][p]
+            if _pl.get("mse") is None:
                 reasons.append(
-                    f"{row['combo']}: 444 roundtrip has non-zero {p} MSE "
-                    f"({row['planes'][p]['mse']}) — the probe itself is wrong")
+                    f"{row['combo']}: 444 roundtrip has no usable {p} MSE "
+                    f"(unparsable/illegal values)")
+                continue
+            if float(_pl.get("rmse") or 0.0) > _RT_BUDGET_RMSE:
+                reasons.append(
+                    f"{row['combo']}: 444 roundtrip exceeds the error budget "
+                    f"on {p} (RMSE {_pl.get('rmse')} > {_RT_BUDGET_RMSE})")
     if reasons:
         return "INVALID", reasons
 

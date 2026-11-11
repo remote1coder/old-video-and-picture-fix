@@ -69,14 +69,21 @@ def sh(cmd, **kw):
 
 
 def probe_timing(path):
-    """用**视频流**的 packet 时间戳观测时间轴（R21-C08）。
+    """用**视频流**的 packet 时间戳观测时间轴（R22-A07 重写）。
 
-    为什么必须单独看：`nb_read_frames` 相同、尺寸相同，仍可能
-    "像素逐帧一致但时间轴错位"或"末帧被重复填充凑够帧数"。
-    这两类只有比对 PTS 与**末帧覆盖**（末帧 PTS + 它自己的时长）才能发现。
+    R21 只留了"帧数 / 首 PTS / 末 PTS / 末端覆盖 / 中位间隔"五个摘要，
+    审核给出了一组摘要相同、逐帧显然不同的反例：
+
+        0, 0.04, 0.08, 0.12, 0.16
+        0, 0.04, 0.10, 0.12, 0.16      ← 中段错位，摘要却一样
+
+    所以现在**保留逐帧 PTS**（`pts`），由 `evaluate()` 逐点比较。
+    另外：不再 `sort()` —— 排序会把"原始顺序乱掉"这个事实抹掉，
+    而乱序本身就是缺陷。
 
     Returns:
-        ``{frames, first_pts, last_pts, last_end, median_interval}``；
+        ``{frames, pts, durations, first_pts, last_pts, last_end,
+        last_frame_duration, median_interval}``；
         失败时 ``{"error": str}``。
     """
     r = sh(["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -84,8 +91,9 @@ def probe_timing(path):
             "-of", "csv=p=0", path])
     if r.returncode != 0:
         return {"error": f"ffprobe rc={r.returncode}"}
-    starts = []
-    end = None
+
+    pts_list = []
+    dur_list = []
     for line in (r.stdout or "").splitlines():
         line = line.strip()
         if not line:
@@ -101,20 +109,46 @@ def probe_timing(path):
                 dur = float(parts[1])
             except (TypeError, ValueError):
                 dur = 0.0
-        starts.append(pts)
-        e = pts + (dur if dur > 0 else 0.0)
-        if end is None or e > end:
-            end = e
-    if not starts:
+        pts_list.append(pts)
+        dur_list.append(dur)
+
+    if not pts_list:
         return {"error": "no packet timestamps"}
-    starts.sort()
-    if end is None or end <= starts[0]:
-        return {"error": "packet durations missing (cannot compute coverage)"}
-    d = [b - a for a, b in zip(starts, starts[1:]) if b > a]
+
+    # ---- 文件顺序 vs 显示顺序 ----
+    # ffprobe 的 `packet=pts_time` 按**文件/解码顺序**输出；有 B 帧时
+    # PTS 本来就不单调（实测 1080p 合成片：0.133467 -> 0.066733）。
+    # 所以这里**排序得到显示顺序**，同时把原始顺序留作证据。
+    # 真正的缺陷是"排序后仍有重复 PTS"，那说明两帧抢同一个时刻。
+    raw_order = [round(x, 6) for x in pts_list]
+    pairs = sorted(zip(pts_list, dur_list), key=lambda t: t[0])
+    disp_pts = [p for p, _d in pairs]
+    disp_dur = [d for _p, d in pairs]
+    for i in range(1, len(disp_pts)):
+        if abs(disp_pts[i] - disp_pts[i - 1]) < 1e-9:
+            return {"error": (f"duplicate presentation timestamp at index {i} "
+                              f"({disp_pts[i]!r})")}
+
+    last_pts, last_dur = disp_pts[-1], disp_dur[-1]
+    # 是否与文件顺序一致（不一致 = 有 B 帧，属于正常，但要留证据）
+    reordered = (raw_order != [round(x, 6) for x in disp_pts])
+    d = [b - a for a, b in zip(disp_pts, disp_pts[1:]) if b > a]
     med = sorted(d)[len(d) // 2] if d else 0.0
-    return {"frames": len(starts), "first_pts": round(starts[0], 6),
-            "last_pts": round(starts[-1], 6), "last_end": round(end, 6),
-            "median_interval": round(med, 6)}
+    return {
+        "frames": len(disp_pts),
+        # 逐帧证据（evaluate 逐点比；result.json 里也留着）
+        "pts": disp_pts,
+        "durations": disp_dur,
+        # 原始（文件/解码）顺序 —— 与上面不同说明有 B 帧
+        "pts_file_order": raw_order,
+        "reordered_by_pts": bool(reordered),
+        "first_pts": round(disp_pts[0], 6),
+        "last_pts": round(last_pts, 6),
+        # 末帧覆盖 = 末帧 pts + **它自己的** duration；缺则等于 last_pts
+        "last_end": round(last_pts + (last_dur if last_dur > 0 else 0.0), 6),
+        "last_frame_duration": round(last_dur, 6),
+        "median_interval": round(med, 6),
+    }
 
 
 def probe(path):
@@ -175,7 +209,9 @@ def probe(path):
                           f"{info['nb_read_frames']}")}
     info.update({k: tl[k] for k in
                  ("frames", "first_pts", "last_pts", "last_end",
-                  "median_interval")})
+                  "median_interval", "last_frame_duration",
+                  # R22-A07：逐帧证据也要带出来（evaluate 逐点比）
+                  "pts", "durations")})
     return info
 
 
@@ -504,6 +540,34 @@ def evaluate(classic, fused, info_c, info_f, cmp_result, frames):
                 reasons.append(
                     f"{key} differs: classic={a} fused={b} "
                     f"(tolerance {_tol}s)")
+
+        # ---- 逐帧 PTS（R22-A07）----
+        # 只比首尾/中位会被"中段错位"骗过：
+        #   0,.04,.08,.12,.16  vs  0,.04,.10,.12,.16  → 摘要完全相同
+        # 所以这里逐点比；缺数组（旧样本）时明确报"未证明"，不放行。
+        _pc, _pf = info_c.get("pts"), info_f.get("pts")
+        if not isinstance(_pc, list) or not isinstance(_pf, list):
+            reasons.append(
+                "per-frame PTS arrays are missing; timing equality is "
+                "unproven (a summary is not evidence)")
+        elif len(_pc) != len(_pf):
+            reasons.append(
+                f"per-frame PTS length differs: {len(_pc)} vs {len(_pf)}")
+        else:
+            for _i, (_x, _y) in enumerate(zip(_pc, _pf)):
+                if abs(float(_x) - float(_y)) > _tol:
+                    reasons.append(
+                        f"per-frame PTS differs at frame {_i}: "
+                        f"classic={_x} fused={_y} (tolerance {_tol}s)")
+                    break
+            # 末帧时长也要逐点对上（末帧被重复填充会体现在这里）
+            _dc, _df = info_c.get("durations"), info_f.get("durations")
+            if isinstance(_dc, list) and isinstance(_df, list) \
+                    and len(_dc) == len(_df) and len(_dc) > 0:
+                if abs(float(_dc[-1]) - float(_df[-1])) > _tol:
+                    reasons.append(
+                        f"the last frame duration differs: "
+                        f"classic={_dc[-1]} fused={_df[-1]}")
 
     # ---- 5) 比较本身必须成功且覆盖全部帧 ----
     if cmp_result.get("returncode") != 0:

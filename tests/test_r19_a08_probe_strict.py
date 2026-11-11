@@ -66,7 +66,10 @@ def _ok_sides():
     info_c = {"width": 3840, "height": 2160, "pix_fmt": "yuv420p16le",
               "nb_read_frames": "20", "frames": 20,
               "first_pts": 0.0, "last_pts": 0.633367,
-              "last_end": 0.6667, "median_interval": 0.033367}
+              "last_end": 0.6667, "median_interval": 0.033367,
+              # R22-A07：判据逐帧比 PTS，合法样本必须给出逐帧证据
+              "pts": [round(i * 0.033367, 6) for i in range(20)],
+              "durations": [0.033367] * 20}
     info_f = dict(info_c)
     rows = [{"n": str(i), "psnr_y": "inf", "psnr_u": "inf", "psnr_v": "inf"}
             for i in range(1, 21)]
