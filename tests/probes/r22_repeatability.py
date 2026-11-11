@@ -47,6 +47,35 @@ MAIN = s3probe.MAIN
 S5_ROOT = r"E:\codex\_media_r22_20261111T2330\s5_repeat"
 
 
+
+def _force_deterministic(cfg_path, on):
+    """把 `vs.deterministic` 写进探针配置。
+
+    为什么要两组：**默认（多线程）下 stage1 的 mvtools 运动估计是竞态的**
+    （第十八轮实测：同 vpy 连跑两次 60 帧里 30 帧不同，本底 PSNR
+    Y≈48.7/U≈51.5/V≈39.6）。所以"字节不同"在多线程下是**已知性质**，
+    不是本轮缺陷；只有 `vs.deterministic: true`（core.num_threads=1）
+    才应当字节完全相同。
+    """
+    if not on:
+        return
+    import yaml
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        doc = yaml.safe_load(f) or {}
+    doc.setdefault("vs", {})["deterministic"] = True
+    # 光有单线程还不够：**stage6 的颗粒是随机数**（`haf.GrainFactory3`
+    # 默认 seed=-1）。实测：单线程下 step1–step4 逐像素相同，step6 的
+    # Y 平面仍不同（psnr_y 51.9，U/V 相同），成品跟着不同（53 dB）。
+    # 所以"可重复"这一组必须把 grain_seed 也固定住。
+    doc.setdefault("global", {})["grain_seed"] = 20261112
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False)
+
+
+
+def _det_suffix(on):
+    return "_deterministic" if on else "_default"
+
 def _sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -111,7 +140,8 @@ def _psnr_rows(a, b):
     return [ln for ln in (r.stdout or "").splitlines() if ln.startswith("n:")]
 
 
-def _one_run(root, idx, chroma_mode, encoder, pix_fmt, frames, size):
+def _one_run(root, idx, chroma_mode, encoder, pix_fmt, frames, size,
+             deterministic=False):
     work = os.path.join(root, f"run_{idx:02d}")
     for sub in ("input", "output", "temp", "logs"):
         os.makedirs(os.path.join(work, sub), exist_ok=True)
@@ -121,6 +151,7 @@ def _one_run(root, idx, chroma_mode, encoder, pix_fmt, frames, size):
     s3probe.FRAMES = frames
     s3probe._make_source(src)
     cfg = s3probe._config_for(work, chroma_mode, encoder, pix_fmt)
+    _force_deterministic(cfg, deterministic)
     manifest = os.path.join(work, "manifest.yaml")
 
     ev = {"run": idx, "work": work}
@@ -137,10 +168,13 @@ def _one_run(root, idx, chroma_mode, encoder, pix_fmt, frames, size):
     sampler = _VramSampler()
     sampler.start()
     t0 = time.monotonic()
+    # **必须保留中间产物**：两遍不一样时要知道"从哪个边界开始不一样"。
+    # 不留中间件的跑法只能看到成品不同，定位不了原因（本轮踩过）。
     run = s3probe._run([PY, "-B", MAIN, "--config", cfg, "--input",
                         os.path.join(work, "input"), "--output",
                         os.path.join(work, "output"), "--no-wsl-redirect",
-                        "--manifest", manifest, "--workers", "1"],
+                        "--manifest", manifest, "--keep-intermediates",
+                        "--workers", "1"],
                        cwd=work, timeout=3600)
     wall = time.monotonic() - t0
     sampler.stop()
@@ -162,7 +196,8 @@ def _one_run(root, idx, chroma_mode, encoder, pix_fmt, frames, size):
     return ev
 
 
-def _fault_rerun(root, chroma_mode, encoder, pix_fmt, frames, size):
+def _fault_rerun(root, chroma_mode, encoder, pix_fmt, frames, size,
+                 deterministic=False):
     """故障重跑：跑到一半强杀，再原样重跑 —— 要求最终仍然成功且可证完成。
 
     强杀的是**整棵进程树**：main 是父进程，stage 是子进程，只杀父会留下
@@ -176,6 +211,7 @@ def _fault_rerun(root, chroma_mode, encoder, pix_fmt, frames, size):
     s3probe.FRAMES = frames
     s3probe._make_source(src)
     cfg = s3probe._config_for(work, chroma_mode, encoder, pix_fmt)
+    _force_deterministic(cfg, deterministic)
     manifest = os.path.join(work, "manifest.yaml")
     scan = s3probe._run([PY, "-B", MAIN, "--config", cfg, "--input",
                          os.path.join(work, "input"), "--output",
@@ -247,13 +283,19 @@ def main():
     ap.add_argument("--size", default="320x240")
     ap.add_argument("--root", default=S5_ROOT)
     ap.add_argument("--skip-fault", action="store_true")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="置 vs.deterministic=true（core.num_threads=1）；"
+                         "只有这一组才要求字节完全相同")
     args = ap.parse_args()
     if not os.path.exists(PY):
         raise SystemExit(f"缺少视频链解释器: {PY}")
 
     size = tuple(int(x) for x in args.size.lower().split("x"))
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    root = os.path.join(args.root, f"{args.mode}_{stamp}")
+    root = os.path.join(args.root,
+                        f"{args.mode}"
+                        f"{_det_suffix(args.deterministic)}_"
+                        f"{stamp}")
     os.makedirs(root, exist_ok=True)
     enc, fmt = ("libx265", "yuv444p10le") if args.mode == "444" \
         else ("libsvtav1", "yuv420p10le")
@@ -264,7 +306,8 @@ def main():
     runs = []
     for i in range(args.runs):
         print(f"[s5] --- run {i} ---")
-        ev = _one_run(root, i, args.mode, enc, fmt, args.frames, size)
+        ev = _one_run(root, i, args.mode, enc, fmt, args.frames, size,
+                      deterministic=args.deterministic)
         runs.append(ev)
         print(f"      rc={ev.get('rc')} wall={ev.get('wall_s')}s "
               f"vram={ev.get('peak_vram_mb')}MB "
@@ -274,13 +317,32 @@ def main():
     fault = None
     if not args.skip_fault:
         print("[s5] --- fault rerun ---")
-        fault = _fault_rerun(root, args.mode, enc, fmt, args.frames, size)
+        fault = _fault_rerun(root, args.mode, enc, fmt, args.frames, size,
+                             deterministic=args.deterministic)
         print(f"      killed_rc={fault.get('killed_rc')} "
               f"killed_at={(fault.get('killed_at') or [])[:2]} "
               f"rerun_rc={fault.get('rerun_rc')} "
               f"sidecars={len(fault.get('sidecars') or [])}")
 
     # ---- 判定 ----
+    psnrs = []
+    if len(runs) > 1 and runs[0].get("final"):
+        pa = os.path.join(runs[0]["work"], "output", runs[0]["final"][0]["file"])
+        for k in range(1, len(runs)):
+            if not runs[k].get("final"):
+                continue
+            pb = os.path.join(runs[k]["work"], "output",
+                              runs[k]["final"][0]["file"])
+            if not (os.path.exists(pa) and os.path.exists(pb)):
+                continue
+            rows = _psnr_rows(pa, pb)
+            identical = bool(rows) and all(
+                "psnr_y:inf" in ln and "psnr_u:inf" in ln
+                and "psnr_v:inf" in ln for ln in rows)
+            psnrs.append({"run": f"0-vs-{k}", "frames": len(rows),
+                          "identical": identical,
+                          "first_row": rows[0] if rows else None})
+            print(f"[s5] run0 vs run{k}: {len(rows)} 帧, 逐像素相同={identical}")
     ok = True
     shas = [tuple(f["sha256"] for f in ev.get("final") or [])
             for ev in runs]
@@ -289,24 +351,37 @@ def main():
             print(f"[FAIL] run {ev['run']} rc={ev.get('rc')}")
             ok = False
     base = shas[0] if shas else ()
-    for i, s in enumerate(shas[1:], start=1):
-        if s != base:
-            print(f"[FAIL] run {i} 成品字节与 run 0 不同: {s} vs {base}")
+    byte_identical = bool(shas) and all(x == base for x in shas)
+    # ---- 字节相同是不是"必须"取决于这一组开没开确定性 ----
+    # 默认（多线程）下 stage1 的 mvtools 运动估计有竞态，**字节不同是已知
+    # 性质**（第十八轮实测：60 帧里 30 帧不同，本底 PSNR Y≈48.7/U≈51.5/V≈39.6）。
+    # 把它当失败会得出"项目一直坏着"的错误结论；反过来，在
+    # `vs.deterministic: true` 下若字节不同，那才是真缺陷。
+    # 字节相同不等于像素相同（mkv 的 SegmentUID/Date 每次都不同），
+    # 所以"可重复"的判据是**逐像素**。实测：同一输入用 libx265 编两遍，
+    # 8/8 帧 PSNR inf，但 md5 不同 —— 差异全部来自容器元数据。
+    pixel_identical = None
+    if psnrs:
+        pixel_identical = all(bool(p.get("identical")) for p in psnrs)
+    if args.deterministic:
+        if pixel_identical is False:
+            print("[FAIL] deterministic 组逐帧不相同 —— 上游仍有未固定的随机源")
+            for p in psnrs:
+                print(f"   {p['run']}: frames={p['frames']} "
+                      f"identical={p['identical']} first={p.get('first_row')}")
             ok = False
+        elif pixel_identical:
+            print("[s5] deterministic 组：逐帧 PSNR 全 inf（像素完全一致）；"
+                  f"文件字节不同={not byte_identical}（容器 UID/时间戳）")
+        else:
+            print("[s5] deterministic 组：没有可比较的成品对")
+    else:
+        if byte_identical:
+            print("[s5] 默认组：成品字节完全一致（多线程下也一致）")
+        else:
+            print("[s5] 默认组：成品字节不同 —— 与多线程 stage1 的已知竞态一致；"
+                  "要看数值量级请读 report 里的 psnr")
     # 逐帧 PSNR（字节不同时要知道差在哪）
-    psnrs = []
-    if len(runs) > 1 and runs[0].get("final") and runs[1].get("final"):
-        pa = os.path.join(runs[0]["work"], "output", runs[0]["final"][0]["file"])
-        pb = os.path.join(runs[1]["work"], "output", runs[1]["final"][0]["file"])
-        if os.path.exists(pa) and os.path.exists(pb):
-            rows = _psnr_rows(pa, pb)
-            identical = bool(rows) and all(
-                "psnr_y:inf" in ln and "psnr_u:inf" in ln
-                and "psnr_v:inf" in ln for ln in rows)
-            psnrs.append({"run": "0-vs-1", "frames": len(rows),
-                          "identical": identical,
-                          "first_row": rows[0] if rows else None})
-            print(f"[s5] run0 vs run1: {len(rows)} 帧, 逐像素相同={identical}")
     if fault is not None:
         if fault.get("rerun_rc") != 0:
             print(f"[FAIL] 故障重跑未成功: rc={fault.get('rerun_rc')}")
@@ -316,6 +391,8 @@ def main():
             ok = False
 
     report = {"root": root, "mode": args.mode, "encoder": enc,
+              "deterministic": bool(args.deterministic),
+              "byte_identical": bool(byte_identical),
               "pix_fmt": fmt, "runs_requested": args.runs,
               "sample": {"w": size[0], "h": size[1], "frames": args.frames},
               "runs": runs, "psnr": psnrs, "fault": fault, "ok": ok,

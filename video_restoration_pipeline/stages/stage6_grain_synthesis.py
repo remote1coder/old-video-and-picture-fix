@@ -70,7 +70,8 @@ def _build_vs_script(input_source: str, vs_format: str,
                      use_addgrainc: bool = False,
                      addgrainc_after_gf3: bool = False,
                      temp_avg: float = 0.0,
-                     deterministic: bool = False) -> str:
+                     deterministic: bool = False,
+                     seed: Optional[int] = None) -> str:
     """Build VapourSynth grain synthesis script.
 
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
@@ -80,6 +81,13 @@ def _build_vs_script(input_source: str, vs_format: str,
       (GrainFactory3 completely unavailable)
     - addgrainc_after_gf3=True: supplement mode, stacks AFTER GrainFactory3
       to enhance temporal continuity. Intensity ≤20% of g1str. Disabled by default.
+
+    R22（N22 实测）：`seed=None` 时传 `-1`，即 `haf.GrainFactory3` 的默认
+    **每次运行随机**。实测同一输入连跑两遍：step1–step4 逐像素相同
+    （PSNR inf），**step6 的 Y 平面不同**（psnr_y 51.9，U/V 相同），
+    成品跟着不同（53 dB）。`grain_seed` 这个参数名此前只出现在
+    `stage_deps` 的依赖表里、**从未被读取**（"声明的参数没人用"病族），
+    于是"可重复"这件事在 stage6 之后就断了。现在给它一条真实通路。
     """
     if use_addgrainc and not addgrainc_after_gf3:
         # Standalone AddGrainC fallback (GrainFactory3 completely unavailable)
@@ -93,7 +101,7 @@ def _build_vs_script(input_source: str, vs_format: str,
             f"clip = core.ffms2.Source(source={repr(input_source)})\n"
             f"clip = core.resize.Bicubic(clip, format={vs_format})\n"
             f"clip = core.grain.Add(clip, var={var}, uvar={uvar}, "
-            f"vvar={vvar}, constant=False)\n"
+            f"vvar={vvar}, constant=False{_seed_arg(seed, False)})\n"
             f"clip.set_output()\n"
         )
 
@@ -106,7 +114,8 @@ def _build_vs_script(input_source: str, vs_format: str,
         f"clip = core.ffms2.Source(source={repr(input_source)})\n"
         f"clip = core.resize.Bicubic(clip, format={vs_format})\n"
         f"clip = haf.GrainFactory3(clip, g1str={g1str}, "
-        f"g2str={g2str}, g3str={g3str}, temp_avg={temp_avg})\n"
+        f"g2str={g2str}, g3str={g3str}, temp_avg={temp_avg}"
+        f"{_seed_arg(seed, True)})\n"
     )
     if addgrainc_after_gf3:
         # FIX-P9-4: Stack AddGrainC after GrainFactory3 for temporal continuity
@@ -116,10 +125,25 @@ def _build_vs_script(input_source: str, vs_format: str,
         vvar = max(0.0, g3str * addgrainc_ratio)
         script += (
             f"clip = core.grain.Add(clip, var={var}, uvar={uvar}, "
-            f"vvar={vvar}, constant=False)\n"
+            f"vvar={vvar}, constant=False{_seed_arg(seed, False)})\n"
         )
     script += "clip.set_output()\n"
     return script
+
+
+def _seed_arg(seed, _for_gf3):
+    """把颗粒随机种子拼成 vapoursynth 脚本片段。
+
+    `seed is None` → 空串（用滤镜默认 `-1`，即每次随机，与历史行为一致）。
+    给了整数就写成 `, seed=N` —— `haf.GrainFactory3` 与 `core.grain.Add`
+    都接受这个关键字。
+    """
+    if seed is None:
+        return ""
+    try:
+        return ", seed=" + str(int(seed))
+    except (TypeError, ValueError):
+        return ""
 
 
 class _TailLog:
@@ -1038,7 +1062,9 @@ def main() -> int:
         addgrainc_ratio, use_addgrainc=False,
         addgrainc_after_gf3=addgrainc_enabled,
         temp_avg=temp_avg,
-        deterministic=_vs_deterministic(params))
+        deterministic=_vs_deterministic(params),
+        # R22：`grain_seed` 给了才固定随机种子（不给 = 历史行为，每次随机）
+        seed=params.get("grain_seed"))
     # FIX-P9-11: removed redundant write here — _run_grain_pipeline writes vs_path internally
 
     # Fix: Use vspipe directly (standard VapourSynth CLI tool)
@@ -1075,7 +1101,8 @@ def main() -> int:
             g1str * 0.5, g2str * 0.5, g3str * 0.5,
             addgrainc_ratio, use_addgrainc=True,
             temp_avg=temp_avg,
-            deterministic=_vs_deterministic(params))
+            deterministic=_vs_deterministic(params),
+            seed=params.get("grain_seed"))
         return _run_grain_pipeline(
             addgrain_script, vs_path, vspipe_cmd, ffmpeg_cmd,
             output_path, logger, fallback_label="AddGrainC",
