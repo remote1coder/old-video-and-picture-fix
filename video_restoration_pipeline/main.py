@@ -1395,6 +1395,21 @@ def verify_published_marker(final_path: str, job: Dict[str, Any],
         except Exception as exc:            # pragma: no cover
             return False, f"cannot compute the current params identity: {exc}"
         if rec_params != cur:
+            # 身份对不上时把**语义视图的差异**打出来 —— 只报"参数变了"
+            # 无法定位是哪一项（本轮 N20 就是靠这条定位到 chain_mode 的）。
+            _rec_view = data.get("params_semantics") or {}
+            _cur_view = (_identity_semantics(params)
+                         if isinstance(params, dict) else {})
+            if _rec_view and _cur_view:
+                _diff = [(k, _rec_view.get(k), _cur_view.get(k))
+                         for k in sorted(set(_rec_view) | set(_cur_view))
+                         if _rec_view.get(k) != _cur_view.get(k)]
+                if logger:
+                    logger.error(
+                        "COMPLETION_MARKER_PARAMS_DIFF",
+                        "The marker records a different effective-parameter "
+                        "set; showing the first differences",
+                        differences=_diff[:6])
             return False, "effective parameters changed since this generation"
 
     ok, why = verify_payload_manifest(data, logger)
@@ -1842,33 +1857,6 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     except Exception:                      # pragma: no cover
         params["_stage7_result_path"] = ""
 
-    # ---- R21-C02：把 marker 的**身份字段**冻结后交给 stage7 ----
-    # 审核 §4.1 第 2–3 步：stage7 负责"媒体 + 必需报告"的不可变清单，
-    # marker 候选必须由**该清单**生成并随同一事务发布。
-    # 但 `impl` / `input_identity` / `params_identity` 只有 main 算得出来
-    # （stage7 拿不到 job/config），所以这里先算好作为**种子**下传，
-    # stage7 只补 output_* 与 payload_manifest，不再自己发明身份。
-    try:
-        params["_marker_seed"] = {
-            "impl": VIDEO_IMPL_VERSION,
-            "job_id": job.get("job_id", ""),
-            "input_path": job.get("input_path", ""),
-            "input_identity": build_input_identity(job.get("input_path", "")),
-            "params_identity": build_params_identity(config, job, _pre_log),
-        }
-        # 同一个值不能两端各算一次（R20 的 input_digest 教训）：
-        # 身份在这里算一次并随 params 下传，同进程内的验证直接比它。
-        # 跨进程（resume）没有这份冻结值，才退回重算 —— 而重算用的键
-        # 已经被 `_IDENTITY_POSITIONAL_KEYS` 排除掉运行期注入。
-        params["_frozen_params_identity"] = build_params_identity(
-            config, job, _pre_log, params=params)
-    except Exception as _mse:              # pragma: no cover - 身份算不出
-        params["_marker_seed"] = {}
-        _pre_log.warning("MARKER_SEED_FAIL",
-                         "Cannot pre-compute the marker identity; stage7 will "
-                         "not publish a marker for this generation",
-                         error=str(_mse))
-
     # ---- R14-06：有效路径预检，必须先于**首次落盘** ----
     # 原来 `--output` 只换 output_dir，而最终媒体仍取 job.output_path，
     # 于是"换了输出目录"其实没换 —— 2026-10-28 那次误覆盖就是这样发生的。
@@ -2104,6 +2092,38 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             "Cannot freeze the quality-param digest; refusing to run a "
             "generation whose identity cannot be established", error=str(_fz))
         return 82, f"cannot freeze the param digest: {_fz}"
+
+    # ---- R21-C02 / R21-C06：marker 的身份字段在**这里**冻结 ----
+    # 审核 §4.1 第 2–3 步：stage7 负责"媒体 + 必需报告"的不可变清单，
+    # marker 候选由该清单生成并随同一事务发布。`impl` / `input_identity` /
+    # `params_identity` 只有 main 算得出来（stage7 拿不到 job/config），
+    # 所以先算好作为**种子**下传。
+    #
+    # 位置很关键：必须在 `resolve_run_plan` 与 `chain_mode` **落定之后**。
+    # 实测（N20）：原来它在两者之前，marker 里的语义视图没有 `chain_mode`，
+    # 验证时却有 → 摘要对不上 → 整批 job 报
+    # `COMPLETION_MARKER_PARAMS_DIFF: chain_mode null -> "none"` 并以 82 结束。
+    try:
+        _frozen_identity = build_params_identity(
+            config, job, job_logger, params=params)
+        params["_frozen_params_identity"] = _frozen_identity
+        params["_marker_seed"] = {
+            "impl": VIDEO_IMPL_VERSION,
+            "job_id": job.get("job_id", ""),
+            "input_path": job.get("input_path", ""),
+            "input_identity": build_input_identity(job.get("input_path", "")),
+            # 同一个值不能两端各算一次（R20 的 input_digest 教训）
+            "params_identity": _frozen_identity,
+            # 语义视图一起存进 marker：身份不匹配时能直接 diff
+            "params_semantics": _identity_semantics(params),
+        }
+    except Exception as _mse:              # pragma: no cover - 身份算不出
+        params["_marker_seed"] = {}
+        params["_frozen_params_identity"] = ""
+        _pre_log.warning("MARKER_SEED_FAIL",
+                         "Cannot freeze the marker identity; stage7 will "
+                         "not publish a marker for this generation",
+                         error=str(_mse))
 
 
     # Determine stage order
