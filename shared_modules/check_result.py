@@ -65,17 +65,21 @@ class CheckResult:
         hard_error: 是否为"硬错误"——输入不可消费、候选无法解码、
             身份摘要无法核对、事务准备失败。**这类永远不可强制。**
         evidence: 结构化证据（采样点、实测值等），便于事后复核。
+        required: 是否为**必需**检查（R21-C04）。必需检查"没能给出结论"
+            （``UNVERIFIED``）时不得进入正常发布，除非用户显式强制；
+            可选的质量提示仍然只降 ``verified``，不阻断。
     """
 
     __slots__ = ("name", "status", "reason", "method", "subject_digest",
-                 "forced", "force_key", "hard_error", "evidence", "severity")
+                 "forced", "force_key", "hard_error", "evidence", "severity",
+                 "required")
 
     def __init__(self, name: str, status: str, reason: str = "",
                  method: str = "", subject_digest: Optional[str] = None,
                  forced: bool = False, force_key: Optional[str] = None,
                  hard_error: bool = False,
                  evidence: Optional[Dict[str, Any]] = None,
-                 severity: str = "info"):
+                 severity: str = "info", required: bool = False):
         if status not in ALL_STATUSES:
             raise ValueError(f"unknown check status: {status!r}")
         if severity not in ("info", "warning", "error"):
@@ -90,6 +94,7 @@ class CheckResult:
         self.force_key = force_key
         self.hard_error = bool(hard_error)
         self.evidence = evidence or {}
+        self.required = bool(required)
 
     # -- 语义 --------------------------------------------------------------
     @property
@@ -106,8 +111,17 @@ class CheckResult:
 
         硬错误（输入不可消费/候选不可解码/摘要不可核对/事务准备失败）
         永远不可强制——用户不能靠一个开关让不存在的能力成功。
+
+        R21-C04：**必需**项的 ``UNVERIFIED`` 也允许强制 —— 它表示"测不出来"，
+        用户可能明知如此仍要出片（例如探针在某类素材上不可用）。
+        强制后状态仍是 UNVERIFIED，报告里留痕，``verified`` 保持 False。
+        非必需项不需要强制：它们本来就不阻断。
         """
-        return (self.status == FAIL) and not self.hard_error
+        if self.hard_error:
+            return False
+        if self.status == FAIL:
+            return True
+        return self.status == UNVERIFIED and self.required
 
     def effective_status(self) -> str:
         """强制后的**记录用**状态：仍然是 FAIL，只是加了 forced 标记。
@@ -131,6 +145,8 @@ class CheckResult:
             d["hard_error"] = True
         if self.evidence:
             d["evidence"] = self.evidence
+        if self.required:
+            d["required"] = True
         return d
 
     def __repr__(self) -> str:      # pragma: no cover - 调试用
@@ -218,6 +234,23 @@ def publish_decision(results: Iterable[CheckResult],
         decision["forced"] = True
         decision["forced_checks"] = [r.name for r in fails]
         decision["verified"] = False
+    # ---- R21-C04：**必需**检查的 UNVERIFIED 必须阻断 ----
+    # 审核反例：只给 `final_timeline=UNVERIFIED` → publish=true。
+    # "测不出来"于是等于"没问题"。必需性由检查项自己声明：
+    #   * 完整性/时间等必需门：UNVERIFIED 不可发布（可被 force_key 强制，
+    #     强制后 verified=False 且记录在 forced_checks 里）；
+    #   * 可选的主观质量/低置信启发式：仍只降 verified，不阻断。
+    _unver_required = [r for r in unver if getattr(r, "required", False)]
+    if _unver_required:
+        _not_forced = [r for r in _unver_required if not _force_ok(r)]
+        if _not_forced:
+            decision["publish"] = False
+            decision["blocked_by"] = [r.name for r in _not_forced]
+            decision["verified"] = False
+            return decision
+        decision["forced"] = True
+        decision["forced_checks"] = ([r.name for r in _unver_required]
+                                     + decision["forced_checks"])
     if unver:
         decision["verified"] = False
     return decision

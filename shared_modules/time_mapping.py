@@ -381,4 +381,26 @@ def check_against_expected(actual_pts: Sequence[float],
             f"per-frame intervals off by {max_err:.6f}s "
             f"(tolerance {interval_tolerance:.6f}s)")
 
+    # ---- 6) 逐帧**累计残差**（R21-C05）----
+    # 审核的精确反例：expected[i] = 0.04i，
+    # actual[i] = expected[i] + 0.001·min(i, 2000−i)，i = 0…2000。
+    # 每一步只差 1 ms（小于 2 ms 间隔容差）、端点完全一致（跨度误差 0），
+    # 但中段整整偏了 1 秒 —— 旧判据全部通过。
+    #
+    # 为什么必须单独查：**相邻差**只能发现"某一步跳了"，
+    # "每一步都少一点点"只有把残差**累加**才看得见。
+    # 残差用相对原点计算，所以合法的整体平移不会误报。
+    # 容差沿用逐点容差（不随帧数放大）—— 逐帧 PTS 若真是一对一复制，
+    # 舍入误差不会累积。
+    resid = [(x - a[0]) - (y - e[0]) for x, y in zip(a, e)]
+    worst_i = max(range(len(resid)), key=lambda i: abs(resid[i]))
+    metrics.update(max_residual_s=round(resid[worst_i], 6),
+                   max_residual_index=worst_i,
+                   residual_tolerance_s=interval_tolerance)
+    if abs(resid[worst_i]) > interval_tolerance:
+        problems.append(
+            f"per-frame timestamps drift by {resid[worst_i]:.6f}s at frame "
+            f"{worst_i} (tolerance {interval_tolerance:.6f}s); the middle of "
+            f"the timeline does not match even though the endpoints do")
+
     return (not problems), problems, metrics

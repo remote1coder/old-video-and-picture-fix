@@ -22,6 +22,7 @@ import datetime
 import re
 import time
 import shutil
+import math
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -785,40 +786,78 @@ def _get_stream_duration(path: str, stream_type: str = "v") -> float:
     return _probe_packet_span(path, stream_type)
 
 
-def _probe_container_duration(path: str, stream_type: str = "v") -> Tuple[float, str]:
-    """**不扫全片**就能拿到的时长：`stream=duration` → `format=duration`。
+def _probe_container_duration(path: str, stream_type: str = "v",
+                              prefer: str = "any") -> Tuple[float, str]:
+    """**不扫全片**就能拿到的时长。
 
     R20-A06 用它给"最终候选"兜底。不用 `_get_stream_duration()`：它的第 2 级
     是 packet 全扫，而这里已经可能因为全扫失败才走到这一步，不该再扫一遍。
 
+    R21-C05：新增 `prefer`，因为这两个量**语义不同**，不能混用：
+
+    - ``prefer="stream"``：只取**视频流**自己的 duration。这是"视频有效覆盖"，
+      语义正确，但 MKV 上通常为 N/A。
+    - ``prefer="format"``：容器总时长。**可能包含音轨末端/起点**，
+      与"视频覆盖"不是一回事，调用方必须如实标注。
+    - ``prefer="any"``（默认）：旧行为，先 stream 再 format。
+
+    Args:
+        path: 媒体路径。
+        stream_type: ``v`` / ``a``。
+        prefer: 见上。
+
     Returns:
         ``(duration, source)``；取不到时返回 ``(0.0, "")``。
+        source ∈ ``stream-duration`` / ``container-duration``。
     """
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", f"{stream_type}:0",
-             "-show_entries", "stream=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, errors="replace", timeout=30,
-            shell=False)
-        if r.returncode == 0:
-            s = r.stdout.strip()
-            if s and s != "N/A":
-                return float(s), "stream-duration"
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, errors="replace", timeout=30,
-            shell=False)
-        if r.returncode == 0:
-            s = r.stdout.strip()
-            if s and s != "N/A":
-                return float(s), "container-duration"
-    except Exception:
-        pass
+    def _stream_dur():
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-select_streams", f"{stream_type}:0",
+                 "-show_entries", "stream=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, errors="replace", timeout=30,
+                shell=False)
+            if r.returncode == 0:
+                s = r.stdout.strip()
+                if s and s != "N/A":
+                    v = float(s)
+                    if math.isfinite(v) and v > 0:
+                        return v
+        except Exception:
+            pass
+        return 0.0
+
+    def _format_dur():
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, errors="replace", timeout=30,
+                shell=False)
+            if r.returncode == 0:
+                s = r.stdout.strip()
+                if s and s != "N/A":
+                    v = float(s)
+                    if math.isfinite(v) and v > 0:
+                        return v
+        except Exception:
+            pass
+        return 0.0
+
+    if prefer == "stream":
+        d = _stream_dur()
+        return (d, "stream-duration") if d > 0 else (0.0, "")
+    if prefer == "format":
+        d = _format_dur()
+        return (d, "container-duration") if d > 0 else (0.0, "")
+    d = _stream_dur()
+    if d > 0:
+        return d, "stream-duration"
+    d = _format_dur()
+    if d > 0:
+        return d, "container-duration"
     return 0.0, ""
 
 
@@ -958,45 +997,80 @@ def measure_final_candidate(candidate: str, logger=None,
         "problems": [],
     }
 
-    # ---- ① 重定时助手刚测过（同一进程、同一批字节）----
-    # 注意：判定用**局部标志**，不能用 `info["measured"]` —— 那个字段要到
-    # 函数末尾才赋值，中途拿它当条件会让后面每一级都白跑一遍（还会被覆盖）。
+    # ---- 取值顺序（R21-C05 重排）----
+    # 审核的三条要求：
+    #   ① "在最终 mux 后测**视频流**，不无条件使用容器总 duration"；
+    #   ② "三帧 0/0.04/0.08、末帧 0.04 的覆盖是 0.12" —— `out_last`
+    #      只是"首帧→末帧"，**不含末帧自己的时长**，不能当完整覆盖；
+    #   ③ Inf 不得通过。
+    #
+    # 所以顺序改成：视频流时长 → 视频 packet 跨度（含末帧时长）→
+    # 容器时长（可能混入音轨，标注）→ retime 跨度（明确标注不完整）。
     _got = False
+    info["coverage_complete"] = False
+
+    # ① 视频流自身的 duration（mp4/mov 有；MKV 通常 N/A）
+    _d, _src = _probe_container_duration(candidate, prefer="stream")
+    if _d > 0:
+        info.update(duration=float(_d), basis=_src, coverage_complete=True)
+        info["attempts"].append({"source": _src, "duration": float(_d)})
+        _got = True
+
+    # ② 视频 packet 跨度（**含**末帧 duration；时间轴本来就变过时必做）
     _rt = retime_info if isinstance(retime_info, dict) else {}
-    if _rt.get("action") == "retimed":
-        _ol = _rt.get("out_last")
-        if isinstance(_ol, (int, float)) and _ol > 0:
-            info.update(duration=float(_ol),
-                        basis="packet-span (retime; excludes the last frame)",
-                        frames=int(_rt.get("frames") or 0))
-            info["attempts"].append({"source": "retime_out_last",
-                                     "duration": float(_ol)})
-            _got = True
-
-    # ---- ② 容器/流时长（瞬时）----
-    if not _got:
-        _d, _src = _probe_container_duration(candidate)
-        if _d > 0:
-            info.update(duration=float(_d), basis=_src)
-            info["attempts"].append({"source": _src, "duration": float(_d)})
-            _got = True
-
-    # ---- ③ packet 全扫（代价大，只在前两级都失败时做）----
-    if not _got:
+    _needs_accuracy = bool(_rt.get("action") in ("retimed", "skipped"))
+    if not _got or _needs_accuracy:
         _tl = _probe_final_timeline(candidate)
         info["attempts"].append({
             "source": "packet-scan", "ok": bool(_tl.get("ok")),
             "duration": _tl.get("span"), "problem": _tl.get("problem") or ""})
         if _tl.get("ok"):
-            info.update(duration=float(_tl["span"]), basis="packet-span",
-                        frames=int(_tl.get("frames") or 0),
-                        varies=_tl.get("varies"))
+            info.update(duration=float(_tl["span"]),
+                        basis="video-packet-span", frames=int(_tl.get("frames") or 0),
+                        varies=_tl.get("varies"), coverage_complete=True)
             _got = True
             if _tl.get("problem"):
                 info["problems"].append(_tl["problem"])
-        else:
+
+    # ③ 容器总时长（可能包含音轨末端/起点 —— 如实标注）
+    if not _got:
+        _d2, _src2 = _probe_container_duration(candidate, prefer="format")
+        if _d2 > 0:
+            info.update(duration=float(_d2), basis=_src2)
+            info["attempts"].append({"source": _src2, "duration": float(_d2)})
             info["problems"].append(
-                _tl.get("problem") or "packet timestamps unavailable")
+                "container duration may include the audio tail; the video "
+                "stream duration could not be measured")
+            _got = True
+
+    # ④ 重定时助手的 out_last：**不含末帧时长**，明确标注不完整
+    if not _got and _rt.get("action") == "retimed":
+        _ol = _rt.get("out_last")
+        _tail = _rt.get("last_frame_duration")
+        if isinstance(_ol, (int, float)) and math.isfinite(float(_ol)) and _ol > 0:
+            _dur = float(_ol)
+            if isinstance(_tail, (int, float)) and math.isfinite(float(_tail)) \
+                    and _tail > 0:
+                _dur += float(_tail)
+                info["coverage_complete"] = True
+                _basis = "retime-span + last-frame duration"
+            else:
+                _basis = "retime-span (excludes the last frame duration)"
+                info["problems"].append(
+                    "retime span excludes the last frame's duration; the true "
+                    "coverage is larger by one frame")
+            info.update(duration=_dur, basis=_basis,
+                        frames=int(_rt.get("frames") or 0))
+            info["attempts"].append({"source": "retime_out_last",
+                                     "duration": _dur})
+            _got = True
+
+
+    if not _got:
+        # 四级全失败：必须留下"为什么测不到"，不能只给一个 measured=False
+        info["problems"].append(
+            "no usable time information: video stream duration, packet span, "
+            "container duration and the retime span all failed")
 
     if not info["frames"]:
         try:
@@ -3806,7 +3880,11 @@ def main():
                                          else ("warning" if _tvs == "UNVERIFIED"
                                                else "info")),
                             "force_key": ("allow_verify_fail_publish"
-                                          if _tvs == "FAIL" else None),
+                                          if _tvs in ("FAIL", "UNVERIFIED")
+                                          else None),
+                            # 用户**声明了**变换时，这条是必需门：
+                            # "没法证明变换生效"不能当正常发布。
+                            "required": bool(_tv.get("requested")),
                             "evidence": _tv,
                         }
 
@@ -3827,6 +3905,8 @@ def main():
                                       if _ftl_problems else "")),
                         "method": "stage7.measure_final_candidate",
                         "severity": "info",
+                        # 时间是**必需**门：测不到就不能正常发布
+                        "required": True,
                         "evidence": _prechecks.get("final_timeline"),
                     }
                 else:
@@ -3840,6 +3920,7 @@ def main():
                         "severity": "warning",
                         # 与 transform 用同一把钥匙：允许"明知未验证仍要发"
                         "force_key": "allow_verify_fail_publish",
+                        "required": True,
                         "evidence": _prechecks.get("final_timeline"),
                     }
 
@@ -3856,7 +3937,10 @@ def main():
                         force_key=_d.get("force_key"),
                         hard_error=bool(_d.get("hard_error")),
                         evidence=_d.get("evidence") or None,
-                        severity=_d.get("severity") or "info"))
+                        severity=_d.get("severity") or "info",
+                        # R21-C04：必需性由检查项自己声明，
+                        # 决策门据此决定 UNVERIFIED 是否阻断。
+                        required=bool(_d.get("required"))))
                 # 按检查项自己的授权匹配：sync 的钥匙不替代 verify 的钥匙
                 _enabled: set = set()
                 for _fk in ("allow_verify_fail_publish",

@@ -103,20 +103,25 @@ def _packets(intervals, start=0.0, dur=0.033):
 
 # ------------------------------------------------ ① 取值顺序与代价
 
-def test_remeasure_prefers_the_retime_helper_measurement(monkeypatch):
-    """重定时助手**刚**实测过（且核过帧数与逐帧间隔）→ 直接采用，不再扫。"""
+def test_remeasure_prefers_the_video_stream_duration(monkeypatch):
+    """有视频流时长时用它 —— 它**含末帧时长**、且不受音轨影响。
+
+    R21-C05 改了优先级：`retime_info["out_last"]` 是"首帧→末帧"，
+    不含末帧自己的时长，不能当完整覆盖；所以它退到最后兜底，
+    只在没有其它证据时才用，并且要标注不完整。
+    """
     monkeypatch.setattr(
         s7, "subprocess",
-        _FakeSubprocess(stream_dur=99.0, fmt_dur=99.0, packets="1.0,0.03\n"))
+        _FakeSubprocess(stream_dur=15.5, fmt_dur=99.0, packets="1.0,0.03\n"))
     monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    # 没有重定时 → 视频流时长直接可用，不需要全扫
     info = s7.measure_final_candidate(
-        "cand.mkv", None, previous_duration=12.0, previous_basis="packet-span",
-        retime_info={"action": "retimed", "out_last": 15.5, "frames": 466})
+        "cand.mkv", None, previous_duration=12.0, previous_basis="packet-span")
     assert info["measured"] is True
     assert info["duration"] == pytest.approx(15.5)
-    assert info["basis"].startswith("packet-span (retime")
-    assert info["frames"] == 466
-    assert [a["source"] for a in info["attempts"]] == ["retime_out_last"]
+    assert info["basis"] == "stream-duration"
+    assert info["coverage_complete"] is True
+    assert info["attempts"][0]["source"] == "stream-duration"
 
 
 def test_remeasure_uses_stream_duration_without_scanning(monkeypatch):
@@ -151,9 +156,11 @@ def test_remeasure_rescans_only_when_nothing_cheaper_is_available(monkeypatch):
     monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
     info = s7.measure_final_candidate("cand.mkv", None)
     assert info["measured"] is True
-    assert info["basis"] == "packet-span"
+    # R21-C05：basis 改名为 video-packet-span（强调"视频流、含末帧时长"）
+    assert info["basis"] == "video-packet-span"
     assert info["frames"] == 18
     assert info["varies"] is True
+    assert info["coverage_complete"] is True
     assert [a["source"] for a in info["attempts"]] == ["packet-scan"]
 
 
