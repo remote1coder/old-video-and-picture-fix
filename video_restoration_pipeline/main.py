@@ -868,6 +868,15 @@ _IDENTITY_POSITIONAL_KEYS = frozenset({
     "temp_dir", "log_dir", "output_dir", "output_path",
     "input_path", "log_path", "manifest_path", "params_file",
     "_effective_params", "job_id", "run_id", "attempt_id",
+# R21-C06：身份只描述**用户/配置提出的计划**，不描述执行过程中由上游
+# 产物或自动回退推导出来的中间决定。这些键在运行期才注入，若参与身份，
+# "冻结时"与"验证时"会算出两个值 —— 同一代被误判成"参数变了"
+# （N20 实跑就是这样全批失败的）。
+    # ---- 运行期注入 / 事后推导 ----
+    "upstream_artifact",      # 上游精确产物路径（位置）
+    "ivtc",                   # stage1 自动回退的结论
+    "ivtc_auto_fallback",
+    "ai_upscale_banned",
 })
 
 
@@ -1380,7 +1389,9 @@ def verify_published_marker(final_path: str, job: Dict[str, Any],
         return False, "marker has no params identity"
     if config is not None:
         try:
-            cur = build_params_identity(config, job, logger)
+            # 同进程内直接用冻结值；resume（新进程）才重算
+            cur = (str((params or {}).get("_frozen_params_identity") or "")
+                   or build_params_identity(config, job, logger))
         except Exception as exc:            # pragma: no cover
             return False, f"cannot compute the current params identity: {exc}"
         if rec_params != cur:
@@ -1845,6 +1856,12 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             "input_identity": build_input_identity(job.get("input_path", "")),
             "params_identity": build_params_identity(config, job, _pre_log),
         }
+        # 同一个值不能两端各算一次（R20 的 input_digest 教训）：
+        # 身份在这里算一次并随 params 下传，同进程内的验证直接比它。
+        # 跨进程（resume）没有这份冻结值，才退回重算 —— 而重算用的键
+        # 已经被 `_IDENTITY_POSITIONAL_KEYS` 排除掉运行期注入。
+        params["_frozen_params_identity"] = build_params_identity(
+            config, job, _pre_log, params=params)
     except Exception as _mse:              # pragma: no cover - 身份算不出
         params["_marker_seed"] = {}
         _pre_log.warning("MARKER_SEED_FAIL",

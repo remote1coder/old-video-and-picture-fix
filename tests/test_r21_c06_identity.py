@@ -224,3 +224,30 @@ def test_every_exit_writes_the_timeline_plan():
     src = open(_STAGE3, encoding="utf-8", errors="replace").read()
     calls = src.count("write_job_timeline_plan(") - 1   # 减去定义本身
     assert calls >= 4, f"只有 {calls} 个出口写了 TimelinePlan"
+
+
+# ------------------------------------------------ 身份不能含运行期注入
+
+def test_runtime_injected_keys_do_not_change_the_identity():
+    """`upstream_artifact` / `ivtc` 等是**运行期**才注入的，不参与身份。
+
+    实测（本轮 N20）：同一代在"冻结时"与"验证时"算出两个不同的
+    `params_identity`，marker 被判 "effective parameters changed"，
+    整个 job 以 82 结束。
+    """
+    import main as M
+    job = {"job_id": "j1", "input_path": "x.mp4"}
+    base = M.merge_params(job, {}, {}, None)
+    id0 = M.build_params_identity({}, dict(job, _effective_params=base), None)
+    for extra in ({"upstream_artifact": "/tmp/a.mkv"},
+                  {"ivtc": True}, {"ivtc_auto_fallback": True},
+                  {"ai_upscale_banned": True}):
+        p = dict(base, **extra)
+        got = M.build_params_identity({}, dict(job, _effective_params=p), None)
+        assert got == id0, f"{list(extra)} 改变了身份"
+
+
+def test_frozen_identity_is_preferred_over_recomputation():
+    src = open(_MAIN, encoding="utf-8", errors="replace").read()
+    assert 'params["_frozen_params_identity"]' in src
+    assert '"_frozen_params_identity"' in src.split("def verify_published_marker")[1]
