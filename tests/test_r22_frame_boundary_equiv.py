@@ -242,6 +242,144 @@ def test_frozen_set_shorter_than_the_input_fails_loudly(tmp_path):
     assert "frozen" in str(why) or "more frames" in str(why), why
 
 
+# ------------------------------------------------ 合同落盘（生产路径）
+
+def _run_classic_meta(tmp_path, src, frame_dir, **kw):
+    st3 = str(tmp_path / "step3_meta.mkv")
+    meta = {}
+    ok, why, n = s3._stream_raw_upscale(
+        input_video=src, output_mkv=st3, width=IN_W, height=IN_H,
+        scale=SCALE, fps_str="10", model="unused", model_dir=str(tmp_path),
+        ai_py=sys.executable, frame_source_dir=frame_dir, inactivity_s=180,
+        meta=meta, **kw)
+    return ok, why, n, meta, st3
+
+
+def test_production_path_writes_a_provable_frame_contract(tmp_path):
+    """合同必须是**生产路径自己写的**，而且帧摘要真的算得出来。
+
+    这条针对"S2 剩余：合同还没接进 stage3 生产落盘"。以前帧摘要只能
+    在测试里用 `digest_ordered_frames()` 自己造 —— 生产不落盘，等于
+    两份合同无从比较。现在 AI 子进程对自己写出的字节算同一个算法。
+    """
+    src = _make_source(tmp_path)
+    fz = str(tmp_path / "frames")
+    _write_raw_frames(fz, 5, pattern="distinct")
+
+    ok, why, n, meta, st3 = _run_classic_meta(tmp_path, src, fz)
+    assert ok, why
+    # 帧数必须以**编码器落盘**为准（曾经固定帧源下恒为 0）
+    assert n == 5, f"返回帧数应为 5，实际 {n}"
+    assert meta["ai_frames"] == 5 and meta["enc_frames"] == 5, meta["frames"]
+
+    sidecar = st3 + ".frame_contract.json"
+    assert os.path.exists(sidecar), "生产路径没有写帧边界合同"
+    c = fc.read_contract(sidecar)
+    assert c is not None
+    assert fc.contract_problems(c) == [], fc.contract_problems(c)
+    assert c["frames"] == 5
+    assert c["pix_fmt"] == "yuv420p16le", c["pix_fmt"]
+    assert c["bit_depth"] == 16
+    assert c["frames_digest_proven"] is True
+    assert c["frames_digest_domain"] == "raw-rgb48le"
+    assert c["source"] == "fixed-frames"
+    assert c["gaps"] == [], c["gaps"]
+    # 摘要必须与"按同样顺序读磁盘帧"算出来的一致 —— 否则两条链不可比
+    expect = fc.digest_ordered_frames(
+        sorted(os.path.join(fz, x) for x in os.listdir(fz)))
+    assert c["frames_digest"] == expect, (c["frames_digest"], expect)
+
+
+def test_both_halves_contracts_prove_the_same_frame_set(tmp_path):
+    """经典物化与融合串流的合同必须**逐字段相同**（帧集+格式）。
+
+    这比"PSNR 全 inf"更强：PSNR 只说明输出相同，合同说明**输入边界**
+    也相同 —— 审核要的正是"两条链消费同一份帧源"。
+    """
+    src = _make_source(tmp_path)
+    fz = str(tmp_path / "frames")
+    _write_raw_frames(fz, 5, pattern="distinct")
+
+    ok, why, _n, _m, st3 = _run_classic_meta(tmp_path, src, fz)
+    assert ok, why
+    fu = str(tmp_path / "fused.mkv")
+    ok, why, _ = s3._stream_raw_upscale(
+        input_video=src, output_mkv=fu, width=IN_W, height=IN_H,
+        scale=SCALE, fps_str="10", model="unused", model_dir=str(tmp_path),
+        ai_py=sys.executable, frame_source_dir=fz, inactivity_s=180,
+        post_filter_chain=s4.build_filter_chain({}),
+        out_pix_fmt="yuv420p16le")
+    assert ok, why
+
+    ca = fc.read_contract(st3 + ".frame_contract.json")
+    cb = fc.read_contract(fu + ".frame_contract.json")
+    assert ca and cb, (ca, cb)
+    assert fc.compare_contracts(ca, cb) == [], fc.compare_contracts(ca, cb)
+
+
+def test_requested_pix_fmt_is_not_silently_overridden(tmp_path):
+    """`out_pix_fmt` 曾经被后面那句固定的 `-pix_fmt yuv420p16le` 覆盖。
+
+    ffmpeg 的输出选项是"后者覆盖前者"，所以传 10-bit 进去、出来还是
+    16-bit，而且**没有任何报错**。合同现在按**探测到的成品**写格式，
+    这条用例同时守住"参数真生效"和"合同不说谎"。
+    """
+    src = _make_source(tmp_path)
+    fz = str(tmp_path / "frames")
+    _write_raw_frames(fz, 5, pattern="distinct")
+    out = str(tmp_path / "ten_bit.mkv")
+    meta = {}
+    ok, why, _ = s3._stream_raw_upscale(
+        input_video=src, output_mkv=out, width=IN_W, height=IN_H,
+        scale=SCALE, fps_str="10", model="unused", model_dir=str(tmp_path),
+        ai_py=sys.executable, frame_source_dir=fz, inactivity_s=180,
+        post_filter_chain=s4.build_filter_chain({}),
+        out_pix_fmt="yuv420p10le", meta=meta)
+    assert ok, why
+    probed = (meta.get("contract") or {}).get("pix_fmt")
+    assert probed == "yuv420p10le", (
+        f"请求 10-bit，实际落盘 {probed}（参数被后面的 -pix_fmt 覆盖了）")
+    assert meta["contract"]["bit_depth"] == 10
+
+
+def test_missing_digest_falls_back_to_unproven_not_to_a_fake(tmp_path,
+                                                             monkeypatch):
+    """拿不到摘要时：`frames_digest_proven=False` + gaps 写清原因。
+
+    绝不允许"摘要没有就编一个顺序号"—— 那是本项目反复踩的坑。
+    """
+    import stream_ai_template as sat
+
+    src = _make_source(tmp_path)
+    fz = str(tmp_path / "frames")
+    _write_raw_frames(fz, 5, pattern="distinct")
+
+    real = sat.build_fixed_frame_script
+
+    def _no_digest(frame_dir, in_w, in_h, out_w, out_h):
+        # 模拟"老版本脚本只报 FRAMES、不报摘要"
+        txt = real(frame_dir, in_w, in_h, out_w, out_h)
+        return "\n".join(ln for ln in txt.splitlines()
+                         if "FRAMES_DIGEST" not in ln
+                         and "_h.update(b'|frames='" not in ln) + "\n"
+
+    monkeypatch.setattr(sat, "build_fixed_frame_script", _no_digest)
+    out = str(tmp_path / "nodigest.mkv")
+    meta = {}
+    ok, why, n = s3._stream_raw_upscale(
+        input_video=src, output_mkv=out, width=IN_W, height=IN_H,
+        scale=SCALE, fps_str="10", model="unused", model_dir=str(tmp_path),
+        ai_py=sys.executable, frame_source_dir=fz, inactivity_s=180,
+        meta=meta)
+    assert ok, why
+    assert n == 5
+    c = meta["contract"]
+    assert c["frames_digest"] is None
+    assert c["frames_digest_proven"] is False
+    assert any("FRAMES_DIGEST" in g for g in c["gaps"]), c["gaps"]
+    assert fc.contract_problems(c), "缺摘要的合同不该被判为完整"
+
+
 # ------------------------------------------------ 实验 ②：同一次 AI 输出
 
 def _can_run_ai():

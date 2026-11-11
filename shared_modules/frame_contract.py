@@ -101,6 +101,7 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
                    ai: Optional[Dict[str, Any]] = None,
                    frames_digest: Optional[str] = None,
                    frames_digest_proven: Optional[bool] = None,
+                   frames_digest_domain: str = "",
                    source: str = "") -> Dict[str, Any]:
     """构造帧边界合同。
 
@@ -114,6 +115,9 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
         frames_digest: 有序帧内容身份；没算就传 None。
         frames_digest_proven: 显式标注摘要是否可作证据；None 时按
             `frames_digest` 是否为空推断。
+        frames_digest_domain: 摘要是对**哪种字节表示**算的
+            （``"raw-rgb48le"`` / ``"png-bytes"`` …）。两份摘要只有在
+            域相同时才可比 —— 不同表示算出的摘要本来就该不同。
         source: ``"model"`` / ``"fixed-frames"`` / ``"png-path"`` 等，
             说明这一串帧是怎么来的。
 
@@ -133,6 +137,7 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
         "channel_order": order,
         "frames_digest": frames_digest or None,
         "frames_digest_proven": bool(frames_digest_proven),
+        "frames_digest_domain": str(frames_digest_domain or ""),
         # 这一串帧是谁产的：模型 / 冻结帧源 / PNG 中转
         "source": str(source),
         "timeline": dict(timeline or {}),
@@ -195,7 +200,17 @@ def compare_contracts(a: Dict[str, Any], b: Dict[str, Any],
         p.append("frames_digest is unproven on at least one side; "
                  "cannot claim the two paths consumed the same frames")
     elif da != db:
-        p.append(f"frames_digest differs: {str(da)[:16]} vs {str(db)[:16]}")
+        # 域不同（raw bytes vs PNG 字节）时摘要本来就该不同 —— 那是
+        # "没法这样比"，不是"两边帧不一样"。分开报，别混成一条。
+        dom_a = str(a.get("frames_digest_domain") or "")
+        dom_b = str(b.get("frames_digest_domain") or "")
+        if dom_a and dom_b and dom_a != dom_b:
+            p.append(f"frames_digest domains differ ({dom_a} vs {dom_b}); "
+                     f"summaries over different representations are not "
+                     f"comparable")
+        else:
+            p.append(f"frames_digest differs: {str(da)[:16]} vs "
+                     f"{str(db)[:16]} (domain={dom_a or 'unspecified'})")
     return p
 
 

@@ -858,7 +858,8 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          timeout_s=None, inactivity_s=1800,
                          logger=None, cancel_guard=None,
                          color_opts=None, post_filter_chain=None,
-                         out_pix_fmt=None, frame_source_dir=None):
+                         out_pix_fmt=None, frame_source_dir=None,
+                         timeline_ref=None, contract_path=None, meta=None):
     """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
 
     为什么这样做
@@ -887,6 +888,10 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
 
     Returns:
         (ok: bool, reason: str, frames: int)
+
+    R22 §5.1：成功时会在 ``<output>.frame_contract.json`` 写一份**帧边界合同**，
+    并可用 ``meta`` 取回细节（帧数/摘要/探测到的格式）。``frames`` 现在
+    以**编码器实际落盘的帧数**为准（曾经只信 AI 自报，固定帧源下恒为 0）。
     """
     import subprocess
     import tempfile
@@ -1010,7 +1015,14 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     #
     # 注意：stage3 每次跑批都会重新生成 step3（没有"已存在则跳过"的逻辑），
     # 所以改这里不会导致旧中间件被复用。
-    enc_cmd += ["-pix_fmt", "yuv420p16le", "-c:v", "ffv1", "-r", str(fps_str)]
+    #
+    # R22 修：这里原先**无条件**追加 `-pix_fmt yuv420p16le`。ffmpeg 的输出
+    # 选项是"后者覆盖前者"，所以融合分支里刚按 `out_pix_fmt` 设的 10-bit
+    # 会被这一行**静默改回 16-bit** —— 传进来等于没传。
+    # 现在只有调用方没指定时才用默认值。
+    if not out_pix_fmt:
+        enc_cmd += ["-pix_fmt", "yuv420p16le"]
+    enc_cmd += ["-c:v", "ffv1", "-r", str(fps_str)]
     # 颜色标签必须与主流程 PNG 路线一致（COL-04），否则中间产物不带
     # colorspace 标签，下游 stage7 会按自己的猜测补标签 → 可能错标。
     enc_cmd += list(color_opts or [])
@@ -1120,23 +1132,43 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
             return ""
 
     dec_txt, ai_txt, enc_txt = _read_err("dec"), _read_err("ai"), _read_err("enc")
-    frames = 0
+    ai_frames, ai_digest = 0, ""
     for ln in ai_txt.splitlines():
         if ln.startswith("FRAMES="):
-            try: frames = int(ln.split("=", 1)[1])
+            try: ai_frames = int(ln.split("=", 1)[1])
             except ValueError: pass
+        elif ln.startswith("FRAMES_DIGEST="):
+            ai_digest = ln.split("=", 1)[1].strip()
     rc_ok = (dec.returncode == 0 and ai.returncode == 0 and enc.returncode == 0)
     if ai.returncode == 83:
-        return False, "OOM in AI process (exit 83)", frames
+        return False, "OOM in AI process (exit 83)", ai_frames
     if not rc_ok:
         # 把三方的 stderr 尾巴都带上——否则"启动失败"会被误当成 OOM
         return False, (f"rc dec={dec.returncode} ai={ai.returncode} "
                        f"enc={enc.returncode} | ai_err={ai_txt[-500:]} "
                        f"| dec_err={dec_txt[-200:]} "
                        f"| enc_err={enc_txt[-200:]} "
-                       f"| script_kept_at={tmpd}"), frames
+                       f"| script_kept_at={tmpd}"), ai_frames
     if not os.path.exists(str(output_mkv)):
-        return False, "encoder produced no output", frames
+        return False, "encoder produced no output", ai_frames
+
+    # ---- 帧数必须以**编码器落盘的事实**为准，不能只信 AI 自报 ----
+    # 原来直接返回 AI stderr 里的 `FRAMES=`。两个后果：
+    #   ① 冻结帧源（内部实验）不打印那行时返回 0，调用方的 "frames" 恒为 0；
+    #   ② 即便打印，"AI 写了 N 帧"也不等于"编码器写进了 N 帧"——
+    #      管道中间丢帧是真实故障形态，两边都数才能发现。
+    enc_frames = 0
+    try:
+        enc_frames = int(_count_video_frames(str(output_mkv)) or 0)
+    except Exception:
+        enc_frames = 0
+    if ai_frames and enc_frames and ai_frames != enc_frames:
+        return False, (f"frame count mismatch across the boundary: AI wrote "
+                       f"{ai_frames} frames, the encoder wrote {enc_frames} "
+                       f"— frames were lost or duplicated in the pipe"), \
+            enc_frames
+    frames = enc_frames or ai_frames
+
     # 成功：清掉临时脚本与 stderr 文件。失败会提前 return，
     # 那时**保留** tmpd 以便排查（项目约定：失败必须留证据）。
     try:
@@ -1144,12 +1176,178 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
         _sh.rmtree(tmpd, ignore_errors=True)
     except Exception:
         pass
+
+    # ---- R22 §5.1：帧边界合同落盘 ----
+    # 写的是**磁盘上实际的结果**（现场探测），不是"我们请求了什么"。
+    # 摘要来自 AI 子进程对自己写出的字节算的 SHA-256，算法与
+    # `frame_contract.digest_ordered_frames` 一致（域 = raw-rgb48le），
+    # 所以经典物化侧只要按同样顺序 digest 原始帧即可直接比。
+    contract = None
+    try:
+        contract = _write_stream_frame_contract(
+            output_mkv=str(output_mkv), out_w=out_w, out_h=out_h,
+            requested_fmt=str(out_pix_fmt or "yuv420p16le"),
+            frames=frames, ai_frames=ai_frames, frames_digest=ai_digest,
+            fps_str=str(fps_str), source=("fixed-frames"
+                                          if frame_source_dir else "model"),
+            model=model, scale=scale, in_w=in_w, in_h=in_h,
+            color_opts=color_opts, fused=bool(post_filter_chain),
+            timeline_ref=timeline_ref, contract_path=contract_path,
+            logger=logger)
+    except Exception as _ce:      # 合同不能把一次成功的产出判成失败
+        if logger:
+            logger.warning("STAGE3_FRAME_CONTRACT_FAILED",
+                           "stream succeeded but the frame-boundary contract "
+                           "could not be written", error=str(_ce))
+    if meta is not None:
+        meta.update({
+            "frames": frames,
+            "ai_frames": ai_frames,
+            "enc_frames": enc_frames,
+            "frames_digest": ai_digest or None,
+            "frames_digest_proven": bool(ai_digest),
+            "frames_digest_domain": "raw-rgb48le" if ai_digest else "",
+            "contract": contract,
+            "contract_path": (contract_path
+                              or f"{output_mkv}.frame_contract.json"),
+        })
     if logger:
         logger.info("STAGE3_STREAM_RAW_OK",
                     "Raw-pipe upscale finished with zero frame files on disk",
-                    frames=frames, in_px=f"{in_w}x{in_h}",
-                    out_px=f"{out_w}x{out_h}")
+                    frames=frames, ai_frames=ai_frames,
+                    enc_frames=enc_frames,
+                    in_px=f"{in_w}x{in_h}", out_px=f"{out_w}x{out_h}",
+                    frames_digest=(ai_digest[:16] + "…") if ai_digest else "")
     return True, "ok", frames
+
+
+def _probe_output_video(path: str) -> dict:
+    """现场探测成品视频流的关键字段（只读、失败给空 dict）。
+
+    合同要写**实际落盘的格式**。拿"请求的 pix_fmt"当事实是本项目反复
+    踩过的坑（`-pix_fmt` 曾被后面的同名选项静默覆盖）。
+    """
+    out = {}
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt,width,height,avg_frame_rate",
+             "-of", "default=noprint_wrappers=1", path],
+            capture_output=True, text=True, errors="replace",
+            timeout=30, shell=False)
+    except Exception:
+        return out
+    if r.returncode != 0:
+        return out
+    for ln in r.stdout.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _receipt_frame_contract(meta):
+    """把流式边界的帧合同压成回执里的一个小节（永不抛）。
+
+    回执是给人/下游判断"这份产物能不能当证据"的，所以**缺口也写进去**
+    —— ``problems`` 非空就说明这份边界证明不完整，不能拿它声称
+    "两条链吃了同一串帧"。
+    """
+    from frame_contract import contract_problems as _cp
+    m = meta or {}
+    c = m.get("contract") or {}
+    probs = []
+    if not c:
+        probs = ["no frame-boundary contract was written"]
+    else:
+        try:
+            probs = list(_cp(c))
+        except Exception as _e:      # pragma: no cover
+            probs = [f"contract could not be evaluated: {_e}"]
+    return {
+        "path": m.get("contract_path") or None,
+        "frames": m.get("frames"),
+        "ai_frames": m.get("ai_frames"),
+        "enc_frames": m.get("enc_frames"),
+        "frames_digest": m.get("frames_digest"),
+        "frames_digest_proven": bool(m.get("frames_digest_proven")),
+        "frames_digest_domain": m.get("frames_digest_domain") or "",
+        "pix_fmt": c.get("pix_fmt"),
+        "bit_depth": c.get("bit_depth"),
+        "source": c.get("source"),
+        "problems": probs,
+    }
+
+
+def _write_stream_frame_contract(*, output_mkv, out_w, out_h, requested_fmt,
+                                 frames, ai_frames, frames_digest, fps_str,
+                                 source, model, scale, in_w, in_h,
+                                 color_opts, fused, timeline_ref,
+                                 contract_path, logger=None):
+    """把流式边界的帧合同写到 ``<output>.frame_contract.json``。
+
+    诚实性约定：
+    - 帧数/格式以**探测到的成品**为准；探测失败时该字段如实留空，
+      不做"按请求值填充"的猜测；
+    - 摘要没拿到就写 ``frames_digest_proven=False`` 并注明原因，
+      绝不拿 FIFO 序号之类的替代物冒充内容身份。
+    """
+    from frame_contract import (build_contract, write_contract,
+                                contract_problems)
+    probed = _probe_output_video(str(output_mkv))
+    pix_fmt = str(probed.get("pix_fmt") or "")
+    width = int(probed.get("width") or 0) or int(out_w)
+    height = int(probed.get("height") or 0) or int(out_h)
+    timeline = dict(timeline_ref or {})
+    timeline.setdefault("fps", str(fps_str))
+    if probed.get("avg_frame_rate"):
+        timeline.setdefault("avg_frame_rate", str(probed["avg_frame_rate"]))
+    _co = [str(x) for x in (color_opts or [])]
+    color = {"declared_on_encode": _co, "declared": bool(_co)}
+    ai = {"impl": "realesrgan" if source == "model" else "fixed-frames",
+          "model": str(model) if source == "model" else "",
+          "scale": int(scale),
+          "native_scale": (2 if "x2plus" in str(model).lower() else 4)
+          if source == "model" else None,
+          "in_px": f"{in_w}x{in_h}", "out_px": f"{out_w}x{out_h}",
+          "fused_stage4": bool(fused)}
+    c = build_contract(
+        frames=int(frames or 0), width=width, height=height,
+        pix_fmt=pix_fmt or str(requested_fmt),
+        timeline=timeline, color=color, ai=ai,
+        frames_digest=frames_digest or None,
+        frames_digest_proven=bool(frames_digest),
+        frames_digest_domain="raw-rgb48le" if frames_digest else "",
+        source=source)
+    # 把自己知道的缺口写进合同（而不是只留在日志里）
+    gaps = []
+    if not frames_digest:
+        gaps.append("the AI subprocess did not report FRAMES_DIGEST; "
+                    "frame content identity is unproven for this boundary")
+    if not pix_fmt:
+        gaps.append("could not probe the output pixel format; the value "
+                    "written here is the requested one, not a measured one")
+    if not int(frames or 0):
+        gaps.append("frame count is unknown")
+    c["gaps"] = gaps
+    if gaps and logger:
+        logger.warning("STAGE3_FRAME_CONTRACT_INCOMPLETE",
+                       "frame-boundary contract is not usable as evidence",
+                       problems=contract_problems(c), gaps=gaps)
+    path = contract_path or f"{output_mkv}.frame_contract.json"
+    if not write_contract(path, c):
+        if logger:
+            logger.warning("STAGE3_FRAME_CONTRACT_UNWRITABLE",
+                           "could not write the frame-boundary contract",
+                           path=str(path))
+        return None
+    if logger:
+        logger.info("STAGE3_FRAME_CONTRACT",
+                    "frame-boundary contract written",
+                    path=str(path), frames=c["frames"],
+                    pix_fmt=c["pix_fmt"], digest_proven=c["frames_digest_proven"])
+    return c
 
 
 def _is_vfr(pts_map, tol: float = 0.01) -> bool:
@@ -2649,7 +2847,9 @@ def main():
 
     # ---- R20-A06：把本次**已确定**的时间轴落成 job 级计划 ----
     # 统一走 `write_job_timeline_plan()`（AI-off 分支也调它），避免两份实现。
-    write_job_timeline_plan(
+    # R22 §5.1：记住路径 —— 帧边界合同要**引用**这份计划（而不是另抄一份
+    # fps 数字），否则同一份时间轴会出现两个来源。
+    _tl_plan_path = write_job_timeline_plan(
         params,
         source_timeline=locals().get("_tl_probe"),
         fps_value=locals().get("_fps_raw_str"),
@@ -2858,6 +3058,7 @@ def main():
                                 _s_out, logger=logger, stage=3)
                         except Exception:
                             pass
+                    _s_meta = {}
                     _s_ok, _s_why, _s_n = _stream_raw_upscale(
                         input_video=stage2_output, output_mkv=_s_out,
                         post_filter_chain=_s_chain, out_pix_fmt=_s_pix_fmt,
@@ -2871,7 +3072,19 @@ def main():
                         logger=logger, cancel_guard=_cancel_guard,
                         # R22 §5.1：内部注入的冻结帧源（正常运行为 None）
                         frame_source_dir=params.get("_frame_source_dir"),
-                        color_opts=_s_copts)
+                        color_opts=_s_copts,
+                        # R22 §5.1：合同**引用**时间轴计划，不另抄一份 fps
+                        timeline_ref={
+                            "plan_path": _tl_plan_path or "",
+                            "source_timeline": str(
+                                locals().get("_tl_probe")
+                                or params.get("source_timeline") or "unknown"),
+                            "fps": _s_fps,
+                            "fps_source": str(_fps_source or ""),
+                            "pts_usable": len(all_pts_map or {}),
+                            "expected_frames": int(total_frames or 0),
+                        },
+                        meta=_s_meta)
                     if _s_ok and os.path.exists(_s_out) and os.path.getsize(_s_out) > 0:
                         if _cancel_guard is not None:
                             try:
@@ -2999,6 +3212,12 @@ def main():
                                     "frames": _s_n,
                                     "filter_chain_sha256": _sha256_text(_s_chain or ""),
                                     "out_pix_fmt": _s_pix_fmt,
+                                    # ---- R22 §5.1：帧边界合同进回执 ----
+                                    # 只写"帧数 5"是不够的：消费方无法判断
+                                    # 这 5 帧是**哪 5 帧**。摘要与域一起写，
+                                    # 才能和经典物化侧的合同直接比。
+                                    "frame_contract": _receipt_frame_contract(
+                                        _s_meta),
                                     # R20-A03：颜色是**一组**属性，单看 pix_fmt
                                     # 既不能证明没被改色、也不能证明改对了色。
                                     "color": _ev.get("color") or {},

@@ -369,12 +369,23 @@ def test_output_pix_fmt_written_by_both_paths():
     """结构守卫：raw 编码器必须显式写 `-pix_fmt yuv420p16le`。
 
     不写的话 ffv1 会把 rgb48le 存成 gbrp16le，与 PNG 路径分叉。
+
+    R22 修：原来断言的是字面量 `'"-pix_fmt", "yuv420p16le", "-c:v", "ffv1"'`，
+    而那行代码**无条件**追加 `-pix_fmt`，正好把融合分支刚按 `out_pix_fmt`
+    设的 10-bit 覆盖掉（ffmpeg 输出选项后写覆盖先写，且不报错）。
+    现在默认值只在调用方没指定时才写，所以断言改成两个方向都守：
+    默认值必须在、且不能存在"无条件追加"的写法。
     """
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage3_ai_upscale.py"),
                encoding="utf-8", errors="replace").read()
-    assert '"-pix_fmt", "yuv420p16le", "-c:v", "ffv1"' in src, \
+    assert 'if not out_pix_fmt:' in src, \
+        "raw 路径应只在调用方没指定格式时才用默认值"
+    assert 'enc_cmd += ["-pix_fmt", "yuv420p16le"]' in src, \
         "raw 路径的编码器必须显式指定 yuv420p16le，否则会存成 gbrp16le"
+    assert '["-pix_fmt", "yuv420p16le", "-c:v", "ffv1"]' not in src, \
+        ("不允许无条件追加 pix_fmt —— 它会静默覆盖融合分支的 "
+         "out_pix_fmt（请求 10-bit 却落盘 16-bit）")
 
 
 def test_probe_script_exists_and_documents_the_numbers():

@@ -68,7 +68,7 @@ def build_fixed_frame_script(frame_dir, in_w, in_h, out_w, out_h):
         raise ValueError("fixed-frame script needs positive dimensions")
 
     lines = [
-        "import os, sys",
+        "import os, sys, hashlib",
         # 与 AI 模板同一条铁律：先抢下真正的 stdout，再把文本层指到 stderr
         "_data = os.fdopen(os.dup(1), 'wb', buffering=0)",
         "os.dup2(2, 1)",
@@ -85,6 +85,12 @@ def build_fixed_frame_script(frame_dir, in_w, in_h, out_w, out_h):
         "    raise SystemExit(84)",
         "",
         "stdin = sys.stdin.buffer",
+        # ---- 有序帧摘要：与 frame_contract.digest_ordered_frames 同算法 ----
+        # 流式管道里帧不落盘，但**这一层能看到每一帧的字节**，所以边界
+        # 内容身份是算得出来的（不是"拿不到就写未证明"）。
+        # 算法必须与 frame_contract 完全一致，否则两条后半链的摘要不可比：
+        #   h.update(每帧字节) 按输出顺序 … 最后 h.update(b'|frames=N')
+        "_h = hashlib.sha256()",
         "i = 0",
         "while True:",
         "    chunk = stdin.read(IN_BYTES)",
@@ -110,6 +116,7 @@ def build_fixed_frame_script(frame_dir, in_w, in_h, out_w, out_h):
         "        sys.stderr.flush()",
         "        raise SystemExit(84)",
         "    _data.write(payload)",
+        "    _h.update(payload)",
         "    i += 1",
         "",
         "if i != len(frames):",
@@ -117,7 +124,11 @@ def build_fixed_frame_script(frame_dir, in_w, in_h, out_w, out_h):
         "        'FIXED_FRAME: used %d of %d frozen frames' % (i, len(frames)))",
         "    sys.stderr.flush()",
         "    raise SystemExit(84)",
-        "sys.stderr.write('FIXED_FRAME: wrote %d frames' % i)",
+        "_h.update(b'|frames=' + str(i).encode('ascii'))",
+        "sys.stderr.write('FIXED_FRAME: wrote %d frames' % i + chr(10))",
+        # 帧数/摘要必须用与真 AI 模板**完全相同**的两行（下游按前缀解析）
+        "sys.stderr.write('FRAMES=%d' % i + chr(10))",
+        "sys.stderr.write('FRAMES_DIGEST=' + _h.hexdigest() + chr(10))",
         "sys.stderr.flush()",
         "",
     ]
@@ -144,6 +155,7 @@ def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
         "os.dup2(2, 1)",
         "",
         "import gc",
+        "import hashlib",
         "import numpy as np",
         "import torch",
         "from basicsr.archs.rrdbnet_arch import RRDBNet",
@@ -253,6 +265,10 @@ def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
         "_in = sys.stdin.buffer",
         "_out = _data",
         "_n = 0",
+        # 有序帧摘要：算的是**写出去的那串字节**（rgb48le，按显示顺序）。
+        # 算法与 frame_contract.digest_ordered_frames 一致 —— 这样
+        # "经典物化"与"融合串流"两条后半链的边界身份可以直接比。
+        "_h = hashlib.sha256()",
         "while True:",
         "    buf = _in.read(IN_BYTES)",
         # R12 边界：空读 = 上游正常结束；**非空但不足一帧 = 协议错误**。
@@ -287,7 +303,10 @@ def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
         " + ' want=' + str(OUT_BYTES) + chr(10))",
         "        sys.stderr.flush()",
         "        sys.exit(84)",
-        "    _out.write(out.tobytes())",
+        # tobytes() 只做一次：4K 16-bit 一帧 ~50 MB，重复调用等于多拷一份
+        "    _b = out.tobytes()",
+        "    _out.write(_b)",
+        "    _h.update(_b)",
         "    _out.flush()",
         "    _n += 1",
         "try:",
@@ -297,7 +316,9 @@ def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
         "gc.collect()",
         "if torch.cuda.is_available():",
         "    torch.cuda.empty_cache()",
+        "_h.update(b'|frames=' + str(_n).encode('ascii'))",
         "sys.stderr.write(('FRAMES=%d' % _n) + chr(10))",
+        "sys.stderr.write('FRAMES_DIGEST=' + _h.hexdigest() + chr(10))",
         "sys.stderr.flush()",
     ]
     return NL.join(lines) + NL

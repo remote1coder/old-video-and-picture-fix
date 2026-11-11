@@ -25,7 +25,11 @@ _STAGE3 = os.path.join(_ROOT, "video_restoration_pipeline", "stages",
 
 def _extract_generated_script():
     src = io.open(_STAGE3, encoding="utf-8", errors="replace").read()
-    i = src.index("_SHM_OK = False")
+    # 锚点必须唯一。原先锚 `_SHM_OK = False`，但 stage3 里现在有**两段**
+    # 生成脚本（单张路径 / 批量路径），两段都带这个守卫；`src.index()` 命中
+    # 第一段，抽出来的是单张脚本 —— 断言就以"PNG 路径被改掉了"的形式失败。
+    # `WB_FRAME_SHM_NAME` 只在批量（PNG/共享内存）脚本里出现，用它做锚。
+    i = src.index("WB_FRAME_SHM_NAME")
     j = src.rindex("f.write(", 0, i)          # 向前找包含它的那个 f.write(
     k, depth = j + len("f.write("), 1
     while depth:
@@ -75,7 +79,14 @@ def test_generated_script_has_both_paths():
     s = _extract_generated_script()
     assert "_SHM_OK = False" in s, "缺少共享内存分支的守卫"
     assert "SharedMemory(name=_IN)" in s, "缺少共享内存挂载"
-    assert "for fp in sorted(glob.glob(" in s, "原 PNG 路径被改掉了"
+    # R22：PNG 路径的 glob 现在先落到 `_inputs` 再判空 —— 字面量
+    # `for fp in sorted(glob.glob(` 已经不成立。断言改成守**行为**：
+    # 仍然要 glob 输入目录、仍然要逐帧循环、且**空目录必须大声失败**。
+    assert "glob.glob(" in s and "os.path.join(input_path, '*.png')" in s, \
+        "原 PNG 路径被改掉了（不再 glob 输入目录）"
+    assert "for fp in _inputs:" in s, "原 PNG 路径的逐帧循环被改掉了"
+    assert "STAGE3_AI_NO_INPUT" in s and "sys.exit(84)" in s, \
+        "空输入目录必须失败（曾经零产出报成功）"
     assert "sys.exit(0)" in s, "共享内存路径应清理后提前退出"
 
 

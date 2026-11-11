@@ -85,7 +85,7 @@ def test_contract_carries_every_required_field():
                           frames_digest="a" * 64, source="model")
     for k in ("frames", "width", "height", "pix_fmt", "bit_depth",
               "channel_order", "frames_digest", "frames_digest_proven",
-              "timeline", "color", "ai", "source"):
+              "frames_digest_domain", "timeline", "color", "ai", "source"):
         assert k in c, k
     assert c["bit_depth"] == 16
     assert c["frames_digest_proven"] is True
@@ -161,6 +161,30 @@ def test_unproven_digest_blocks_the_comparison():
     b = fc.build_contract(frames=5, width=640, height=480,
                           pix_fmt="rgb48le")
     assert any("unproven" in p for p in fc.compare_contracts(a, b))
+
+
+def test_different_digest_domains_are_not_a_frame_difference():
+    """摘要域不同（raw 字节 vs PNG 字节）= "没法这样比"，不是"帧不一样"。
+
+    分开报的原因：混成一条会让真正的错位被误读成"表示不同可以忽略"，
+    反过来也会让"只是换了表示"被当成致命差异。
+    """
+    a = fc.build_contract(frames=5, width=640, height=480,
+                          pix_fmt="rgb48le", frames_digest="a" * 64,
+                          frames_digest_domain="raw-rgb48le")
+    b = dict(a, frames_digest="b" * 64, frames_digest_domain="png-bytes")
+    problems = fc.compare_contracts(a, b)
+    assert any("domains differ" in p for p in problems), problems
+    assert not any("frames_digest differs" in p for p in problems), problems
+
+
+def test_same_domain_different_digest_is_a_real_difference():
+    a = fc.build_contract(frames=5, width=640, height=480,
+                          pix_fmt="rgb48le", frames_digest="a" * 64,
+                          frames_digest_domain="raw-rgb48le")
+    b = dict(a, frames_digest="b" * 64)
+    problems = fc.compare_contracts(a, b)
+    assert any("frames_digest differs" in p for p in problems), problems
 
 
 # ------------------------------------------------ 侧车读写
