@@ -498,17 +498,26 @@ def test_rv09_output_without_completion_marker_is_not_reused(tmp_path):
 
 
 def _write_receipt(final, src):
-    """写一份"本代"的 verify 报告（含 run_identity）。
+    """写一份"本代"的 verify 报告（含 run_identity）+ fullchain + journal。
 
     R17-01 之后，marker 要求 verify.json 带 run_identity 才肯写 ——
     只比对"当前 verify 与当前媒体彼此一致"已经不够（下一代会把两者一起
     替换，二者仍然自洽）。这些用例原本不写报告，现在必须补上。
+
+    R21-C02 之后，resume 还要用**同一个整代验证器**核对必需报告与
+    journal 终态 —— 只造媒体+marker 的夹具不再代表"完整代"。
     """
     import json as _json
     with open(str(final) + ".verify.json", "w", encoding="utf-8") as f:
         _json.dump({"media_sha256": vmain._plain_sha256(str(final)),
                     "run_identity": {
                         "input": vmain.build_input_identity(str(src))}}, f)
+    with open(str(final) + ".fullchain.json", "w", encoding="utf-8") as f:
+        _json.dump({"ok": True}, f)
+    import publish_journal as _pj
+    _pj.write_journal(str(final) + ".journal.json",
+                      {"phase": "COMMITTED", "job_id": "j1",
+                       "targets": [str(final)], "records": {}})
 
 
 def test_rv09_matching_marker_is_accepted(tmp_path):

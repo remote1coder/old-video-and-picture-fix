@@ -1162,6 +1162,104 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
         return False
 
 
+def required_generation_reports(final_path: str) -> List[str]:
+    """一代的**必需报告**：少一份就不是完整代（R21-C02）。
+
+    stage7 每次都会发布这两个对象（`Artifact("verify")` /
+    `Artifact("fullchain")`），所以"媒体在、报告缺"必然意味着这一代被换过
+    或者发布被打断 —— 不能当完成。
+    """
+    return [str(final_path) + ".verify.json",
+            str(final_path) + ".fullchain.json"]
+
+
+def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = None,
+                              logger=None) -> Tuple[bool, str]:
+    """核对**磁盘上这一代**是否完整：媒体 + 必需报告 + journal 终态。
+
+    R21-C02：审核指出完成判定有两条互不相干的路径 ——
+    新任务只看私有结果，resume 只看 `.done.json` 与媒体。
+    两条路会漂移（一条认"文件在"，另一条认"marker 在"），
+    于是"报告被删掉的一代"在 resume 眼里仍然是完整的。
+
+    这里把"整代在不在"抽成**唯一**判定，新任务收尾与 resume 都调它。
+    它只回答磁盘事实，不回答"是不是本 job 的" —— 后者由 marker /
+    run_identity 负责。
+
+    Returns:
+        ``(ok, reason)``。
+    """
+    p = str(final_path)
+    if not os.path.exists(p):
+        return False, "media is missing"
+    try:
+        if os.path.getsize(p) == 0:
+            return False, "media is empty"
+    except OSError as exc:
+        return False, f"media is unreadable: {exc}"
+
+    verify_p, full_p = required_generation_reports(p)
+    media_digest = _plain_sha256(p)
+    recorded = None
+    try:
+        with open(verify_p, "r", encoding="utf-8") as f:
+            _v = json.load(f) or {}
+        if not isinstance(_v, dict):
+            return False, "verify report is not an object"
+        recorded = _v.get("media_sha256")
+        # 报告本身必须能说明"它描述的是哪一份媒体"
+        if recorded and media_digest and recorded != media_digest:
+            return False, ("verify report describes different media bytes "
+                           f"(recorded {str(recorded)[:16]}, "
+                           f"actual {media_digest[:16]})")
+    except FileNotFoundError:
+        return False, "required report is missing: verify.json"
+    except (OSError, ValueError) as exc:
+        return False, f"verify report is unreadable: {exc}"
+
+    try:
+        with open(full_p, "r", encoding="utf-8") as f:
+            _fc = json.load(f)
+        if not isinstance(_fc, (dict, list)):
+            return False, "fullchain report is not structured"
+    except FileNotFoundError:
+        return False, "required report is missing: fullchain.json"
+    except (OSError, ValueError) as exc:
+        return False, f"fullchain report is unreadable: {exc}"
+
+    # ---- journal 终态 ----
+    # 没有 journal = 这一代来自 R14 之前的实现，无法证明发布事务已收尾。
+    # 判"未经验证"而不是"通过"（旧产物仍保留，只是不自动复用）。
+    try:
+        from publish_journal import read_journal as _rj
+        try:
+            from publish_journal import journal_path_for as _jpf
+            jp = _jpf(p)
+        except Exception:                   # pragma: no cover
+            jp = p + ".journal.json"
+        if not os.path.exists(jp):
+            return False, ("no publish journal for this generation; its "
+                           "terminal state cannot be proven (legacy/unproven)")
+        _doc = _rj(jp)
+        if not isinstance(_doc, dict):
+            return False, "publish journal is unreadable"
+        phase = str(_doc.get("phase") or "")
+        if phase != "COMMITTED":
+            return False, (f"publish journal is not COMMITTED (phase={phase!r})")
+        if _doc.get("resolved") is False:
+            return False, "publish journal is marked unresolved"
+        if job is not None:
+            _want = str(job.get("job_id") or "")
+            _got = str(_doc.get("job_id") or "")
+            if _want and _got and _want != _got:
+                return False, (f"journal belongs to job {_got!r}, "
+                               f"not {_want!r}")
+    except Exception as exc:                # pragma: no cover - 部署异常
+        return False, f"cannot verify the publish journal: {exc}"
+
+    return True, "media + required reports + COMMITTED journal"
+
+
 def resume_artifact_matches(final_path: str, job: Dict[str, Any],
                             config: Dict[str, Any],
                             logger=None) -> Tuple[bool, str]:
@@ -1219,6 +1317,14 @@ def resume_artifact_matches(final_path: str, job: Dict[str, Any],
         # 不自动当作 verified 复用。
         return False, ("completion marker predates content digests; "
                        "artifact is legacy/unproven and is not auto-reused")
+
+    # ---- R21-C02：marker 只能证明"这份媒体是谁的"，不能证明"整代都在" ----
+    # 审核：resume 检查"仍主要围绕 .done.json 和媒体；受控路径没有读取所需
+    # 报告和 journal，不能证明缺失报告的一代可继续被当作完整完成"。
+    # 这里复用**同一个**整代验证器，新任务收尾与 resume 不再各判一套。
+    _gen_ok, _gen_why = verify_generation_objects(final_path, job, logger)
+    if not _gen_ok:
+        return False, f"generation is not complete: {_gen_why}"
 
     return True, "identity-match"
 
@@ -2215,20 +2321,75 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 temp_dir, job_id, keep_steps, current_step=stage_num,
                 current_run_hashes=_current_run_param_hashes(_last_produced))
 
-    logger.info("JOB_DONE", f"Job {job_id} complete")
-    # RV-09: 成功后写下"这个产物是用哪个输入/哪套参数做出来的"，
-    # 否则下一次运行没有任何依据判断能否复用。
+    # ---- R21-C02：**先证明完成，再说 JOB_DONE** ----
+    # 审核：main 先记 JOB_DONE，再调用 write_completion_marker，
+    # 且**没有检查它的 False 返回值**。受控调用确认：即使标记写入明确失败，
+    # 仍返回 (0, "")。于是"这一代没被证明"和"任务成功"同时成立。
+    # 顺序现在反过来，而且抽成可测函数（见 `finish_job_completion`）。
+    return finish_job_completion(job, config, args, params, logger, job_logger)
+
+
+def finish_job_completion(job: Dict[str, Any], config: Dict[str, Any], args,
+                          params: Dict[str, Any], logger, job_logger
+                          ) -> Tuple[int, str]:
+    """任务收尾：**先证明完成，再报 JOB_DONE**（R21-C02）。
+
+    审核要求（§3.3）："`JOB_DONE` 必须放在整代验证成功之后。
+    `write_completion_marker` 返回 False、抛异常、终态 pending、
+    私有结果缺失/错误 attempt，都应显式传播失败或未完成状态。"
+
+    Returns:
+        ``(exit_code, detail)``。只有**全部**证据成立才返回 ``(0, "")``；
+        其余一律 ``82``，并留下 `JOB_COMPLETION_UNPROVEN`。
+    """
+    # `--stage N`（单步调试/补跑）**不宣称完成**：这一趟根本没跑完整链，
+    # 用"没有成品"去否掉它是错的。只有默认全链或显式 `--stage 7` 才要求
+    # 完整代的证据。
+    #
+    # 注意：**worker 里的 `args` 是 dict**（见 `_build_worker_tasks`），
+    # 单进程模式才是 Namespace。只写 getattr 会在并行入口永远拿到 None。
+    _stage = (args.get("stage") if isinstance(args, dict)
+              else getattr(args, "stage", None))
+    if _stage not in (None, 7):
+        try:
+            logger.info("JOB_PARTIAL_STAGE_RUN",
+                        "Single-stage run; this invocation does not claim a "
+                        "completed generation", stage=_stage)
+        except Exception:
+            pass
+        return 0, ""
+
+    _marker_ok = False
+    _marker_path = ""
+    _marker_why = ""
     try:
         finals = find_final_output(job, config, args,
                                    plan=params.get("_run_plan_obj"))
-        for cand in finals:
-            if os.path.exists(cand) and os.path.getsize(cand) > 0:
-                write_completion_marker(cand, job, config, job_logger,
-                                           params=params)
-                break
     except Exception as e:
-        job_logger.warning("COMPLETION_MARKER_SKIP",
-                           f"Could not record completion identity: {e}")
+        finals = []
+        _marker_why = f"find_final_output raised: {e}"
+    for cand in finals:
+        if os.path.exists(cand) and os.path.getsize(cand) > 0:
+            _marker_path = cand
+            try:
+                _marker_ok = bool(write_completion_marker(
+                    cand, job, config, job_logger, params=params))
+            except Exception as e:      # 写标记抛异常也算失败，不能算完成
+                _marker_ok = False
+                _marker_why = f"write_completion_marker raised: {e}"
+            break
+    else:
+        _marker_why = _marker_why or "no finished output candidate was found"
+
+    if not _marker_ok:
+        job_logger.error(
+            "JOB_COMPLETION_UNPROVEN",
+            "The job produced output but its completion could not be proven "
+            "(marker/identity/generation). This is NOT a successful job.",
+            output=_marker_path, reason=_marker_why)
+        return 82, (_marker_why or "completion could not be proven")
+
+    logger.info("JOB_DONE", f"Job {job.get('job_id', '')} complete")
     return 0, ""
 
 

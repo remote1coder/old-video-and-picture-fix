@@ -157,6 +157,24 @@ def test_id02_identity_semantics_strips_internal_keys(tmp_path):
 # ID-03：成品内容摘要
 # ---------------------------------------------------------------------------
 
+def _complete_generation(final_path):
+    """补齐"一整代"的其它成员：fullchain 报告 + 未决 journal 的终态。
+
+    R21-C02 起 `resume_artifact_matches()` 复用**同一个**整代验证器：
+    媒体 + 必需报告 + COMMITTED journal 缺一不可。只造"媒体 + marker"的
+    夹具不再代表完整代，会让"身份没问题的样本"被判成不完整。
+    """
+    import publish_journal as _pj
+    p = str(final_path)
+    with open(p + ".verify.json", "w", encoding="utf-8") as f:
+        json.dump({"media_sha256": M._plain_sha256(p)}, f)
+    with open(p + ".fullchain.json", "w", encoding="utf-8") as f:
+        json.dump({"ok": True}, f)
+    _pj.write_journal(p + ".journal.json",
+                      {"phase": "COMMITTED", "job_id": "jobT",
+                       "targets": [p], "records": {}})
+
+
 def test_id03_equal_length_replacement_is_detected(tmp_path):
     out = tmp_path / "clip_restored.mkv"
     out.write_bytes(b"AAAA")
@@ -166,6 +184,7 @@ def test_id03_equal_length_replacement_is_detected(tmp_path):
                   params_identity=M.build_params_identity(_config(), job, None),
                   output_size=4,
                   output_sha256=M._chunked_sha256(str(out)))
+    _complete_generation(out)
     ok, _ = M.resume_artifact_matches(str(out), job, _config(), None)
     assert ok is True
 

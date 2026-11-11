@@ -1,0 +1,247 @@
+# -*- coding: utf-8 -*-
+"""R21-C02：完成判定 —— JOB_DONE 仍在成功之前，resume 只看媒体。
+
+## 审核原文（R20 §3，P1）
+
+> 另一方面，main 先记录 `JOB_DONE`，再调用 `write_completion_marker`，
+> 没有检查它的 False 返回值。原 main 尾段的受控调用确认：即使标记写入
+> 明确失败，仍返回 `(0, "")`。
+>
+> resume 检查仍主要围绕 `.done.json` 和媒体；受控路径没有读取所需报告和
+> journal，不能证明缺失报告的一代可继续被当作完整完成。
+
+## 本文件锁住什么
+
+1. `finish_job_completion()` 只有在**全部证据成立**时才返回 `(0, "")`；
+   找不到成品 / 标记写失败 / 标记抛异常 → `82`，且**不**打 `JOB_DONE`。
+2. `verify_generation_objects()` 把"整代在不在"判成唯一结论：
+   媒体 + 必需报告 + journal 终态，缺一不可。
+3. `resume_artifact_matches()` 复用同一个验证器 —— 报告被删的一代，
+   即使 marker 完好也不许当"已完成"复用。
+"""
+import json
+import os
+import sys
+
+import pytest
+
+import conftest  # noqa: F401
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (_ROOT,
+           os.path.join(_ROOT, "shared_modules"),
+           os.path.join(_ROOT, "video_restoration_pipeline")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import main as vmain  # noqa: E402
+import publish_journal as J  # noqa: E402
+
+
+class _Log:
+    def __init__(self):
+        self.events = []
+
+    def _rec(self, ev, msg="", **kw):
+        self.events.append((ev, msg, kw))
+
+    info = warning = error = critical = _rec
+
+    def names(self):
+        return [e[0] for e in self.events]
+
+
+def _write(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    mode = "wb" if isinstance(data, bytes) else "w"
+    with open(path, mode, **({} if mode == "wb" else {"encoding": "utf-8"})) as f:
+        f.write(data)
+    return path
+
+
+def _gen(tmp_path, *, with_reports=True, with_journal=True,
+         journal_phase="COMMITTED", resolved=True, media=b"MEDIA-BYTES"):
+    final = str(tmp_path / "out" / "clip_restored.mkv")
+    _write(final, media)
+    if with_reports:
+        _write(final + ".verify.json",
+               json.dumps({"media_sha256": vmain._plain_sha256(final)}))
+        _write(final + ".fullchain.json", json.dumps({"ok": True}))
+    if with_journal:
+        J.write_journal(final + ".journal.json",
+                        {"phase": journal_phase, "job_id": "j1",
+                         "targets": [final], "records": {},
+                         "resolved": resolved})
+    return final
+
+
+# ------------------------------------------------ 收尾顺序
+
+def test_no_finished_output_is_not_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(vmain, "find_final_output", lambda *a, **k: [])
+    log = _Log()
+    rc, why = vmain.finish_job_completion(
+        {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")},
+        {}, None, {}, log, log)
+    assert rc == 82, (rc, why)
+    assert "JOB_DONE" not in log.names()
+    assert "JOB_COMPLETION_UNPROVEN" in log.names()
+
+
+def test_marker_failure_blocks_done(tmp_path, monkeypatch):
+    final = _gen(tmp_path)
+    monkeypatch.setattr(vmain, "find_final_output", lambda *a, **k: [final])
+    monkeypatch.setattr(vmain, "write_completion_marker",
+                        lambda *a, **k: False)
+    log = _Log()
+    rc, why = vmain.finish_job_completion(
+        {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")},
+        {}, None, {}, log, log)
+    assert rc == 82
+    assert "JOB_DONE" not in log.names(), "标记失败仍然报了 JOB_DONE"
+
+
+def test_marker_exception_blocks_done(tmp_path, monkeypatch):
+    final = _gen(tmp_path)
+    monkeypatch.setattr(vmain, "find_final_output", lambda *a, **k: [final])
+
+    def _boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(vmain, "write_completion_marker", _boom)
+    log = _Log()
+    rc, why = vmain.finish_job_completion(
+        {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")},
+        {}, None, {}, log, log)
+    assert rc == 82
+    assert "JOB_DONE" not in log.names()
+    assert "disk full" in why
+
+
+def test_success_logs_done_exactly_once(tmp_path, monkeypatch):
+    final = _gen(tmp_path)
+    monkeypatch.setattr(vmain, "find_final_output", lambda *a, **k: [final])
+    monkeypatch.setattr(vmain, "write_completion_marker", lambda *a, **k: True)
+    log = _Log()
+    rc, why = vmain.finish_job_completion(
+        {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")},
+        {}, None, {}, log, log)
+    assert (rc, why) == (0, "")
+    assert log.names().count("JOB_DONE") == 1
+
+
+def test_done_is_logged_after_the_marker_not_before(tmp_path, monkeypatch):
+    """顺序断言：写标记必须发生在 JOB_DONE **之前**。"""
+    order = []
+    final = _gen(tmp_path)
+    monkeypatch.setattr(vmain, "find_final_output", lambda *a, **k: [final])
+    monkeypatch.setattr(vmain, "write_completion_marker",
+                        lambda *a, **k: order.append("marker") or True)
+
+    log = _Log()
+
+    class _L(_Log):
+        def _rec(self, ev, msg="", **kw):
+            if ev == "JOB_DONE":
+                order.append("done")
+            super()._rec(ev, msg, **kw)
+
+        # 必须重新绑定：`_Log` 里 info/error 是**函数对象**的别名，
+        # 子类只覆盖 `_rec` 不会改变 `info` 指向。
+        info = warning = error = critical = _rec
+
+    vmain.finish_job_completion(
+        {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")},
+        {}, None, {}, _L(), log)
+    assert order == ["marker", "done"], order
+
+
+# ------------------------------------------------ 整代验证器
+
+def test_complete_generation_passes(tmp_path):
+    final = _gen(tmp_path)
+    ok, why = vmain.verify_generation_objects(final, {"job_id": "j1"})
+    assert ok is True, why
+
+
+@pytest.mark.parametrize("kwargs,fragment", [
+    ({"media": b""}, "empty"),
+    ({"with_reports": False}, "missing"),
+    ({"with_journal": False}, "journal"),
+    ({"journal_phase": "PREPARED"}, "not COMMITTED"),
+    ({"resolved": False}, "unresolved"),
+])
+def test_incomplete_generation_is_rejected(tmp_path, kwargs, fragment):
+    final = _gen(tmp_path, **kwargs)
+    ok, why = vmain.verify_generation_objects(final, {"job_id": "j1"})
+    assert ok is False, why
+    assert fragment in why, why
+
+
+def test_media_bytes_changed_after_the_report_is_rejected(tmp_path):
+    final = _gen(tmp_path)
+    _write(final, b"DIFFERENT-BYTES")
+    ok, why = vmain.verify_generation_objects(final, {"job_id": "j1"})
+    assert ok is False
+    assert "different media bytes" in why
+
+
+def test_missing_media_is_rejected(tmp_path):
+    final = _gen(tmp_path)
+    os.remove(final)
+    ok, why = vmain.verify_generation_objects(final, {"job_id": "j1"})
+    assert ok is False and "missing" in why
+
+
+# ------------------------------------------------ resume 复用同一验证器
+
+def _make_marker(final, job, config, log):
+    payload = {
+        "impl": vmain.VIDEO_IMPL_VERSION,
+        "job_id": job.get("job_id", ""),
+        "input_path": job.get("input_path", ""),
+        "input_identity": vmain.build_input_identity(job.get("input_path", "")),
+        "params_identity": vmain.build_params_identity(config, job, log),
+        "output_path": final,
+        "output_size": os.path.getsize(final),
+        "output_sha256": vmain._chunked_sha256(final),
+    }
+    _write(vmain.completion_marker_path(final),
+           json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return payload
+
+
+def test_resume_accepts_a_fully_proven_generation(tmp_path):
+    job = {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")}
+    _write(job["input_path"], b"SOURCE")
+    final = _gen(tmp_path)
+    log = _Log()
+    _make_marker(final, job, {"global": {}}, log)
+    ok, why = vmain.resume_artifact_matches(final, job, {"global": {}}, log)
+    assert ok is True, why
+
+
+def test_resume_refuses_when_a_required_report_is_gone(tmp_path):
+    """marker 完好、媒体完好，但 fullchain 被删 → 不是完整代。"""
+    job = {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")}
+    _write(job["input_path"], b"SOURCE")
+    final = _gen(tmp_path)
+    log = _Log()
+    _make_marker(final, job, {"global": {}}, log)
+    os.remove(final + ".fullchain.json")
+
+    ok, why = vmain.resume_artifact_matches(final, job, {"global": {}}, log)
+    assert ok is False, why
+    assert "generation is not complete" in why, why
+
+
+def test_resume_refuses_when_the_journal_is_unresolved(tmp_path):
+    job = {"job_id": "j1", "input_path": str(tmp_path / "in.mp4")}
+    _write(job["input_path"], b"SOURCE")
+    final = _gen(tmp_path, journal_phase="PREPARED", resolved=False)
+    log = _Log()
+    _make_marker(final, job, {"global": {}}, log)
+
+    ok, why = vmain.resume_artifact_matches(final, job, {"global": {}}, log)
+    assert ok is False, why
+    assert "not complete" in why

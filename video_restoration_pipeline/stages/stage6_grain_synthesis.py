@@ -206,6 +206,9 @@ class GrainPipelineResult:
     vspipe_rc: Optional[int] = None
     ffmpeg_rc: Optional[int] = None
     failed_stage: str = ""
+    #: 失败发生在 **Popen 之前/之中**（进程根本没跑起来）。
+    #: 与 `failed_stage` 分开：后者说"哪一步"，这个说"有没有真的启动"。
+    failed_at_start: bool = False
     cancelled: bool = False
     log_paths: Tuple[str, ...] = field(default_factory=tuple)
     stderr_tail: str = ""
@@ -247,21 +250,18 @@ class GrainPipelineResult:
         if self.ok or self.cancelled:
             return False
 
+        # ① 进程根本没起来（vspipe/ffmpeg 可执行文件缺失、脚本路径错）
+        #    → **不算插件能力问题**：AddGrainC 回退同样要跑这两个可执行文件，
+        #      换插件救不了环境问题，只会把真原因盖住。
+        if self.failed_at_start:
+            return False
+
         _prod = (self.vspipe_tail or "").lower()
         _hit = any(k in _prod for k in self._PLUGIN_TOKENS)
 
-        # ① 生产者侧失败 → 看它自己的尾部
+        # ② 生产者侧失败 → 看它自己的尾部
         if self.failed_stage == "vspipe":
             return _hit
-        # ② 进程根本没起来（vspipe 二进制/脚本缺失）
-        #    必须确认是**生产者**没起来：编码器缺失不是插件问题。
-        if self.failed_stage == "start":
-            _d = (self.detail or "").lower()
-            _producer_side = ("step=vspipe" in _d
-                              or ("vspipe" in _d and "step=ffmpeg" not in _d))
-            return _producer_side and ("filenotfound" in _d
-                                       or "no such file" in _d
-                                       or "cannot find the file" in _d)
         # ③ 只在"生产者先挂了、编码器跟着挂"的连带失败里认插件
         #    —— 但必须**真的**有插件特征，否则就是编码/磁盘问题
         if self.failed_stage in ("ffmpeg", "wait") and _hit:
@@ -397,6 +397,8 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
     #: 取消与异常要分开：取消**不能**被当成插件失败去回退。
     _fail_stage = ""
     _is_cancel = False
+    #: 是否"进程根本没起来"（Popen 抛异常）。与 `_fail_stage` 分开记。
+    _at_start_failure = False
     #: 当前正在启动/等待哪一步。失败时写进 detail，
     #: 让调用方（和测试）能区分"第一步就起不来"与"第二步失败但第一步要回收"。
     _step = "vspipe"
@@ -497,16 +499,14 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
         _is_cancel = (isinstance(exc, (KeyboardInterrupt, SystemExit))
                       or _exc_name in ("CancelledError", "Cancelled",
                                        "StageCancelled"))
-        # ---- R21-C01：Popen 抛异常 = **启动失败**，不是"该阶段跑失败" ----
-        # 旧实现把 `_fail_stage` 直接设成 `_step`，于是"第二个进程命令不存在"
-        # 会被记成 `failed_stage="ffmpeg"` —— 调用方会以为编码器跑起来了。
-        # 现在统一记 "start"，用 `step=xxx` 指明是哪一步没起来。
-        if _step in ("vspipe", "ffmpeg"):
-            _fail_stage = "start"
-            _where = f"start (step={_step})"
-        else:
-            _fail_stage = _step or "exception"
-            _where = _step or "unknown"
+        # ---- R21-C01：Popen 抛异常 = **启动失败**，与"该阶段跑失败"分开 ----
+        # `failed_stage` 仍记为 `_step`（诊断需要知道是第几步），
+        # 另用 `failed_at_start` 表示"进程根本没跑起来"。
+        # 旧实现两者都没有，于是"第二个进程命令不存在"会被当成编码器跑失败。
+        _at_start = _step in ("vspipe", "ffmpeg")
+        _at_start_failure = _at_start
+        _fail_stage = _step or "exception"
+        _where = f"{_step or 'unknown'}{' (start)' if _at_start else ''}"
         detail = (f"grain pipeline failed at {_where}"
                   f"{' (cancelled)' if _is_cancel else ''}: "
                   f"{_exc_name}: {exc}")
@@ -619,6 +619,7 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
     return GrainPipelineResult(
         ok=False, vspipe_rc=vs_rc, ffmpeg_rc=enc_rc,
         failed_stage=stage_name,
+        failed_at_start=bool(_at_start_failure),
         cancelled=_is_cancel,
         log_paths=_logs, stderr_tail=_tail,
         vspipe_tail=_vs_tail, encoder_tail=_enc_tail, detail=detail)

@@ -217,7 +217,12 @@ def test_consumer_fails_first_is_attributed_to_the_encoder(tmp_path):
 
 
 def test_second_process_start_failure_reaps_the_first(tmp_path):
-    """第二个进程起不来（命令不存在）→ 第一个也不能留成孤儿。"""
+    """第二个进程起不来（命令不存在）→ 第一个也不能留成孤儿。
+
+    `failed_stage` 记"哪一步"（这里是 ffmpeg，说明 vspipe 已经起来了），
+    `failed_at_start=True` 额外说明"它根本没跑起来"。两者分开，
+    既保住诊断信息，又不会把"启动失败"误当成"编码器跑失败"。
+    """
     case = _Case(tmp_path, "start_fail")
     r = s6._run_grain_pipeline(
         "print('script')", str(case.dir / "grain.vpy"),
@@ -225,7 +230,10 @@ def test_second_process_start_failure_reaps_the_first(tmp_path):
         ["definitely-not-a-real-binary-r21"],
         case.out, _Log(), inactivity_s=30.0)
     assert r.ok is False
-    assert r.failed_stage == "start", r.detail
+    assert r.failed_stage == "ffmpeg", r.detail
+    assert r.failed_at_start is True
+    assert r.is_plugin_capability_failure() is False, (
+        "启动失败不该走插件回退：回退同样要跑这两个可执行文件")
     _assert_no_orphans(case)
 
 
