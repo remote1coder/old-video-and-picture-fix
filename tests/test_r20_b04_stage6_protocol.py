@@ -49,10 +49,17 @@ def test_success_result_is_ok(s6):
 
 
 def test_plugin_failure_on_producer_is_fallbackable(s6):
-    """vspipe 求值 .vpy 失败且 stderr 提到 GrainFactory3 → 可回退。"""
+    """vspipe 求值 .vpy 失败且**生产者侧**尾部提到 GrainFactory3 → 可回退。
+
+    R21-C01：夹具补上 `vspipe_tail`。分类只认生产者侧尾部 ——
+    合并尾部（`stderr_tail`）里既有插件报错也有编码器报错，拿它判定
+    会把"编码器磁盘满"当成插件缺失。生产代码两个字段都填，
+    只填合并尾部的夹具不是生产的形状。
+    """
     r = s6.GrainPipelineResult(
         ok=False, vspipe_rc=1, ffmpeg_rc=0, failed_stage="vspipe",
-        stderr_tail="Script evaluation failed: name 'GrainFactory3' is not defined")
+        stderr_tail="Script evaluation failed: name 'GrainFactory3' is not defined",
+        vspipe_tail="Script evaluation failed: name 'GrainFactory3' is not defined")
     assert r.is_plugin_capability_failure() is True
 
 
@@ -73,12 +80,29 @@ def test_cancel_is_never_fallbackable(s6):
     assert r.is_plugin_capability_failure() is False
 
 
-def test_both_fail_is_not_fallbackable(s6):
-    """生产者 + 编码器都失败时，不是纯插件问题。"""
+def test_cascading_encoder_failure_still_points_at_the_plugin(s6):
+    """生产者先挂、编码器跟着挂（没输入）→ **仍属插件能力失败**。
+
+    R21-C01 改了这条**期望**：旧版断言"两边都失败 = 不是纯插件问题"，
+    但真实机器上插件缺失时 ffmpeg 必然拿不到输入而一起非零，
+    于是这条期望让**所有真实插件缺失都得不到回退**
+    （审核原文：不能简单把"编码器非零"全部当成绝不允许插件回退）。
+    判据改为看**首发原因**：生产者侧尾部有插件特征即可。
+    """
     r = s6.GrainPipelineResult(
         ok=False, vspipe_rc=1, ffmpeg_rc=1, failed_stage="vspipe",
-        stderr_tail="GrainFactory3 failed")
-    assert r.is_plugin_capability_failure() is False
+        stderr_tail="GrainFactory3 failed",
+        vspipe_tail="GrainFactory3 failed")
+    assert r.is_plugin_capability_failure() is True
+    assert r.is_cascading_encoder_failure() is False  # 首发在生产者，不是编码器
+
+
+def test_cascading_helper_flags_encoder_stage_failures(s6):
+    """首发被判到编码器、但生产者确实先失败 → 标成"连带失败"。"""
+    r = s6.GrainPipelineResult(
+        ok=False, vspipe_rc=1, ffmpeg_rc=1, failed_stage="ffmpeg",
+        vspipe_tail="GrainFactory3 failed")
+    assert r.is_cascading_encoder_failure() is True
 
 
 def test_start_failure_is_not_fallbackable(s6):

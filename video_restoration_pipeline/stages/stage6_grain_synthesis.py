@@ -196,6 +196,9 @@ class GrainPipelineResult:
     - ``cancelled``：是否被取消/中断。**取消绝不能当成插件失败去回退**。
     - ``log_paths``：本次 attempt 的 stderr 落盘路径。
     - ``stderr_tail``：有界尾部（合并 vspipe + ffmpeg）。
+    - ``vspipe_tail`` / ``encoder_tail``：**分开**保存两侧尾部（R21-C01）。
+      合并尾部无法回答"这句报错是生产者说的还是编码器说的"，
+      而"首发原因"正是回退判定的唯一依据。
     - ``detail``：人类可读摘要。
     """
 
@@ -206,47 +209,93 @@ class GrainPipelineResult:
     cancelled: bool = False
     log_paths: Tuple[str, ...] = field(default_factory=tuple)
     stderr_tail: str = ""
+    vspipe_tail: str = ""
+    encoder_tail: str = ""
     detail: str = ""
+
+    #: 插件/滤镜缺失的特征词（**只在生产者侧尾部里找**）
+    #:
+    #: R21-C01 实测补充：本机（`tools_r4/vs_portable/r72`）未装 GrainFactory3 时，
+    #: 真实报错是
+    #:   `AttributeError: No attribute with the name grainfactory exists.
+    #:    Did you mistype a plugin namespace or forget to install a plugin?`
+    #: —— 里面**没有** `grainfactory3` 这个词。旧表只认
+    #: `("grainfactory3", "haf.", "havsfunc")`，于是真实的插件缺失
+    #: **一次也匹配不上**，只能掉到最后那条隐式成功。
+    #: 另外 `haf.` 也匹配不到 `NameError: name 'haf' is not defined`。
+    _PLUGIN_TOKENS: Tuple[str, ...] = (
+        "grainfactory3", "grainfactory", "havsfunc",
+        "haf.", "name 'haf'",
+        "no attribute", "not found in the plugin", "unknown function",
+        "modulenotfounderror", "importerror")
 
     def is_plugin_capability_failure(self) -> bool:
         """是否属于"插件能力缺失"，可按配置尝试 AddGrainC 回退。
 
-        审核要求：**只有**明确的插件能力失败才允许回退。
-        编码器失败、磁盘错误、取消都不得用插件回退掩盖。
+        审核 R20-C01 要求区分**首发原因**与**连带失败**：
+
+        - 插件缺失 → vspipe 立即失败 → ffmpeg 拿到空输入，通常也非零退出。
+          此时 ffmpeg 的 returncode 是**后果**，不能拿它否掉插件判定
+          （旧实现要求 ``ffmpeg_rc in (None, 0)``，于是真实的插件缺失
+          反而永远走不到回退）。
+        - 独立编码/磁盘错误 → ``failed_stage == "ffmpeg"``，
+          且生产者侧尾部**没有**插件特征 → 绝不回退。
 
         Returns:
-            bool: 满足以下全部条件才为 True。
+            bool: 首发原因是插件能力缺失时为 True。
         """
         if self.ok or self.cancelled:
             return False
-        # 必须是生产者侧（vspipe 求值 .vpy 失败），而不是编码器侧
-        if self.failed_stage not in ("vspipe", "wait"):
+
+        _prod = (self.vspipe_tail or "").lower()
+        _hit = any(k in _prod for k in self._PLUGIN_TOKENS)
+
+        # ① 生产者侧失败 → 看它自己的尾部
+        if self.failed_stage == "vspipe":
+            return _hit
+        # ② 进程根本没起来（vspipe 二进制/脚本缺失）
+        #    必须确认是**生产者**没起来：编码器缺失不是插件问题。
+        if self.failed_stage == "start":
+            _d = (self.detail or "").lower()
+            _producer_side = ("step=vspipe" in _d
+                              or ("vspipe" in _d and "step=ffmpeg" not in _d))
+            return _producer_side and ("filenotfound" in _d
+                                       or "no such file" in _d
+                                       or "cannot find the file" in _d)
+        # ③ 只在"生产者先挂了、编码器跟着挂"的连带失败里认插件
+        #    —— 但必须**真的**有插件特征，否则就是编码/磁盘问题
+        if self.failed_stage in ("ffmpeg", "wait") and _hit:
+            return True
+        return False
+
+    def is_cascading_encoder_failure(self) -> bool:
+        """编码器失败是否只是生产者失败的**连带**后果。
+
+        用于日志归因：报错要指向首发原因，而不是把"ffmpeg rc=1"
+        当成根因反复排查。
+        """
+        if self.ok or self.cancelled:
             return False
-        # 编码器本身不能也失败，否则不是纯插件问题
-        if self.ffmpeg_rc not in (None, 0):
-            return False
-        tail = (self.stderr_tail or "").lower()
-        return any(k in tail for k in ("grainfactory3", "haf.", "havsfunc"))
+        return (self.failed_stage == "ffmpeg"
+                and self.vspipe_rc not in (None, 0))
+
 
 def _reap_pipeline(procs, threads, logger=None, label: str = "stage6") -> None:
     """收尾一组**可能部分启动**的进程。本函数不抛异常。
 
-    顺序很重要（反了会出问题）：
+    顺序很重要。R21-C01 调整了它（审核：'停止子进程前先等待日志线程，
+    停止后没有完整再次收束'）：
 
-    1. **先 join 排空线程** —— 否则关句柄时 `read()` 还阻塞在管道上；
-    2. terminate → 有界 wait → kill 残留 → 再 wait；
-    3. 关 stdout/stderr/stdin 句柄；
+    1. **先停进程** terminate → 有界 wait → kill 残留 → 再 wait。
+       先 join 线程的话，只要还有一个子进程在往管道里写，join 就要
+       空等满超时；terminate 之后管道自然 EOF，线程随即退出。
+    2. **再 join 排空线程**（此时读到 EOF，正常返回；仍有超时兜底）。
+    3. 关 stdout/stderr/stdin 句柄。
     4. 解取消守卫登记 —— 必须先停进程再注销，否则会遗留写入者。
 
     Raises:
         不抛。收尾阶段抛异常只会掩盖真正的原因。
     """
-    for t in threads or []:
-        try:
-            t.join(timeout=10)
-        except BaseException:
-            pass
-
     live = []
     for p in procs or []:
         try:
@@ -279,6 +328,13 @@ def _reap_pipeline(procs, threads, logger=None, label: str = "stage6") -> None:
                             pid=getattr(p, "pid", None), label=label)
                     except BaseException:
                         pass
+
+    # ---- 停完进程再 join：此时管道 EOF，线程不会卡在 read 上 ----
+    for t in threads or []:
+        try:
+            t.join(timeout=10)
+        except BaseException:
+            pass
 
     for p in procs or []:
         if p is None:
@@ -313,7 +369,9 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
 
     Returns:
-        ``(status, detail)``；``status == 0`` 表示成功。
+        ``GrainPipelineResult``。**不是** ``(status, detail)`` 元组 ——
+        R19-B04 起改为结构化对象，R21-C01 补上两侧分离的尾部。
+        ``result.ok`` 为真才算成功；失败时 ``failed_stage`` 指出首发位置。
 
     R19 重写要点（审核 R18-A07）：
 
@@ -346,6 +404,12 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
     _base = output_path or "stage6"
     enc_log = _TailLog(_base + ".enc.log")
     vs_log = _TailLog(_base + ".vs.log")
+
+    #: 谁先退出（"vspipe" / "ffmpeg"）。两边都非零时用它归因首发原因。
+    _exit_order: list = []
+    import threading as _threading_exit
+    _exit_mon_stop = _threading_exit.Event()
+    _exit_mon = None
 
     try:
         # ---- ① 第一个进程：创建后**立刻**纳入管理 ----
@@ -392,6 +456,27 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
             _t.start()
             threads.append(_t)
 
+        # ---- ③b 退出顺序监视（R21-C01）----
+        # 两边都非零时，"谁先退出"是唯一可靠的归因证据。
+        # 20ms 轮询、两个进程都退出即停；由 finally 里的 stop/join 收束。
+        def _watch_exits():
+            while not _exit_mon_stop.is_set():
+                for _p, _tag in ((vspipe_proc, "vspipe"),
+                                 (ffmpeg_proc, "ffmpeg")):
+                    try:
+                        if _p is not None and _p.poll() is not None \
+                                and _tag not in _exit_order:
+                            _exit_order.append(_tag)
+                    except BaseException:
+                        pass
+                if len(_exit_order) >= 2:
+                    return
+                _exit_mon_stop.wait(0.02)
+
+        _exit_mon = threading.Thread(target=_watch_exits, daemon=True)
+        _exit_mon.start()
+        threads.append(_exit_mon)
+
         # ---- ④ 按心跳等（不设总时长）----
         _hb = (lambda: (os.path.getsize(output_path)
                         if output_path and os.path.exists(output_path)
@@ -412,8 +497,17 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
         _is_cancel = (isinstance(exc, (KeyboardInterrupt, SystemExit))
                       or _exc_name in ("CancelledError", "Cancelled",
                                        "StageCancelled"))
-        _fail_stage = _step or "exception"
-        detail = (f"grain pipeline failed at {_step}"
+        # ---- R21-C01：Popen 抛异常 = **启动失败**，不是"该阶段跑失败" ----
+        # 旧实现把 `_fail_stage` 直接设成 `_step`，于是"第二个进程命令不存在"
+        # 会被记成 `failed_stage="ffmpeg"` —— 调用方会以为编码器跑起来了。
+        # 现在统一记 "start"，用 `step=xxx` 指明是哪一步没起来。
+        if _step in ("vspipe", "ffmpeg"):
+            _fail_stage = "start"
+            _where = f"start (step={_step})"
+        else:
+            _fail_stage = _step or "exception"
+            _where = _step or "unknown"
+        detail = (f"grain pipeline failed at {_where}"
                   f"{' (cancelled)' if _is_cancel else ''}: "
                   f"{_exc_name}: {exc}")
         if logger:
@@ -423,6 +517,14 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
             except BaseException:
                 pass
     finally:
+        # 先让监视线程停手，再收尾进程：否则它会把"我们自己 terminate 掉的"
+        # 也记成退出顺序，污染首发归因。
+        try:
+            _exit_mon_stop.set()
+            if _exit_mon is not None:
+                _exit_mon.join(timeout=2)
+        except BaseException:
+            pass
         _reap_pipeline(procs, threads, logger=logger, label="stage6-grain")
         enc_log.close()
         vs_log.close()
@@ -432,8 +534,11 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
     enc_rc = None if ffmpeg_proc is None else ffmpeg_proc.returncode
     _logs = tuple(x for x in (getattr(enc_log, "path", None),
                              getattr(vs_log, "path", None)) if x)
-    _tail = ((vs_log.tail_text()[-800:] + "\n" + enc_log.tail_text()[-800:])
-             .strip())
+    # R21-C01：两侧尾部**分开**保存。合并后无法回答"这句报错是谁说的"，
+    # 而"首发原因"正是插件回退与编码失败的唯一区分依据。
+    _vs_tail = vs_log.tail_text()[-800:]
+    _enc_tail = enc_log.tail_text()[-800:]
+    _tail = (_vs_tail + "\n" + _enc_tail).strip()
 
     stage_name = ""
     if status is None:
@@ -442,6 +547,36 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
             detail = ("grain pipeline did not start: "
                       f"vspipe={'ok' if vspipe_proc else 'missing'}, "
                       f"ffmpeg={'ok' if ffmpeg_proc else 'missing'}")
+        elif vs_rc != 0 and enc_rc not in (None, 0):
+            # ---- R21-C01：两边都非零时按**实测退出顺序**归因 ----
+            # 消费者先死 → 生产者 stdout 变断管，通常跟着非零退出。
+            # 只看 vspipe 的 rc 会把"编码器先失败"错记成"插件失败"，
+            # 进而误触发 AddGrain 回退（等于用换插件掩盖磁盘/编码错误）。
+            # 这里用监视线程记下的**谁先退出**判定，不依赖关键词表。
+            _first = _exit_order[0] if _exit_order else None
+            if _first == "ffmpeg":
+                status, stage_name = 84, "ffmpeg"
+                detail = (f"both processes failed; the encoder exited first "
+                          f"(vspipe rc={vs_rc}, ffmpeg rc={enc_rc}): "
+                          f"{enc_log.tail_text()[-800:]}")
+            elif _first == "vspipe":
+                status, stage_name = 84, "vspipe"
+                detail = (f"both processes failed; the producer exited first "
+                          f"(vspipe rc={vs_rc}, ffmpeg rc={enc_rc}): "
+                          f"{vs_log.tail_text()[-800:]}")
+            elif (vs_log.tail_text() or "").strip():
+                # 同一轮轮询里双双退出、顺序不可辨 → 退回"谁留下了报错"
+                status, stage_name = 84, "vspipe"
+                detail = (f"both processes failed; exit order indistinguishable, "
+                          f"the producer left a message "
+                          f"(vspipe rc={vs_rc}, ffmpeg rc={enc_rc}): "
+                          f"{vs_log.tail_text()[-800:]}")
+            else:
+                status, stage_name = 84, "ffmpeg"
+                detail = (f"both processes failed; exit order indistinguishable "
+                          f"and the producer stayed silent "
+                          f"(vspipe rc={vs_rc}, ffmpeg rc={enc_rc}): "
+                          f"{enc_log.tail_text()[-800:]}")
         elif vs_rc != 0:
             status, stage_name = 84, "vspipe"
             detail = (f"producer (vspipe) failed rc={vs_rc}: "
@@ -485,7 +620,8 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
         ok=False, vspipe_rc=vs_rc, ffmpeg_rc=enc_rc,
         failed_stage=stage_name,
         cancelled=_is_cancel,
-        log_paths=_logs, stderr_tail=_tail, detail=detail)
+        log_paths=_logs, stderr_tail=_tail,
+        vspipe_tail=_vs_tail, encoder_tail=_enc_tail, detail=detail)
 
 
 def get_video_dimensions(input_source: str) -> tuple:
@@ -866,34 +1002,193 @@ def main() -> int:
         output_path, logger,
         # 卡死阈值与阶段级看门狗同源：只看"产出是否停止增长"，不设总时长。
         inactivity_s=float(params.get("stage_inactivity_timeout", 1800.0)))
-    if result.ok:
+
+    # ---- R21-C01：结果分派抽成**可测函数** ----
+    # 原实现把 5 条返回路径散在 main() 尾部，其中两条直接走到函数末尾
+    # （隐式 None → sys.exit(None) = 0 = "成功"）。抽出来后既能逐条单测，
+    # 也不会因为 `if/elif` 少一个分支就静默变成成功。
+    def _run_fallback() -> "GrainPipelineResult":
+        addgrain_script = _build_vs_script(
+            input_source, vs_format,
+            g1str * 0.5, g2str * 0.5, g3str * 0.5,
+            addgrainc_ratio, use_addgrainc=True,
+            temp_avg=temp_avg,
+            deterministic=_vs_deterministic(params))
+        return _run_grain_pipeline(
+            addgrain_script, vs_path, vspipe_cmd, ffmpeg_cmd,
+            output_path, logger, fallback_label="AddGrainC",
+            inactivity_s=float(params.get("stage_inactivity_timeout", 1800.0)))
+
+    rc, _degraded = dispatch_result(
+        result, addgrainc_enabled=addgrainc_enabled, logger=logger,
+        run_fallback=_run_fallback)
+    if rc == 0:
         # NEW-V-06: 产物已完整落盘，取消守卫不再有权删它（RV-12）。
         if _cancel_guard is not None:
             _cancel_guard.release_outputs()
-        return 0
+        if _degraded is not None:
+            _write_degraded_note(output_path, result, _degraded,
+                                 g1str, g2str, g3str, addgrainc_ratio, logger)
+    return rc
 
-    # If GrainFactory3 failed, try AddGrainC fallback (if enabled)
-    # FIX-P9-6: respect addgrainc_enabled config; if disabled, fail immediately
-    # FIX-P9-9: AddGrainC standalone fallback uses halved intensity
-    # per v6.32 §7.17: conservative fallback to avoid over-graining
-    # ---- 结构化结果分派（审核 R19-B04：不再解包 (int, str)）----
+
+def dispatch_result(result: "GrainPipelineResult", addgrainc_enabled: bool,
+                    logger, run_fallback=None) -> Tuple[int, Optional["GrainPipelineResult"]]:
+    """把一次 stage6 管道结果分派成**退出码**（R21-C01 抽成可测函数）。
+
+    覆盖全部返回路径，**不允许隐式成功**：
+
+    | 输入 | 退出码 | 副作用 |
+    |---|---|---|
+    | ``result.ok`` | 0 | — |
+    | ``result.cancelled`` | 88 | **绝不**回退 |
+    | 插件能力失败 + 回退禁用 | 84 | 记录 STAGE6_GF3_FAILED |
+    | 插件能力失败 + 允许回退，回退成功 | 0 | 返回降级结果 |
+    | 插件能力失败 + 允许回退，回退失败 | 84 | 记录两次失败 |
+    | 其他一切失败（编码器/磁盘/异常） | 84 | 记录 STAGE6_FAIL |
+
+    Args:
+        result: 首次（GrainFactory3）管道结果。
+        addgrainc_enabled: 配置是否允许 AddGrainC 独立回退。
+        logger: 日志器。
+        run_fallback: 执行回退的可调用对象，返回新的 ``GrainPipelineResult``。
+            为 None 且需要回退时按"回退失败"处理（不会静默成功）。
+
+    Returns:
+        ``(exit_code, degraded_result_or_None)``。第二项非 None 表示
+        **这一次是降级产物**，调用方必须落侧车记录。
+    """
+    if result.ok:
+        return 0, None
+
     if result.cancelled:
-        logger.error("STAGE6_CANCELLED",
-                     "Grain synthesis was cancelled; no plugin fallback attempted",
-                     failed_stage=result.failed_stage,
-                     vspipe_rc=result.vspipe_rc, ffmpeg_rc=result.ffmpeg_rc)
-        return 88
+        if logger:
+            logger.error("STAGE6_CANCELLED",
+                         "Grain synthesis was cancelled; no plugin fallback "
+                         "attempted",
+                         failed_stage=result.failed_stage,
+                         vspipe_rc=result.vspipe_rc,
+                         ffmpeg_rc=result.ffmpeg_rc)
+        return 88, None
 
-    # 只有**明确的插件能力失败**才允许回退；编码器失败/磁盘错误/异常都不回退
     if result.is_plugin_capability_failure():
         if not addgrainc_enabled:
-            logger.critical("STAGE6_GF3_FAILED",
-                           "GrainFactory3 failed. AddGrainC is disabled by config. "
-                           "GrainFactory3 produces multi-scale structured grain; "
-                           "AddGrainC fallback would produce lower quality grain.",
-                           failed_stage=result.failed_stage,
-                           detail=result.detail[:500])
-            return 84
+            if logger:
+                logger.critical(
+                    "STAGE6_GF3_FAILED",
+                    "GrainFactory3 failed. AddGrainC is disabled by config. "
+                    "GrainFactory3 produces multi-scale structured grain; "
+                    "AddGrainC fallback would produce lower quality grain.",
+                    failed_stage=result.failed_stage,
+                    detail=(result.detail or "")[:500])
+            return 84, None
+
+        if logger:
+            logger.warning(
+                "STAGE6_FALLBACK",
+                "GrainFactory3 is unavailable; running the AddGrainC fallback "
+                "at halved intensity (lower quality, declared)",
+                first_stage=result.failed_stage,
+                vspipe_rc=result.vspipe_rc,
+                ffmpeg_rc=result.ffmpeg_rc,
+                vspipe_tail=(result.vspipe_tail or "")[-400:])
+        if run_fallback is None:            # 调用方没给回退实现 → 不得算成功
+            if logger:
+                logger.error("STAGE6_FALLBACK_UNAVAILABLE",
+                             "AddGrainC fallback was required but no fallback "
+                             "runner was supplied; failing instead of "
+                             "pretending success")
+            return 84, None
+
+        second = run_fallback()
+        if getattr(second, "ok", False):
+            return 0, second
+        if logger:
+            logger.error(
+                "STAGE6_FAIL",
+                "Grain synthesis failed and the AddGrainC fallback also failed",
+                first_stage=result.failed_stage,
+                first_vspipe_rc=result.vspipe_rc,
+                fallback_stage=getattr(second, "failed_stage", ""),
+                fallback_vspipe_rc=getattr(second, "vspipe_rc", None),
+                fallback_ffmpeg_rc=getattr(second, "ffmpeg_rc", None),
+                fallback_detail=(getattr(second, "detail", "") or "")[:500])
+        return 84, None
+
+    # ---- 其余失败必须有非零返回 ----
+    # 旧实现走到这里就"函数结束"→ 隐式返回 None → `sys.exit(None)` = 0，
+    # 也就是**普通编码失败被当成成功**。这是审核 R20-C01 的第二条。
+    if logger:
+        logger.error("STAGE6_FAIL",
+                     "Grain synthesis failed (no plugin fallback applies)",
+                     failed_stage=result.failed_stage,
+                     vspipe_rc=result.vspipe_rc,
+                     ffmpeg_rc=result.ffmpeg_rc,
+                     cascading_from_producer=result.is_cascading_encoder_failure(),
+                     detail=(result.detail or "")[:800])
+    return 84, None
+
+
+def _write_degraded_note(output_path: str, first: "GrainPipelineResult",
+                         second: "GrainPipelineResult",
+                         g1str: float, g2str: float, g3str: float,
+                         addgrainc_ratio: float, logger) -> None:
+    """把"这一代是降级产物"落成侧车文件（R21-C01）。
+
+    审核要求：回退成功必须验证实际输出，**并记录降级**。
+    只写日志不够 —— 日志会轮转，而读报告的人需要知道"这份 step6 用的不是
+    GrainFactory3"。侧车写失败只告警，不改变阶段结论（产物本身没坏）。
+
+    Args:
+        output_path: 本次产物路径（侧车与它同名 + `.degraded.json`）。
+        first: 首次（GrainFactory3）失败结果，用于记录首发原因。
+        second: 回退（AddGrainC）成功结果。
+        g1str / g2str / g3str: 配置的原始颗粒强度（回退按 0.5 施加）。
+        addgrainc_ratio: 配置的 AddGrainC 比例。
+    """
+    try:
+        import json as _json
+        _note = {
+            "schema": "stage6-degraded/1",
+            "output": os.path.abspath(output_path),
+            "output_size": (os.path.getsize(output_path)
+                            if os.path.exists(output_path) else 0),
+            "degraded": True,
+            "plugin_used": "AddGrainC",
+            "plugin_missing": "GrainFactory3",
+            "intensity": {
+                "configured": {"g1str": g1str, "g2str": g2str,
+                               "g3str": g3str},
+                "applied_scale": 0.5,
+                "addgrainc_ratio": addgrainc_ratio,
+                "note": "standalone fallback uses halved intensity "
+                        "(v6.32 §7.17 / FIX-P9-9)",
+            },
+            "first_failure": {
+                "stage": first.failed_stage,
+                "vspipe_rc": first.vspipe_rc,
+                "ffmpeg_rc": first.ffmpeg_rc,
+                "detail": (first.detail or "")[:800],
+            },
+            "fallback": {
+                "stage": second.failed_stage,
+                "vspipe_rc": second.vspipe_rc,
+                "ffmpeg_rc": second.ffmpeg_rc,
+            },
+            "recorded_at": __import__("datetime").datetime.now()
+                                 .astimezone().isoformat(),
+        }
+        _tmp = output_path + ".degraded.json.tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            _json.dump(_note, f, ensure_ascii=False, indent=2)
+        os.replace(_tmp, output_path + ".degraded.json")
+    except Exception as exc:            # 诊断失败不改变阶段结论
+        try:
+            logger.warning("STAGE6_DEGRADED_NOTE_FAIL",
+                           "Could not write the degraded-output sidecar; the "
+                           "degradation is only in the log", error=str(exc))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
