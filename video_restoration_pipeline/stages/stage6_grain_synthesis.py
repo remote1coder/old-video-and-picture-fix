@@ -179,6 +179,27 @@ class _TailLog:
             self._fh = None
 
 
+def _sha256_file(path: str, chunk: int = 1 << 20):
+    """文件的 SHA-256；读不出来返回 None。
+
+    R22-A06：降级侧车要绑定**产物内容**。本文件原来没有这个工具，
+    直接调用会 `NameError` —— 与 R20 stage7 缺 `_sha256_text`、
+    stage3 缺 `_sha256_file` 是同一类问题（**语法通过 ≠ 能跑**）。
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                b = fh.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 @dataclass
 class GrainPipelineResult:
     """stage6 颗粒合成管道的**结构化**结果（审核 R19-B04）。
@@ -209,6 +230,10 @@ class GrainPipelineResult:
     #: 失败发生在 **Popen 之前/之中**（进程根本没跑起来）。
     #: 与 `failed_stage` 分开：后者说"哪一步"，这个说"有没有真的启动"。
     failed_at_start: bool = False
+    #: **谁先退出**："vspipe" / "ffmpeg" / ""（同轮轮询同时看到 → 顺序不明）。
+    #: R22-A06：20ms 轮询得到的是**观察顺序**，不是严格因果；同一轮里两个都
+    #: 死了就不能宣称"生产者首发"。空串表示"顺序不可辨"，一律保守处理。
+    first_exit: str = ""
     cancelled: bool = False
     log_paths: Tuple[str, ...] = field(default_factory=tuple)
     stderr_tail: str = ""
@@ -226,11 +251,18 @@ class GrainPipelineResult:
     #: `("grainfactory3", "haf.", "havsfunc")`，于是真实的插件缺失
     #: **一次也匹配不上**，只能掉到最后那条隐式成功。
     #: 另外 `haf.` 也匹配不到 `NameError: name 'haf' is not defined`。
+    # R22-A06：**收紧**。审核受控例："编码器报磁盘无空间、生产者留下
+    # 无关的 AttributeError" 时，R21 的泛化词 `no attribute` / `importerror`
+    # 仍会判成插件缺失，从而触发一次不该发生的回退。
+    # 现在只认**指向具体插件/模块**的措辞：
+    #   - `grainfactory`（本机真实报错的原文，见上）
+    #   - `havsfunc` / `haf.` / `name 'haf'`（havsfunc 缺失或未导入）
+    #   - `not found in the plugin` / `unknown function`（VS 插件注册错误）
+    # 裸的 `no attribute` / `importerror` **不再**算证据 —— 它们太泛。
     _PLUGIN_TOKENS: Tuple[str, ...] = (
         "grainfactory3", "grainfactory", "havsfunc",
         "haf.", "name 'haf'",
-        "no attribute", "not found in the plugin", "unknown function",
-        "modulenotfounderror", "importerror")
+        "not found in the plugin", "unknown function")
 
     def is_plugin_capability_failure(self) -> bool:
         """是否属于"插件能力缺失"，可按配置尝试 AddGrainC 回退。
@@ -262,10 +294,12 @@ class GrainPipelineResult:
         # ② 生产者侧失败 → 看它自己的尾部
         if self.failed_stage == "vspipe":
             return _hit
-        # ③ 只在"生产者先挂了、编码器跟着挂"的连带失败里认插件
-        #    —— 但必须**真的**有插件特征，否则就是编码/磁盘问题
-        if self.failed_stage in ("ffmpeg", "wait") and _hit:
-            return True
+        # ③ 编码器失败：只有**确认生产者先退出**的级联才算插件问题。
+        #    R22-A06：审核指出"一次轮询同时看到两个进程结束时，固定先遍历
+        #    vspipe，于是把它记在前面" —— 那是观察顺序，不是因果。
+        #    所以 `first_exit` 为空（顺序不明）时一律**不认**插件失败。
+        if self.failed_stage in ("ffmpeg", "wait"):
+            return _hit and self.first_exit == "vspipe"
         return False
 
     def is_cascading_encoder_failure(self) -> bool:
@@ -463,15 +497,23 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
         # 20ms 轮询、两个进程都退出即停；由 finally 里的 stop/join 收束。
         def _watch_exits():
             while not _exit_mon_stop.is_set():
+                _found = []
                 for _p, _tag in ((vspipe_proc, "vspipe"),
                                  (ffmpeg_proc, "ffmpeg")):
                     try:
                         if _p is not None and _p.poll() is not None \
-                                and _tag not in _exit_order:
-                            _exit_order.append(_tag)
+                                and _tag not in _exit_order \
+                                and _tag not in _found:
+                            _found.append(_tag)
                     except BaseException:
                         pass
-                if len(_exit_order) >= 2:
+                if _found:
+                    # R22-A06：**同一轮**里看到两个都退出 = 顺序不可辨。
+                    # 旧实现固定先遍历 vspipe，于是把它记成"首发" ——
+                    # 那是遍历顺序，不是因果。这里显式记成空串。
+                    _exit_order.append(_found[0] if len(_found) == 1 else "")
+                if len([x for x in _exit_order if x != ""]) >= 2 or \
+                        _exit_order.count("") >= 1 and len(_exit_order) >= 2:
                     return
                 _exit_mon_stop.wait(0.02)
 
@@ -620,6 +662,8 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
         ok=False, vspipe_rc=vs_rc, ffmpeg_rc=enc_rc,
         failed_stage=stage_name,
         failed_at_start=bool(_at_start_failure),
+        # 空串 = 同轮同时退出/顺序不可辨 → 调用方不得宣称"生产者首发"
+        first_exit=str((_exit_order[0] if _exit_order else "") or ""),
         cancelled=_is_cancel,
         log_paths=_logs, stderr_tail=_tail,
         vspipe_tail=_vs_tail, encoder_tail=_enc_tail, detail=detail)
@@ -1102,6 +1146,18 @@ def dispatch_result(result: "GrainPipelineResult", addgrainc_enabled: bool,
             return 84, None
 
         second = run_fallback()
+        # R22-A06：回退期间被取消 → 必须保持**取消语义**（88）。
+        # 审核实测：首次插件失败后回退结果 cancelled=True，dispatch 却返回 84。
+        # 取消不是"失败"，上层要靠 88 把半成品清掉并停下，
+        # 走 84 会被当成"可以继续/重试"的普通失败。
+        if getattr(second, "cancelled", False):
+            if logger:
+                logger.error(
+                    "STAGE6_CANCELLED_DURING_FALLBACK",
+                    "The AddGrainC fallback was cancelled; reporting the "
+                    "cancel exit code rather than a generic failure",
+                    first_stage=result.failed_stage)
+            return 88, None
         if getattr(second, "ok", False):
             return 0, second
         if logger:
@@ -1154,6 +1210,9 @@ def _write_degraded_note(output_path: str, first: "GrainPipelineResult",
             "output": os.path.abspath(output_path),
             "output_size": (os.path.getsize(output_path)
                             if os.path.exists(output_path) else 0),
+            # R22-A06：侧车必须绑定**内容**，否则"这份降级说明属于哪一份
+            # 产物"只能靠文件名猜（同大小替换 / 重跑覆盖都会错配）。
+            "output_sha256": _sha256_file(output_path) or "",
             "degraded": True,
             "plugin_used": "AddGrainC",
             "plugin_missing": "GrainFactory3",

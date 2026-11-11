@@ -228,23 +228,36 @@ def test_every_exit_writes_the_timeline_plan():
 
 # ------------------------------------------------ 身份不能含运行期注入
 
-def test_runtime_injected_keys_do_not_change_the_identity():
-    """`upstream_artifact` / `ivtc` 等是**运行期**才注入的，不参与身份。
+def test_processing_choices_are_part_of_the_identity():
+    """`ivtc=VIVTC` 与 `ivtc=sRestore` 必须**可区分**（R22-A03）。
 
-    实测（本轮 N20）：同一代在"冻结时"与"验证时"算出两个不同的
-    `params_identity`，marker 被判 "effective parameters changed"，
-    整个 job 以 82 结束。
+    R21 把这个键塞进了"位置/运行期"排除列表，换来"摘要稳定"，
+    代价是宣称"两种反交错算法等价" —— 审核当场用生产函数复现了同一摘要。
+    现在身份读的是**计划快照**（stage 开始前冻结），所以：
+      * 用户/overrides 里的 `ivtc` 进身份（选择可追踪）
+      * stage 跑完后 main 再注入的 `ivtc` 不改身份（那是观测）
     """
     import main as M
     job = {"job_id": "j1", "input_path": "x.mp4"}
     base = M.merge_params(job, {}, {}, None)
-    id0 = M.build_params_identity({}, dict(job, _effective_params=base), None)
-    for extra in ({"upstream_artifact": "/tmp/a.mkv"},
-                  {"ivtc": True}, {"ivtc_auto_fallback": True},
-                  {"ai_upscale_banned": True}):
-        p = dict(base, **extra)
-        got = M.build_params_identity({}, dict(job, _effective_params=p), None)
-        assert got == id0, f"{list(extra)} 改变了身份"
+    a = M.build_params_identity({}, job, None, params=dict(base, ivtc="VIVTC"))
+    b = M.build_params_identity({}, job, None,
+                                params=dict(base, ivtc="sRestore"))
+    assert a != b, "两种 IVTC 选择给出了同一个身份"
+
+
+def test_post_execution_injection_does_not_change_a_frozen_identity():
+    """计划快照冻结之后，运行期注入（含 `ivtc`/`upstream_artifact`）不再改身份。"""
+    import main as M
+    job = {"job_id": "j1", "input_path": "x.mp4"}
+    base = M.merge_params(job, {}, {}, None)
+    p = dict(base)
+    p["_plan_snapshot"] = M._identity_semantics(p)
+    i1 = M.build_params_identity({}, job, None, params=p)
+    p2 = dict(p, ivtc=True, upstream_artifact="/tmp/a.mkv",
+              ivtc_auto_fallback=True)
+    i2 = M.build_params_identity({}, job, None, params=p2)
+    assert i1 == i2, "冻结之后仍有键改变了身份"
 
 
 def test_frozen_identity_is_preferred_over_recomputation():

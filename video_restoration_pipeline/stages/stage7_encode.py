@@ -892,8 +892,7 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
         out["problem"] = f"ffprobe failed: {exc}"
         return out
 
-    starts: List[float] = []
-    end: Optional[float] = None
+    packets: List[tuple] = []          # [(pts, duration), ...]
     for line in r.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -909,24 +908,40 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
                 dur = float(parts[1])
             except (TypeError, ValueError):
                 dur = 0.0
-        starts.append(pts)
-        e = pts + (dur if dur > 0 else 0.0)
-        if end is None or e > end:
-            end = e
+        packets.append((pts, dur))
 
-    if not starts:
+    if not packets:
         out["problem"] = "no packet timestamps"
+        out["coverage"] = "unknown"
         return out
-    starts.sort()
+    packets.sort(key=lambda x: x[0])
+    starts = [p for p, _d in packets]
     first = starts[0]
-    if end is None or end <= first:
-        # 没有 packet duration 时退回"末帧 PTS"，此时跨度少算最后一帧，
-        # 明确标注，别当成完整跨度。
-        end = starts[-1]
-        out["problem"] = "packet durations missing (span excludes the last frame)"
-    out.update(first_pts=round(first, 6), last_pts=round(starts[-1], 6),
-               frames=len(starts))
+    last_pts, last_dur = packets[-1]
+
+    # ---- R22-A04：末帧覆盖必须**逐帧**判断，不能用 `end > first` ----
+    # 审核反例：PTS 0/0.04/0.08、**所有** duration 都是 N/A 时，
+    # 旧判据 `end > first` 仍然成立（end 退回 0.08），于是返回
+    # `ok=True, span=0.08, problem=""` —— 少算了整整一帧的覆盖却不报。
+    #
+    # 现在只看**末帧自己的 duration**：
+    #   observed —— 末帧有 duration，跨度 = 末帧 pts + 它的 duration
+    #   derived  —— 末帧缺 duration（多帧）：跨度只能算到末帧 PTS，
+    #               明确标"少一帧"，上层不得当成完整覆盖
+    #   unknown  —— 单帧且缺 duration：连"一帧多长"都不知道
+    if last_dur > 0:
+        end = last_pts + last_dur
+        out["coverage"] = "observed"
+    else:
+        end = last_pts
+        out["coverage"] = "unknown" if len(packets) == 1 else "derived"
+        out["problem"] = ("the last packet has no duration; the span excludes "
+                          "the final frame")
+    out["last_frame_duration"] = round(last_dur, 6)
+    out.update(first_pts=round(first, 6), last_pts=round(last_pts, 6),
+               frames=len(packets))
     out["span"] = round(end - first, 6)
+    # `ok` 只表示"拿到了可用的时间信息"；是否**完整覆盖**看 `coverage`。
     out["ok"] = out["span"] > 0
 
     if len(starts) >= 3:
@@ -1025,9 +1040,17 @@ def measure_final_candidate(candidate: str, logger=None,
             "source": "packet-scan", "ok": bool(_tl.get("ok")),
             "duration": _tl.get("span"), "problem": _tl.get("problem") or ""})
         if _tl.get("ok"):
+            # R22-A04：`coverage_complete` 由**末帧是否有 duration** 决定，
+            # 不再一律 True。审核反例：0/0.04/0.08 三帧、duration 全 N/A，
+            # 旧实现返回 ok=True/span=0.08 并标"完整"—— 少一帧却不报。
+            _cov = str(_tl.get("coverage") or "unknown")
             info.update(duration=float(_tl["span"]),
-                        basis="video-packet-span", frames=int(_tl.get("frames") or 0),
-                        varies=_tl.get("varies"), coverage_complete=True)
+                        basis="video-packet-span",
+                        frames=int(_tl.get("frames") or 0),
+                        varies=_tl.get("varies"),
+                        coverage_complete=(_cov == "observed"),
+                        coverage=_cov,
+                        last_frame_duration=_tl.get("last_frame_duration"))
             _got = True
             if _tl.get("problem"):
                 info["problems"].append(_tl["problem"])
@@ -1078,7 +1101,15 @@ def measure_final_candidate(candidate: str, logger=None,
         except Exception:
             info["frames"] = 0
 
-    info["measured"] = info["duration"] > 0
+    # R22-A04：`measured` 不能只看"时长 > 0"。
+    # 审核反例：视频时长取不到、无 packet、容器 12 秒、**帧数 0** →
+    # 旧实现 measured=True，`final_timeline` 于是判 PASS。
+    # "有时长"和"测到了这一代"是两件事：零帧的成品不能算时间已测。
+    info["measured"] = bool(info["duration"] > 0 and info["frames"] > 0)
+    if not info["measured"] and info["duration"] > 0:
+        info["problems"].append(
+            f"duration={info['duration']} but no video frames were measured; "
+            "this is not a usable timeline measurement")
     if info["measured"] and prev > 0:
         info["delta_ms"] = round((info["duration"] - prev) * 1000.0, 3)
         info["changed"] = (abs(info["duration"] - prev) / prev) > relation_tolerance
@@ -3977,7 +4008,12 @@ def main():
                 #   PASS       → 确实从最终字节测到了时长
                 #   UNVERIFIED → 测不到，必须显式强制才能发布（verified=false）
                 _ftl_problems = _final_tl.get("problems") or []
-                if _final_tl.get("measured"):
+                # R22-A04：PASS 还要求**完整覆盖**。
+                # 审核反例：0/0.04/0.08 三帧、duration 全 N/A 时，
+                # 旧实现只标一条 problem 就判 PASS —— `coverage_complete`
+                # 虽然算出来了，却没有被任何判据消费。
+                _ftl_cov_ok = bool(_final_tl.get("coverage_complete"))
+                if _final_tl.get("measured") and _ftl_cov_ok:
                     _checks["final_timeline"] = {
                         "name": "final_timeline",
                         "status": "PASS",
@@ -3992,12 +4028,18 @@ def main():
                         "evidence": _prechecks.get("final_timeline"),
                     }
                 else:
+                    _why_ftl = (
+                        "the final candidate's duration could not be measured "
+                        "after the last mux; the pre-encode value is not "
+                        "evidence for the published file"
+                        if not _final_tl.get("measured") else
+                        "the final candidate's timeline has no complete "
+                        "last-frame coverage (packet durations missing); "
+                        "the measured span is short by at least one frame")
                     _checks["final_timeline"] = {
                         "name": "final_timeline",
                         "status": "UNVERIFIED",
-                        "reason": ("the final candidate's duration could not be "
-                                   "measured after the last mux; the pre-encode "
-                                   "value is not evidence for the published file"),
+                        "reason": _why_ftl,
                         "method": "stage7.measure_final_candidate",
                         "severity": "warning",
                         # 与 transform 用同一把钥匙：允许"明知未验证仍要发"

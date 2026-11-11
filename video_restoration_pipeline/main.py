@@ -864,31 +864,57 @@ def build_input_identity(input_path: str) -> Dict[str, Any]:
 # ID-02（第七轮）：纯位置字段 —— 它们不影响媒体内容，不能进身份摘要。
 # 把 temp_dir / 日志目录之类算进身份，会导致"只改了输出目录就触发全量重算"，
 # 以及"同一份结果换个目录就认不出来"。
+#
+# R22-A03：**处理选择不能靠"从身份里删字段"来稳定**。
+# 审核复现：`ivtc=VIVTC` 与 `ivtc=sRestore` 曾经给出**同一个摘要** ——
+# 因为 R21 把这个键当成"运行期注入"排除了。可它同时承载用户的实际选择，
+# 排除它等于宣称"两种反交错算法等价"。
+#
+# 正解是把三份数据分开（见 `_plan_snapshot`）：
+#   ① 不可变用户请求（job.user_overrides / CLI）
+#   ② 解析后有效计划 —— 在 stage 开始**之前**快照，参与身份
+#   ③ 执行观测/降级记录 —— stage 跑完才注入，**不参与**身份
+# 所以 `ivtc` 等键回到身份里；真正该排除的只有纯位置字段与
+# `upstream_artifact`（上游精确产物路径，位置性质）。
 _IDENTITY_POSITIONAL_KEYS = frozenset({
     "temp_dir", "log_dir", "output_dir", "output_path",
     "input_path", "log_path", "manifest_path", "params_file",
     "_effective_params", "job_id", "run_id", "attempt_id",
-# R21-C06：身份只描述**用户/配置提出的计划**，不描述执行过程中由上游
-# 产物或自动回退推导出来的中间决定。这些键在运行期才注入，若参与身份，
-# "冻结时"与"验证时"会算出两个值 —— 同一代被误判成"参数变了"
-# （N20 实跑就是这样全批失败的）。
-    # ---- 运行期注入 / 事后推导 ----
-    "upstream_artifact",      # 上游精确产物路径（位置）
-    "ivtc",                   # stage1 自动回退的结论
-    "ivtc_auto_fallback",
-    "ai_upscale_banned",
+    "upstream_artifact",      # 上游精确产物路径（位置，不是选择）
+})
+
+#: 只在"执行之后"才被写入的键 —— 它们属于观测记录，不属于计划。
+#: 注意：**不要**把它们塞进 `_IDENTITY_POSITIONAL_KEYS`，
+#: 那是把"选择"和"位置"混为一谈的老问题。
+_POST_EXECUTION_KEYS = frozenset({
+    "ivtc_auto_fallback",     # 自动回退发生过的标记
+    "ai_upscale_banned",      # 分类器结论（执行前由 classify 给出，随 job 进计划）
 })
 
 
 def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
-    """从有效参数里挑出**影响媒体语义**的部分，用于身份摘要。
+    """从**计划快照**里挑出影响媒体语义的部分，用于身份摘要。
 
     任务书 §2.3：『按语义规范化的有效参数；不要把日志路径、输出目录等
     纯位置字段当作媒体语义，导致无谓重算』。
+
+    R22-A03：如果 `params["_plan_snapshot"]` 存在，就用它 —— 那是 stage
+    开始**之前**冻结的视图，运行期的任何注入都不会改变它。
     """
+    src = params or {}
+    snap = src.get("_plan_snapshot")
+    if isinstance(snap, dict):
+        # 快照已经过滤过一遍；这里只防御性剔除位置键
+        return {k: v for k, v in snap.items()
+                if k not in _IDENTITY_POSITIONAL_KEYS}
+
     out: Dict[str, Any] = {}
-    for k, v in (params or {}).items():
+    for k, v in src.items():
         if k in _IDENTITY_POSITIONAL_KEYS:
+            continue
+        # 没有快照时（resume 新进程 / 老调用）额外剔除"纯观测"键：
+        # 它们只可能在执行后出现，新进程重算时本来就没有，不剔会永远对不上。
+        if k in _POST_EXECUTION_KEYS:
             continue
         if k.startswith("_"):          # 内部临时键（_shake_probe 等）
             continue
@@ -2172,6 +2198,12 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     # 验证时却有 → 摘要对不上 → 整批 job 报
     # `COMPLETION_MARKER_PARAMS_DIFF: chain_mode null -> "none"` 并以 82 结束。
     try:
+        # R22-A03：先把**计划**抄成不可变快照，再算身份。
+        # 此后 stage 往 params 里注入的任何东西（`ivtc` 的自动回退结论、
+        # 上游产物路径……）都不会再改变这一代的身份 —— 因为身份读快照。
+        # 反过来，用户在 overrides/CLI 里指定的 `ivtc` 在快照里，
+        # 所以 VIVTC 与 sRestore 会被正确区分开（审核 A03 的复现点）。
+        params["_plan_snapshot"] = _identity_semantics(params)
         _frozen_identity = build_params_identity(
             config, job, job_logger, params=params)
         params["_frozen_params_identity"] = _frozen_identity

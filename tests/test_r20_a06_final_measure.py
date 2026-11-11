@@ -113,7 +113,7 @@ def test_remeasure_prefers_the_video_stream_duration(monkeypatch):
     monkeypatch.setattr(
         s7, "subprocess",
         _FakeSubprocess(stream_dur=15.5, fmt_dur=99.0, packets="1.0,0.03\n"))
-    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 20)
     # 没有重定时 → 视频流时长直接可用，不需要全扫
     info = s7.measure_final_candidate(
         "cand.mkv", None, previous_duration=12.0, previous_basis="packet-span")
@@ -141,7 +141,7 @@ def test_remeasure_uses_stream_duration_without_scanning(monkeypatch):
 def test_remeasure_falls_back_to_container_duration(monkeypatch):
     monkeypatch.setattr(s7, "subprocess",
                         _FakeSubprocess(stream_dur=None, fmt_dur=9.5))
-    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 20)
     info = s7.measure_final_candidate("cand.mkv", None)
     assert info["measured"] is True
     assert info["basis"] == "container-duration"
@@ -153,7 +153,7 @@ def test_remeasure_rescans_only_when_nothing_cheaper_is_available(monkeypatch):
     monkeypatch.setattr(
         s7, "subprocess",
         _FakeSubprocess(packets=_packets([0.04] * 9 + [0.08] * 9)))
-    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 20)
     info = s7.measure_final_candidate("cand.mkv", None)
     assert info["measured"] is True
     # R21-C05：basis 改名为 video-packet-span（强调"视频流、含末帧时长"）
@@ -167,7 +167,7 @@ def test_remeasure_rescans_only_when_nothing_cheaper_is_available(monkeypatch):
 def test_remeasure_reports_unmeasured_instead_of_reusing_the_old_value(monkeypatch):
     """全部取不到 → measured=False 且 duration=0（旧值不得冒充已验证）。"""
     monkeypatch.setattr(s7, "subprocess", _FakeSubprocess())
-    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 20)
     info = s7.measure_final_candidate("cand.mkv", None,
                                       previous_duration=12.0,
                                       previous_basis="packet-span")
@@ -180,7 +180,7 @@ def test_remeasure_reports_unmeasured_instead_of_reusing_the_old_value(monkeypat
 def test_remeasure_survives_a_probe_exception(monkeypatch):
     monkeypatch.setattr(s7, "subprocess",
                         _FakeSubprocess(raise_on=("ffprobe",)))
-    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 20)
     info = s7.measure_final_candidate("cand.mkv", None, previous_duration=12.0)
     assert info["measured"] is False
     assert info["duration"] == 0.0
@@ -191,7 +191,7 @@ def test_remeasure_survives_a_probe_exception(monkeypatch):
 
 def test_changed_flag_uses_a_relative_tolerance(monkeypatch):
     monkeypatch.setattr(s7, "subprocess", _FakeSubprocess(stream_dur=10.4))
-    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 20)
     near = s7.measure_final_candidate("c.mkv", None, previous_duration=10.0)
     assert near["changed"] is False, "4% 的变化在默认 5% 容差之内"
     assert near["delta_ms"] == pytest.approx(400.0, abs=1.0)

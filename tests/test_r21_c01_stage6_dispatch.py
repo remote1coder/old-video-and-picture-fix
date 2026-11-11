@@ -228,9 +228,29 @@ def test_a_disk_error_in_the_encoder_tail_does_not_trigger_fallback():
 def test_cascading_helper_reports_the_truth_when_both_fail():
     r = s6.GrainPipelineResult(
         ok=False, failed_stage="ffmpeg", vspipe_rc=1, ffmpeg_rc=1,
-        vspipe_tail=GF3_ERR)
+        vspipe_tail=GF3_ERR,
+        # R22-A06：级联要成立，必须有"生产者**确认先退出**"的证据。
+        # 顺序不明（同轮同时退出）时不能宣称首发 —— 这是审核明确要求的。
+        first_exit="vspipe")
     assert r.is_cascading_encoder_failure() is True
     assert r.is_plugin_capability_failure() is True
+
+
+def test_ambiguous_exit_order_is_not_treated_as_a_plugin_failure():
+    """同轮轮询同时看到两个进程结束 → 顺序不可辨 → 不得触发插件回退。"""
+    r = s6.GrainPipelineResult(
+        ok=False, failed_stage="ffmpeg", vspipe_rc=1, ffmpeg_rc=1,
+        vspipe_tail=GF3_ERR, first_exit="")
+    assert r.is_plugin_capability_failure() is False
+
+
+def test_unrelated_attribute_error_does_not_trigger_fallback():
+    """审核受控例：编码器磁盘错误 + 生产者无关 AttributeError → 不回退。"""
+    r = s6.GrainPipelineResult(
+        ok=False, failed_stage="ffmpeg", vspipe_rc=1, ffmpeg_rc=1,
+        vspipe_tail="AttributeError: module 'unrelated' has no attribute 'x'",
+        first_exit="vspipe")
+    assert r.is_plugin_capability_failure() is False
 
 
 # ------------------------------------------------ 结构守卫

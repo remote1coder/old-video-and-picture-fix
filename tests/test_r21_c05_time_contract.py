@@ -108,7 +108,7 @@ def test_non_finite_actual_is_rejected_before_anything_else():
 
 # ------------------------------------------------ ② 最终测量的量
 
-def _patch_probes(monkeypatch, stream=None, fmt=None, packet=None):
+def _patch_probes(monkeypatch, stream=None, fmt=None, packet=None, frames=20):
     monkeypatch.setattr(
         s7, "_probe_container_duration",
         lambda path, stream_type="v", prefer="any": (
@@ -120,7 +120,9 @@ def _patch_probes(monkeypatch, stream=None, fmt=None, packet=None):
         lambda path, **kw: (packet or {"ok": False, "span": 0.0,
                                        "frames": 0, "varies": None,
                                        "problem": "no packets"}))
-    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: 0)
+    # R22-A04：`measured` 现在还要求 frames>0（零帧不算测到），
+    # 所以桩必须给出一个合理帧数 —— 这些用例测的是取值顺序，不是帧数。
+    monkeypatch.setattr(s7, "_count_frames_quietly", lambda *a, **k: frames)
 
 
 def test_retime_span_without_tail_is_flagged_incomplete(monkeypatch):
@@ -160,7 +162,8 @@ def test_video_packet_span_wins_when_the_timeline_changed(monkeypatch):
     _patch_probes(
         monkeypatch, stream=0.0, fmt=9.99,
         packet={"ok": True, "span": 0.12, "frames": 3, "varies": False,
-                "problem": ""})
+                "problem": "", "coverage": "observed",
+                "last_frame_duration": 0.04})
     info = s7.measure_final_candidate(
         "x.mkv", _Log(),
         retime_info={"action": "retimed", "out_last": 0.08, "frames": 3})
