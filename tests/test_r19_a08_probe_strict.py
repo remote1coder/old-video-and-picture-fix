@@ -61,8 +61,12 @@ def _ok_sides():
     fused = {"rc": 0, "step3": None,
              "step4": "/w/f/temp/b_step4.mkv",
              "receipts": ["b.fused_stage34.json"]}
+    # R21-C08：判据新增"时间轴必须独立核对"，所以**合法样本**也要带上
+    # PTS / 末帧覆盖 —— 否则它证明不了"两边时间轴相同"，被拒绝是对的。
     info_c = {"width": 3840, "height": 2160, "pix_fmt": "yuv420p16le",
-              "nb_read_frames": "20"}
+              "nb_read_frames": "20", "frames": 20,
+              "first_pts": 0.0, "last_pts": 0.633367,
+              "last_end": 0.6667, "median_interval": 0.033367}
     info_f = dict(info_c)
     rows = [{"n": str(i), "psnr_y": "inf", "psnr_u": "inf", "psnr_v": "inf"}
             for i in range(1, 21)]

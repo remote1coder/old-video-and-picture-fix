@@ -68,6 +68,55 @@ def sh(cmd, **kw):
                           errors="replace", shell=False, **kw)
 
 
+def probe_timing(path):
+    """用**视频流**的 packet 时间戳观测时间轴（R21-C08）。
+
+    为什么必须单独看：`nb_read_frames` 相同、尺寸相同，仍可能
+    "像素逐帧一致但时间轴错位"或"末帧被重复填充凑够帧数"。
+    这两类只有比对 PTS 与**末帧覆盖**（末帧 PTS + 它自己的时长）才能发现。
+
+    Returns:
+        ``{frames, first_pts, last_pts, last_end, median_interval}``；
+        失败时 ``{"error": str}``。
+    """
+    r = sh(["ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,duration_time",
+            "-of", "csv=p=0", path])
+    if r.returncode != 0:
+        return {"error": f"ffprobe rc={r.returncode}"}
+    starts = []
+    end = None
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        try:
+            pts = float(parts[0])
+        except (TypeError, ValueError):
+            continue
+        dur = 0.0
+        if len(parts) > 1:
+            try:
+                dur = float(parts[1])
+            except (TypeError, ValueError):
+                dur = 0.0
+        starts.append(pts)
+        e = pts + (dur if dur > 0 else 0.0)
+        if end is None or e > end:
+            end = e
+    if not starts:
+        return {"error": "no packet timestamps"}
+    starts.sort()
+    if end is None or end <= starts[0]:
+        return {"error": "packet durations missing (cannot compute coverage)"}
+    d = [b - a for a, b in zip(starts, starts[1:]) if b > a]
+    med = sorted(d)[len(d) // 2] if d else 0.0
+    return {"frames": len(starts), "first_pts": round(starts[0], 6),
+            "last_pts": round(starts[-1], 6), "last_end": round(end, 6),
+            "median_interval": round(med, 6)}
+
+
 def probe(path):
     """探测媒体参数。
 
@@ -113,6 +162,20 @@ def probe(path):
 
     if not info.get("pix_fmt") or not isinstance(info["pix_fmt"], str):
         return {"error": f"pix_fmt missing/invalid: {info.get('pix_fmt')!r}"}
+
+    # ---- R21-C08：时间轴也必须**独立**核对 ----
+    # 审核："evaluator 比较尺寸、格式、帧数，却未核对实际 PTS、尾帧覆盖和
+    #       时间映射。受控输入中，声明时间不同仍判 IDENTICAL。"
+    # 只比帧数/尺寸无法发现"像素一样但时间轴不同"或"末帧被重复填充凑数"。
+    tl = probe_timing(path)
+    if "error" in tl:
+        return {"error": f"timing probe failed: {tl['error']}"}
+    if tl["frames"] != info["nb_read_frames"]:
+        return {"error": (f"packet count {tl['frames']} != nb_read_frames "
+                          f"{info['nb_read_frames']}")}
+    info.update({k: tl[k] for k in
+                 ("frames", "first_pts", "last_pts", "last_end",
+                  "median_interval")})
     return info
 
 
@@ -308,8 +371,15 @@ def compare(a, b):
 
 #: 只接受这些字面量作为 "完全相同"。审核 R19-B07：
 #: 「拒绝随便以 inf 开头的坏值」—— ``startswith("inf")`` 会放过 ``infinity_bad``。
-_INF_TOKENS = frozenset({"inf", "+inf", "-inf", "infinity", "+infinity",
-                         "-infinity"})
+#: 只接受**正**无穷 —— 它才是"逐像素完全相同"（MSE=0）的唯一合法表示。
+#:
+#: R21-C08：审核指出旧集合接受 `-inf/-infinity`。
+#: 负无穷在 PSNR 里没有"零误差"的含义（它来自坏的 1/x 或错误统计），
+#: 把它当 inf 计数等于**用错误数值证明等价**。
+_INF_TOKENS = frozenset({"inf", "+inf", "infinity", "+infinity"})
+
+#: 负无穷：显式判为**非法值**，既不算 inf 也不算有限值。
+_NEG_INF_TOKENS = frozenset({"-inf", "-infinity"})
 
 
 def _plane(rows, key, total=None):
@@ -340,6 +410,10 @@ def _plane(rows, key, total=None):
             missing_idx.append(i + 1)
             continue
         tok = v.strip().lower()
+        if tok in _NEG_INF_TOKENS:
+            # 负无穷不能证明零误差 → 记成非法行
+            bad_idx.append(i + 1)
+            continue
         if tok in _INF_TOKENS:
             vals.append(None)
             continue
@@ -410,6 +484,26 @@ def evaluate(classic, fused, info_c, info_f, cmp_result, frames):
             elif info_c.get(k) != info_f.get(k):
                 reasons.append(
                     f"{k} differs: {info_c.get(k)} vs {info_f.get(k)}")
+
+    # ---- 4b) 时间轴：PTS、末帧覆盖、帧号连续性（R21-C08）----
+    # 审核："未核对实际 PTS、尾帧覆盖和时间映射。受控输入中，
+    #       声明时间不同仍判 IDENTICAL。"
+    # 容差按时间基给：MKV 的 packet 时间戳是毫秒量化，取 max(2ms, 2×tb)。
+    _tol = 0.002
+    if "error" not in info_c and "error" not in info_f:
+        for key in ("frames", "first_pts", "last_pts", "last_end"):
+            a, b = info_c.get(key), info_f.get(key)
+            if a is None or b is None:
+                reasons.append(f"timing field {key} unproven on one side")
+                continue
+            if key == "frames":
+                if int(a) != int(b):
+                    reasons.append(f"timing frame count differs: {a} vs {b}")
+                continue
+            if abs(float(a) - float(b)) > _tol:
+                reasons.append(
+                    f"{key} differs: classic={a} fused={b} "
+                    f"(tolerance {_tol}s)")
 
     # ---- 5) 比较本身必须成功且覆盖全部帧 ----
     if cmp_result.get("returncode") != 0:

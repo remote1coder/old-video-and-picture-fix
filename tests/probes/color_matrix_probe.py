@@ -38,19 +38,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
 
 #: 有损组合：chroma 子采样 × 矩阵 × 量化范围
+#: 8 种基本组合：chroma × matrix × range 全交叉。
+#: R21-C09：审核指出旧表缺 BT.601 **full** 与 444 的对应组合。
 COMBOS = [
     ("444", "bt709", "limited"),
     ("444", "bt709", "full"),
     ("444", "bt601", "limited"),
+    ("444", "bt601", "full"),
     ("420", "bt709", "limited"),
     ("420", "bt709", "full"),
     ("420", "bt601", "limited"),
+    ("420", "bt601", "full"),
 ]
 
 #: 标签错配：按 (编码) 写、按 (解码) 读
@@ -112,11 +117,27 @@ def back_to_rgb(src, dst, matrix, rng):
     return dst
 
 
-def psnr_rgb(a, b):
-    """RGB 域逐帧 PSNR（对 rgb24 输入，ffmpeg 报 r/g/b 三个平面）。"""
+def psnr_rgb(a, b, expected_frames=None):
+    """RGB 域逐帧 PSNR **与逐帧 MSE**（R21-C09 重写）。
+
+    旧实现的四处硬伤（审核逐条点名）：
+
+    1. 不看 `returncode` —— 比较进程失败仍然继续解析空输出；
+    2. 不检查每行是否**每个平面都有值** —— 缺一个平面照样算平均；
+    3. 不检查帧号是否 1..N 连续唯一 —— 重复行/缺行不被发现；
+    4. 统计用"先平均 dB 再反推 RMSE" —— 那等价于对 MSE 作几何平均，
+       与"先累计平方误差再求总体 RMSE"不是一回事。
+
+    现在返回逐帧 `mse_*`，由 `aggregate()` 用**总平方误差 / 总样本数**
+    求总体统计量。
+
+    Returns:
+        ``{rc, frames, rows, problems, seq}``；``problems`` 非空即不可采信。
+    """
     r = sh(["ffmpeg", "-hide_banner", "-v", "info", "-i", a, "-i", b,
             "-lavfi", "[0:v]format=rgb24[x];[1:v]format=rgb24[y];"
                       "[x][y]psnr=stats_file=-", "-f", "null", "-"])
+    problems = []
     rows = []
     for ln in (r.stdout or "").splitlines():
         if not ln.startswith("n:"):
@@ -127,29 +148,123 @@ def psnr_rgb(a, b):
                 k, v = tok.split(":", 1)
                 row[k] = v
         rows.append(row)
-    planes = {}
+
+    if r.returncode != 0:
+        problems.append(f"comparison rc={r.returncode}: "
+                        f"{(r.stderr or '')[-200:]}")
+
+    seq = []
+    for i, row in enumerate(rows):
+        try:
+            seq.append(int(row.get("n")))
+        except (TypeError, ValueError):
+            problems.append(f"row {i + 1} has no parsable frame number")
+        for p in ("r", "g", "b"):
+            if not row.get(f"mse_{p}") and not row.get(f"psnr_{p}"):
+                problems.append(f"row {i + 1} lacks plane {p}")
+                break
+    if seq and seq != list(range(1, len(seq) + 1)):
+        problems.append("frame numbers are not 1..N contiguous "
+                        "(duplicate/missing rows are not evidence)")
+    if expected_frames is not None and len(rows) != int(expected_frames):
+        problems.append(f"compared {len(rows)} of {expected_frames} frames")
+    if not rows:
+        problems.append("no psnr rows at all")
+
+    return {"rc": r.returncode, "frames": len(rows), "rows": rows,
+            "seq": seq, "problems": problems}
+
+
+def _num(tok):
+    """解析统计值：``inf`` → None（表示零误差）；非法 → ``"bad"``。"""
+    t = str(tok or "").strip().lower()
+    if t in ("inf", "+inf", "infinity", "+infinity"):
+        return None
+    if t in ("-inf", "-infinity"):
+        return "bad"
+    try:
+        v = float(t)
+    except (TypeError, ValueError):
+        return "bad"
+    # `float("nan")` 能解析成功但它会污染整批均值；非有限一律判非法
+    if not math.isfinite(v) or v < 0:
+        return "bad"
+    return v
+
+
+def aggregate(res):
+    """用**总平方误差 / 总样本数**求各通道 MSE、RMSE、PSNR（R21-C09）。
+
+    为什么不能先平均 dB：dB 是对数域，平均 dB 再反推 RMSE 相当于对 MSE
+    作几何平均；动态素材里个别极差帧会被系统性低估。
+    """
+    out = {"frames": res.get("frames", 0), "planes": {},
+           "problems": list(res.get("problems") or [])}
+    rows = res.get("rows") or []
     for p in ("r", "g", "b"):
-        # 注意统计行的键名是 `psnr_r` / `psnr_g` / `psnr_b`，
-        # 不是裸的 `r`（第一版按裸键取，全部拿到 None → 误判 INVALID）
-        key = f"psnr_{p}"
-        vals = []
+        mses = []
+        bad = 0
         for row in rows:
-            v = row.get(key)
-            try:
-                vals.append(float(v))
-            except (TypeError, ValueError):
-                continue        # inf 会在这里被跳过，单独判断
-        inf_all = bool(rows) and all(row.get(key) == "inf" for row in rows)
-        if inf_all:
-            planes[p] = {"psnr": "inf", "frames": len(rows)}
-        else:
-            planes[p] = {
-                "psnr": (sum(vals) / len(vals)) if vals else None,
-                "min": min(vals) if vals else None,
-                "frames": len(vals),
-            }
-    return {"frames": len(rows), "planes": planes,
-            "rc": r.returncode}
+            m = _num(row.get(f"mse_{p}"))
+            if m == "bad":
+                bad += 1
+                continue
+            if m is None:            # psnr=inf ⇒ mse=0
+                m = 0.0
+            mses.append(float(m))
+        if bad or not mses:
+            out["problems"].append(
+                f"plane {p}: {bad} unparsable mse value(s), {len(mses)} usable")
+            out["planes"][p] = {"mse": None, "rmse": None, "psnr": None,
+                                "frames": len(mses)}
+            continue
+        mse = sum(mses) / len(mses)          # 每帧像素数相同 → 样本均值
+        rmse = mse ** 0.5
+        psnr = ("inf" if mse == 0
+                else round(10.0 * __import__("math").log10((255.0 ** 2) / mse), 4))
+        out["planes"][p] = {"mse": round(mse, 6), "rmse": round(rmse, 4),
+                            "psnr": psnr, "frames": len(mses)}
+    return out
+
+
+def evaluate(results, expected_frames=None, expected_combos=None):
+    """把一轮 N21 的原始结果判成 OK / SUSPECT / INVALID（R21-C09）。
+
+    审核："必须先修退出码、完整帧/平面、有限数及错误传播，
+    才能让新数据承担验收责任。"
+
+    Returns:
+        ``(verdict, reasons)``。``verdict`` ∈ ``OK`` / ``SUSPECT`` / ``INVALID``。
+    """
+    reasons = []
+    for row in results.get("roundtrip", []) + results.get("mismatch", []):
+        if row.get("error"):
+            reasons.append(f"{row.get('combo')}: {row['error']}")
+        for p in row.get("problems") or []:
+            reasons.append(f"{row.get('combo')}: {p}")
+    if reasons:
+        return "INVALID", reasons
+
+    rt = results.get("roundtrip", [])
+    if expected_combos is not None and len(rt) != expected_combos:
+        reasons.append(f"only {len(rt)} of {expected_combos} combos ran")
+        return "INVALID", reasons
+
+    # 444 无操作往返必须**逐像素相同**（同表示、同参数）
+    for row in rt:
+        if row.get("chroma") != "444":
+            continue
+        for p in ("r", "g", "b"):
+            if row["planes"][p]["mse"] != 0:
+                reasons.append(
+                    f"{row['combo']}: 444 roundtrip has non-zero {p} MSE "
+                    f"({row['planes'][p]['mse']}) — the probe itself is wrong")
+    if reasons:
+        return "INVALID", reasons
+
+    if not any(r.get("chroma") == "420" for r in rt):
+        return "INVALID", ["no 420 combo ran; N21's question is unanswered"]
+    return "OK", []
 
 
 def db_to_8bit(db):
@@ -197,14 +312,15 @@ def main():
         try:
             to_yuv(ref, mid, chroma, matrix, rng)
             back_to_rgb(mid, back, matrix, rng)
-            m = psnr_rgb(ref, back)
+            m = aggregate(psnr_rgb(ref, back, expected_frames=args.frames))
         except Exception as exc:
             print(f"  [失败] {tag}: {exc}")
             results["roundtrip"].append({"combo": tag, "error": str(exc)})
             continue
         row = {"combo": tag, "chroma": chroma, "matrix": matrix,
                "range": rng, **m,
-               "rmse8": {p: db_to_8bit(m["planes"][p]["psnr"])
+               "rmse8": {p: (None if m["planes"][p]["rmse"] is None
+                             else round(m["planes"][p]["rmse"], 4))
                          for p in ("r", "g", "b")}}
         results["roundtrip"].append(row)
         print("  {:<22} r={:<10} g={:<10} b={:<10}".format(
@@ -221,14 +337,15 @@ def main():
         try:
             to_yuv(ref, mid, "444", enc_m, enc_r)
             back_to_rgb(mid, back, dec_m, dec_r)
-            m = psnr_rgb(ref, back)
+            m = aggregate(psnr_rgb(ref, back, expected_frames=args.frames))
         except Exception as exc:
             print(f"  [失败] {tag}: {exc}")
             results["mismatch"].append({"combo": tag, "error": str(exc)})
             continue
         row = {"combo": tag, "encode": [enc_m, enc_r],
                "decode": [dec_m, dec_r], **m,
-               "rmse8": {p: db_to_8bit(m["planes"][p]["psnr"])
+               "rmse8": {p: (None if m["planes"][p]["rmse"] is None
+                             else round(m["planes"][p]["rmse"], 4))
                          for p in ("r", "g", "b")}}
         results["mismatch"].append(row)
         print("  {:<34} r={:<10} g={:<10} b={:<10}".format(
@@ -237,43 +354,26 @@ def main():
             str(m["planes"]["g"]["psnr"])[:8],
             str(m["planes"]["b"]["psnr"])[:8]))
 
-    # ---- ③ 判据 ----
+    # ---- ③ 判据（R21-C09：改用统一的 evaluate）----
     print("\n  === 判定 ===")
-    verdict, reasons = "OK", []
-    for row in results["roundtrip"]:
-        if row.get("error"):
-            verdict = "INVALID"
-            reasons.append(f"{row['combo']}: {row['error']}")
-            continue
-        if row["chroma"] == "444":
-            for p in ("r", "g", "b"):
-                if row["planes"][p]["psnr"] != "inf":
-                    verdict = "INVALID"
-                    reasons.append(
-                        f"{row['combo']} 的 {p} 平面不是 inf（{row['planes'][p]['psnr']}）"
-                        "—— 说明命令本身有问题，整轮结论作废")
-    if not any(r["chroma"] == "420" for r in results["roundtrip"]
-               if not r.get("error")):
-        verdict = "INVALID"
-        reasons.append("没有一组 420 结果，无法回答 N21 的问题")
-
-    # 错配必须显著大于同参数 420
-    base420 = None
-    for r in results["roundtrip"]:
-        if r.get("chroma") == "420" and r.get("matrix") == "bt709" \
-                and r.get("range") == "limited" and not r.get("error"):
-            base420 = r["planes"]["g"]["psnr"]
-    for r in results["mismatch"]:
-        if r.get("error"):
-            continue
-        g = r["planes"]["g"]["psnr"]
-        if isinstance(base420, float) and isinstance(g, float) \
-                and g > base420:
-            verdict = "SUSPECT"
-            reasons.append(
-                f"{r['combo']} 的 G 平面 PSNR({g:.2f}) 反而高于同参数 420"
-                f"({base420:.2f}) —— 标签可能没生效，需复查 scale 参数")
-
+    verdict, reasons = evaluate(results, expected_frames=args.frames,
+                                expected_combos=len(COMBOS))
+    if verdict == "OK":
+        # 错配应当**明显大于**同参数 420 的损失；否则说明标签没真正生效
+        base420 = None
+        for r in results["roundtrip"]:
+            if (r.get("chroma") == "420" and r.get("matrix") == "bt709"
+                    and r.get("range") == "limited" and not r.get("error")):
+                base420 = r["planes"]["g"]["mse"]
+        for r in results["mismatch"]:
+            if r.get("error") or base420 in (None, 0):
+                continue
+            mse = r["planes"]["g"]["mse"]
+            if isinstance(mse, (int, float)) and mse <= base420:
+                verdict = "SUSPECT"
+                reasons.append(
+                    f"{r['combo']} 的 G 通道 MSE({mse}) 不高于同参数 420"
+                    f"({base420}) —— 标签可能没生效，需复查 scale 参数")
     print(f"    verdict = {verdict}")
     for x in reasons:
         print(f"      - {x}")
@@ -284,7 +384,8 @@ def main():
     with open(out, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"    json    = {out}")
-    return 0 if verdict in ("OK", "SUSPECT") else 1
+    # 退出码约定（R21-C09）：0=OK，2=SUSPECT（结论不可用于验收），1=INVALID
+    return {"OK": 0, "SUSPECT": 2}.get(verdict, 1)
 
 
 if __name__ == "__main__":
