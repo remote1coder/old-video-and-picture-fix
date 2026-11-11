@@ -274,13 +274,21 @@ def test_p03_crash_mid_commit_rolls_back_on_recover(tmp_path):
     jp = _journal(tmp_path)
     doc = {"phase": "COMMITTING", "attempt_id": "att-mid",
            "targets": [media, verify, full], "records": {
+               # R21-C03：record 必须带**真实**的 `new_digest`。
+               # 原来靠 `_fill_records` 填成 "old_digest 或 dddd…"，
+               # 而磁盘上的媒体其实是 b"NEW-MEDIA" —— 于是恢复无法证明
+               # "这份字节是本 attempt 写的"，被正确判成 foreign 并拒绝。
+               # 生产 publish 记录的 new_digest 就是候选件摘要，这里照同一形状。
                media: {"existed": True, "old_digest": file_digest(bk_media),
+                       "new_digest": file_digest(m),
                        "backup": bk_media,
                        "backup_digest": file_digest(bk_media)},
                verify: {"existed": True, "old_digest": file_digest(bk_verify),
+                        "new_digest": file_digest(v),
                         "backup": bk_verify,
                         "backup_digest": file_digest(bk_verify)},
                full: {"existed": True, "old_digest": file_digest(bk_full),
+                      "new_digest": file_digest(f),
                       "backup": bk_full,
                       "backup_digest": file_digest(bk_full)},
            }}

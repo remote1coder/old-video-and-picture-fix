@@ -351,10 +351,14 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                         f"unreadable; refusing to touch it: {art.final}")
                     break
                 if _fstate == "ABSENT":
-                    old_snapshot[art.final] = {"existed": False,
-                                               "old_digest": None,
-                                               "backup": None,
-                                               "backup_digest": None}
+                    old_snapshot[art.final] = {
+                        "existed": False, "old_digest": None,
+                        # R21-C03：带上"我准备写进去的内容摘要"。
+                        # 没有它就分不清"当前这份字节是我写的"和"是别人后来换的"，
+                        # 只能无条件删除 —— 那正是审核复现的破坏行为。
+                        "new_digest": row["digest"],
+                        "backup": None,
+                        "backup_digest": None}
                     continue
                 bk = _backup_path(backup_dir, art.final, attempt_id)
                 try:
@@ -374,6 +378,7 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                     break
                 old_snapshot[art.final] = {
                     "existed": True, "old_digest": _fdig,
+                    "new_digest": row["digest"],
                     "backup": bk, "backup_digest": _bkdig}
             if res.errors:
                 # 备份阶段失败：还没动任何正式文件，清掉这次的备份即可
@@ -710,76 +715,152 @@ def classify_generation(records: Optional[Dict[str, Dict[str, Any]]]) -> str:
     return GENERATION_UNKNOWN
 
 
+def _classify_target(fin: str, snap: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
+    """判定**这一个**目标当前处于哪一种身份（R21-C03）。
+
+    审核 R20-C03 的核心：`existed=false` 本身**不构成**删除当前文件的权力。
+    必须先证明"当前这份字节正是本 attempt 写进去的新内容"，才允许按
+    "原本不存在"的合同撤下它；否则一律保留现场。
+
+    Returns:
+        ``(kind, state, digest)``：
+
+        ``kind`` ∈
+          - ``absent``        目标不存在（对 existed=False 而言已是终态）
+          - ``old``           内容等于旧代
+          - ``new``           内容等于本 attempt 的新代
+          - ``unreadable``    读不出（目录/权限/IO 错误）
+          - ``foreign``       内容既不是旧代也不是新代，或摘要缺失无法证明
+          - ``unknown_flag``  journal 里的 `existed` 不是真布尔
+        ``state`` 是 ``file_state()`` 的原始结果，``digest`` 是当前摘要。
+    """
+    if snap.get("existed") is None:
+        return "unknown_flag", "UNKNOWN", None
+    st, dig = file_state(fin)
+    if st == "ERROR":
+        return "unreadable", st, dig
+    if st == "ABSENT":
+        return "absent", st, None
+    old_d = snap.get("old_digest")
+    new_d = snap.get("new_digest")
+    if dig is None:
+        return "foreign", st, dig
+    if new_d and dig == new_d:
+        return "new", st, dig
+    if old_d and dig == old_d:
+        return "old", st, dig
+    return "foreign", st, dig
+
+
 def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
                     logger=None) -> Dict[str, Any]:
     """把目标恢复到旧代。**先预检全组，再动手。**
 
-    预检：每个需要恢复的目标都必须有可读且与 ``old_digest`` 一致的备份。
-    任一不满足 → 一个字节都不动，返回 ``fully_restored=False``。
+    R21-C03 重写了预检。旧实现只校验"备份是否可读且与 old_digest 一致"，
+    对 ``existed = False`` 的目标直接放行 —— 于是执行阶段无条件
+    ``os.remove(fin)``，把**别人后来换进来的文件**删掉（审核用真实小文件
+    复现：返回 ok=true 且目标消失）。
+
+    现在的规则（每个目标先分类，再决定动作）：
+
+    | 目标当前 | ``existed`` | 动作 |
+    |---|---|---|
+    | 不存在 | False | 已是终态，不动 |
+    | 不存在 | True  | 从备份恢复（需备份有效） |
+    | 等于**新代** | 任意 | 回滚：False → 撤下；True → 用备份覆盖 |
+    | 等于**旧代** | True  | 幂等，不动 |
+    | 等于旧代 | False | **不可能**（旧代本就不存在）→ 保留现场 |
+    | 外来内容 / 读不出 | 任意 | **保留现场**，整代判 `recovery_required` |
+
+    任一目标落入"保留现场"，**整代一个字节都不动** —— 不允许"边查边改，
+    改到一半才发现陌生文件"。
     """
     restored: List[str] = []
     removed: List[str] = []
     failed: List[Dict[str, Any]] = []
     impossible: List[str] = []
+    #: 目标 → (kind, state, digest)，预检结论，执行阶段据此复核
+    plans: Dict[str, Tuple[str, str, Optional[str]]] = {}
 
-    # --- 预检（只读）---
+    # --- 预检（只读、整代一次做完）---
     for fin, snap in snapshot.items():
-        # 审核 R19-B02：`existed` 只认**真布尔**。
-        # `not snap.get("existed")` 会把 None（未知）也当成"原来不存在"，
-        # 随后在执行阶段直接删目标。未知必须进 impossible，交给人工。
-        _ex = snap.get("existed")
-        if _ex is None:
+        kind, st, dig = _classify_target(fin, snap)
+        plans[fin] = (kind, st, dig)
+        ex = snap.get("existed")
+
+        if kind in ("unknown_flag", "unreadable", "foreign"):
             impossible.append(fin)
             continue
-        if _ex is False:
-            # 旧代本来不存在 → 恢复动作是"撤下本次新建的文件"
+        if ex is False:
+            # 只有"当前确实是本 attempt 写的新内容"或"本来就不存在"才允许动
+            if kind in ("absent", "new"):
+                continue
+            impossible.append(fin)          # 旧代/外来内容 → 保留现场
+            continue
+        # existed is True
+        if kind in ("old", "absent"):
+            # 幂等保留 / 从备份重建，都需要备份有效
+            pass
+        elif kind == "new":
+            pass                            # 回滚
+        else:                                # pragma: no cover - 已被上面拦掉
+            impossible.append(fin)
             continue
         bk = snap.get("backup")
         old_dig = snap.get("old_digest")
         if not bk or not old_dig:
             impossible.append(fin)
             continue
-        st, dig = file_state(bk)
-        if st != "PRESENT" or not dig or dig != old_dig:
+        b_st, b_dig = file_state(bk)
+        if b_st != "PRESENT" or not b_dig or b_dig != old_dig:
             impossible.append(fin)
 
     if impossible:
         if logger:
             logger.error(
                 "PUBLISH_RESTORE_PRECHECK_FAILED",
-                "Cannot restore: some backups are missing or do not match the "
-                "recorded old digest. Nothing was modified.",
-                impossible=impossible)
+                "Cannot restore: some targets are unknown/unreadable/foreign, "
+                "or their backups are missing/mismatched. Nothing was "
+                "modified.",
+                impossible=impossible,
+                details={k: plans[k][0] for k in impossible})
         return {"restored": [], "removed": [], "failed": [],
                 "impossible": impossible, "fully_restored": False,
-                "precheck_failed": True}
+                "precheck_failed": True, "recovery_required": True,
+                "target_states": {k: plans[k][0] for k in snapshot}}
 
-    # --- 执行 ---
+    # --- 执行（每次写删前**重验**该目标当前内容）---
     for fin, snap in snapshot.items():
         try:
-            _ex2 = snap.get("existed")
-            if _ex2 is None:
-                # 未知身份：**保留现场**，不删不改
+            ex2 = snap.get("existed")
+            kind, _st, _dig = _classify_target(fin, snap)
+            if kind != plans[fin][0] or _dig != plans[fin][2]:
+                # 预检之后被外部程序改过 → 停手，保留现场
                 failed.append({"target": fin,
-                               "reason": "existed is unknown; kept in place"})
+                               "reason": "content changed after precheck; "
+                                         "kept in place",
+                               "before": plans[fin][0], "now": kind})
                 continue
-            if _ex2 is False:
-                # 本次新建的 → 撤下
-                if os.path.exists(fin):
-                    os.remove(fin)
-                    removed.append(fin)
+            if ex2 is False:
+                if kind == "absent":
+                    continue
+                if kind != "new":
+                    failed.append({"target": fin,
+                                   "reason": "not the content this attempt "
+                                             "wrote; kept in place",
+                                   "state": kind})
+                    continue
+                os.remove(fin)
+                removed.append(fin)
                 continue
-            # **本就没被替换成功的目标**：内容仍是旧代 → 不需要动它。
-            # 原实现会无条件再 replace 一次，若那次 replace 也失败，
-            # 就把"其实完好"的旧代误判成"恢复失败"。
-            _cur_st, _cur_dig = file_state(fin)
-            if _cur_st == "PRESENT" and _cur_dig == snap.get("old_digest"):
+            # existed is True
+            if kind == "old":
                 restored.append(fin)
                 continue
             tmp = _restore_tmp_path(fin, attempt_id)
             shutil.copyfile(snap["backup"], tmp)
-            _st, _dig = file_state(tmp)
-            if _st != "PRESENT" or _dig != snap["old_digest"]:
+            _tst, _tdig = file_state(tmp)
+            if _tst != "PRESENT" or _tdig != snap["old_digest"]:
                 try:
                     os.remove(tmp)
                 except OSError:
@@ -799,7 +880,9 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
 
     ok = not failed and not impossible
     return {"restored": restored, "removed": removed, "failed": failed,
-            "impossible": impossible, "fully_restored": ok}
+            "impossible": impossible, "fully_restored": ok,
+            "recovery_required": bool(impossible or failed),
+            "target_states": {k: plans[k][0] for k in snapshot}}
 
 
 def recover(journal_path: str, backup_dir: str, attempt_id: str,
@@ -1080,6 +1163,11 @@ def _recover_locked(journal_path: str, backup_dir: str, attempt_id: str,
             "existed": rec.get("existed") if isinstance(
                 rec.get("existed"), bool) else None,
             "old_digest": rec.get("old_digest"),
+            # R21-C03：**必须**带上新代摘要 —— 没有它就分不清
+            # "当前这份字节是本 attempt 写的"和"是别人后来换进来的"。
+            # 旧快照只带 old/backup，于是 `existed=false` 的目标
+            # 无论当前内容是什么都会被删掉（审核真实文件复现）。
+            "new_digest": rec.get("new_digest"),
             "backup": rec.get("backup"),
             "backup_digest": rec.get("backup_digest"),
         }
