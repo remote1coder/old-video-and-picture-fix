@@ -149,9 +149,16 @@ def test_wsl_copyback_uses_frozen_digests_and_full_set():
     m = re.search(r"if not os\.path\.exists\(_src\):\s*\n\s*continue", src)
     assert m is None, "缺报告仍被静默跳过（WSL 目标侧会是不完整的一代）"
 
-    # 复制后必须再核对一次摘要
-    assert src.count("_fdig(_stage_path) != _want") >= 1, \
+    # 复制后必须再核对一次摘要。
+    # R21-C07 抽成 `stage_generation_copy()` 后，局部别名 `_fstate/_fdig`
+    # 换成函数内 import 的 `_fs/_fd` —— 断言改为在**该函数块内**找比较，
+    # 而不是在整文件里找某一行原文。
+    j = src.index("def stage_generation_copy(")
+    block = src[j:j + 5000]
+    assert "_fd(stage_path) != want" in block or \
+        "_fdig(_stage_path) != _want" in block, \
         "复制后必须核对摘要，否则复制期间的替换检测不到"
+    assert "_fs(src)" in block, "复制前也必须核对源摘要（冻结代）"
 
 
 # ------------------------------------------------ B09 两进程写标记

@@ -452,11 +452,15 @@ def test_wsl_staging_is_attempt_private_not_shared_tmp(tmp_path):
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage7_encode.py"),
                encoding="utf-8", errors="replace").read()
-    # 暂存名必须把 attempt 编进去（旧实现是 `{_attempt_id}` 插值，
-    # R16-03 改成字符串拼接 —— 两种写法都算"带 attempt 标识"）
-    assert (".wsl-{_attempt_id}" in src
-            or (".wsl-" in src and "_attempt_id" in src)), \
-        "WSL 暂存必须带 attempt 标识"
+    # 暂存名必须把 attempt 编进去。
+    # R21-C07 把这段复制逻辑抽成了模块级 `stage_generation_copy()`，
+    # 字面量 `.wsl-` 变成了 `.{tag}-{attempt_id}` —— 断言要跟着**位置**走，
+    # 但检查的仍是同一条性质：暂存名里有 attempt，不是共享的 `<original>.tmp`。
+    i = src.index("def stage_generation_copy(")
+    block = src[i:i + 5000]
+    assert "-{attempt_id}" in block, \
+        "WSL 暂存必须带 attempt 标识（在 stage_generation_copy 里）"
+    assert 'tag: str = "wsl"' in src, "默认标记应仍是 wsl（跨卷/WSL 共用实现）"
     # 只在**非注释行**里查调用（注释里提到旧函数名是正常的）
     code = [ln for ln in src.splitlines()
             if ln.strip() and not ln.strip().startswith("#")]

@@ -1152,6 +1152,66 @@ def _zscale_has_option(option_expr: str) -> bool:
     return available
 
 
+def generation_suffix(name: str) -> str:
+    """产物名 → 目标侧后缀（copyback 与校验都用同一份映射）。"""
+    if name == "media":
+        return ""
+    return {"verify": ".verify.json",
+            "fullchain": ".fullchain.json",
+            "marker": ".done.json"}.get(name, "." + name)
+
+
+def stage_generation_copy(src_entries, dest_prefix: str, attempt_id: str,
+                          tag: str = "wsl",
+                          src_lock=None) -> Tuple[list, list]:
+    """把**已冻结的一代**复制到目标侧的 attempt 私有暂存（R21-C07）。
+
+    审核要求："源侧复制保持同一冻结代，目标侧使用 attempt 私有暂存和统一事务。"
+    所以这里做三件事，缺一不可：
+
+    1. 复制**前**核对源文件摘要 == 冻结值（源被下一代替换就中止，绝不拷混代）；
+    2. 复制**后**再核一次（防止复制过程中源被换）；
+    3. 目标侧文件名带 `attempt_id`，避免两次尝试互相踩。
+
+    Args:
+        src_entries: ``[(name, source_path, frozen_digest), ...]``。
+        dest_prefix: 目标侧成品路径（如 `E:////out////clip.mkv`）。
+        attempt_id: 本次 attempt。
+        tag: 暂存后缀标记（默认 `wsl`，跨卷/WSL 共用同一实现）。
+        src_lock: 未使用，仅为未来在锁内调用保留位置。
+
+    Returns:
+        ``(staged_spec, digests)``：
+        ``staged_spec = [(name, staging_path, final_path), ...]``；
+        ``digests = [(name, final_path, digest), ...]``（供构造 payload manifest）。
+
+    Raises:
+        OSError: 任一侧摘要不符。
+    """
+    staged: list = []
+    digests: list = []
+    # `_fstate` / `_fdig` 是 `process()` 里的局部别名，模块级函数拿不到
+    # （R21-C07 抽函数时踩到，与 R20 `check_declared_timeline_mapping` 同族）。
+    from publish_journal import file_state as _fs, file_digest as _fd
+    for name, src, want in src_entries:
+        st, cur = _fs(src)
+        if st != "PRESENT" or cur != want:
+            raise OSError(
+                f"source changed underneath: {name} at {src} (state={st}); "
+                f"refusing to copy a mixed generation")
+        suf = generation_suffix(name)
+        stage_path = f"{dest_prefix}{suf}.{tag}-{attempt_id}"
+        with open(src, "rb") as fi, open(stage_path, "wb") as fo:
+            shutil.copyfileobj(fi, fo, 1 << 20)
+        if _fd(stage_path) != want:
+            raise OSError(
+                f"copied bytes do not match the frozen digest: {name}")
+        final = f"{dest_prefix}{suf}"
+        staged.append((name, stage_path, final))
+        digests.append((name, final, want))
+    return staged, digests
+
+
 def build_marker_candidate(seed: Dict[str, Any],
                            pub_digests,
                            attempt_id: str,
@@ -4027,46 +4087,6 @@ def main():
             # 审核：`terminal_pending=True` 即使媒体已落地，**也不能 JOB_DONE**。
             # 这里并进 `_generation_incomplete`，走同一条 `return 82` 出口 ——
             # stage7 非零 → main 不会写完成标记。
-            # ---- R20-A01：把整代回执原子写到 **attempt 私有** 路径 ----
-            # 审核 §3.2 第 5 步："publisher 返回冻结回执。stage7 将其原子写到
-            # 指定 attempt 私有 result JSON；禁止 main 通过共享文件名、
-            # 最新 mtime 或 stdout 混合日志重建回执。"
-            # 写失败 → 同样算"这一代不可靠"（与 terminal_pending 一条出口）。
-            _res_path = str(params.get("_stage7_result_path") or "")
-            if _res_path:
-                try:
-                    _tmp_res = _res_path + ".tmp"
-                    _payload = {
-                        "schema": 1,
-                        "attempt_id": _attempt_id,
-                        "ok": bool(_pres.ok),
-                        "terminal_pending": bool(
-                            getattr(_pres, "terminal_pending", False)),
-                        "journal_phase": getattr(_pres, "phase", None),
-                        "journal_path": getattr(_pres, "journal_path", None),
-                        "generation_receipt": (
-                            _pres.generation_receipt.to_dict()
-                            if getattr(_pres, "generation_receipt", None)
-                            else None),
-                        "publish_result": _pres.as_dict(),
-                    }
-                    os.makedirs(os.path.dirname(_res_path) or ".",
-                                exist_ok=True)
-                    with open(_tmp_res, "w", encoding="utf-8") as _rf:
-                        json.dump(_payload, _rf, ensure_ascii=False, indent=2)
-                    os.replace(_tmp_res, _res_path)
-                    logger.info("STAGE7_RESULT_JSON_WRITTEN",
-                                "Wrote the attempt-private publish result for "
-                                "main to read back.", path=_res_path)
-                except Exception as _rje:      # pragma: no cover
-                    _generation_incomplete = True
-                    logger.error(
-                        "STAGE7_RESULT_JSON_FAIL",
-                        "The generation was published but its attempt-private "
-                        "result JSON could not be written; main cannot prove "
-                        "which generation this is, so the job must not be "
-                        "marked done.", path=_res_path, error=str(_rje))
-
             if getattr(_pres, "terminal_pending", False):
                 _generation_incomplete = True
                 logger.error(
@@ -4096,6 +4116,7 @@ def main():
             if original_output_path:
                 _wsl_arts = []
                 _wsl_staged = []
+                _wsl_digests: List[tuple] = []
                 try:
                     # R16-03：**必须**在源端锁内、按发布前冻结的摘要复制。
                     #   ① 集合与本次发布**完全一致** —— 原来"存在就拷、不存在就 continue"，
@@ -4103,23 +4124,11 @@ def main():
                     #   ② 每个文件复制前后都核对摘要 —— 源被下一代替换就中止，
                     #      绝不提交"A 媒体 + B 报告"。
                     with _acq_src([output_path], timeout=60, logger=logger):
-                        for _nm, _fin, _want in _pub_digests:
-                            _st, _cur = _fstate(_fin)
-                            if _st != "PRESENT" or _cur != _want:
-                                raise OSError(
-                                    f"source changed underneath: {_nm} at {_fin} "
-                                    f"(state={_st}); refusing to copy a mixed generation")
-                            _suf = ("" if _nm == "media"
-                                    else {"verify": ".verify.json",
-                                          "fullchain": ".fullchain.json"}.get(_nm, "." + _nm))
-                            _stage_path = original_output_path + _suf + ".wsl-" + _attempt_id
-                            shutil.copyfile(_fin, _stage_path)
-                            if _fdig(_stage_path) != _want:
-                                raise OSError(
-                                    f"copied bytes do not match the frozen digest: {_nm}")
+                        _staged_spec, _wsl_digests = stage_generation_copy(
+                            _pub_digests, original_output_path, _attempt_id)
+                        for _nm, _stage_path, _final in _staged_spec:
                             _wsl_staged.append(_stage_path)
-                            _wsl_arts.append(_Artifact(_nm, _stage_path,
-                                                       original_output_path + _suf))
+                            _wsl_arts.append(_Artifact(_nm, _stage_path, _final))
                 except (OSError, _LockTimeout) as _we:
                     for _t in _wsl_staged:
                         try:
@@ -4135,15 +4144,60 @@ def main():
                         expected=[(n, d) for n, _f, d in _pub_digests])
                     return 82
 
+                # ---- R21-C07：目标侧也要有**自己的** marker ----
+                # 中转代那份 marker 记的是重定向路径（清单里的 object.path 也是
+                # 重定向路径）。直接拷过去的话，在原路径上验证必然对不上 ——
+                # 等于"最终目标永久不可证明完成"。
+                # 这里按**最终路径**重建一份，随回拷事务一起提交。
+                _w_marker_stage = ""
+                _w_marker_digest = ""
+                _w_marker_final = f"{original_output_path}.done.json"
+                try:
+                    if isinstance(_seed, dict) and _seed:
+                        _w_marker, _w_marker_stage, _w_marker_digest, _ = \
+                            build_marker_candidate(
+                                seed=_seed,
+                                pub_digests=_wsl_digests,
+                                attempt_id=f"{_attempt_id}-wsl",
+                                job_id=job_id,
+                                output_path=original_output_path,
+                                media_digest=_wsl_digests[0][2],
+                                media_size=os.path.getsize(_wsl_arts[0].staging))
+                        _wsl_staged.append(_w_marker_stage)
+                        _wsl_arts.append(_Artifact("marker", _w_marker_stage,
+                                                   _w_marker_final))
+                except Exception as _wme:
+                    for _t in _wsl_staged:
+                        try:
+                            os.remove(_t)
+                        except OSError:
+                            pass
+                    logger.error(
+                        "STAGE7_WSL_MARKER_FAIL",
+                        "Could not build the completion marker for the WSL "
+                        "target; refusing to commit a generation that cannot "
+                        "be proven complete", original=original_output_path,
+                        error=str(_wme))
+                    return 86
+
                 _wres = _publish(
                     _wsl_arts,
                     journal_path=f"{original_output_path}.journal.json",
                     backup_dir=os.path.join(str(temp_dir),
                                             "publish_backup_wsl"),
+                    # ---- R21-C07：授权根必须来自**最终目标** ----
+                    # 原来写的是 `os.path.dirname(output_path)` —— 那是
+                    # **重定向后**的目录，而 artifacts 的目标是
+                    # `original_output_path`。首次无旧 journal 时不暴露，
+                    # 恢复时就会出现"根授权与目标不匹配"。
                     allowed_output_roots=[os.path.dirname(
-                        os.path.abspath(output_path))],
+                        os.path.abspath(original_output_path))],
                     attempt_id=f"{_attempt_id}-wsl",
                     decision=_dec,
+                    required_objects=[_a.final for _a in _wsl_arts],
+                    marker_digest=_w_marker_digest,
+                    run_identity=str((params.get("_run_identity") or {}).get(
+                        "digest") or ""),
                     logger=logger)
                 if not _wres.ok:
                     for _t in _wsl_staged:
@@ -4162,6 +4216,18 @@ def main():
                         failed_at=_wres.failed_at, restored=_wres.restored,
                         errors=_wres.errors)
                     return 82
+                # ---- R21-C07：终态 pending 在**两端**同一规则 ----
+                # 只检查 `_wres.ok` 是不够的：COMMITTED 写失败时 ok=True
+                # 但 terminal_pending=True。目标侧没定态 → 不能算完成。
+                if getattr(_wres, "terminal_pending", False):
+                    _generation_incomplete = True
+                    logger.error(
+                        "STAGE7_WSL_TERMINAL_NOT_PERSISTED",
+                        "The WSL target holds the new generation but its "
+                        "COMMITTED terminal state could not be persisted; this "
+                        "target is NOT reliably complete.",
+                        original=original_output_path,
+                        journal=getattr(_wres, "journal_path", None))
                 logger.info("STAGE7_WSL_COPYBACK",
                             "Media and reports committed to the WSL original "
                             "path as one generation",
@@ -4169,6 +4235,61 @@ def main():
                             published=_wres.published)
                 output_path = original_output_path
             
+            # ---- R20-A01：把整代回执原子写到 **attempt 私有** 路径 ----
+            # 审核 §3.2 第 5 步："publisher 返回冻结回执。stage7 将其原子写到
+            # 指定 attempt 私有 result JSON；禁止 main 通过共享文件名、
+            # 最新 mtime 或 stdout 混合日志重建回执。"
+            # 写失败 → 同样算"这一代不可靠"（与 terminal_pending 一条出口）。
+            # R21-C07：这份结果必须在**回拷之后**写 —— 它要证明的是
+            # "用户最终看到的那一代"，不是中转代。原来写在回拷之前，
+            # 于是 result / 回执 / JOB_DONE 指向的是重定向路径。
+            _final_target = str(original_output_path or output_path)
+            _res_path = str(params.get("_stage7_result_path") or "")
+            if _res_path:
+                try:
+                    _tmp_res = _res_path + ".tmp"
+                    _payload = {
+                        "schema": 1,
+                        "attempt_id": _attempt_id,
+                        "ok": bool(_pres.ok) and bool(_wres.ok
+                                                     if original_output_path
+                                                     else True),
+                        "terminal_pending": bool(
+                            getattr(_pres, "terminal_pending", False)),
+                        "journal_phase": getattr(_pres, "phase", None),
+                        "journal_path": getattr(_pres, "journal_path", None),
+                        "generation_receipt": (
+                            _pres.generation_receipt.to_dict()
+                            if getattr(_pres, "generation_receipt", None)
+                            else None),
+                        # 最终目标侧的事务结果（无回拷时即 _pres）
+                        "final_output_path": _final_target,
+                        "final_publish_result": (
+                            _wres.as_dict() if original_output_path
+                            else _pres.as_dict()),
+                        "terminal_pending": bool(
+                            getattr(_pres, "terminal_pending", False)
+                            or (getattr(_wres, "terminal_pending", False)
+                                if original_output_path else False)),
+                        "publish_result": _pres.as_dict(),
+                    }
+                    os.makedirs(os.path.dirname(_res_path) or ".",
+                                exist_ok=True)
+                    with open(_tmp_res, "w", encoding="utf-8") as _rf:
+                        json.dump(_payload, _rf, ensure_ascii=False, indent=2)
+                    os.replace(_tmp_res, _res_path)
+                    logger.info("STAGE7_RESULT_JSON_WRITTEN",
+                                "Wrote the attempt-private publish result for "
+                                "main to read back.", path=_res_path)
+                except Exception as _rje:      # pragma: no cover
+                    _generation_incomplete = True
+                    logger.error(
+                        "STAGE7_RESULT_JSON_FAIL",
+                        "The generation was published but its attempt-private "
+                        "result JSON could not be written; main cannot prove "
+                        "which generation this is, so the job must not be "
+                        "marked done.", path=_res_path, error=str(_rje))
+
             # ==== R12-05：核对早已在锁外对**候选件**完成 ====
             # 原来这里会再对正式路径跑一次 `verify_output` 并重写 sidecar：
             #   ① 多花一次全量解码（12 秒片子约 5 分钟，长片不可接受）；
