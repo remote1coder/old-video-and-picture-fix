@@ -1010,6 +1010,23 @@ def main() -> int:
     else:
         vs_format = "vs.YUV420P8"
         pix_fmt = "yuv420p"
+    # R22 §5.2：色度跟工作表示走。
+    # **这里必须同时改 vs_format**：vspipe 的输出格式由脚本决定，
+    # 只改 ffmpeg 侧 `-pix_fmt` 会变成"把 420 转成 444 再落盘"——
+    # 标签变了、细节没回来，正是审核禁止的"静默转换后仍称 444"。
+    try:
+        from work_format import (boundary_pix_fmt as _bpf,
+                                 set_bit_depth as _sbd,
+                                 vs_format_of as _vsf)
+        _g_fmt = _sbd(
+            _bpf(params, "stage6_out", default="yuv420p10le"),
+            vs_bit_depth if vs_bit_depth in (8, 10, 16) else 16)
+        _g_vs = _vsf(_g_fmt)
+        if _g_vs:
+            pix_fmt = _g_fmt
+            vs_format = _g_vs
+    except Exception:                                  # pragma: no cover
+        pass
 
     # FIX-R5-06: vpy 路径同样转绝对路径。vspipe 找到脚本后会 chdir 到脚本
     # 所在目录，路径确定后这个 chdir 目标才可控（脚本里已无相对路径依赖）。

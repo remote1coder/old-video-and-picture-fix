@@ -2187,6 +2187,40 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             "generation whose identity cannot be established", error=str(_fz))
         return 82, f"cannot freeze the param digest: {_fz}"
 
+    # ---- R22 §5.2：工作表示（色度/位深）必须在**动手之前**解析并核验 ----
+    # 审核要求"手动选择通过前置能力核验后执行"、"无法满足的要求应明确
+    # 失败/降级，用户决定是否接受"。所以这一步放在计划冻结之前：
+    #   * 解析结果冻结进 `params["_work_format"]`（下划线开头，不进身份）；
+    #   * 有 blocker 且用户没显式接受降级 → 直接停，不跑任何 stage。
+    try:
+        from work_format import resolve as _wf_resolve, describe as _wf_desc
+        _wf_plan = _wf_resolve(
+            params, source_path=str(job.get("input_path") or ""),
+            logger=job_logger)
+        params["_work_format"] = _wf_plan
+        job_logger.info("WORK_FORMAT_PLAN", _wf_desc(_wf_plan),
+                        mode=_wf_plan.get("mode"),
+                        resolved=_wf_plan.get("resolved"),
+                        recommendation=_wf_plan.get("recommendation"),
+                        boundaries=_wf_plan.get("boundaries"))
+        if _wf_plan.get("blockers") and not _wf_plan.get("accepted_degraded"):
+            job_logger.error(
+                "WORK_FORMAT_REFUSED",
+                "The requested working representation cannot be produced by "
+                "this chain. Nothing was executed. Either change "
+                "`chroma_mode` / `pix_fmt` / `video_encoder`, or set "
+                "`chroma_mode_accept_degraded: true` to accept the stated "
+                "degradation.", blockers=_wf_plan.get("blockers"))
+            return 86, ("work format unsupported: "
+                        f"{_wf_plan.get('blockers')}")
+    except Exception as _wfe:
+        # 解析本身失败不等于"能力不足"——不能因此静默跑默认路径
+        job_logger.error("WORK_FORMAT_RESOLVE_FAIL",
+                         "Cannot resolve the working representation; refusing "
+                         "to run a generation whose chroma/bit depth is "
+                         "undetermined", error=str(_wfe))
+        return 86, f"work format resolve failed: {_wfe}"
+
     # ---- R21-C02 / R21-C06：marker 的身份字段在**这里**冻结 ----
     # 审核 §4.1 第 2–3 步：stage7 负责"媒体 + 必需报告"的不可变清单，
     # marker 候选由该清单生成并随同一事务发布。`impl` / `input_identity` /

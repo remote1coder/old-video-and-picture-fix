@@ -81,6 +81,16 @@ def build_filter_chain(params: Dict[str, Any]) -> str:
     gain_g = _to_offset(params.get("color_gain_g", 1.02))
     gain_b = _to_offset(params.get("color_gain_b", 1.02))
 
+    # R22 §5.2：掩模分支的工作格式也跟工作表示走。
+    # 人的肤色判据读的是 cb/cr —— 在 420 上先把色度降采样再判，
+    # 等于用**已经被平均过**的色度判肤色。选 444 时必须用 444 判，
+    # 否则"全程 444"在掩模这一步就已经不成立了。
+    try:
+        from work_format import boundary_pix_fmt as _bpf
+        _mask_fmt = _bpf(params, "stage4_mask", default="yuv420p")
+    except Exception:                                  # pragma: no cover
+        _mask_fmt = "yuv420p"
+
     # FIX-P8-4: Selective local processing per v6.32 §3
     # ORIGINAL: No skin/hair protection; unsharp applied to textured regions
     # Per v6.32 §3: "Human subjects, skin, hair regions are COMPLETELY
@@ -110,7 +120,7 @@ def build_filter_chain(params: Dict[str, Any]) -> str:
         # FIX-R6-04: geq 的命名选项必须用 ':' 分隔（lum/cb/cr 是同一滤镜的
         # 三个选项）。原来用 ',' 会被解析成新滤镜 cb='128' → ffmpeg 报
         # "No option name near '128'"。
-        "[main1]format=yuv420p,"
+        "[main1]format=" + _mask_fmt + ","
         "geq=lum='if(between(cb(X,Y),77,127)*between(cr(X,Y),133,173)"
         "*gt(lum(X,Y),80),255,0)':"
         "cb='128':cr='128'[skinmask];"
@@ -120,7 +130,7 @@ def build_filter_chain(params: Dict[str, Any]) -> str:
         # (union) so the person mask covers both skin and hair. ORIGINAL
         # (方案B) relied on edgedetect classifying hair as textured -> copy
         # branch, which protects it implicitly but fails on low-edge dark hair.
-        "[main2]format=yuv420p,"
+        "[main2]format=" + _mask_fmt + ","
         "geq=lum='if(gt(lum(X,Y),16)*lt(lum(X,Y),80),255,0)':"
         "cb='128':cr='128'[hairmask];"
         "[skinmask][hairmask]blend=all_mode=screen[personmask];"
@@ -333,12 +343,17 @@ def main():
     filter_chain = build_filter_chain(params)
 
     # v6.3 §3.6: Intermediate format must be FFV1 YUV420P16
+    # R22 §5.2：色度跟工作表示走（444 时是 yuv444p16le），位深仍固定 16。
     vs_bit_depth = params.get("vs_bit_depth", 16)
     if vs_bit_depth != 16:
         logger.warning("STAGE4_BITDEPTH_FORCE",
                        f"vs_bit_depth={vs_bit_depth}, "
                        "forcing 16bit for intermediate")
-    pix_fmt = "yuv420p16le"
+    try:
+        from work_format import boundary_pix_fmt as _bpf2
+        pix_fmt = _bpf2(params, "stage4_out", default="yuv420p16le")
+    except Exception:                                  # pragma: no cover
+        pix_fmt = "yuv420p16le"
 
     cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",

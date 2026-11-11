@@ -457,7 +457,20 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
     params.pop("_color_meta_cache", None)
 
     # VapourSynth format based on bit depth (FIX-W10: always 16bit)
+    #
+    # R22 §5.2：色度采样不再是设计结论。`chroma_mode: 444` 时这里渲染成
+    # YUV444P16 —— 这是全链 444 的**第一处**；若这一处仍是 420，后面
+    # 各 stage 标成 444 也只是把已经丢掉的色度放大回去，属于
+    # "静默转换后仍称全程 444 保真"，审核明确禁止。
     vs_format = "vs.YUV420P16"
+    try:
+        from work_format import boundary_pix_fmt as _bpf
+        _render_fmt = _bpf(params, "stage1_render", default="yuv420p16le")
+        if "444" in str(_render_fmt).lower():
+            vs_format = "vs.YUV444P16"
+    except Exception:
+        # 老调用方（不带 params / 模块缺失）保持历史行为
+        vs_format = "vs.YUV420P16"
 
     # Determine range from pre-fetched color metadata (FIX-P6-2 / FIX-P6-7)
     detected_range = color_meta.get("color_range", "")

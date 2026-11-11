@@ -1920,6 +1920,15 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
         pix_fmt_out = "yuv420p10le"
     else:
         pix_fmt_out = "yuv420p"
+    # R22 §5.2：色度跟工作表示走（444 时保持 444 出片），位深不变。
+    try:
+        from work_format import (boundary_pix_fmt as _bpf,
+                                 set_bit_depth as _sbd)
+        pix_fmt_out = _sbd(
+            _bpf(params, "stage5_out", default="yuv420p10le"),
+            vs_bit_depth if vs_bit_depth in (8, 10, 16) else 16)
+    except Exception:                                  # pragma: no cover
+        pass
 
     # FIX-W9-07: Per v7.32 §3.10.5, preserve 16bit precision through the
     # streaming face-restore path for passthrough (non-face) frames. ORIGINAL
@@ -2533,6 +2542,15 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
         pix_fmt = "yuv420p10le"
     else:
         pix_fmt = "yuv420p"
+    # R22 §5.2：同 pix_fmt_out，色度跟工作表示走
+    try:
+        from work_format import (boundary_pix_fmt as _bpf,
+                                 set_bit_depth as _sbd)
+        pix_fmt = _sbd(
+            _bpf(params, "stage5_out", default="yuv420p10le"),
+            vs_bit_depth if vs_bit_depth in (8, 10, 16) else 16)
+    except Exception:                                  # pragma: no cover
+        pass
 
     # ---- R16-06：VFR 必须按**逐帧时长**重新封装 ----
     # 原来只用单个 `-framerate fps_str`，等于把可变间隔压成常数。

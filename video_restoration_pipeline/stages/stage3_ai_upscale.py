@@ -859,6 +859,7 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          logger=None, cancel_guard=None,
                          color_opts=None, post_filter_chain=None,
                          out_pix_fmt=None, frame_source_dir=None,
+                         chain_input_fmt=None,
                          timeline_ref=None, contract_path=None, meta=None):
     """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
 
@@ -990,14 +991,16 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
         # 与 PNG 路径在 stage3 编码时做的是同一件事，因此两条路径可对齐。
         _chain = str(post_filter_chain)
         _tag = "[0:v]"
+        # R22 §5.2：进链前统一到的格式必须与**经典路径 step3 的落盘格式**
+        # 一致（原来写死 yuv420p16le）。选 444 时经典 step3 是 yuv444p16le，
+        # 这里若仍是 420 前缀，融合与经典就从不同表示起步 —— 又是
+        # 「静默转换后仍称全程 444」。
+        _in_fmt = str(chain_input_fmt or "yuv420p16le")
         if _chain.startswith(_tag):
-            _chain = _tag + "format=yuv420p16le," + _chain[len(_tag):]
+            _chain = _tag + f"format={_in_fmt}," + _chain[len(_tag):]
         else:
-            _chain = "format=yuv420p16le," + _chain
+            _chain = f"format={_in_fmt}," + _chain
         enc_cmd += ["-filter_complex", _chain, "-map", "[vout]"]
-        if out_pix_fmt:
-            # stage4 也是"滤镜之后再转输出格式"，两边在同一个位置做转换
-            enc_cmd += ["-pix_fmt", str(out_pix_fmt)]
     # ---- step3 统一输出 yuv420p16le ----
     # 原来 raw 路径不指定 pix_fmt，ffv1 就把 rgb48le 存成 **gbrp16le**
     # （planar RGB 16）；而 PNG 路径显式写了 `-pix_fmt yuv420p16le`。
@@ -1016,12 +1019,16 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 注意：stage3 每次跑批都会重新生成 step3（没有"已存在则跳过"的逻辑），
     # 所以改这里不会导致旧中间件被复用。
     #
-    # R22 修：这里原先**无条件**追加 `-pix_fmt yuv420p16le`。ffmpeg 的输出
-    # 选项是"后者覆盖前者"，所以融合分支里刚按 `out_pix_fmt` 设的 10-bit
-    # 会被这一行**静默改回 16-bit** —— 传进来等于没传。
-    # 现在只有调用方没指定时才用默认值。
-    if not out_pix_fmt:
-        enc_cmd += ["-pix_fmt", "yuv420p16le"]
+    # R22 修（两次）：
+    #   ① 原先这里**无条件**追加 `-pix_fmt yuv420p16le`，而 ffmpeg 的输出
+    #      选项是"后写覆盖先写"，融合分支刚按 `out_pix_fmt` 设的 10-bit
+    #      会被**静默改回 16-bit**；
+    #   ② 改成"只在 out_pix_fmt 为空时写默认值"之后，**"给了 out_pix_fmt
+    #      但没走融合"这条组合一次都不写** —— 实测非融合流式 step3 落盘成
+    #      gbrp16le（请求的是 yuv420p16le），两条路径的格式分叉又回来了。
+    #      这就是"修一个分支、漏另一个分支"的老毛病。
+    # 现在收敛成一句：任何路径都显式写，值 = 调用方给的 or 默认。
+    enc_cmd += ["-pix_fmt", str(out_pix_fmt or "yuv420p16le")]
     enc_cmd += ["-c:v", "ffv1", "-r", str(fps_str)]
     # 颜色标签必须与主流程 PNG 路线一致（COL-04），否则中间产物不带
     # colorspace 标签，下游 stage7 会按自己的猜测补标签 → 可能错标。
@@ -2973,13 +2980,25 @@ def main():
                 # 若要再保守一点，可先用一段真实素材跑 g34_equiv_det.py 对照。
                 _s_chain = None
                 _s_pix_fmt = None
+                # R22 §5.2：step3 的落盘格式由工作表示决定，不再写死 420。
+                # 非融合路径取 `stage3_step3`，融合路径取 `stage4_out`；
+                # 两者都按 `vs_bit_depth` 调位深（历史行为：16 位中间件，
+                # 10 位任务的融合输出走 10 位）。
+                try:
+                    from work_format import (boundary_pix_fmt as _bpf,
+                                             set_bit_depth as _sbd)
+                except Exception:                      # pragma: no cover
+                    _bpf = _sbd = None
                 if _s_fuse34:
                     try:
                         _bfc = _load_stage4_filter_builder()
                         _s_chain = _bfc(params)
-                        _s_pix_fmt = ("yuv420p16le"
-                                      if params.get("vs_bit_depth", 16) == 16
-                                      else "yuv420p10le")
+                        # R22 §5.2：色度由工作表示决定，位深沿用历史策略
+                        _bd = 16 if params.get("vs_bit_depth", 16) == 16 else 10
+                        _s_pix_fmt = (
+                            _sbd(_bpf(params, "stage4_out",
+                                      default="yuv420p16le"), _bd)
+                            if _bpf else "yuv420p16le")
                         # 产物直接叫 step4：下游（stage5/6）是**按 glob**
                         # `*_step4_postprocess*` 找输入的，不依赖 hash。
                         _s_out = str(Path(temp_dir) / (
@@ -2999,6 +3018,11 @@ def main():
                                        "could not build the stage4 filter "
                                        "chain; falling back to the classic "
                                        "two-stage execution", error=str(_fe))
+
+                if not _s_fuse34 and _bpf:
+                    # 经典两阶段：step3 的落盘格式也由工作表示决定
+                    _s_pix_fmt = _bpf(params, "stage3_step3",
+                                      default="yuv420p16le")
 
                 # R13-02：**不能在这里第二次猜 fps**。
                 # 原实现重新 probe 一次、失败就用 "25"；于是首次成功得到
@@ -3062,6 +3086,10 @@ def main():
                     _s_ok, _s_why, _s_n = _stream_raw_upscale(
                         input_video=stage2_output, output_mkv=_s_out,
                         post_filter_chain=_s_chain, out_pix_fmt=_s_pix_fmt,
+                        # 融合进链前的统一格式 = 经典 step3 的落盘格式
+                        chain_input_fmt=(_bpf(params, "stage3_step3",
+                                              default="yuv420p16le")
+                                         if _bpf else None),
                         width=_s_dims[0], height=_s_dims[1], scale=scale,
                         fps_str=_s_fps, model=model,
                         model_dir=str(SCRIPT_DIR.parent / "models"),
@@ -3709,6 +3737,17 @@ def main():
                 path=("vfr-concat" if (is_vfr and all_pts) else "cfr-sequence"))
 
     concat_path: Optional[str] = None
+    # R22 §5.2：PNG 中转路径（VFR 与 CFR 两条分支）的落盘格式也必须跟
+    # 工作表示走。这两条分支原来各自写死 `yuv420p16le`；选了 444 的批次
+    # 一旦因 VFR 回退到 PNG 路径，step3 就悄悄变回 420 —— 而日志里
+    # 整链仍然写着 444。这正是"某条分支漏改"的老毛病，所以提到分叉之前
+    # 只算一次。
+    try:
+        from work_format import boundary_pix_fmt as _bpf_png
+        _png_pix_fmt = _bpf_png(params, "stage3_step3",
+                                default="yuv420p16le")
+    except Exception:                                  # pragma: no cover
+        _png_pix_fmt = "yuv420p16le"
     if is_vfr and all_pts:
         # Use concat demuxer to preserve VFR timestamps
         concat_path = str(Path(temp_dir) / f"{job_id}_concat.txt")
@@ -3766,7 +3805,7 @@ def main():
             # 原始时间戳，绝不能让它再做帧率重整。
             "-fps_mode", "passthrough",
             "-c:v", "ffv1",
-            "-pix_fmt", "yuv420p16le",
+            "-pix_fmt", _png_pix_fmt,
             *_color_opts,
             "-an",
             output_path,
@@ -3778,7 +3817,7 @@ def main():
             "-framerate", fps_str,
             "-i", str(Path(output_dir) / "frame_%08d.png"),
             "-c:v", "ffv1",
-            "-pix_fmt", "yuv420p16le",
+            "-pix_fmt", _png_pix_fmt,
             *_color_opts,
             "-an",
             output_path,

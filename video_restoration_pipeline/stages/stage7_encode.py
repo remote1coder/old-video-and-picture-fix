@@ -1542,8 +1542,14 @@ def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
         return "unverified", info
 
 
-def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
-    """Return the 16→10 bit filter chain that this ffmpeg can actually run."""
+def _zscale_dither_filters(dither: str, logger=None,
+                           final_fmt: str = "yuv420p10le") -> List[str]:
+    """Return the 16→10 bit filter chain that this ffmpeg can actually run.
+
+    R22 §5.2：链条最后的降采样格式由 `final_fmt` 决定（444 时不再是
+    ``format=yuv420p10le``）。抖动仍在 444 空间做 —— 那本来就是
+    "先在高色度分辨率下量化、最后才降采样"的正确顺序。
+    """
     filters: List[str] = ["format=yuv444p16"]
     if _zscale_has_option("format=yuv444p10"):
         filters.append(f"zscale=rangein=limited:range=limited:"
@@ -1581,7 +1587,7 @@ def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
                 "is effective here; which filter performs the reduction "
                 "internally is not asserted.", dither=dither,
                 zscale_format_probe=reason)
-    filters.append("format=yuv420p10le")
+    filters.append(f"format={final_fmt}")
     return filters
 
 
@@ -2462,7 +2468,18 @@ def main():
     #   * 编码 + 校验（非空 / A-V 同步）全部通过后，才用 os.replace 发布到
     #     output_path（同盘是单次原子替换；跨盘回退为 copy + unlink）。
     #   * output_path 在整个过程中**从未被写**，失败/取消时保持原样。
-    _attempt_id = f"{os.getpid()}-{int(time.time() * 1000)}"
+    # ---- R22 修：attempt 身份**只能有一个来源** ----
+    # 原来这里自己造 `f"{pid}-{ms}"`，而 main 下发的 `params["attempt_id"]`
+    # 是另一套值。`verify_generation_completion(expect_attempt=...)` 用 main
+    # 的值去核，stage7 却把自造值写进私有 result →
+    # 实测每一次真实跑批都以
+    #   COMPLETION_UNPROVEN  reason="result belongs to attempt
+    #   '19656-1794420484787', not '412c3e9b35a64c43'"
+    # 结束（rc=82）。这与 R20 的 `input_digest` 是同一个病族：
+    # **同一个量绝不能两端各算一次**。
+    # main 给了就用 main 的；只有直接调 stage7（裸跑/测试）时才自造。
+    _attempt_id = str(params.get("attempt_id") or "").strip() \
+        or f"{os.getpid()}-{int(time.time() * 1000)}"
     # 注意：**必须保留原扩展名**。ffmpeg 靠扩展名推断 muxer，若命名为
     # `xxx.mkv.attempt-1-2.partial` 会报
     #   "Unable to find a suitable output format for '...partial'"
@@ -2487,6 +2504,28 @@ def main():
     crf = params.get("crf", 24)
     preset = params.get("preset", 4)
     pix_fmt = params.get("pix_fmt", "yuv420p10le")
+    # R22 §5.2：成品格式必须整链一致。这里**只对齐色度**，位深保留用户的
+    # `pix_fmt`（有人要 8-bit 成品是合理的）。若工作表示解析成 444，
+    # 而成品还写 yuv420p10le，那就是"最后一步把 444 降回 420"——
+    # 前面所有 444 处理等于白做，而且日志里仍写着 444。
+    try:
+        from work_format import (boundary_pix_fmt as _bpf,
+                                 chroma_of_pix_fmt as _cof,
+                                 bit_depth_of as _bdo,
+                                 set_bit_depth as _sbd)
+        _wf_final = _bpf(params, "stage7_final", default="yuv420p10le")
+        if _cof(pix_fmt) != _cof(_wf_final):
+            _keep_depth = _bdo(pix_fmt) or 10
+            _aligned = _sbd(_wf_final, _keep_depth)
+            logger.warning(
+                "STAGE7_PIX_FMT_REALIGNED",
+                "The final pixel format's chroma did not match the resolved "
+                "working representation; keeping the user's bit depth and "
+                "taking the chroma from the plan",
+                requested=pix_fmt, resolved_working=_wf_final, using=_aligned)
+            pix_fmt = _aligned
+    except Exception:                                  # pragma: no cover
+        pass
     color_range = params.get("color_range", "limited")
 
     # FIX-P7-5: Preset adaptive per v6.32 §7.10:
@@ -2780,11 +2819,13 @@ def main():
 
         if _zscale_ed_available:
             # Per v6.32 §阶段3: error_diffusion dithering in YUV444 space
-            vf_parts.extend(_zscale_dither_filters("error_diffusion", logger))
+            vf_parts.extend(_zscale_dither_filters("error_diffusion", logger,
+                                                   final_fmt=pix_fmt))
             logger.info("STAGE7_DITHER", "Using error_diffusion dithering (16bit->10bit)")
         else:
             # Fallback: ordered dithering (available on all zimg versions)
-            vf_parts.extend(_zscale_dither_filters("ordered", logger))
+            vf_parts.extend(_zscale_dither_filters("ordered", logger,
+                                                   final_fmt=pix_fmt))
             logger.warning("STAGE7_DITHER_FALLBACK",
                           "error_diffusion not available in zscale, "
                           "using ordered dithering (16bit->10bit)")
