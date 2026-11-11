@@ -640,6 +640,17 @@ def _decide_timing(original_duration: float, processed_duration: float,
 
 
 
+def _sha256_text(text: str) -> str:
+    """UTF-8 文本的 SHA-256（R21-C02：payload manifest 的摘要）。
+
+    本文件原来没有这个工具，`build_marker_candidate()` 直接调它会
+    `NameError` —— 而那段代码在发布事务里，一旦跑真实链路就是 rc=1。
+    由 `tests/test_r21_c02_generation_integration.py` 的失败抓出来。
+    """
+    import hashlib
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
 def _sha256_file(path: str, chunk: int = 1 << 20) -> Optional[str]:
     """文件的 SHA-256；读不出来返回 None。
 
@@ -1139,6 +1150,82 @@ def _zscale_has_option(option_expr: str) -> bool:
     available = (_zscale_probe(option_expr) == "supported")
     _ZSCALE_CAP_CACHE[option_expr] = available
     return available
+
+
+def build_marker_candidate(seed: Dict[str, Any],
+                           pub_digests,
+                           attempt_id: str,
+                           job_id: str,
+                           output_path: str,
+                           media_digest: str,
+                           media_size: int,
+                           completed_at: str = "") -> Tuple[Dict[str, Any], str, str, str]:
+    """构造**随发布事务一起提交**的完成标记（R21-C02）。
+
+    审核 §4.1 第 4 步：「避免摘要自引用：先冻结不含 marker/journal 的
+    payload manifest，再生成引用它的 marker」。
+
+    所以顺序是固定的：
+
+    1. 用"媒体 + 必需报告"的 (name, final, digest) 组出 ``payload_manifest``；
+    2. 对它做**规范化序列化**（`sort_keys` + 紧凑分隔符）再取摘要 ——
+       同一份内容永远得到同一个值，重算才可比；
+    3. marker 引用该摘要（而不是引用自己的摘要）。
+
+    Args:
+        seed: main 冻结的身份字段（impl / job_id / input_path /
+            input_identity / params_identity）。
+        pub_digests: ``[(name, final_path, sha256), ...]``，**不含 marker**。
+        attempt_id: 本次 attempt。
+        job_id: 作业号（写进 manifest 便于排查）。
+        output_path: 最终媒体路径。
+        media_digest: 候选媒体的 sha256。
+        media_size: 候选媒体的字节数。
+        completed_at: 时间戳；空则取当前时间。
+
+    Returns:
+        ``(marker_dict, staging_path, marker_digest, payload_manifest_digest)``。
+        staging 文件已写好并关闭，可直接作为 ``Artifact`` 的 staging。
+
+    Raises:
+        OSError: 写 staging 或回读摘要失败。
+    """
+    payload_manifest = {
+        "schema": "generation-payload/1",
+        "attempt_id": attempt_id,
+        "job_id": job_id,
+        "objects": [
+            {"name": _n, "path": os.path.abspath(_f), "sha256": _d}
+            for (_n, _f, _d) in pub_digests
+        ],
+    }
+    _pm_text = json.dumps(payload_manifest, sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":"))
+    _pm_digest = _sha256_text(_pm_text)
+
+    marker = dict(seed)
+    marker.update({
+        "output_path": os.path.abspath(output_path),
+        "output_size": int(media_size),
+        "output_sha256": str(media_digest),
+        "payload_manifest": payload_manifest,
+        "payload_manifest_digest": _pm_digest,
+        "completed_at": (completed_at
+                         or datetime.datetime.now().astimezone().isoformat()),
+    })
+
+    # marker 与 main 的 `completion_marker_path()` 必须同名：
+    # 那边是 `str(final_path) + ".done.json"`。
+    marker_final = f"{output_path}.done.json"
+    staging = f"{marker_final}.staging-{attempt_id}"
+    # 路径铁律：写持久产物的一律自建父目录（marker 与成品同目录）
+    os.makedirs(os.path.dirname(os.path.abspath(staging)), exist_ok=True)
+    with open(staging, "w", encoding="utf-8") as f:
+        json.dump(marker, f, ensure_ascii=False, sort_keys=True, indent=2)
+    digest = _sha256_file(staging)
+    if not digest:
+        raise OSError("marker staging is unreadable")
+    return marker, staging, digest, _pm_digest
 
 
 def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
@@ -3851,6 +3938,49 @@ def main():
                 _discard_attempt_tmp(_publish_tmp, logger)
                 return 86
 
+            # ---- R21-C02：marker 作为**发布事务的成员** ----
+            # 审核 §4.1 第 3–4 步：
+            #   ③ 基于不可变内容清单生成 marker 候选，与媒体/verify/fullchain
+            #      一并交给 publisher；
+            #   ④ 避免摘要自引用 —— 先冻结**不含 marker/journal** 的
+            #      payload manifest，再生成**引用它**的 marker。
+            # 旧实现由 main 在发布**之后**单独写 marker：它不在锁集合里，
+            # 也不在 `GenerationReceipt.required_objects` 里，
+            # 于是"媒体已换代、marker 还是旧的"无法被整体拒绝。
+            _marker_stage = ""
+            _marker_digest = ""
+            _pm_digest = ""
+            _seed = params.get("_marker_seed") or {}
+            if isinstance(_seed, dict) and _seed:
+                try:
+                    _mk, _marker_stage, _marker_digest, _pm_digest = \
+                        build_marker_candidate(
+                            seed=_seed,
+                            pub_digests=_pub_digests,
+                            attempt_id=_attempt_id,
+                            job_id=job_id,
+                            output_path=output_path,
+                            media_digest=_cand_digest,
+                            media_size=os.path.getsize(_publish_tmp))
+                    _arts.append(_Artifact("marker", _marker_stage,
+                                           f"{output_path}.done.json"))
+                    logger.info(
+                        "STAGE7_MARKER_PREPARED",
+                        "Built the completion marker from the frozen payload "
+                        "manifest and added it to the same publish transaction",
+                        marker=_marker_stage,
+                        payload_manifest_digest=_pm_digest[:16],
+                        objects=len(_pub_digests))
+                except Exception as _mke:
+                    # 造不出 marker = 这一代不可提交（宁可失败，也不要
+                    # 发一份"永远无法证明完成"的产物）。
+                    logger.error("STAGE7_MARKER_PREPARE_FAIL",
+                                 "Could not build the completion marker; "
+                                 "refusing to publish an unprovable "
+                                 "generation", error=str(_mke))
+                    _discard_attempt_tmp(_publish_tmp, logger)
+                    return 86
+
             _pres = _publish(
                 _arts,
                 journal_path=f"{output_path}.journal.json",
@@ -3860,6 +3990,12 @@ def main():
                 allowed_output_roots=[os.path.dirname(
                     os.path.abspath(output_path))],
                 decision=_dec,
+                # R21-C02：必需对象集合来自**本次发布的清单**，
+                # 不让报告自行删减；marker 也在其中。
+                required_objects=[_a.final for _a in _arts],
+                marker_digest=_marker_digest,
+                run_identity=str((params.get("_run_identity") or {}).get(
+                    "digest") or ""),
                 logger=logger)
 
             if not _pres.ok:

@@ -985,7 +985,31 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
     decodes" — which is satisfied by a different input, a different config or
     a different job that happens to share the basename.
     """
-    # ---- R20-A01：先看 stage7 有没有写**本 attempt 私有**的结果 ----
+    # ---- R21-C02：优先验证**随事务发布**的 marker ----
+    # stage7 现在把 marker 作为发布事务的成员一起落位（引用冻结的
+    # payload manifest）。验证通过就不必再写 —— 写的动作本身也会破坏
+    # "marker 与媒体在同一事务里"这个性质。
+    _pub_ok, _pub_why = verify_published_marker(final_path, job, config,
+                                               params, logger)
+    if _pub_ok:
+        if logger:
+            logger.info("COMPLETION_MARKER_VERIFIED_PUBLISHED",
+                        "The completion marker was published in the same "
+                        "transaction as the media and its payload manifest "
+                        "checks out", output_path=str(final_path))
+        return True
+
+    # 有 marker 但**验证不过** → 不能退回去重写一份（那等于覆盖证据）。
+    if os.path.exists(completion_marker_path(final_path)):
+        if logger:
+            logger.error("COMPLETION_MARKER_PUBLISHED_INVALID",
+                         "A published marker exists but does not verify; "
+                         "refusing to overwrite it with a freshly written one.",
+                         output_path=str(final_path), reason=_pub_why)
+        return False
+
+    # ---- 以下是"没有随事务发布 marker"的兼容路径（手工跑 stage7 / 旧流程）----
+    # R20-A01：先看 stage7 有没有写**本 attempt 私有**的结果 ----
     # 审核 §3.2 第 6 步："main 读取该确切结果，核对 attempt 与 RunIdentity，
     # 再使用同一个整代验证入口确认当前发布对象。"
     # 这一步比下面从 `verify.json` 反推更强：那份回执是 stage7 在
@@ -1260,6 +1284,114 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
     return True, "media + required reports + COMMITTED journal"
 
 
+def verify_payload_manifest(marker: Dict[str, Any], logger=None
+                            ) -> Tuple[bool, str]:
+    """核对 marker 引用的 **payload manifest** 与磁盘现状（R21-C02）。
+
+    marker 是随发布事务一起落位的，它引用的是**发布前冻结**的清单
+    （不含 marker 自身，避免摘要自引用）。这里做三件事：
+
+    1. 用清单原文重算摘要，必须等于 marker 里记的 `payload_manifest_digest`
+       —— 防止"清单被改过、marker 却没变"；
+    2. 清单里每个对象的路径与摘要必须与磁盘一致
+       —— 防止"清单没变、文件被换了"；
+    3. 清单里必须有 `media` 一项，且与 marker 的 `output_sha256` 一致。
+
+    没有 payload manifest 的 marker 属于旧格式（R21 之前），
+    由调用方按 legacy 处理 —— 这里返回 True 表示"没有可核对的东西"。
+    """
+    pm = marker.get("payload_manifest")
+    if not isinstance(pm, dict):
+        return True, "no payload manifest (legacy marker)"
+    recorded = str(marker.get("payload_manifest_digest") or "")
+    if not recorded:
+        return False, "marker has a payload manifest but no digest for it"
+    text = json.dumps(pm, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+    if _plain_sha256_text(text) != recorded:
+        return False, "payload manifest does not match the digest in the marker"
+    objs = pm.get("objects")
+    if not isinstance(objs, list) or not objs:
+        return False, "payload manifest lists no objects"
+    seen_media = None
+    for row in objs:
+        if not isinstance(row, dict):
+            return False, "payload manifest has a malformed object entry"
+        path = str(row.get("path") or "")
+        want = str(row.get("sha256") or "")
+        name = str(row.get("name") or "")
+        if not path or not want:
+            return False, f"payload manifest entry {name!r} is incomplete"
+        got = _plain_sha256(path) if os.path.exists(path) else None
+        if got is None:
+            return False, f"object {name!r} is missing: {path}"
+        if got != want:
+            return False, (f"object {name!r} changed since it was published "
+                           f"(recorded {want[:16]}, now {got[:16]})")
+        if name == "media":
+            seen_media = want
+    if not seen_media:
+        return False, "payload manifest has no media entry"
+    if str(marker.get("output_sha256") or "") != seen_media:
+        return False, "marker output_sha256 does not match the published media"
+    return True, "payload manifest matches the published bytes"
+
+
+def _plain_sha256_text(text: str) -> str:
+    """UTF-8 文本的 sha256（与 `_sha256_text` 同义，单独命名避免歧义）。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def verify_published_marker(final_path: str, job: Dict[str, Any],
+                            config: Dict[str, Any],
+                            params: Optional[Dict[str, Any]] = None,
+                            logger=None) -> Tuple[bool, str]:
+    """验证**随发布事务落位**的完成标记。
+
+    与"main 事后写 marker"的区别：这份 marker 是 publisher 在锁内与媒体
+    一起落位的，内容引用冻结的 payload manifest。因此只要能验证它，
+    就不再需要猜"这份 marker 属于哪一代"。
+    """
+    p = completion_marker_path(final_path)
+    if not os.path.exists(p):
+        return False, "no published marker"
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError) as exc:
+        return False, f"published marker is unreadable: {exc}"
+    if not isinstance(data, dict):
+        return False, "published marker is not an object"
+
+    if str(data.get("impl") or "") != VIDEO_IMPL_VERSION:
+        return False, (f"marker was produced by {data.get('impl')!r}, "
+                       f"current is {VIDEO_IMPL_VERSION!r}")
+    if str(data.get("job_id") or "") != str(job.get("job_id") or ""):
+        return False, (f"marker belongs to job {data.get('job_id')!r}, "
+                       f"not {job.get('job_id')!r}")
+    _st = _input_identity_status(data.get("input_identity") or {},
+                                 build_input_identity(job.get("input_path", "")))
+    if _st == "changed":
+        return False, "input content changed since this generation"
+    if _st == "unproven":
+        return False, "input identity cannot be verified"
+    rec_params = str(data.get("params_identity") or "")
+    if not rec_params:
+        return False, "marker has no params identity"
+    if config is not None:
+        try:
+            cur = build_params_identity(config, job, logger)
+        except Exception as exc:            # pragma: no cover
+            return False, f"cannot compute the current params identity: {exc}"
+        if rec_params != cur:
+            return False, "effective parameters changed since this generation"
+
+    ok, why = verify_payload_manifest(data, logger)
+    if not ok:
+        return False, why
+    return True, "published marker verified"
+
+
 def resume_artifact_matches(final_path: str, job: Dict[str, Any],
                             config: Dict[str, Any],
                             logger=None) -> Tuple[bool, str]:
@@ -1306,7 +1438,16 @@ def resume_artifact_matches(final_path: str, job: Dict[str, Any],
     # 冒充"这个 job 的成品"。"能解码"更不能当身份。
     recorded_sha = data.get("output_sha256")
     if recorded_sha:
-        current_sha = _chunked_sha256(final_path)
+        # ---- R21-C02：新格式用**纯内容**摘要 ----
+        # `_chunked_sha256()` 在内容之后又拼了 size 字符串，与 publisher /
+        # journal / verify 报告用的 `file_digest`（纯内容）**不是同一套算法**。
+        # 带 payload manifest 的 marker 由 stage7 生成，记的是纯内容摘要
+        # （与 manifest 里 media 的 sha256 同值），所以按纯内容比。
+        # 旧 marker（无 manifest）仍按老算法比，保住既有产物的可复用性。
+        _plain_marker = bool(isinstance(data, dict)
+                             and data.get("payload_manifest"))
+        current_sha = (_plain_sha256(final_path) if _plain_marker
+                       else _chunked_sha256(final_path))
         if current_sha is None:
             return False, "artifact unreadable while verifying its digest"
         if current_sha != recorded_sha:
@@ -1322,6 +1463,19 @@ def resume_artifact_matches(final_path: str, job: Dict[str, Any],
     # 审核：resume 检查"仍主要围绕 .done.json 和媒体；受控路径没有读取所需
     # 报告和 journal，不能证明缺失报告的一代可继续被当作完整完成"。
     # 这里复用**同一个**整代验证器，新任务收尾与 resume 不再各判一套。
+    # 另外：若 marker 带 payload manifest（R21 起），必须核对清单与磁盘一致 ——
+    # 否则"清单没变、文件被换"仍会被放过。
+    _mdata: Dict[str, Any] = {}
+    try:
+        with open(marker, "r", encoding="utf-8") as _mf:
+            _mdata = json.load(_mf) or {}
+    except (OSError, ValueError):
+        _mdata = {}
+    if isinstance(_mdata, dict) and _mdata.get("payload_manifest"):
+        _pm_ok, _pm_why = verify_payload_manifest(_mdata, logger)
+        if not _pm_ok:
+            return False, f"payload manifest mismatch: {_pm_why}"
+
     _gen_ok, _gen_why = verify_generation_objects(final_path, job, logger)
     if not _gen_ok:
         return False, f"generation is not complete: {_gen_why}"
@@ -1695,6 +1849,27 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                         f".attempt-{params['attempt_id']}.result.json")
     except Exception:                      # pragma: no cover
         params["_stage7_result_path"] = ""
+
+    # ---- R21-C02：把 marker 的**身份字段**冻结后交给 stage7 ----
+    # 审核 §4.1 第 2–3 步：stage7 负责"媒体 + 必需报告"的不可变清单，
+    # marker 候选必须由**该清单**生成并随同一事务发布。
+    # 但 `impl` / `input_identity` / `params_identity` 只有 main 算得出来
+    # （stage7 拿不到 job/config），所以这里先算好作为**种子**下传，
+    # stage7 只补 output_* 与 payload_manifest，不再自己发明身份。
+    try:
+        params["_marker_seed"] = {
+            "impl": VIDEO_IMPL_VERSION,
+            "job_id": job.get("job_id", ""),
+            "input_path": job.get("input_path", ""),
+            "input_identity": build_input_identity(job.get("input_path", "")),
+            "params_identity": build_params_identity(config, job, _pre_log),
+        }
+    except Exception as _mse:              # pragma: no cover - 身份算不出
+        params["_marker_seed"] = {}
+        _pre_log.warning("MARKER_SEED_FAIL",
+                         "Cannot pre-compute the marker identity; stage7 will "
+                         "not publish a marker for this generation",
+                         error=str(_mse))
 
     # ---- R14-06：有效路径预检，必须先于**首次落盘** ----
     # 原来 `--output` 只换 output_dir，而最终媒体仍取 job.output_path，

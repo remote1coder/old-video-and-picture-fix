@@ -67,10 +67,14 @@ def test_generation_not_complete_when_terminal_not_persisted():
 
 
 def test_generation_complete_when_everything_present():
+    # R21-C02：`is_complete()` 现在还要求 journal_phase == COMMITTED
+    # （停在 PREPARED/COMMITTING 的一代不算完成）。生产 publisher 在
+    # 提交成功时就是写 COMMITTED，这里照同一形状。
     g = R.GenerationReceipt(
         generation=1, attempt_id="att-1", run_identity="a" * 64,
         required_objects=["/x/a.mkv"], object_digests={"/x/a.mkv": "b" * 64},
-        marker_digest="c" * 64, terminal_persisted=True)
+        marker_digest="c" * 64, terminal_persisted=True,
+        journal_phase="COMMITTED")
     assert g.is_complete() == (True, "")
 
 
@@ -80,7 +84,8 @@ def test_generation_incomplete_when_any_part_missing(missing):
     kw = dict(generation=1, attempt_id="att-1", run_identity="a" * 64,
               required_objects=["/x/a.mkv"],
               object_digests={"/x/a.mkv": "b" * 64},
-              marker_digest="c" * 64, terminal_persisted=True)
+              marker_digest="c" * 64, terminal_persisted=True,
+              journal_phase="COMMITTED")
     kw[missing] = [] if missing == "required_objects" else (
         {} if missing == "object_digests" else "")
     g = R.GenerationReceipt(**kw)
@@ -93,7 +98,8 @@ def test_generation_incomplete_when_object_lacks_digest():
         generation=1, attempt_id="att-1", run_identity="a" * 64,
         required_objects=["/x/a.mkv", "/x/a.json"],
         object_digests={"/x/a.mkv": "b" * 64},   # json 没摘要
-        marker_digest="c" * 64, terminal_persisted=True)
+        marker_digest="c" * 64, terminal_persisted=True,
+        journal_phase="COMMITTED")
     ok, why = g.is_complete()
     assert ok is False and "digest" in why
 

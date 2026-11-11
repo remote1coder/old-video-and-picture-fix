@@ -207,12 +207,26 @@ class GenerationReceipt:
     def is_complete(self) -> Tuple[bool, str]:
         """这一代是否**可以说"完成了"**。
 
+        R21-C02：审核指出旧实现"使用字段真值判断，未严格要求 COMMITTED、
+        非空 attempt、真实布尔类型；字符串 `"false"` 可以被当成真"。
+        这里逐条收紧：
+
+        - `terminal_persisted` 必须是**真布尔 True**（`"false"` 之类一律不算）；
+        - `journal_phase` 必须是 `COMMITTED` —— 停在 PREPARED/COMMITTING
+          的一代，即使媒体已在正式路径，也不是"已完成"；
+        - `attempt_id` 不能为空（空 attempt 说明回执不是一次具体执行写的）；
+        - 每个必需对象都要有摘要，marker 摘要与 run identity 都非空。
+
         Returns:
-            ``(ok, reason)``。任一必需对象缺失摘要、marker 缺失、
-            或终态未持久化，都不是完成。
+            ``(ok, reason)``。
         """
-        if not self.terminal_persisted:
+        if self.terminal_persisted is not True:
             return False, "terminal state was not persisted (terminal_pending)"
+        if str(self.journal_phase or "") != "COMMITTED":
+            return False, (f"journal phase is {self.journal_phase!r}, "
+                           f"not COMMITTED")
+        if not str(self.attempt_id or "").strip():
+            return False, "attempt id is empty; the receipt is not bound to an execution"
         if not self.required_objects:
             return False, "no required objects declared"
         missing = [p for p in self.required_objects
@@ -262,17 +276,45 @@ def load_receipt(raw: Dict[str, Any]) -> Optional[Any]:
                 reused_from=raw.get("reused_from") or "",
             )
         if kind == "GenerationReceipt":
-            return GenerationReceipt(
+            # R21-C02：`terminal_persisted` 只认**真布尔**。
+            # 旧实现 `bool(raw.get(...))` 会把字符串 "false" 读成 True，
+            # 于是"没持久化"的一代被当成完成。
+            _tp = raw.get("terminal_persisted")
+            if not isinstance(_tp, bool):
+                return None
+            _obj = GenerationReceipt(
                 generation=int(raw["generation"]),
-                attempt_id=raw["attempt_id"],
-                run_identity=raw["run_identity"],
+                attempt_id=str(raw["attempt_id"] or ""),
+                run_identity=str(raw["run_identity"] or ""),
                 required_objects=list(raw.get("required_objects") or []),
                 object_digests=dict(raw.get("object_digests") or {}),
                 marker_digest=raw.get("marker_digest") or "",
-                terminal_persisted=bool(raw.get("terminal_persisted")),
+                terminal_persisted=_tp,
                 journal_phase=raw.get("journal_phase") or "",
                 check_digest=raw.get("check_digest") or "",
             )
+            return _verify_declared_digest(raw, _obj)
     except (KeyError, TypeError, ValueError):
         return None
     return None
+
+
+def _verify_declared_digest(raw: Dict[str, Any], obj: Any) -> Optional[Any]:
+    """反序列化后核对"声明摘要"是否与内容一致（R21-C02）。
+
+    回执里带 `digest` 字段却没被验过，等于给了一份可以自称的证明。
+    缺摘要（旧对象）按原样返回；有摘要但对不上 → 视为不可信（None）。
+
+    注意：`digest` 只在 `to_dict()` 里出现，`digest()` 的计算输入不含它，
+    所以这里没有自引用问题。
+    """
+    declared = raw.get("digest")
+    if declared is None:
+        return obj
+    try:
+        actual = obj.digest()
+    except Exception:
+        return None
+    if str(declared) != str(actual):
+        return None
+    return obj

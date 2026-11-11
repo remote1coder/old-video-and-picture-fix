@@ -245,3 +245,50 @@ def test_resume_refuses_when_the_journal_is_unresolved(tmp_path):
     ok, why = vmain.resume_artifact_matches(final, job, {"global": {}}, log)
     assert ok is False, why
     assert "not complete" in why
+
+
+# ------------------------------------------------ 回执强类型（C02 第三点）
+
+def _receipt(**kw):
+    import receipts as R
+    base = dict(generation=1, attempt_id="att-1", run_identity="a" * 64,
+                required_objects=["/x/a.mkv"],
+                object_digests={"/x/a.mkv": "b" * 64},
+                marker_digest="c" * 64, terminal_persisted=True,
+                journal_phase="COMMITTED")
+    base.update(kw)
+    return R.GenerationReceipt(**base)
+
+
+def test_receipt_requires_committed_journal_phase():
+    ok, why = _receipt(journal_phase="PREPARED").is_complete()
+    assert ok is False and "COMMITTED" in why, why
+
+
+def test_receipt_rejects_an_empty_attempt_id():
+    ok, why = _receipt(attempt_id="").is_complete()
+    assert ok is False and "attempt" in why, why
+
+
+def test_receipt_string_false_is_not_a_persisted_terminal():
+    """`"false"` 不是布尔 True —— 旧实现 `bool("false")` 会读成真。"""
+    import receipts as R
+    raw = dict(_receipt().to_dict(), kind="GenerationReceipt")
+    raw["terminal_persisted"] = "false"
+    assert R.load_receipt(raw) is None, "字符串 'false' 被当成了真"
+
+
+def test_receipt_with_a_wrong_declared_digest_is_rejected():
+    import receipts as R
+    raw = dict(_receipt().to_dict(), kind="GenerationReceipt")
+    raw["digest"] = "0" * 64
+    assert R.load_receipt(raw) is None
+
+
+def test_receipt_with_a_matching_declared_digest_round_trips():
+    import receipts as R
+    raw = dict(_receipt().to_dict(), kind="GenerationReceipt")
+    obj = R.load_receipt(raw)
+    assert obj is not None
+    ok, why = obj.is_complete()
+    assert ok is True, why
