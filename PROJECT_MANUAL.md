@@ -352,6 +352,31 @@ python video_restoration_pipeline/main.py \
 - `--ai-upscale-factor`: AI放大倍数 (2或4)
 - `--face-restore`: 面部修复模型 (GFPGAN或CodeFormer)
 
+#### 工作表示（色度 / 位深）—— 视频链，R22 起
+
+在 config 的 `global` 段加一项即可，默认不需要写：
+
+```yaml
+global:
+  chroma_mode: "auto"     # auto（默认）| preserve | 444 | 420
+  # chroma_mode_accept_degraded: false   # 能力不足时是否接受降级
+```
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认）| 与历史一致（4:2:0）；源是 4:4:4 时只在日志里**建议** 444，不擅自切换 |
+| `preserve` | 跟随源素材色度；源读不出来 → **直接报错**（不猜 420）|
+| `444` | 全链 4:4:4（stage1 渲染起每一处边界都 444）|
+| `420` | 显式 4:2:0 |
+
+**换成 444 时通常还要改编码器**：`libsvtav1` 只支持 4:2:0
+（`ffmpeg -h encoder=libsvtav1` 实测只有 `yuv420p yuv420p10le`），
+所以要么 `video_encoder: libx265` / `libaom-av1`，要么显式接受降级。
+不满足时工具会在**动手之前**以 rc=86 停下并说明原因，不会跑一半再失败。
+
+切换 420/444 会改变 `param_hash`，旧中间产物**不会被复用**（不会出现
+"拿旧 420 的产物换个标签当 444"）。
+
 ### 6.2 批量修复 (使用清单)
 
 #### 步骤1：生成清单

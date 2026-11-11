@@ -357,11 +357,15 @@ def test_fusion_chain_forces_unified_pix_fmt_before_filters():
                encoding="utf-8", errors="replace").read()
     i_block = src.find("if post_filter_chain:")
     assert i_block > 0, "找不到融合注入块"
-    block = src[i_block:i_block + 3000]
-    assert "format=yuv420p16le" in block, \
-        "融合进链前必须补 format=yuv420p16le（否则色度会整片偏）"
-    assert '_tag + "format=yuv420p16le,"' in block or \
-        '"format=yuv420p16le," + _chain' in block, \
+    block = src[i_block:i_block + 4000]
+    # R22：进链统一格式现在由工作表示决定（`chain_input_fmt`），
+    # 默认仍是 yuv420p16le，但字面量 `_tag + "format=yuv420p16le,"` 已不成立。
+    # 断言改成守**行为**：前缀必须插在 [0:v] 之后、值必须来自同一个来源。
+    assert 'format={_in_fmt},' in block, \
+        "融合进链前必须补 format=<统一格式>（否则色度会整片偏）"
+    assert 'chain_input_fmt or "yuv420p16le"' in block, \
+        "统一格式必须可注入且默认为 yuv420p16le"
+    assert '_tag + f"format={_in_fmt},"' in block, \
         "必须在 [0:v] 之后立刻统一格式，不能插到链中间"
 
 
@@ -373,19 +377,23 @@ def test_output_pix_fmt_written_by_both_paths():
     R22 修：原来断言的是字面量 `'"-pix_fmt", "yuv420p16le", "-c:v", "ffv1"'`，
     而那行代码**无条件**追加 `-pix_fmt`，正好把融合分支刚按 `out_pix_fmt`
     设的 10-bit 覆盖掉（ffmpeg 输出选项后写覆盖先写，且不报错）。
-    现在默认值只在调用方没指定时才写，所以断言改成两个方向都守：
-    默认值必须在、且不能存在"无条件追加"的写法。
+
+    之后又发现"只在空值时写默认值"漏了第三条分支（给了 out_pix_fmt 但没走
+    融合 → 一次都不写，实测落盘成 gbrp16le）。最终收敛成一句
+    `-pix_fmt str(out_pix_fmt or "yuv420p16le")`。断言跟着改成守这条不变式：
+    **任何路径都必须显式写，且默认值只能出现在 or 的右侧。**
     """
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage3_ai_upscale.py"),
                encoding="utf-8", errors="replace").read()
-    assert 'if not out_pix_fmt:' in src, \
-        "raw 路径应只在调用方没指定格式时才用默认值"
-    assert 'enc_cmd += ["-pix_fmt", "yuv420p16le"]' in src, \
-        "raw 路径的编码器必须显式指定 yuv420p16le，否则会存成 gbrp16le"
+    assert 'enc_cmd += ["-pix_fmt", str(out_pix_fmt or "yuv420p16le")]' in src, \
+        "raw 路径必须显式写 -pix_fmt，默认值走 or 的右侧"
     assert '["-pix_fmt", "yuv420p16le", "-c:v", "ffv1"]' not in src, \
         ("不允许无条件追加 pix_fmt —— 它会静默覆盖融合分支的 "
          "out_pix_fmt（请求 10-bit 却落盘 16-bit）")
+    assert 'if not out_pix_fmt:' not in src, \
+        ("不要回到'只在空值时写默认值'：那条分支组合（给了 out_pix_fmt "
+         "但没走融合）会一次都不写")
 
 
 def test_probe_script_exists_and_documents_the_numbers():

@@ -94,6 +94,36 @@ stage2.mkv → ffmpeg 抽帧 frame_%08d.png → AI 读写 PNG → ffmpeg 编 ste
 - File naming: `{job_id}_{input_name}_step{N}_{operation}_p{param_hash}.{ext}`
 - param_hash = SHA-256 of file identity + quality params (v6.3 §3.7)
 
+#### 2.2.1 工作表示（色度 / 位深）：`shared_modules/work_format.py`
+
+R22 §5.2 起，"用哪种工作表示"是一个**显式选择**，不再是写死的结论。
+
+| 模式 | 行为 |
+|---|---|
+| `auto`（默认）| 走兼容 4:2:0，只给 `recommendation` + 理由，**不改行为** |
+| `preserve` | 跟随源素材色度；源读不出来 → **明确失败**（不猜 420）|
+| `444` | 全链 4:4:4 |
+| `420` | 显式 4:2:0 |
+
+三个表示层分开表达：`model_rgb`（模型输入输出是 `rgb48le`，无子采样）、
+处理中间表示（`boundaries["stageN_out"]`）、最终输出采样
+（`boundaries["stage7_final"]`）。各 stage **只能**通过
+`boundary_pix_fmt(params, "<边界名>")` 取值，不准自己拼
+`yuv420p...` 字符串 —— 否则"选了 444 但某条分支还写死 420"会再次发生
+（实测踩过：PNG 中转的 VFR/CFR 两条分支各写一次）。
+
+**能力前置核验是实测的**：`ffmpeg_encoder_formats()` 读
+`ffmpeg -h encoder=<name>` 的 "Supported pixel formats"。本机实测
+`libsvtav1` 只有 `yuv420p / yuv420p10le` → 选 444 会被**在动手之前**
+拒绝（rc=86，零 stage 执行），并列出生效替代（`libx265` / `libaom-av1`）。
+无法满足时也可以由用户显式接受降级（`chroma_mode_accept_degraded: true`），
+降级原因会留在计划里。
+
+`chroma_mode` 是普通参数键（不带 `_` 前缀），因此进计划身份：
+切换 420/444 → `param_hash` 全变 → 旧产物不会被复用再换标签。
+
+---
+
 ---
 
 ## 3. Classifier System

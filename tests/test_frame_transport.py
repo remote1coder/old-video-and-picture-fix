@@ -26,9 +26,29 @@ def test_manual_png_wins():
     assert "手动指定" in r["reason"]
 
 
-def test_manual_shared_memory_wins():
+def test_manual_shared_memory_wins(monkeypatch):
+    """手动选 shared_memory 时必须赢过 auto 的保守判定。
+
+    R22：这条原来**直接读本机真实可用内存** —— 全量跑批时实测偶发失败
+    （`available_bytes()` 在某些用例之后返回 None，forced 分支仍会退回
+    PNG）。用例不该依赖宿主机当前内存，这里把探测结果固定住。
+    """
+    monkeypatch.setattr(ft, "available_bytes", lambda: 64 * GB)
     r = ft.plan_transport(1 * MB, 256, {"ai_frame_transport": "shared_memory"})
     assert r["transport"] == "shared_memory"
+
+
+def test_manual_shared_memory_still_falls_back_when_memory_is_unreadable(
+        monkeypatch):
+    """探测不到内存时，**连手动强制也退回 PNG** —— 这是有意的保守。
+
+    记录成用例的原因：它不是缺陷，而是一个容易被当成缺陷的行为。
+    宁可 PNG（慢但一定跑得通），也不赌一个测不出来的内存预算。
+    """
+    monkeypatch.setattr(ft, "available_bytes", lambda: None)
+    r = ft.plan_transport(1 * MB, 256, {"ai_frame_transport": "shared_memory"})
+    assert r["transport"] == "png"
+    assert "探测不到" in r["reason"]
 
 
 def test_invalid_mode_falls_back_to_auto():
