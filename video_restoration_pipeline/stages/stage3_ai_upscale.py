@@ -850,6 +850,26 @@ def _load_stage4_filter_builder():
     return _mod.build_filter_chain
 
 
+def _sha256_file(path: str, chunk: int = 1 << 20):
+    """文件的 SHA-256（R21-C06：回执要绑定**内容**，不能只记字节数）。
+
+    读不出来返回 None。本文件原来只有 `_sha256_text`，
+    直接调 `_sha256_file` 会 NameError —— 与 R20 stage7 缺 `_sha256_text` 同族。
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                b = fh.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def _sha256_text(text):
     """文本的 SHA-256（用于把滤镜图身份写进回执）。"""
     import hashlib
@@ -2098,6 +2118,55 @@ def _load_params(args):
     return json.loads(args.params) if args.params else {}
 
 
+def resolve_manual_fps(params, logger=None):
+    """解析**人工指定**的帧率，含 `fps_interpret`（R21-N15）。
+
+    审核 R20 的 N15 要求："仅给 `fps_interpret` 且源 probe 失败"这条路径
+    也要有明确行为。旧实现只看 `original_fps` / `fps`：用户只写
+    `fps_interpret: 25` 时会被当成"没给帧率"→ 直接 rc=86，
+    而这恰恰是最需要人工解释的场景（源读不出帧率）。
+
+    Args:
+        params: 有效参数。
+        logger: 可选。
+
+    Returns:
+        ``(rate_obj_or_None, source_label)``。``rate_obj`` 是
+        `rate_spec.parse_rate()` 的返回（含 `.value` / `.as_ffmpeg()`）。
+        ``source_label`` ∈ ``user`` / ``manifest`` / ``user-interpretation``
+        / ``manifest-interpretation`` / ``""``。
+    """
+    def _parse(spec, src, event):
+        try:
+            from rate_spec import parse_rate as _pr
+            r = _pr(spec, source=src)
+            if logger:
+                logger.info(event, "Using an explicit frame rate",
+                            rate=r.as_ffmpeg(), source=src)
+            return r, src
+        except Exception as exc:
+            if logger:
+                logger.error(
+                    "STAGE3_FPS_SPEC_INVALID",
+                    "The provided frame rate is not usable; refusing to "
+                    "guess. Expected a number, a decimal or a fraction like "
+                    "30000/1001.", spec=str(spec),
+                    reason=getattr(exc, "reason", str(exc)))
+            return None, ""
+
+    _spec = params.get("original_fps") or params.get("fps")
+    _src = "user" if params.get("_fps_from_user") else "manifest"
+    if _spec not in (None, ""):
+        return _parse(_spec, _src, "STAGE3_FPS_FROM_SPEC")
+
+    # 只有 fps_interpret：这是一次**人工解释**，不是探测结果。
+    _interp = params.get("fps_interpret")
+    if _interp not in (None, ""):
+        return _parse(_interp, f"{_src}-interpretation",
+                      "STAGE3_FPS_FROM_INTERPRETATION")
+    return None, ""
+
+
 def write_job_timeline_plan(params, source_timeline=None, fps_value=None,
                             fps_source=None, pts_usable=0,
                             expected_frames=0, logger=None):
@@ -2565,39 +2634,19 @@ def main():
             # 依据执行指令："缺少构造时间轴所必需的信息时，自动模式停止
             # 时间相关处理并说明所缺条件；明确保留人工指定 fps 的入口，
             # 记录 explicit_assumption / UNVERIFIED"。
-            _manual_spec = params.get("original_fps") or params.get("fps")
-            # R14-08：用**有理数解析器**，不要 `float()`。
-            # `float("30000/1001")` 抛 ValueError → 被当成"用户没给帧率"
-            # → 直接 86：用户填最标准的 NTSC 帧率反而失败。
-            # 同时保留精确分数，避免 float 往返误差。
-            _manual_rate = None
-            if _manual_spec not in (None, ""):
-                try:
-                    from rate_spec import parse_rate as _parse_rate
-                    # R14-05：`job.fps` 是 manifest/probe 来源，
-                    # **不等于**用户明确选择 —— 来源要如实记录。
-                    _src = ("user" if params.get("_fps_from_user")
-                            else "manifest")
-                    _manual_rate = _parse_rate(_manual_spec, source=_src)
-                except Exception as _rse:
-                    logger.error(
-                        "STAGE3_FPS_SPEC_INVALID",
-                        "The provided frame rate is not usable; refusing to "
-                        "guess. Expected a number, a decimal or a fraction "
-                        "like 30000/1001.",
-                        spec=str(_manual_spec),
-                        reason=getattr(_rse, "reason", str(_rse)))
-                    _manual_rate = None
+            # R21-N15：沿用 `resolve_manual_fps()` —— 它**也认 `fps_interpret`**。
+            # 旧实现只看 original_fps/fps，于是"只给 fps_interpret 且源
+            # probe 失败"会被当成"没给帧率"→ rc=86，把唯一可行的
+            # 人工入口堵死。
+            _manual_rate, _manual_src = resolve_manual_fps(params, logger)
             if _manual_rate is not None:
                 actual_fps = _manual_rate.value
                 _fps_ok = True
-                _fps_source = ("user-assumed"
-                               if _manual_rate.source == "user"
-                               else "manifest-assumed")
+                # 来源如实记录：user-assumed / manifest-assumed /
+                # user-interpretation / manifest-interpretation
+                _fps_source = (_manual_src if _manual_src.endswith("-interpretation")
+                               else f"{_manual_src}-assumed")
                 _fps_raw_str = _manual_rate.as_ffmpeg()
-                logger.info("STAGE3_FPS_FROM_SPEC",
-                            "Using the frame rate from an explicit spec",
-                            rate=_fps_raw_str, source=_fps_source)
                 logger.warning(
                     "STAGE3_FPS_EXPLICIT_ASSUMPTION",
                     "Frame rate could not be measured; using the value the "
@@ -2959,12 +3008,24 @@ def main():
                                         params.get("_frozen_param_digest") or ""),
                                     "output": str(_s_out),
                                     "output_size": os.path.getsize(_s_out),
+                                    # R21-C06：回执必须绑定**内容摘要**。
+                                    # 只有 size 时"同大小替换"能直接冒充；
+                                    # 消费方也无法证明这份产物就是它验过的那份。
+                                    "output_sha256": _sha256_file(_s_out) or "",
                                     "frames": _s_n,
                                     "filter_chain_sha256": _sha256_text(_s_chain or ""),
                                     "out_pix_fmt": _s_pix_fmt,
                                     # R20-A03：颜色是**一组**属性，单看 pix_fmt
                                     # 既不能证明没被改色、也不能证明改对了色。
                                     "color": _ev.get("color") or {},
+                                    # R21-C06：源状态与"丢/变"结论也必须写进来。
+                                    # 只写输出侧的话，消费方无法判断
+                                    # "未知"是源本来就没有，还是没测到。
+                                    "color_source": _ev.get("color_source") or {},
+                                    "color_lost_tags":
+                                        list(_ev.get("color_lost_tags") or []),
+                                    "color_changed_tags":
+                                        list(_ev.get("color_changed_tags") or []),
                                     # R20-A03：帧数/时长/尺寸的**判定结论**
                                     # （经典路线由 stage4 自己做，融合路线在此补上）。
                                     "bounds": _ev.get("bounds") or {},

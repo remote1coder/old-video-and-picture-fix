@@ -13,6 +13,7 @@
 本文件锁住 `shared_modules/generation_evidence.py` 的语义，尤其是
 **"没查过" ≠ "查过了没问题"**。
 """
+import hashlib
 import json
 import os
 import sys
@@ -211,7 +212,9 @@ def test_verify_fused_receipt_requires_the_evidence_blocks(tmp_path):
     def _write(doc):
         base = {"attempt_id": "a1", "input_digest": dig,
                 "input_digest_kind": "source-only", "param_digest": "",
-                "output": str(out), "output_size": out.stat().st_size}
+                "output": str(out), "output_size": out.stat().st_size,
+                # R21-C06：回执必须带内容摘要，否则按 legacy 拒
+                "output_sha256": hashlib.sha256(out.read_bytes()).hexdigest()}
         base.update(doc)
         rcpt.write_text(json.dumps(base), encoding="utf-8")
 
@@ -264,6 +267,7 @@ def test_receipt_with_a_stage_dependent_digest_is_rejected(tmp_path):
     doc = _good_receipt()
     doc.update({"attempt_id": "a1", "output": str(out),
                 "output_size": 4,
+                "output_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
                 # 旧写法：把"源+参数"的摘要塞进 input_digest，且不声明 kind
                 "input_digest": compute_param_hash(str(src), {"crf": 20})})
     rcpt.write_text(json.dumps(doc), encoding="utf-8")
@@ -282,6 +286,7 @@ def test_param_digest_is_compared_against_the_frozen_value(tmp_path):
     rcpt = tmp_path / "o.mkv.fused_stage34.json"
     doc = _good_receipt()
     doc.update({"attempt_id": "a1", "output": str(out), "output_size": 4,
+                "output_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
                 "input_digest": fr.source_digest(str(src)),
                 "input_digest_kind": "source-only",
                 "param_digest": "deadbeef"})
@@ -307,6 +312,7 @@ def test_frozen_param_digest_absent_skips_the_param_check(tmp_path):
     rcpt = tmp_path / "o.mkv.fused_stage34.json"
     doc = _good_receipt()
     doc.update({"attempt_id": "a1", "output": str(out), "output_size": 4,
+                "output_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
                 "input_digest": fr.source_digest(str(src)),
                 "input_digest_kind": "source-only", "param_digest": ""})
     rcpt.write_text(json.dumps(doc), encoding="utf-8")

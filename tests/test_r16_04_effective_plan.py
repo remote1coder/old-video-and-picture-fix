@@ -282,6 +282,10 @@ def test_stage3_reinterpret_overrides_probe():
     assert 'params.get("fps_interpret")' in src
     assert '_fps_source = "user-assumed"' in src
     # 反例：这段必须在 `if not _fps_ok:` 之外（否则 probe 成功就永远走不到）
-    _i_re = src.find('params.get("fps_interpret")')
+    # R21-N15：`fps_interpret` 现在还有**另一处**合法用途 ——
+    # `resolve_manual_fps()` 把"只给 fps_interpret"当作人工帧率来源，
+    # 它本来就该在 probe 失败分支里。所以定位要认**重解释块本身**
+    # （`_reinterp = ...`），不能用裸的 `params.get("fps_interpret")`。
+    _i_re = src.find('_reinterp = params.get("fps_interpret")')
     _i_blk = src.find("if not _fps_ok:")
     assert _i_re > _i_blk, "重解释逻辑落在了 probe 失败分支里"

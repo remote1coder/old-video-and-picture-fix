@@ -127,3 +127,85 @@ def test_transform_check_is_required_only_when_requested():
                             "stage7_encode.py"),
                encoding="utf-8", errors="replace").read()
     assert '"required": bool(_tv.get("requested"))' in src
+
+
+# ------------------------------------------------ 映射校验的四态（C04 尾）
+
+import stage7_encode as s7  # noqa: E402
+
+
+def _patch_pts(monkeypatch, src=None, act=None, tb=0.001, raises=False):
+    import vfr_timecodes as vt
+    if raises:
+        def _boom(path):
+            raise RuntimeError("probe exploded")
+        monkeypatch.setattr(vt, "probe_pts", lambda p: (_ for _ in ()).throw(
+            RuntimeError("probe exploded")))
+    else:
+        def _pts(path):
+            return list(src if "src" in str(path) else (act or []))
+        monkeypatch.setattr(vt, "probe_pts", _pts)
+    monkeypatch.setattr(vt, "probe_time_base", lambda p: tb)
+
+
+def test_identity_transform_is_not_applicable(monkeypatch):
+    _patch_pts(monkeypatch, src=[0.0, 0.04], act=[0.0, 0.04])
+    state, info = s7.check_declared_timeline_mapping({}, "src.mkv", "cand.mkv")
+    assert state == "not_applicable"
+    assert info["mapping_ok"] is None
+
+
+def test_declared_transform_without_source_pts_is_unverified(monkeypatch):
+    _patch_pts(monkeypatch, src=[], act=[0.0, 0.04])
+    state, info = s7.check_declared_timeline_mapping(
+        {"expected_speed": 2.0}, "src.mkv", "cand.mkv")
+    assert state == "unverified", info
+    assert info["mapping_ok"] is None
+
+
+def test_declared_transform_without_candidate_pts_is_unverified(monkeypatch):
+    _patch_pts(monkeypatch, src=[0.0, 0.04, 0.08], act=[])
+    state, info = s7.check_declared_timeline_mapping(
+        {"expected_speed": 2.0}, "src.mkv", "cand.mkv")
+    assert state == "unverified", info
+
+
+def test_probe_exception_is_unverified_not_pass(monkeypatch):
+    _patch_pts(monkeypatch, raises=True)
+    state, info = s7.check_declared_timeline_mapping(
+        {"expected_speed": 2.0}, "src.mkv", "cand.mkv")
+    assert state == "unverified", info
+    assert "raised" in info.get("mapping_reason", "")
+
+
+@pytest.mark.parametrize("state,status,required,force_key", [
+    ("pass", "PASS", True, None),
+    ("fail", "FAIL", True, "allow_verify_fail_publish"),
+    ("unverified", "UNVERIFIED", True, "allow_verify_fail_publish"),
+    ("not_applicable", "NOT_APPLICABLE", False, None),
+])
+def test_mapping_entry_maps_each_state(state, status, required, force_key):
+    e = s7.mapping_check_entry(state, {"mapping_problems": ["x"]})
+    assert e["status"] == status
+    assert e["required"] is required
+    assert e.get("force_key") == force_key
+
+
+def test_fail_or_unverified_mapping_blocks_the_gate():
+    for state in ("fail", "unverified"):
+        e = s7.mapping_check_entry(state, {})
+        r = CR.CheckResult(e["name"], e["status"], reason="x",
+                           required=e["required"],
+                           force_key=e.get("force_key"),
+                           severity=e.get("severity", "info"))
+        d = CR.publish_decision([r], enabled_forces=set())
+        assert d["publish"] is False, (state, d)
+
+
+def test_stage7_writes_the_mapping_check_into_the_gate():
+    src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
+                            "stage7_encode.py"),
+               encoding="utf-8", errors="replace").read()
+    assert src.count('_checks["timeline_mapping"] = mapping_check_entry(') == 2, (
+        "两个分支都必须把映射结论写进统一发布门")
+    assert "_map_ok, _map_info" not in src, "仍在用旧的布尔返回"

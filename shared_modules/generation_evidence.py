@@ -108,6 +108,23 @@ def bounds_report(src: str, out: str, stage: str, params: Optional[Dict[str, Any
     return res
 
 
+def _changed_tags(src_color: Dict[str, Any],
+                  out_color: Dict[str, Any]) -> list:
+    """源与产物**都有值但不同**的颜色字段（R21-C06）。
+
+    审核："known→另一 known 值，需要与实际转换吻合"。融合路径里 stage3 与
+    stage4 都不做色彩空间转换（只做 16 位 4:2:0 的像素格式转换），所以
+    matrix/range/primaries/transfer 的任何变化都意味着"标签被改写"或
+    "确实做了转换但没声明" —— 两种都必须报出来，不能静默。
+    """
+    changed = []
+    for k in ("range", "matrix", "primaries", "transfer"):
+        a, b = src_color.get(k), out_color.get(k)
+        if a and b and str(a) != str(b):
+            changed.append({"field": k, "source": a, "output": b})
+    return changed
+
+
 def _lost_tags(src_color: Dict[str, Any],
                out_color: Dict[str, Any]) -> list:
     """源**有**标签、产物**丢了**的字段列表。
@@ -141,6 +158,8 @@ def collect(src: str, out: str, stage: str,
     return {"color": oc,
             "color_source": sc,
             "color_lost_tags": _lost_tags(sc, oc),
+            # R21-C06：源与产物都有值但不同 → 必须报出来
+            "color_changed_tags": _changed_tags(sc, oc),
             "bounds": bounds_report(src, out, stage, params, logger)}
 
 
@@ -164,6 +183,13 @@ def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
         if isinstance(lost, list) and lost:
             problems.append("colour tags lost between input and output: "
                             + ",".join(lost))
+        changed = (rcpt or {}).get("color_changed_tags")
+        if isinstance(changed, list) and changed:
+            problems.append(
+                "colour tags changed between input and output without a "
+                "declared conversion: "
+                + ",".join(f"{c.get('field')}={c.get('source')}->{c.get('output')}"
+                           for c in changed if isinstance(c, dict)))
     bounds = (rcpt or {}).get("bounds")
     if not isinstance(bounds, dict):
         problems.append("no bounds evidence (legacy receipt)")

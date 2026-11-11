@@ -48,6 +48,15 @@ _ATT = "att-test"
 _P = {"attempt_id": _ATT}
 
 
+def _file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for c in iter(lambda: f.read(65536), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
 def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT,
                    params=None):
     stem = os.path.splitext(os.path.basename(str(job["input_path"])))[0]
@@ -74,6 +83,8 @@ def _write_receipt(temp_dir, job, size=None, jid=None, attempt=_ATT,
                        "_frozen_param_digest") or ""),
                    "chain_mode": "stage34", "output": out,
                    "output_size": os.path.getsize(out),
+                   # R21-C06：回执必须带**内容摘要**（同大小替换要能被发现）
+                   "output_sha256": _file_sha256(out),
                    "logical_stages": ["stage3", "stage4"],
                    # R20-A03：回执必须带**证据块**。没有它们，
                    # 消费方无法区分"这次转换是对的"和"没人检查过"。

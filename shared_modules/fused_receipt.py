@@ -140,6 +140,23 @@ def verify_fused_receipt(rcpt_path: str, params: Dict[str, Any],
         except (OSError, TypeError, ValueError):
             return False, "receipt output size unreadable", rcpt
 
+    # ---- 3b) 内容摘要：同大小替换必须能被发现（R21-C06）----
+    # 审核："当前 output 校验主要是存在与可选文件大小，没有内容摘要。
+    #       同大小替换仍可通过。"
+    rec_dig = str(rcpt.get("output_sha256") or "")
+    if not rec_dig:
+        return False, "receipt has no output digest (legacy)", rcpt
+    try:
+        from publish_journal import file_digest as _fd
+        cur = _fd(str(out))
+    except Exception as exc:                # pragma: no cover - 部署异常
+        return False, f"cannot digest the receipt output: {exc}", rcpt
+    if not cur:
+        return False, "receipt output is unreadable", rcpt
+    if cur != rec_dig:
+        return False, (f"receipt output bytes changed "
+                       f"(recorded {rec_dig[:16]}, now {cur[:16]})"), rcpt
+
     # ---- 4) 颜色与边界的证据块（R20-A03）----
     # 「没查过」和「查过了没问题」必须分开：前者是未证明，后者才是通过。
     try:

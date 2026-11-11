@@ -91,43 +91,61 @@ def s7():
     return _stage7()
 
 
-def test_returns_ok_when_no_transform_declared(s7, tmp_path):
-    """没声明变换 → 不算失败（mapping_ok=None，不是 False）。"""
+def test_returns_not_applicable_when_no_transform_declared(s7, tmp_path):
+    """没声明变换 → `not_applicable`（既不是失败，也不是"验过了"）。
+
+    R21-C04 把返回值从布尔改成**四态**：`True` 无法区分
+    "不需要检查"与"检查通过"，而审审核关切的正是这两者不能混。
+    """
     src = tmp_path / "s.mkv"
     src.write_bytes(b"x")
     cand = tmp_path / "c.mkv"
     cand.write_bytes(b"y")
-    ok, info = s7.check_declared_timeline_mapping(
+    state, info = s7.check_declared_timeline_mapping(
         {}, str(src), str(cand), None)
-    assert ok is True
+    assert state == "not_applicable"
     assert info.get("mapping_ok") is None
-    assert "no declared transform" in info.get("mapping_reason", "")
+    assert "no timing transform" in info.get("mapping_reason", "")
 
 
-def test_returns_ok_when_source_pts_unreadable(s7, tmp_path):
-    """源 PTS 读不出来（不存在/非视频）→ 不阻断，但要标 mapping_ok=None。"""
-    ok, info = s7.check_declared_timeline_mapping(
+def test_returns_unverified_when_source_pts_unreadable(s7, tmp_path):
+    """源 PTS 读不出来 → **unverified**，不是"通过"。
+
+    R21-C04 改的正是这条期望：审核明确要求"缺 PTS 时不能返回 True"，
+    否则"声明了变换却没法验证"会被当成没问题。
+    """
+    state, info = s7.check_declared_timeline_mapping(
         {"fps_interpret": "25"}, str(tmp_path / "nope.mp4"),
         str(tmp_path / "nope2.mp4"), None)
-    assert ok is True
+    assert state == "unverified"
     assert info.get("mapping_ok") is None
 
 
 def test_speed_transform_mismatch_is_reported(s7, tmp_path):
-    """真实素材：声明 2× 变速但候选没变速 → 必须报 fail。"""
+    """真实素材：声明 2× 变速但候选没变速 → 必须报 fail。
+
+    R21：这条在 R20 里因"造片失败"被跳过（审核点名要求补验）。
+    原因是用 `os.system` + `libx264`：本机 anaconda 的 ffmpeg 没有 libx264，
+    命令失败但文件路径已存在（0 字节），于是只判 `exists()` 会漏。
+    现在改用**一定可用**的 FFV1/mkv，并检查 returncode，失败就让测试红，
+    不再 `skip` 掩盖。
+    """
     import shutil
+    import subprocess as _sp
     ff = shutil.which("ffmpeg")
-    if not ff:
-        pytest.skip("ffmpeg 不在 PATH")
-    src = tmp_path / "s.mp4"
-    os.system(f'"{ff}" -v error -y -f lavfi -i '
-              f'"testsrc2=size=64x48:rate=10:duration=2" '
-              f'-c:v libx264 -pix_fmt yuv420p "{src}"')
-    if not src.exists():
-        pytest.skip("造片失败")
-    # 候选 = 原样（没变速），但声明 speed=2 → 期望时长应减半
-    ok, info = s7.check_declared_timeline_mapping(
+    assert ff, "ffmpeg 必须在 PATH 上（本项目测试链路依赖它）"
+    src = tmp_path / "s.mkv"
+    r = _sp.run([ff, "-v", "error", "-y", "-f", "lavfi",
+                 "-i", "testsrc2=size=64x48:rate=10:duration=2",
+                 "-c:v", "ffv1", "-pix_fmt", "yuv420p", str(src)],
+                capture_output=True, text=True, errors="replace", timeout=120,
+                shell=False)
+    assert r.returncode == 0, f"造片失败: {(r.stderr or '')[:300]}"
+    assert src.exists() and src.stat().st_size > 0
+
+    # 候选 = 原样（没变速），但声明 speed=2 → 期望时长减半，必须报 fail
+    state, info = s7.check_declared_timeline_mapping(
         {"expected_speed": 2.0}, str(src), str(src), None)
-    assert ok is False, info
+    assert state == "fail", info
     assert info.get("mapping_ok") is False
     assert info.get("mapping_problems")

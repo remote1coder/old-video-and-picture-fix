@@ -1818,25 +1818,6 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         import uuid as _uuid
         params["attempt_id"] = _uuid.uuid4().hex[:16]
 
-    # ---- R20-A03（修正）：**在计划阶段冻结**质量参数摘要 ----
-    # 实测反例（2026-11-10 N20）：融合回执用
-    # `compute_param_hash(源, params)` 当 `input_digest`，而同一源在 stage1
-    # 算出 `07363d3b…`、在 stage3 算出 `1b93756b…` —— 因为 params 会随后续
-    # stage 注入而变化。消费方（main/stage5）**重新计算**再比对，
-    # 于是**每一次**都判成"源/参数变了"，融合回执永远不可用，
-    # stage4 静默回落到 step2（1080p 未超分），整条融合路线名存实亡。
-    # 修法：摘要只在**这里**算一次，随 params 下传，谁都不再自己重算。
-    try:
-        from checkpoint import compute_param_hash as _cph_frozen
-        params["_frozen_param_digest"] = _cph_frozen(
-            str(job.get("input_path") or ""), params)
-    except Exception as _fz:               # pragma: no cover - 身份算不出
-        params["_frozen_param_digest"] = ""
-        _pre_log.warning("FROZEN_PARAM_DIGEST_FAIL",
-                         "Cannot freeze the quality-param digest; fused "
-                         "receipts will not be able to prove 'same params'",
-                         error=str(_fz))
-
     # ---- R20-A01：给 stage7 一个 **attempt 私有** 的结果路径 ----
     # 审核 §3.2 第 1 步："main 冻结身份并给 stage7 明确的 attempt 私有结果路径。
     # stage7 通过参数传递接收，不用 glob 猜。"
@@ -2077,6 +2058,35 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         }
     except Exception as _rid_exc:         # pragma: no cover
         job_logger.warning("RUN_IDENTITY_FAIL", str(_rid_exc))
+
+    # ---- R21-C06：质量参数摘要必须在**最终有效计划**落定之后才算 ----
+    # 审核 R20-C06："`main._frozen_param_digest` 当前早于 resolve_run_plan 和
+    # chain_mode 落定。只保留一个最终有效计划冻结点，冻结后不再偷偷更改参与
+    # 身份的参数；冻结失败不能变成空字符串然后跳过校验。"
+    #
+    # 原来的位置在 resolve_run_plan（约 1880 行）和 chain_mode（约 2010 行）
+    # **之前** —— 那时 `_run_plan` 还没解析、`chain_mode` 还是用户原话，
+    # 冻结下来的摘要与实际执行的参数不是同一份。
+    # 现在与 `_run_identity` 同一处：计划已解析、模式已冻结。
+    try:
+        from checkpoint import compute_param_hash as _cph_frozen
+        _fz_digest = _cph_frozen(str(job.get("input_path") or ""), params)
+        if not _fz_digest:
+            raise ValueError("compute_param_hash returned an empty digest")
+        params["_frozen_param_digest"] = _fz_digest
+        job_logger.info("FROZEN_PARAM_DIGEST",
+                        "Froze the quality-param digest after the effective "
+                        "plan and execution mode were settled",
+                        digest=str(_fz_digest)[:16],
+                        chain_mode=params.get("chain_mode"))
+    except Exception as _fz:
+        # 冻结失败**不能**退化成空串然后跳过校验 —— 那样融合回执会
+        # "看起来有摘要、实际不比"。身份都算不出来，这一代不该继续。
+        job_logger.error(
+            "FROZEN_PARAM_DIGEST_FAIL",
+            "Cannot freeze the quality-param digest; refusing to run a "
+            "generation whose identity cannot be established", error=str(_fz))
+        return 82, f"cannot freeze the param digest: {_fz}"
 
 
     # Determine stage order

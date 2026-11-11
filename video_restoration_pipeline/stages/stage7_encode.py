@@ -1362,24 +1362,66 @@ def build_marker_candidate(seed: Dict[str, Any],
     return marker, staging, digest, _pm_digest
 
 
-def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
-    """按**声明的变换**核对候选的时间轴（R20-A06 抽成独立函数）。
+def mapping_check_entry(state: str, info: Dict[str, Any]) -> Dict[str, Any]:
+    """把映射校验的四态变成一条**检查项规格**（R21-C04）。
 
-    审核 R19-A06：
-    > 纯时间检查独立于 mkvmerge。工具是否存在只决定能否执行该重封装方案，
-    > 不能决定是否检查时间。
+    为什么要有这一步：旧实现里 `strict=false` 只打一条 CRITICAL 就继续发布，
+    这条结论根本没进 `publish_decision`。现在它和其它检查走同一个门：
+    `FAIL` / `UNVERIFIED` 都会挡住发布，除非用户显式打开
+    `allow_verify_fail_publish`。
 
-    旧实现把这段校验**嵌在 `_has_timing_transform` 分支里**：
-    - 没声明变换 → 根本不校验；
-    - 没装 mkvmerge → 走 `elif not _mkv` 分支，**也不校验**。
-
-    现在它是一个独立函数，两条分支都调用。
+    Args:
+        state: ``pass`` / ``fail`` / ``unverified`` / ``not_applicable``。
+        info: `check_declared_timeline_mapping()` 返回的证据。
 
     Returns:
-        ``(ok, info)``。``ok`` 为 False 表示"已知时间轴不对"；
-        ``info`` 进 ``_retime_info`` 供报告与排查。
+        可直接放进 `_checks` 的 dict。
     """
-    info = {}
+    _base = {
+        "name": "timeline_mapping",
+        "method": "stage7.check_declared_timeline_mapping",
+        "evidence": info or None,
+    }
+    if state == "pass":
+        return dict(_base, status="PASS", severity="info", required=True,
+                    reason="candidate matches the declared transform mapping")
+    if state == "fail":
+        return dict(_base, status="FAIL", severity="error", required=True,
+                    force_key="allow_verify_fail_publish",
+                    reason="; ".join((info or {}).get("mapping_problems") or [])
+                           or "candidate does not match the declared transform")
+    if state == "unverified":
+        return dict(_base, status="UNVERIFIED", severity="warning",
+                    required=True, force_key="allow_verify_fail_publish",
+                    reason=(info or {}).get("mapping_reason")
+                           or "the declared transform could not be verified")
+    return dict(_base, status="NOT_APPLICABLE", severity="info", required=False,
+                reason=(info or {}).get("mapping_reason")
+                       or "no timing transform was declared")
+
+
+def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
+    """按**声明的变换**核对候选的时间轴（R20-A06 抽出，R21-C04 改四态）。
+
+    审核 R21-C04：
+
+    > 映射函数在缺 PTS、数据不足或 probe 异常时可以返回 True，
+    > 同时把 `mapping_ok` 留为 None。
+
+    "测不出来"和"没有问题"必须是两件事。所以返回**四态**，而不是布尔：
+
+    ==============  ====================================================
+    ``pass``        声明了变换，且候选与期望映射逐帧吻合
+    ``fail``        声明了变换，但候选与期望映射不符（已知错误）
+    ``unverified``  声明了变换，但缺 PTS / 数据不足 / probe 异常
+                    —— **不是通过**
+    ``not_applicable`` 没有声明变换（identity）：本来就不需要这项检查
+    ==============  ====================================================
+
+    Returns:
+        ``(state, info)``。``info["mapping_ok"]`` 仍保留布尔/None 供报告用。
+    """
+    info: Dict[str, Any] = {}
     try:
         # 注意：`_probe_pts` / `_probe_time_base` 在调用方是**局部 import** 的名字，
         # 模块级函数拿不到 —— 这里自己 import（R20-A06 抽函数时踩过）。
@@ -1391,22 +1433,49 @@ def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
             check_against_expected as _check_map,
             describe_mapping as _desc_map)
 
-        _tsrc = _probe_pts(orig_src)
         _tt = _tfp(params)
-        if not (_tsrc and len(_tsrc) >= 2 and _tt.kind != "identity"):
-            info["mapping_ok"] = None
-            info["mapping_reason"] = (
-                "no declared transform, or source PTS unusable")
-            return True, info
+        if _tt.kind == "identity":
+            info.update(mapping_ok=None,
+                        mapping_state="not_applicable",
+                        mapping_reason="no timing transform was declared")
+            return "not_applicable", info
+
+        info["declared_transform"] = {"kind": _tt.kind, "value": _tt.value}
+
+        _tsrc = _probe_pts(orig_src)
+        if not _tsrc or len(_tsrc) < 2:
+            info.update(mapping_ok=None, mapping_state="unverified",
+                        mapping_reason=("a transform was declared but the "
+                                        "source PTS is unavailable"))
+            if logger:
+                logger.error(
+                    "STAGE7_EXPECTED_MAPPING_UNVERIFIED",
+                    "A timing transform was declared but the source has no "
+                    "usable PTS; the mapping cannot be verified. This is NOT "
+                    "a pass.", transform=_tt.kind, value=_tt.value)
+            return "unverified", info
 
         _exp = _exp_pts(_tsrc, _tt)
         _act = _probe_pts(candidate)
+        if not _act or len(_act) < 2:
+            info.update(mapping_ok=None, mapping_state="unverified",
+                        mapping_reason=("a transform was declared but the "
+                                        "candidate PTS is unavailable"))
+            if logger:
+                logger.error(
+                    "STAGE7_EXPECTED_MAPPING_UNVERIFIED",
+                    "A timing transform was declared but the candidate has no "
+                    "usable PTS; the mapping cannot be verified. This is NOT "
+                    "a pass.", transform=_tt.kind, value=_tt.value)
+            return "unverified", info
+
         _tb_pub = _probe_time_base(candidate)
         _m_ok, _m_problems, _m_metrics = _check_map(
             _act, _exp, time_base=_tb_pub)
         info.update({
             "expected_mapping": _desc_map(_tsrc, _tt),
             "mapping_ok": bool(_m_ok),
+            "mapping_state": "pass" if _m_ok else "fail",
             "mapping_problems": _m_problems[:4],
             "mapping_metrics": _m_metrics,
         })
@@ -1417,7 +1486,7 @@ def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
                     "The candidate matches the expected output mapping for the "
                     "declared transform",
                     transform=_tt.kind, value=_tt.value)
-            return True, info
+            return "pass", info
         if logger:
             logger.error(
                 "STAGE7_EXPECTED_MAPPING_FAIL",
@@ -1426,13 +1495,17 @@ def check_declared_timeline_mapping(params, orig_src, candidate, logger=None):
                 "is known to be wrong.",
                 transform=_tt.kind, value=_tt.value,
                 problems=_m_problems[:4], metrics=_m_metrics)
-        return False, info
-    except Exception as _mexc:              # pragma: no cover
+        return "fail", info
+    except Exception as _mexc:
+        # probe 抛异常 = 没测到，不是通过
         if logger:
-            logger.warning("STAGE7_EXPECTED_MAPPING_ERROR", str(_mexc))
-        info["mapping_ok"] = None
-        info["mapping_error"] = str(_mexc)
-        return True, info
+            logger.error("STAGE7_EXPECTED_MAPPING_ERROR",
+                         "The mapping check raised; treating the timeline as "
+                         "UNVERIFIED, not as passing", error=str(_mexc))
+        info.update(mapping_ok=None, mapping_state="unverified",
+                    mapping_error=str(_mexc),
+                    mapping_reason=f"the mapping check raised: {_mexc}")
+        return "unverified", info
 
 
 def _zscale_dither_filters(dither: str, logger=None) -> List[str]:
@@ -3390,18 +3463,21 @@ def main():
                     _retime_info = {"action": "unavailable", "reason": "no mkvmerge"}
                     # ---- R20-A06：mkvmerge 缺失**不能**跳过时间检查 ----
                     # 工具只决定"能不能执行该重封装方案"，不决定"要不要校验"。
-                    _map_ok, _map_info = check_declared_timeline_mapping(
+                    _map_state, _map_info = check_declared_timeline_mapping(
                         params, _orig_src, _publish_tmp, logger)
                     _retime_info.update(_map_info)
-                    if not _map_ok:
+                    # R21-C04：结论进**统一发布门**，不再只打日志
+                    _checks["timeline_mapping"] = mapping_check_entry(
+                        _map_state, _map_info)
+                    if _map_state == "fail":
                         if params.get("timeline_mapping_strict", True):
                             _discard_attempt_tmp(_publish_tmp, logger)
                             return 86
                         logger.critical(
                             "STAGE7_EXPECTED_MAPPING_FAIL_NONSTRICT",
                             "The candidate does not match the declared transform "
-                            "but timeline_mapping_strict=false; this generation is "
-                            "marked unverified, not 'verified'.",
+                            "but timeline_mapping_strict=false; the publish gate "
+                            "now requires an explicit force.",
                             problems=(_map_info.get("mapping_problems") or [])[:4])
                 elif _has_timing_transform(params):
                     # 用户/上游声明了**时间变换**（变速、重解释帧率、倍帧/抽帧）。
@@ -3430,18 +3506,21 @@ def main():
                     # ---- P0-C / R20-A06：按声明的变换核对候选 ----
                     # 已抽成 `check_declared_timeline_mapping()`：
                     # **mkvmerge 缺失时也照样校验**（见上面 `elif not _mkv`）。
-                    _map_ok, _map_info = check_declared_timeline_mapping(
+                    _map_state, _map_info = check_declared_timeline_mapping(
                         params, _orig_src, _publish_tmp, logger)
                     _retime_info.update(_map_info)
-                    if not _map_ok:
+                    # R21-C04：结论进**统一发布门**，不再只打日志
+                    _checks["timeline_mapping"] = mapping_check_entry(
+                        _map_state, _map_info)
+                    if _map_state == "fail":
                         if params.get("timeline_mapping_strict", True):
                             _discard_attempt_tmp(_publish_tmp, logger)
                             return 86
                         logger.critical(
                             "STAGE7_EXPECTED_MAPPING_FAIL_NONSTRICT",
                             "The candidate does not match the declared transform "
-                            "but timeline_mapping_strict=false; this generation is "
-                            "marked unverified, not 'verified'.",
+                            "but timeline_mapping_strict=false; the publish gate "
+                            "now requires an explicit force.",
                             problems=(_map_info.get("mapping_problems") or [])[:4])
                 elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
                     _ok_r, _retime_info = _retime(_orig_src, _publish_tmp, _mkv,
