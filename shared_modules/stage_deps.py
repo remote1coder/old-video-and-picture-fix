@@ -147,6 +147,14 @@ NON_SEMANTIC_PARAMS: Set[str] = {
     "keep_steps", "retry_count", "publish_lock_timeout",
     "output_dir", "temp_dir", "output_path", "input_path",
     "duration", "job_id", "run_id", "attempt_id",
+    # ---- R23-05：main 在每个 stage 前**临时注入**、跑完就 pop 的位置键 ----
+    # `upstream_artifact` 是"上游产物在哪个路径"，不是"选了什么"。
+    # 它进 stage_scope 会让**同一个 stage 在"有/无 pin"两次运行里算出不同身份**
+    # —— 实测（R23-05 编排计数）：同配置重跑时 stage2 报 `params-changed` 但
+    # `changed_keys` 为空，于是 2→7 全部重算。
+    # 上游**内容**由侧车里的 `upstream_digest` 绑定，`main` 在复用前会比对
+    # （ID-08），所以把它排除出参数身份不会丢证明。
+    "upstream_artifact",
     # ---- R23-13：下面这些**会被读**，但不改变媒体像素/音频 ----------
     # 它们控制"怎么跑"和"门禁多严"，不是"跑出什么"。
     # 放进这里而不是 CORE_QUALITY_PARAMS：改它们不该让中间产物重算
@@ -295,6 +303,7 @@ def build_reuse_plan(
     *,
     result_artifact: Optional[str] = None,
     ai_stages: Sequence[int] = (3, 5),
+    applicable_stages: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """生成复用计划（任务书 §2.2 要求的那六项）。
 
@@ -328,7 +337,16 @@ def build_reuse_plan(
     notes: List[str] = []
     first_invalid: Optional[int] = None
 
+    _applicable = (set(int(x) for x in applicable_stages)
+                   if applicable_stages is not None else None)
+
     for stage in sorted(STAGE_NAMES):
+        # ---- R23-05：**计划里不适用**的阶段不参与判定 ----
+        # 审核要求的"计划子集"就体现在这里：`face_restore` 关掉时 stage5
+        # 根本不跑，它没有侧车不是"身份缺失"，更不该让 6/7 跟着失效。
+        # 实测（R23-05 编排计数）：不加这一条，同配置重跑仍会重跑 stage7。
+        if _applicable is not None and stage not in _applicable:
+            continue
         rec = recorded_by_stage.get(stage)
         if rec is None:
             # 没有记录：stage 0 是从源头开始，属正常；其余记为身份缺失

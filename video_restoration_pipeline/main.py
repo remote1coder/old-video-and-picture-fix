@@ -2719,7 +2719,16 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                         except Exception:
                             continue
                 _recorded[_sn] = _rec
-            _reuse_plan = build_reuse_plan(params, _recorded)
+            # ---- R23-05：**计划里不适用**的阶段不参与复用判定 ----
+            # stage3 由 `ai_enabled` 决定、stage5 由 `face_restore` 决定；
+            # 它们没跑过就没有侧车，那不是"身份缺失"。
+            _applicable = [0, 1, 2, 4, 6, 7]
+            if _strict_bool(params.get("ai_enabled"), False):
+                _applicable.append(3)
+            if str(params.get("face_restore") or "").strip():
+                _applicable.append(5)
+            _reuse_plan = build_reuse_plan(
+                params, _recorded, applicable_stages=sorted(_applicable))
             # ---- R23-08：降级侧车必须被**这一代**记住 ----
             # 复用计划已经读过侧车；这里把"复用的是降级产物"落到 params，
             # stage7 会写进 verify 侧车（必需对象），完成验证与读报告的人
