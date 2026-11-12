@@ -133,6 +133,10 @@ def determinism_preamble(params: Any) -> List[str]:
 
 
 def render_cost_note() -> str:
-    """一句可直接写进日志的代价说明。"""
-    return ("vs.deterministic=true 会让 VapourSynth 渲染慢约 4.78 倍"
-            "（实测 4.95s → 23.47s / 60 帧 1080p），换取逐像素可复现。")
+    """一句可直接写进日志的代价说明。
+
+    R23-B14：不写死倍数。第十八轮的 4.78× 是"一台机器 + 60 帧 1080p"
+    的单点观测，随素材/机器变化，不能当通用成本；日志里只说明**方向**。
+    """
+    return ("vs.deterministic=true 会让 VapourSynth 单线程渲染，明显更慢"
+            "（具体倍数取决于素材与机器），换取逐像素可复现。")

@@ -122,6 +122,19 @@ R22 §5.2 起，"用哪种工作表示"是一个**显式选择**，不再是写�
 `chroma_mode` 是普通参数键（不带 `_` 前缀），因此进计划身份：
 切换 420/444 → `param_hash` 全变 → 旧产物不会被复用再换标签。
 
+**R23-B09 起解析成两层**（`work_format.resolve()` 的 `working` / `delivery`）：
+
+| 层 | 由谁决定 | 影响 |
+|---|---|---|
+| 工作表示 `working.chroma` | `chroma_mode` | stage1–stage6 的落盘格式（`boundaries`）|
+| 交付格式 `delivery.pix_fmt` | `pix_fmt` | 只有 stage7 的最终编码 |
+
+**444 工作 + 420 交付是合法组合**：计划里写成
+`conversion = {from: "444", to: "420", stage: "stage7_final", operation:
+"single chroma down-sample at delivery", loss: ...}`，不是冲突。
+能力核验只看**交付格式**能否被该编码器接受；`accept_degraded` 为真时
+必须生成**具体替代格式**（`degraded{from,to,reason}`），而不是只把判定翻成通过。
+
 ---
 
 ---

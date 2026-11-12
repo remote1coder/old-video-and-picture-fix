@@ -2490,9 +2490,12 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             params["chain_mode"] = _raw_mode
         # ---- vs.deterministic：VapourSynth 渲染确定性（默认关）----
         # 打开后 stage1/stage6 会在 vpy 里写 `core.num_threads = 1`，
-        # 输出逐像素可复现，代价是渲染慢约 4.78 倍。
-        # 不打开时两次跑批的差异本底为 Y~48.7 / U~51.5 / V~39.6（min 42.07），
-        # 任何低于这个量级的"差异"都不能作为不等价的证据。
+        # 输出逐像素可复现。
+        #
+        # R23-B14：**不要**把"4.78 倍"当通用成本写进普通日志。
+        # 那个数字是第十八轮在**一台机器、一段 60 帧 1080p 样本**上的观测
+        # （4.95 s → 23.47 s），不是对所有素材/机器成立的上界，更不该出现在
+        # 每一次正常跑批的日志里冒充"已知代价"。历史值留在注释里备查。
         if "vs_deterministic" not in params:
             _cfg_vs = config.get("vs") or {}
             if not isinstance(_cfg_vs, dict):
@@ -2504,8 +2507,10 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 job_logger.warning(
                     "VS_DETERMINISTIC_ON",
                     "VapourSynth rendering is forced to a single thread so "
-                    "outputs are pixel-reproducible. This is about 4.78x "
-                    "slower; use it for acceptance runs, not bulk production.")
+                    "outputs are pixel-reproducible. Single-thread rendering "
+                    "is materially slower and the slowdown depends on the "
+                    "clip and the machine; use it for acceptance runs, not "
+                    "bulk production.")
 
         job_logger.info("CHAIN_MODE", "Effective execution-group mode",
                         chain_mode=params.get("chain_mode"))

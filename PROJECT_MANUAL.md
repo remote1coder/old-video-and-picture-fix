@@ -369,13 +369,27 @@ global:
 | `444` | 全链 4:4:4（stage1 渲染起每一处边界都 444）|
 | `420` | 显式 4:2:0 |
 
-**换成 444 时通常还要改编码器**：`libsvtav1` 只支持 4:2:0
+**工作表示与交付格式是两层**（R23 起）：
+
+| 层 | 由哪个键决定 | 作用范围 |
+|---|---|---|
+| 工作表示 | `chroma_mode` | stage1–stage6 的中间产物格式 |
+| 交付格式 | `pix_fmt` | 只有最终编码 |
+
+所以 **`chroma_mode: "444"` + `pix_fmt: "yuv420p10le"` 是合法组合**：
+中间全程 4:4:4，最后一次性降到 4:2:0 交付。计划里会写明这次转换及其损失。
+想让成品也是 444，把 `pix_fmt` 也设成 `yuv444p10le`。
+
+**换成 444 交付时通常还要改编码器**：`libsvtav1` 只支持 4:2:0
 （`ffmpeg -h encoder=libsvtav1` 实测只有 `yuv420p yuv420p10le`），
-所以要么 `video_encoder: libx265` / `libaom-av1`，要么显式接受降级。
+所以要么 `video_encoder: libx265` / `libaom-av1`，要么把
+`chroma_mode_accept_degraded` 设为 `true` 接受一个**具体的替代格式**
+（计划会写出 `degraded{from,to,reason}`，不是悄悄换掉）。
 不满足时工具会在**动手之前**以 rc=86 停下并说明原因，不会跑一半再失败。
 
-切换 420/444 会改变 `param_hash`，旧中间产物**不会被复用**（不会出现
-"拿旧 420 的产物换个标签当 444"）。
+`chroma_mode` 只接受 `auto / preserve / 444 / 420`；写错值会直接报错
+（不会被当成 `auto`）。切换 420/444 或改 `grain_seed` 都会改变
+`param_hash`，旧中间产物**不会被复用**。
 
 ### 6.2 批量修复 (使用清单)
 
