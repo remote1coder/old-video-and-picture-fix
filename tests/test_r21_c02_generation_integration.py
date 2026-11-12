@@ -115,11 +115,14 @@ def _publish_generation(tmp_path, job, *, media=b"NEW-MEDIA-BYTES",
         media_size=os.path.getsize(arts[0].staging))
     arts.append(P.Artifact("marker", staging, out + ".done.json"))
 
+    # R23-B01：回执要带 RunIdentity 摘要（生产 stage7 就是这么传的）
+    _ri = vmain.build_run_identity({}, job, None, params=_eff)
     res = P.publish(arts, out + ".journal.json", str(tmp_path / "backup"),
                     attempt_id="att1", decision={"publish": True},
                     allowed_output_roots=[str(tmp_path / "out")],
                     required_objects=[a.final for a in arts],
-                    marker_digest=mdig)
+                    marker_digest=mdig,
+                    run_identity=str(_ri["digest"]))
 
     # ---- R22-A01：正常收尾必须消费 **attempt 私有 result** ----
     # 审核的绕过路径正是"有 marker 就不看 result"。这里按 stage7 的真实形状

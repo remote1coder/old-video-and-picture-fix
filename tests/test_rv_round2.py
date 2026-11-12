@@ -519,8 +519,10 @@ def _write_receipt(final, src):
     with open(str(final) + ".fullchain.json", "w", encoding="utf-8") as f:
         _json.dump({"ok": True}, f)
     import publish_journal as _pj
+    # R23-B01：journal 必须与 marker 绑定同一个 attempt（生产 publisher 会写）
     _pj.write_journal(str(final) + ".journal.json",
                       {"phase": "COMMITTED", "job_id": "j1",
+                       "attempt_id": "att1",
                        "targets": [str(final),
                                    str(final) + ".verify.json",
                                    str(final) + ".fullchain.json"],

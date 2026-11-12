@@ -1128,27 +1128,31 @@ _MANIFEST_ROLES = ("media", "verify", "fullchain", "marker")
 
 
 def check_payload_manifest(marker: Dict[str, Any], final_path: str,
-                           logger=None) -> Tuple[str, str, list]:
-    """核对 marker 引用的 payload manifest，返回**三态**（R22-A01）。
+                           logger=None, planned: Optional[Dict[str, Any]] = None
+                           ) -> Tuple[str, str, list]:
+    """核对 marker 引用的 payload manifest（R23-B02：集合由**计划**决定）。
 
-    R21 的实现有两个洞（本轮审核用真实小文件复现）：
+    R22 的版本修掉了两个洞（旧格式直接放行、media 路径不看），但仍是
+    **被检查者自报集合**：审核请求 `full_chain_verify=True`，把 fullchain
+    从清单里删掉再删文件，验证照样通过 —— "清单没列它"就自动变成合法。
 
-    1. 没有 payload 的旧 marker 直接 ``return True`` —— "没有可核对的内容"
-       被当成了"核对通过"；配合同大小替换媒体，验证器仍然通过。
-    2. 只要求存在一个叫 ``media`` 的条目，**不问它的路径是不是当前成品** ——
-       拿别的路径上正确的文件也能冒充。
+    现在必需集合来自 `_planned_generation_roles()`：
 
-    现在改成三态 + 结构校验：
-
-    - ``MANIFEST_OK``：清单自洽、角色齐全、**media 路径等于 final_path**、
-      每个对象摘要与磁盘一致
-    - ``MANIFEST_LEGACY``：没有 payload —— 显式降为 unproven，调用方必须拒绝
-    - ``MANIFEST_BAD``：有 payload 但对不上
+    - 每个**计划必需**的角色都必须在清单里，且路径等于规范路径；
+    - 清单里的角色必须属于"计划必需 ∪ 计划可选"（多写陌生角色 = BAD）；
+    - 可选角色（如关闭 fullchain 时）允许缺失；给了就必须自洽；
+    - 每个条目的摘要必须与磁盘一致；media 摘要必须等于 `marker.output_sha256`。
 
     Returns:
-        ``(state, reason, objects)``；``objects`` 为
-        ``[(name, path, digest), ...]``（只有 ``MANIFEST_OK`` 时有意义）。
+        ``(state, reason, objects)``。
     """
+    pl = planned if isinstance(planned, dict) else \
+        _planned_generation_roles(str(final_path))
+    req = {k: str(v) for k, v in (pl.get("required") or {}).items()}
+    opt = {k: str(v) for k, v in (pl.get("optional") or {}).items()}
+    # marker 自身不可能出现在自己的 payload 里，由 marker_digest 绑定
+    req_in_payload = {k: v for k, v in req.items() if k != "marker"}
+
     pm = marker.get("payload_manifest")
     if not isinstance(pm, dict):
         return (MANIFEST_LEGACY,
@@ -1168,6 +1172,7 @@ def check_payload_manifest(marker: Dict[str, Any], final_path: str,
     if not isinstance(objs, list) or not objs:
         return MANIFEST_BAD, "payload manifest lists no objects", []
 
+    allowed = set(req) | set(opt)
     seen = {}
     out = []
     for row in objs:
@@ -1180,8 +1185,23 @@ def check_payload_manifest(marker: Dict[str, Any], final_path: str,
             return MANIFEST_BAD, f"manifest entry {name!r} is incomplete", []
         if name not in _MANIFEST_ROLES:
             return MANIFEST_BAD, f"manifest entry has unknown role {name!r}", []
+        if name not in allowed:
+            return (MANIFEST_BAD,
+                    f"manifest lists role {name!r}, which this plan does not "
+                    f"publish (allowed: {sorted(allowed)})", [])
         if name in seen:
             return MANIFEST_BAD, f"manifest lists role {name!r} twice", []
+        _canon = req.get(name) or opt.get(name) or ""
+        if _canon and os.path.abspath(path) != os.path.abspath(_canon):
+            if name == "media":
+                # 媒体这一条保留原来的措辞：它是最常被复现的绕过路径
+                # （拿别处正确的文件冒充当前成品）。
+                return (MANIFEST_BAD,
+                        f"manifest media path is not the artifact under test "
+                        f"({path} != {_canon})", [])
+            return (MANIFEST_BAD,
+                    f"manifest role {name!r} points at {path!r}, but this "
+                    f"generation's canonical path is {_canon!r}", [])
         seen[name] = (path, want)
         got = _plain_sha256(path) if os.path.exists(path) else None
         if got is None:
@@ -1192,9 +1212,13 @@ def check_payload_manifest(marker: Dict[str, Any], final_path: str,
                     f"(recorded {want[:16]}, now {got[:16]})", [])
         out.append((name, path, want))
 
-    # ---- 角色必须覆盖 media，且**必须就是当前成品** ----
-    # 旧实现只检查"存在一个叫 media 的条目"，于是拿别的路径上正确的文件
-    # 也能通过 —— 那不是"当前这一代已发布"的证明。
+    # ---- 计划必需的角色一个都不能少 ----
+    missing = sorted(set(req_in_payload) - set(seen))
+    if missing:
+        return (MANIFEST_BAD,
+                "payload manifest is missing planned object(s): "
+                f"{missing}", [])
+
     if "media" not in seen:
         return MANIFEST_BAD, "manifest has no media entry", []
     media_path, media_dig = seen["media"]
@@ -1205,47 +1229,141 @@ def check_payload_manifest(marker: Dict[str, Any], final_path: str,
     if str(marker.get("output_sha256") or "") != media_dig:
         return MANIFEST_BAD, "marker output_sha256 does not match the media", []
 
+    # payload 记录的 attempt 必须与 marker 顶层一致（同一代）
+    _pm_att = str(pm.get("attempt_id") or "")
+    _mk_att = str(marker.get("attempt_id") or "")
+    if _pm_att and _mk_att and _pm_att != _mk_att:
+        return (MANIFEST_BAD,
+                f"payload manifest belongs to attempt {_pm_att!r}, marker "
+                f"says {_mk_att!r}", [])
+
     return MANIFEST_OK, "payload manifest matches the published bytes", out
 
 
-def _acq_final(final_path: str, logger=None):
-    """目标锁上下文（R22-A01：整个完成验证在对应锁集合内进行）。
+class _LockUnavailable(RuntimeError):
+    """完成验证的锁依赖不可用（R23-B02）。
 
-    锁模块不可用时返回 nullcontext，但**记一条 error** —— 静默降级等于
-    "以为持锁实际没持"，那正是这条要求要防的情况。
+    旧实现 `return nullcontext()`：拿不到锁也照常跑完、照常返回成功，
+    只在日志里写一条 error。审核用受控导入失败复现过 —— 这等于
+    "以为持锁、实际没持"，而完成验证的全部意义就是锁内核对。
+    """
+
+
+class _FailingLock:
+    """一个进入即失败的上下文：把"锁不可用"变成明确失败。"""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason or "unknown")
+
+    def __enter__(self):
+        raise _LockUnavailable(self.reason)
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _acq_final(final_path: str, logger=None):
+    """目标锁上下文（R23-B02：锁不可用 → **验证失败**，不再降级为成功）。
+
+    与 R22 的区别只有一点，但是关键的一点：
+    R22 拿不到锁时返回 `nullcontext()`，验证照跑、成功照给；
+    现在返回一个进入即抛 `_LockUnavailable` 的上下文，由调用方转成
+    `published_unverified`（不是 DONE）。
     """
     try:
         from publish_lock import acquire_target_locks as _acq
+    except Exception as exc:                # pragma: no cover - 部署异常
+        if logger:
+            logger.error(
+                "COMPLETION_LOCK_UNAVAILABLE",
+                "The completion lock dependency is unavailable; this "
+                "generation cannot be verified (lock-free success is not "
+                "accepted).", output_path=str(final_path), error=str(exc))
+        return _FailingLock(str(exc))
+    try:
         return _acq([str(final_path)], timeout=120, logger=logger)
     except Exception as exc:                # pragma: no cover - 部署异常
         if logger:
             logger.error(
                 "COMPLETION_LOCK_UNAVAILABLE",
                 "Could not acquire the target lock for completion "
-                "verification; the check runs WITHOUT the lock. Treat the "
-                "result as weaker than a locked check.",
+                "verification; the generation stays unverified.",
                 output_path=str(final_path), error=str(exc))
-        from contextlib import nullcontext
-        return nullcontext()
+        return _FailingLock(str(exc))
+
+
+def _real_bool(value):
+    """只接受**真布尔**（R23-B01）。``"false"`` / ``1`` / ``"true"`` 都不算。"""
+    return value if isinstance(value, bool) else None
+
+
+def _planned_generation_roles(final_path: str, config=None, params=None):
+    """由**可信计划**推出这一代的必需/可选对象角色与规范路径（R23-B02）。
+
+    审核复现：请求 `full_chain_verify=True`，把 fullchain 从 marker 清单里
+    删掉再删文件，仍然 `JOB_DONE`。根因是必需集合取自**被检查者自报**的
+    marker。这里改成从计划推：
+
+    - `media` / `verify` / `marker` 永远必需；
+    - `fullchain` 由 `full_chain_verify` 决定（缺省与 stage7 一致：开启）；
+    - 关闭时它进 `optional`：**允许不存在**；存在就必须自洽（不能半坏）。
+
+    Returns:
+        ``{"required": {role: path}, "optional": {role: path},
+           "full_chain_verify": bool}``。
+    """
+    p = str(final_path)
+    full = _strict_bool((params or {}).get("full_chain_verify"), True)
+    req = {
+        "media": p,
+        "verify": p + ".verify.json",
+        "marker": completion_marker_path(p),
+    }
+    opt = {}
+    if full:
+        req["fullchain"] = p + ".fullchain.json"
+    else:
+        opt["fullchain"] = p + ".fullchain.json"
+    return {"required": req, "optional": opt, "full_chain_verify": full}
 
 
 def load_private_result(final_path: str, expect_attempt: str,
-                        params: Optional[Dict[str, Any]], logger=None
+                        params: Optional[Dict[str, Any]], logger=None,
+                        current_identity: Optional[Dict[str, Any]] = None,
+                        planned: Optional[Dict[str, Any]] = None
                         ) -> Tuple[bool, str, Dict[str, Any]]:
-    """读取并严格核对 **attempt 私有发布结果**（R22-A01）。
+    """读取并严格核对 **attempt 私有发布结果**（R23-B01）。
 
-    审核复现的绕过路径正是"有 marker 就不看 result"。这里把 result 变成
-    正常收尾的**必经步骤**，任何一项不成立都返回 False：
+    审核 R22-B01 用生产 marker/publisher + 自产小文件复现了八类"错误通过"。
+    原来的实现有三个结构性问题：
 
-    - 路径必须由调用方给出（不猜、不 glob）
-    - 必须是 JSON 对象，``schema`` 必须是 1
-    - ``attempt_id`` 必须等于本次 attempt
-    - ``final_output_path`` 必须等于当前成品
-    - 不得是 ``terminal_pending``，``ok`` 必须为真
-    - ``run_identity`` 必须存在且摘要可重算（R22-A02）
+    1. **类型用真值判断**：`ok="false"`（字符串）为真、`schema=True` 等于 1、
+       `terminal_pending=0` 为假 —— 三个坏字段一起也照样 DONE。
+    2. **RunIdentity 只与自身比**：`digest` 只要能从自己的四个字段重算出来
+       就算通过，从不与**当前**任务/计划/输入比。于是"另一份输入的计划"
+       也能冒充这一代。
+    3. **`generation_receipt` / `publish_result` 根本没进判据**：result 里
+       有没有这两份、内容对不对，都不影响结论。
+
+    现在逐条改成**关系**：
+
+    - 类型：`schema` 必须是真 int 1、`ok` 必须是真 True、
+      `terminal_pending` 必须是真 False/0/None；
+    - 身份：四个字段必须与**当前** RunIdentity 完全一致（不是自洽即可）；
+    - 回执：必须存在、可反序列化、`is_complete()` 通过、attempt 一致、
+      `run_identity` 等于当前身份摘要、`journal_phase=COMMITTED`；
+    - 发布结果：必须存在、`ok is True`、`phase=COMMITTED`、
+      `attempt_id` 一致、`journal_path` 等于规范路径、`published` 覆盖必需对象。
+
+    Args:
+        current_identity: 当前计划的身份（`build_run_identity` 的结果）。
+            不给时按 "无法核对" 处理 —— 拒绝，而不是退回自洽检查。
+        planned: `_planned_generation_roles()` 的结果；用于核对 published
+            是否覆盖计划必需对象。
 
     Returns:
-        ``(ok, reason, data)``。
+        ``(ok, reason, data)``；``data`` 仍返回原始 dict（诊断用），
+        失败时调用方不得使用它做任何判断。
     """
     rp = str((params or {}).get("_stage7_result_path") or "")
     if not rp:
@@ -1260,8 +1378,11 @@ def load_private_result(final_path: str, expect_attempt: str,
     if not isinstance(data, dict):
         return False, "attempt-private result is not an object", {}
 
-    if data.get("schema") != 1:
-        return False, (f"result schema is {data.get('schema')!r}, expected 1"), {}
+    # ---- 1) 严格类型 ----
+    _schema = data.get("schema")
+    if isinstance(_schema, bool) or not isinstance(_schema, int) or _schema != 1:
+        return (False,
+                f"result schema is {_schema!r}, expected the integer 1", {})
     got_att = str(data.get("attempt_id") or "")
     if got_att != str(expect_attempt):
         return (False,
@@ -1272,13 +1393,18 @@ def load_private_result(final_path: str, expect_attempt: str,
         return (False,
                 f"result describes {fin!r}, not the artifact under test "
                 f"{final_path!r}", {})
-    if data.get("terminal_pending"):
-        return False, ("result says the terminal state was not persisted "
-                       "(terminal_pending)"), {}
-    if not data.get("ok"):
-        return False, "result reports a failed publish (ok is false)", {}
+    if data.get("ok") is not True:
+        return (False,
+                f"result reports a failed publish (ok={data.get('ok')!r}; "
+                f"only the boolean True counts)", {})
+    _tp = data.get("terminal_pending")
+    if not (_tp is False or _tp is None or
+            (isinstance(_tp, int) and not isinstance(_tp, bool) and _tp == 0)):
+        return (False,
+                f"result says the terminal state was not persisted "
+                f"(terminal_pending={_tp!r})", {})
 
-    # ---- RunIdentity：必须是可重算的结构，不是"看起来像摘要"的字符串 ----
+    # ---- 2) RunIdentity：必须与**当前**身份一致，不是自洽即可 ----
     ri = data.get("run_identity")
     if not isinstance(ri, dict):
         return False, "result carries no run_identity object", {}
@@ -1290,7 +1416,92 @@ def load_private_result(final_path: str, expect_attempt: str,
         return (False,
                 f"run_identity digest cannot be reproduced "
                 f"(recorded {want[:16]}, recomputed {str(_re)[:16]})", {})
+    if not isinstance(current_identity, dict) or not current_identity:
+        return (False,
+                "no current run identity was supplied; the result's identity "
+                "cannot be bound to this plan", {})
+    _cur_digest = str(current_identity.get("digest") or "")
+    if want != _cur_digest:
+        _fields = [(k, str(ri.get(k) or "")[:16],
+                    str(current_identity.get(k) or "")[:16])
+                   for k in ("schema", "input_digest", "plan_digest",
+                             "impl_fingerprint")
+                   if str(ri.get(k) or "") != str(current_identity.get(k) or "")]
+        return (False,
+                "run_identity does not match the current plan "
+                f"(recorded {want[:16]}, current {_cur_digest[:16]}; "
+                f"differing fields: {[f[0] for f in _fields] or 'digest only'})",
+                {})
+
+    # ---- 3) GenerationReceipt：必须存在并自证 ----
+    _gr_raw = data.get("generation_receipt")
+    if not isinstance(_gr_raw, dict):
+        return False, ("result carries no generation receipt; the published "
+                       "generation is not proven"), {}
+    try:
+        from receipts import load_receipt as _load_receipt
+    except Exception as exc:                # pragma: no cover - 部署异常
+        return False, f"cannot load the receipt module: {exc}", {}
+    _gr = _load_receipt(dict(_gr_raw, kind="GenerationReceipt"))
+    if _gr is None:
+        return False, ("generation receipt cannot be deserialized (schema or "
+                       "declared digest is not trustworthy)"), {}
+    _gr_ok, _gr_why = _gr.is_complete()
+    if not _gr_ok:
+        return False, f"generation receipt is incomplete: {_gr_why}", {}
+    if str(_gr.attempt_id) != str(expect_attempt):
+        return (False,
+                f"generation receipt belongs to attempt {_gr.attempt_id!r}, "
+                f"not {expect_attempt!r}", {})
+    if str(_gr.run_identity) != _cur_digest:
+        return (False,
+                "generation receipt was produced for a different run identity "
+                f"({str(_gr.run_identity)[:16]} != {_cur_digest[:16]})", {})
+
+    # ---- 4) PublishResult：必须存在且与本次执行一致 ----
+    _pr = data.get("publish_result")
+    if not isinstance(_pr, dict):
+        return False, "result carries no structured publish result", {}
+    if _pr.get("ok") is not True:
+        return (False,
+                f"publish result does not report success (ok={_pr.get('ok')!r})",
+                {})
+    _ph = str(_pr.get("phase") or "")
+    if _ph != "COMMITTED":
+        return False, f"publish result phase is {_ph!r}, not COMMITTED", {}
+    if str(_pr.get("attempt_id") or "") != str(expect_attempt):
+        return (False,
+                f"publish result belongs to attempt "
+                f"{_pr.get('attempt_id')!r}, not {expect_attempt!r}", {})
+    _jp = str(_pr.get("journal_path") or "")
+    _want_jp = _journal_path_for(str(final_path))
+    if os.path.abspath(_jp) != os.path.abspath(_want_jp):
+        return (False,
+                f"publish result points at journal {_jp!r}, expected "
+                f"{_want_jp!r}", {})
+    _pub = {os.path.abspath(str(x)) for x in (_pr.get("published") or [])}
+    _req = {os.path.abspath(str(x))
+            for r, x in (planned or {}).get("required", {}).items()
+            if r != "marker"}
+    if not _pub:
+        return False, "publish result lists no published objects", {}
+    if _req:
+        _miss = sorted(_req - _pub)
+        if _miss:
+            return (False,
+                    "publish result does not cover required object(s): "
+                    f"{[os.path.basename(x) for x in _miss[:3]]}", {})
+
     return True, "private result is consistent with this attempt", data
+
+
+def _journal_path_for(final_path: str) -> str:
+    """这一代的 journal 规范路径（publisher 就是写在这里）。"""
+    try:
+        from publish_journal import journal_path_for as _jpf
+        return str(_jpf(str(final_path)))
+    except Exception:                       # pragma: no cover
+        return str(final_path) + ".journal.json"
 
 
 def _recompute_run_identity_digest(ri: Dict[str, Any]) -> str:
@@ -1316,29 +1527,36 @@ def verify_generation_completion(final_path: str, job: Dict[str, Any],
                                  logger=None,
                                  expect_attempt: Optional[str] = None
                                  ) -> Tuple[bool, str]:
-    """**唯一**的整代完成证明入口（R22-A01）。
+    """**唯一**的整代完成证明入口（R23-B01/B02 重写）。
 
-    审核把 R21 的问题总结得很准："同一个对象的字段、来源和消费条件不一致"。
-    表现就是 ``write_completion_marker`` 里 `verify_published_marker` 成功
-    就 `return True`，而它只核对 marker 的部分身份，**不看**私有 result、
-    attempt、journal 终态 —— 与 ``resume`` 的判据不是同一套。
+    审核 R22 的判词是准的：
 
-    这里的顺序固定，**没有任何"提前返回 True"的分支**：
+    > 几份各自自洽的记录，没有被验证成"当前请求的同一次执行、同一份最终产物"。
 
-    1. 目标锁集合内（锁不可用会记 error，结果按较弱处理）
-    2. 正常收尾（``expect_attempt`` 非空）→ 必须读 attempt 私有 result，
-       核对 schema / attempt / 最终路径 / RunIdentity / 终态
-    3. marker 必须存在，payload 必须是 ``MANIFEST_OK``（旧格式 = unproven）
-    4. 按 marker 的对象集合核对整代磁盘事实（媒体 + 计划确定的报告 +
-       journal COMMITTED）
+    原来的实现按"字段齐不齐"验证；现在按**关系**验证：
+
+    ```
+    计划必需角色  == marker.payload.objects  == journal.targets ⊆ receipt.required
+    result.attempt == marker.attempt == journal.attempt == 本次 attempt（正常）
+    receipt.run_identity == 当前计划的 RunIdentity 摘要
+    receipt.marker_digest == 当前 marker 文件的摘要
+    每个必需角色的磁盘摘要 == marker 记录 == receipt 记录
+    ```
+
+    执行顺序固定、无提前返回 True：
+
+    1. 目标是锁集合内（**锁不可用 = 未验证**，不是成功）
+    2. 解析**计划**：必需/可选对象由 `_planned_generation_roles()` 决定
+    3. 正常收尾 → 读 attempt 私有结果（含 receipt / publish_result / 身份）
+    4. marker 身份 + payload 三态（集合、路径、摘要、attempt 一致）
+    5. journal 终态：COMMITTED + resolved 真布尔 + targets 覆盖计划必需对象
+    6. 回执对象摘要 vs 磁盘
+    7. 整代磁盘事实
 
     Args:
-        final_path: 当前成品路径。
-        job: 作业（用于 job_id / input_path）。
-        config: 有效配置（用于重算身份）。
-        params: 有效参数（含 ``_stage7_result_path`` / ``attempt_id``）。
-        logger: 可选。
-        expect_attempt: 正常收尾传本次 attempt；resume 传 None（允许跨 attempt）。
+        expect_attempt: 正常收尾传本次 attempt；resume 传 None。resume 允许
+            跨 attempt，但仍要求"同一份完整代"（result 存在时它的 attempt
+            必须等于 marker/journal 的 attempt）。
 
     Returns:
         ``(ok, reason)``。
@@ -1347,98 +1565,240 @@ def verify_generation_completion(final_path: str, job: Dict[str, Any],
     if expect_attempt is not None and not str(expect_attempt).strip():
         return False, "completion requires a non-empty attempt id"
 
-    with _acq_final(p, logger):
-        # ---- 1) 私有 result（正常收尾必须）----
-        if expect_attempt is not None:
-            ok, why, _res = load_private_result(p, str(expect_attempt),
-                                                params, logger)
-            if not ok:
-                return False, why
+    planned = _planned_generation_roles(p, config, params)
+    try:
+        with _acq_final(p, logger):
+            return _verify_generation_locked(p, job, config, params, logger,
+                                             expect_attempt, planned)
+    except _LockUnavailable as exc:
+        # 锁不可用 = **未验证**。不能返回同一个成功（R23-B02）。
+        if logger:
+            logger.error(
+                "COMPLETION_UNVERIFIED_NO_LOCK",
+                "The target lock is unavailable, so this generation cannot be "
+                "verified. It stays unverified rather than becoming a success.",
+                output_path=p, reason=str(exc))
+        return False, ("completion lock is unavailable; the generation cannot "
+                       f"be verified: {exc}")
 
-        # ---- 2) marker + payload ----
-        mp = completion_marker_path(p)
-        if not os.path.exists(mp):
-            return False, ("no published completion marker; this generation "
-                           "cannot be proven (re-run rather than trusting it)")
-        try:
-            with open(mp, "r", encoding="utf-8") as f:
-                mdata = json.load(f) or {}
-        except (OSError, ValueError) as exc:
-            return False, f"completion marker is unreadable: {exc}"
-        if not isinstance(mdata, dict):
-            return False, "completion marker is not an object"
 
-        _st = _input_identity_status(mdata.get("input_identity") or {},
-                                     build_input_identity(
-                                         job.get("input_path", "")))
-        if _st == "changed":
-            return False, "input content changed since this generation"
-        if _st == "unproven":
-            return False, "input identity cannot be verified"
-        if str(mdata.get("job_id") or "") != str(job.get("job_id") or ""):
-            return (False,
-                    f"marker belongs to job {mdata.get('job_id')!r}, "
-                    f"not {job.get('job_id')!r}")
-        if str(mdata.get("impl") or "") != VIDEO_IMPL_VERSION:
-            return (False,
-                    f"marker was produced by {mdata.get('impl')!r}, "
-                    f"current is {VIDEO_IMPL_VERSION!r}")
+def _verify_generation_locked(p: str, job: Dict[str, Any],
+                              config: Dict[str, Any],
+                              params: Optional[Dict[str, Any]], logger,
+                              expect_attempt: Optional[str],
+                              planned: Dict[str, Any]) -> Tuple[bool, str]:
+    """锁内执行的实际核对（拆出来只是为了在 `with` 里保持一段直线代码）。"""
+    # ---- 当前计划身份（唯一来源：main 冻结的那份；退化时才现算）----
+    _cur = (params or {}).get("_run_identity")
+    if not isinstance(_cur, dict) or not str(_cur.get("digest") or ""):
+        _cur = build_run_identity(config, job, logger, params=params)
 
-        # ---- 参数身份：当前有效参数必须与发布时一致 ----
-        # resume 也走这里，所以"参数变了就不复用"用的是同一套判据。
-        _rec_params = str(mdata.get("params_identity") or "")
-        if not _rec_params:
-            return False, "marker has no params identity"
-        _cur_params = str((params or {}).get("_frozen_params_identity") or "")
-        if not _cur_params:
-            _cur_params = build_params_identity(config, job, logger,
-                                                params=params)
-        if _rec_params != _cur_params:
-            _rec_view = mdata.get("params_semantics") or {}
-            _cur_view = (_identity_semantics(params)
-                         if isinstance(params, dict) else {})
-            if _rec_view and _cur_view and logger:
-                _diff = [(k, _rec_view.get(k), _cur_view.get(k))
-                         for k in sorted(set(_rec_view) | set(_cur_view))
-                         if _rec_view.get(k) != _cur_view.get(k)]
-                if _diff:
-                    logger.error(
-                        "COMPLETION_PARAMS_DIFF",
-                        "The marker records a different effective-parameter "
-                        "set; showing the first differences",
-                        differences=_diff[:6])
-            return False, "effective parameters changed since this generation"
-
-        state, why, objects = check_payload_manifest(mdata, p, logger)
-        if state == MANIFEST_LEGACY:
-            return False, f"legacy marker cannot prove this generation: {why}"
-        if state != MANIFEST_OK:
+    # ---- 1) 私有 result（正常收尾必须；resume 只在存在时作一致性核对）----
+    _res: Dict[str, Any] = {}
+    if expect_attempt is not None:
+        ok, why, _res = load_private_result(
+            p, str(expect_attempt), params, logger,
+            current_identity=_cur, planned=planned)
+        if not ok:
             return False, why
+    else:
+        _rp = str((params or {}).get("_stage7_result_path") or "")
+        if _rp and os.path.exists(_rp):
+            _res = _load_result_for_consistency(_rp, p)
+            if _res is None:
+                return (False,
+                        "a private result exists but cannot be read; resume "
+                        "cannot prove which generation it describes")
 
-        # ---- 3) 整代磁盘事实（用**同一个**集合适配器）----
-        return verify_generation_objects(p, job, logger,
-                                         expected_objects=objects,
-                                         marker=mdata,
-                                         config=config, params=params)
+    # ---- 2) marker 存在且身份字段对得上 ----
+    mp = completion_marker_path(p)
+    if not os.path.exists(mp):
+        return False, ("no published completion marker; this generation "
+                       "cannot be proven (re-run rather than trusting it)")
+    try:
+        with open(mp, "r", encoding="utf-8") as f:
+            mdata = json.load(f) or {}
+    except (OSError, ValueError) as exc:
+        return False, f"completion marker is unreadable: {exc}"
+    if not isinstance(mdata, dict):
+        return False, "completion marker is not an object"
+
+    _st = _input_identity_status(mdata.get("input_identity") or {},
+                                 build_input_identity(job.get("input_path", "")))
+    if _st == "changed":
+        return False, "input content changed since this generation"
+    if _st == "unproven":
+        return False, "input identity cannot be verified"
+    if str(mdata.get("job_id") or "") != str(job.get("job_id") or ""):
+        return (False,
+                f"marker belongs to job {mdata.get('job_id')!r}, "
+                f"not {job.get('job_id')!r}")
+    if str(mdata.get("impl") or "") != VIDEO_IMPL_VERSION:
+        return (False,
+                f"marker was produced by {mdata.get('impl')!r}, "
+                f"current is {VIDEO_IMPL_VERSION!r}")
+
+    _rec_params = str(mdata.get("params_identity") or "")
+    if not _rec_params:
+        return False, "marker has no params identity"
+    _cur_params = str((params or {}).get("_frozen_params_identity") or "")
+    if not _cur_params:
+        _cur_params = build_params_identity(config, job, logger, params=params)
+    if _rec_params != _cur_params:
+        _rec_view = mdata.get("params_semantics") or {}
+        _cur_view = (_identity_semantics(params)
+                     if isinstance(params, dict) else {})
+        if _rec_view and _cur_view and logger:
+            _diff = [(k, _rec_view.get(k), _cur_view.get(k))
+                     for k in sorted(set(_rec_view) | set(_cur_view))
+                     if _rec_view.get(k) != _cur_view.get(k)]
+            if _diff:
+                logger.error(
+                    "COMPLETION_PARAMS_DIFF",
+                    "The marker records a different effective-parameter set; "
+                    "showing the first differences", differences=_diff[:6])
+        return False, "effective parameters changed since this generation"
+
+    # ---- 3) payload：集合由计划决定 ----
+    state, why, objects = check_payload_manifest(mdata, p, logger,
+                                                 planned=planned)
+    if state == MANIFEST_LEGACY:
+        return False, f"legacy marker cannot prove this generation: {why}"
+    if state != MANIFEST_OK:
+        return False, why
+
+    # ---- 3b) marker 的 attempt：必须能绑定到一次具体执行 ----
+    # 放在 payload 检查**之后**：旧格式 marker（没有 payload/attempt）应当
+    # 明确报 "legacy"，而不是被这一条抢先说成"没有 attempt"—— 诊断信息
+    # 要指向真正的缺口。
+    _mk_att = str(mdata.get("attempt_id") or "")
+    if not _mk_att:
+        return False, ("marker carries no attempt id; it cannot be bound to "
+                       "an execution")
+    if expect_attempt is not None and _mk_att != str(expect_attempt):
+        return (False,
+                f"marker belongs to attempt {_mk_att!r}, not the current "
+                f"attempt {expect_attempt!r}")
+
+    # ---- 4) journal：终态 + 覆盖 + 同一 attempt ----
+    jp = _journal_path_for(p)
+    if not os.path.exists(jp):
+        return False, ("no publish journal for this generation; its terminal "
+                       "state cannot be proven (legacy/unproven)")
+    try:
+        from publish_journal import read_journal as _rj
+        _doc = _rj(jp)
+    except Exception as exc:                # pragma: no cover - 部署异常
+        return False, f"cannot verify the publish journal: {exc}"
+    if not isinstance(_doc, dict):
+        return False, "publish journal is unreadable"
+    _phase = str(_doc.get("phase") or "")
+    if _phase != "COMMITTED":
+        return False, f"publish journal is not COMMITTED (phase={_phase!r})"
+    # `resolved` 只出现在**恢复**写的终态里；正常 COMMITTED 由 phase 表达。
+    # 所以：缺席 = 正常；出现就必须是真布尔 True（`"false"` 字符串不算）。
+    if "resolved" in _doc and _doc.get("resolved") is not True:
+        return (False,
+                "publish journal is unresolved "
+                f"(resolved={_doc.get('resolved')!r}; only boolean True counts)")
+    if str(_doc.get("attempt_id") or "") != _mk_att:
+        return (False,
+                f"journal belongs to attempt {_doc.get('attempt_id')!r}, "
+                f"marker says {_mk_att!r}")
+    if job is not None:
+        _want_j = str(job.get("job_id") or "")
+        _got_j = str(_doc.get("job_id") or "")
+        if _want_j and _got_j and _want_j != _got_j:
+            return (False,
+                    f"journal belongs to job {_got_j!r}, not {_want_j!r}")
+    _targets = [str(x) for x in (_doc.get("targets") or [])]
+    if not _targets:
+        return False, ("publish journal records no targets; it cannot prove "
+                       "which objects were committed")
+    _t_set = {os.path.abspath(x) for x in _targets}
+    _need = {os.path.abspath(str(v))
+             for k, v in (planned.get("required") or {}).items() if k != "marker"}
+    _miss = sorted(_need - _t_set)
+    if _miss:
+        return (False,
+                "publish journal does not cover planned object(s): "
+                f"{[os.path.basename(x) for x in _miss[:3]]}")
+
+    # ---- 5) resume：result 若存在，必须描述**同一个** attempt ----
+    if expect_attempt is None and _res:
+        _r_att = str(_res.get("attempt_id") or "")
+        if _r_att and _r_att != _mk_att:
+            return (False,
+                    f"the private result describes attempt {_r_att!r} but the "
+                    f"published marker is attempt {_mk_att!r}")
+
+    # ---- 6) 回执：marker 摘要 + 每个必需对象的摘要 ----
+    _gr_raw = _res.get("generation_receipt") if _res else None
+    if isinstance(_gr_raw, dict):
+        try:
+            from receipts import load_receipt as _lr
+            _gr = _lr(dict(_gr_raw, kind="GenerationReceipt"))
+        except Exception:
+            _gr = None
+        if _gr is None:
+            return False, "generation receipt is not trustworthy"
+        _mk_dig = _plain_sha256(mp)
+        if str(_gr.marker_digest) != str(_mk_dig):
+            return (False,
+                    "generation receipt was written for a different marker "
+                    f"({str(_gr.marker_digest)[:16]} != {str(_mk_dig)[:16]})")
+        for name, path, digest in objects:
+            _rec = (_gr.object_digests or {}).get(path)
+            if _rec is None:
+                _rec = (_gr.object_digests or {}).get(os.path.abspath(path))
+            if _rec is None:
+                return (False,
+                        f"generation receipt does not bind object {name!r}")
+            if str(_rec) != str(digest):
+                return (False,
+                        f"generation receipt digest for {name!r} does not "
+                        f"match the marker/disk")
+
+    # ---- 7) 整代磁盘事实 ----
+    return verify_generation_objects(p, job, logger,
+                                     expected_objects=objects,
+                                     marker=mdata,
+                                     config=config, params=params,
+                                     planned=planned)
+
+
+def _load_result_for_consistency(result_path: str, final_path: str
+                                 ) -> Optional[Dict[str, Any]]:
+    """resume 用：只读 result 的 attempt/最终路径，不做"本次执行"要求。"""
+    try:
+        with open(result_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    fin = str(data.get("final_output_path") or "")
+    if fin and os.path.abspath(fin) != os.path.abspath(str(final_path)):
+        return None
+    return data
+
 
 def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = None,
                               logger=None, expected_objects=None,
                               marker: Optional[Dict[str, Any]] = None,
-                              config=None, params=None) -> Tuple[bool, str]:
-    """核对**磁盘上这一代**是否完整。
+                              config=None, params=None,
+                              planned: Optional[Dict[str, Any]] = None
+                              ) -> Tuple[bool, str]:
+    """核对**磁盘上这一代**是否完整（R23-B02：集合由计划决定）。
 
-    R22-A01 重构：必需集合**由计划决定**，不再硬编码"两份报告"。
+    与 R22 的区别：
 
-    审核指出的矛盾：`full_chain_verify=false` 时 stage7 允许不提交 fullchain，
-    而这里无条件要求两份 —— 一端可选、一端固定，合法关闭的报告被当成缺陷。
-
-    集合来源按优先级：
-
-    1. ``expected_objects``（来自 marker payload，即**发布时冻结的那一份**）
-    2. 没有时退回 ``required_generation_reports()``（老调用兜底）
-
-    摘要比对在锁内的 `check_payload_manifest` 里已经做过；这里补的是
-    "路径仍在、报告与媒体同代、journal 覆盖同一集合"。
+    - 兜底集合不再写死"两份报告"，而是由 `_planned_generation_roles()`
+      给出（`full_chain_verify` 关闭时 fullchain 进可选）；
+    - `verify` 报告的 `media_sha256` **必须存在**（空 `{}` 不再放过）；
+    - journal 的 `resolved` 必须是真布尔 True（字符串 `"false"` 之前能过）；
+    - journal 的 `targets` **必须非空**并覆盖计划必需对象（空列表之前被
+      `if _targets:` 跳过，等于"没记录也算过"）。
 
     Returns:
         ``(ok, reason)``。
@@ -1452,6 +1812,11 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
     except OSError as exc:
         return False, f"media is unreadable: {exc}"
 
+    pl = planned if isinstance(planned, dict) else \
+        _planned_generation_roles(p, config, params)
+    _req_roles = dict(pl.get("required") or {})
+    _opt_roles = dict(pl.get("optional") or {})
+
     # ---- 期望集合 ----
     if expected_objects:
         objs = [(str(n), str(pp), str(d)) for (n, pp, d) in expected_objects]
@@ -1460,16 +1825,14 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
         if not media_digest:
             return False, "media is unreadable"
         objs = [("media", p, media_digest)]
-        # 兜底路径没有 marker payload，按**角色**补上计划默认的报告。
-        # 这里必须用 "verify"/"fullchain" 这两个**角色名**，不能用 basename ——
-        # 否则后面的 `o[0] == "verify"` 找不到（R22 第一次改就栽在这）。
-        _roles = ("verify", "fullchain")
-        for _role, rp in zip(_roles, required_generation_reports(p)):
-            d = _plain_sha256(rp)
+        for _role, rp in _req_roles.items():
+            if _role in ("media", "marker"):
+                continue
+            d = _plain_sha256(str(rp))
             if d is None:
                 return False, ("required report is missing: "
-                               f"{os.path.basename(rp)}")
-            objs.append((_role, rp, d))
+                               f"{os.path.basename(str(rp))}")
+            objs.append((_role, str(rp), d))
 
     media = [o for o in objs if o[0] == "media"]
     if len(media) != 1:
@@ -1480,7 +1843,14 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
         if not os.path.exists(path):
             return False, f"object {name!r} is missing: {path}"
 
-    # ---- verify 报告必须描述**当前**媒体（防止报告串代）----
+    # ---- 计划必需的角色一个都不能少 ----
+    _have = {o[0] for o in objs}
+    _miss_roles = sorted(set(_req_roles) - {"marker"} - _have)
+    if _miss_roles:
+        return (False,
+                f"the verified object set lacks planned role(s): {_miss_roles}")
+
+    # ---- verify 报告必须描述**当前**媒体，且必须给出摘要 ----
     verify_rows = [o for o in objs if o[0] == "verify"]
     if not verify_rows:
         return False, "the required object set has no verify report"
@@ -1489,10 +1859,14 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
             _v = json.load(f) or {}
     except (OSError, ValueError) as exc:
         return False, f"verify report is unreadable: {exc}"
-    if not isinstance(_v, dict):
-        return False, "verify report is not an object"
+    if not isinstance(_v, dict) or not _v:
+        return False, ("verify report is empty; it does not describe any "
+                       "measurement of this media")
     recorded = _v.get("media_sha256")
-    if recorded and media_digest and str(recorded) != str(media_digest):
+    if not recorded:
+        return False, ("verify report does not record media_sha256; it cannot "
+                       "prove it describes this media")
+    if media_digest and str(recorded) != str(media_digest):
         return False, ("verify report describes different media bytes "
                        f"(recorded {str(recorded)[:16]}, "
                        f"actual {str(media_digest)[:16]})")
@@ -1500,11 +1874,7 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
     # ---- journal 终态 ----
     try:
         from publish_journal import read_journal as _rj
-        try:
-            from publish_journal import journal_path_for as _jpf
-            jp = _jpf(p)
-        except Exception:                   # pragma: no cover
-            jp = p + ".journal.json"
+        jp = _journal_path_for(p)
         if not os.path.exists(jp):
             return False, ("no publish journal for this generation; its "
                            "terminal state cannot be proven (legacy/unproven)")
@@ -1514,23 +1884,36 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
         phase = str(_doc.get("phase") or "")
         if phase != "COMMITTED":
             return False, f"publish journal is not COMMITTED (phase={phase!r})"
-        if _doc.get("resolved") is False:
-            return False, "publish journal is marked unresolved"
+        # 同上：恢复路径才写 `resolved`；正常 COMMITTED 由 phase 表达。
+        if "resolved" in _doc and _doc.get("resolved") is not True:
+            return (False,
+                    "publish journal is unresolved "
+                    f"(resolved={_doc.get('resolved')!r})")
         if job is not None:
             _want = str(job.get("job_id") or "")
             _got = str(_doc.get("job_id") or "")
             if _want and _got and _want != _got:
                 return False, (f"journal belongs to job {_got!r}, "
                                f"not {_want!r}")
-        # ---- journal 必须覆盖**同一个**对象集合 ----
-        _targets = {os.path.abspath(str(x))
-                    for x in (_doc.get("targets") or [])}
-        if _targets:
-            _need = {os.path.abspath(x[1]) for x in objs}
-            _missing = sorted(_need - _targets)
-            if _missing:
-                return False, ("publish journal does not cover object(s): "
-                               f"{[os.path.basename(x) for x in _missing[:3]]}")
+        # marker 与 journal 必须描述同一次执行
+        if isinstance(marker, dict):
+            _mk_att = str(marker.get("attempt_id") or "")
+            _j_att = str(_doc.get("attempt_id") or "")
+            if _mk_att and _j_att and _mk_att != _j_att:
+                return (False,
+                        f"journal belongs to attempt {_j_att!r}, marker says "
+                        f"{_mk_att!r}")
+        # ---- journal 必须**记录并覆盖**计划必需对象 ----
+        _targets = [str(x) for x in (_doc.get("targets") or [])]
+        if not _targets:
+            return False, ("publish journal records no targets; it cannot "
+                           "prove which objects were committed")
+        _t_set = {os.path.abspath(x) for x in _targets}
+        _need = {os.path.abspath(x[1]) for x in objs}
+        _missing = sorted(_need - _t_set)
+        if _missing:
+            return False, ("publish journal does not cover object(s): "
+                           f"{[os.path.basename(x) for x in _missing[:3]]}")
     except Exception as exc:                # pragma: no cover - 部署异常
         return False, f"cannot verify the publish journal: {exc}"
 

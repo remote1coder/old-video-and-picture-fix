@@ -77,8 +77,10 @@ def _gen(tmp_path, *, with_reports=True, with_journal=True,
         _targets = [final]
         if with_reports:
             _targets += [final + ".verify.json", final + ".fullchain.json"]
+        # R23-B01：journal 必须写明 attempt，且与 marker 是同一代
         J.write_journal(final + ".journal.json",
                         {"phase": journal_phase, "job_id": "j1",
+                         "attempt_id": "att1",
                          "targets": _targets, "records": {},
                          "resolved": resolved})
     return final

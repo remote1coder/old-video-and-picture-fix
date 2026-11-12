@@ -91,6 +91,11 @@ class RunIdentity:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        # R23-B01：生产写出的回执必须能被 `load_receipt()` 读回来。
+        # 原来 to_dict 不写 `kind`，而 load_receipt **要求** kind ——
+        # 于是"生产者→序列化→消费者"这条往返在正式代码里从未成立
+        # （测试里是手工 `dict(obj.to_dict(), kind=...)` 补上的）。
+        d["kind"] = "RunIdentity"
         d["digest"] = self.digest()
         return d
 
@@ -153,6 +158,11 @@ class CheckpointReceipt:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        # R23-B01：生产写出的回执必须能被 `load_receipt()` 读回来。
+        # 原来 to_dict 不写 `kind`，而 load_receipt **要求** kind ——
+        # 于是"生产者→序列化→消费者"这条往返在正式代码里从未成立
+        # （测试里是手工 `dict(obj.to_dict(), kind=...)` 补上的）。
+        d["kind"] = "CheckpointReceipt"
         d["digest"] = self.digest()
         return d
 
@@ -241,6 +251,11 @@ class GenerationReceipt:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        # R23-B01：生产写出的回执必须能被 `load_receipt()` 读回来。
+        # 原来 to_dict 不写 `kind`，而 load_receipt **要求** kind ——
+        # 于是"生产者→序列化→消费者"这条往返在正式代码里从未成立
+        # （测试里是手工 `dict(obj.to_dict(), kind=...)` 补上的）。
+        d["kind"] = "GenerationReceipt"
         d["digest"] = self.digest()
         return d
 

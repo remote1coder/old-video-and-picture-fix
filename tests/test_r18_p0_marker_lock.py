@@ -140,11 +140,14 @@ def _publish_full(tmp_path, media_bytes=b"GEN-A", input_bytes=b"src"):
         job_id=job["job_id"], output_path=out, media_digest=digests[0][2],
         media_size=os.path.getsize(arts[0].staging))
     arts.append(_P.Artifact("marker", mk_stage, out + ".done.json"))
+    # R23-B01：回执必须带 RunIdentity 摘要（生产 stage7 就是这么传的）
+    _ri = vmain.build_run_identity({}, job, None, params=eff)
     res = _P.publish(arts, out + ".journal.json", str(tmp_path / "backup"),
                      attempt_id="att1", decision={"publish": True},
                      allowed_output_roots=[str(tmp_path)],
                      required_objects=[a.final for a in arts],
-                     marker_digest=mk_dig)
+                     marker_digest=mk_dig,
+                     run_identity=str(_ri["digest"]))
     assert res.ok, res.errors
 
     result_path = str(tmp_path / "stage7_result.json")

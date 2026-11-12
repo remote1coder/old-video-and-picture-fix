@@ -92,7 +92,7 @@ def _snapshot(*paths):
 
 def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
           attempt="att1", with_result=True, result_over=None,
-          journal_phase=None):
+          journal_phase=None, params_over=None):
     """用**生产函数**组装一整代并发布；可选把 journal 改成未决态。
 
     Returns:
@@ -120,6 +120,10 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
     digests = [(a.name, a.final, _sha(a.staging)) for a in arts]
     eff = vmain.merge_params(job, {}, {}, None)
     eff["attempt_id"] = attempt
+    # R23-B02：必需对象由**计划**决定。要造"计划说 fullchain 可选"的场景，
+    # 必须在算身份**之前**就把这个选择放进计划，否则身份与 marker 对不上。
+    if params_over:
+        eff.update(params_over)
     seed = {
         "impl": vmain.VIDEO_IMPL_VERSION,
         "job_id": "j1",
@@ -134,11 +138,16 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
         media_size=os.path.getsize(arts[0].staging))
     arts.append(P.Artifact("marker", mk_stage, out + ".done.json"))
 
+    # R23-B01：真实 stage7 会把 RunIdentity 摘要交给 publisher，回执里必须
+    # 有它。这个夹具此前没传，于是回执的 `run_identity` 恒为空 ——
+    # 既掩盖了生产行为，也让"回执证明这一代"变成空话。
+    _ri = vmain.build_run_identity({}, job, None, params=eff)
     res = P.publish(arts, out + ".journal.json", str(tmp_path / "backup"),
                     attempt_id=attempt, decision={"publish": True},
                     allowed_output_roots=[str(tmp_path / "out")],
                     required_objects=[a.final for a in arts],
-                    marker_digest=mk_dig)
+                    marker_digest=mk_dig,
+                    run_identity=str(_ri["digest"]))
     assert res.ok, res.errors
 
     if journal_phase:
@@ -160,8 +169,7 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
                                    if res.generation_receipt else None),
             "final_output_path": out,
             "publish_result": res.as_dict(),
-            "run_identity": vmain.build_run_identity({}, job, None,
-                                                     params=eff),
+            "run_identity": _ri,
         }
         payload.update(result_over or {})
         _w(result_path, json.dumps(payload, ensure_ascii=False, default=str))
@@ -187,10 +195,32 @@ def test_complete_generation_is_proven(tmp_path):
 def test_optional_fullchain_is_not_required_when_the_plan_omits_it(tmp_path):
     """`full_chain_verify=false`：发布端只交 media+verify，验证端**不能**
     反过来硬要 fullchain（审核点名的"一端可选、一端固定"）。"""
-    ctx = build(tmp_path, with_fullchain=False)
+    ctx = build(tmp_path, with_fullchain=False,
+                params_over={"full_chain_verify": False})
     assert not os.path.exists(ctx["out"] + ".fullchain.json")
     ok, why = verify(ctx)
     assert ok is True, why
+
+
+def test_enabled_fullchain_cannot_be_dropped_from_the_manifest(tmp_path):
+    """R22-B02 的反例：计划要求 fullchain，但清单里删掉它再删文件 → 必须拒绝。
+
+    旧实现把 marker 清单当作计划集合，于是"清单没列它"自动变成合法。
+    """
+    ctx = build(tmp_path, with_fullchain=True)
+    m = json.loads(open(ctx["out"] + ".done.json", encoding="utf-8").read())
+    m["payload_manifest"]["objects"] = [
+        o for o in m["payload_manifest"]["objects"] if o["name"] != "fullchain"]
+    m["payload_manifest_digest"] = hashlib.sha256(
+        json.dumps(m["payload_manifest"], sort_keys=True,
+                   ensure_ascii=False,
+                   separators=(",", ":")).encode("utf-8")).hexdigest()
+    with open(ctx["out"] + ".done.json", "w", encoding="utf-8") as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+    os.remove(ctx["out"] + ".fullchain.json")
+    ok, why = verify(ctx)
+    assert ok is False, "启用中的 fullchain 被从清单删掉仍然通过"
+    assert "missing planned object" in why, why
 
 
 def test_resume_shares_the_core_but_allows_another_attempt(tmp_path):

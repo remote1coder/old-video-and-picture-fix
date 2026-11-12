@@ -88,11 +88,15 @@ def _publish_full(tmp_path, *, media=b"GENUINE", attempt="att1",
         job_id=job["job_id"], output_path=out, media_digest=digests[0][2],
         media_size=os.path.getsize(arts[0].staging))
     arts.append(_P.Artifact("marker", mk_stage, out + ".done.json"))
+    # R23-B01：真实 stage7 把 RunIdentity 摘要交给 publisher；回执里有它
+    # 才能被"当前计划身份"核对。夹具此前没传，回执的 run_identity 恒为空。
+    _ri0 = vmain.build_run_identity({}, job, None, params=eff)
     res = _P.publish(arts, out + ".journal.json", str(tmp_path / "backup"),
                      attempt_id=attempt, decision={"publish": True},
                      allowed_output_roots=[str(tmp_path)],
                      required_objects=[a.final for a in arts],
-                     marker_digest=mk_dig)
+                     marker_digest=mk_dig,
+                     run_identity=str(_ri0["digest"]))
     assert res.ok, res.errors
 
     rp = str(tmp_path / "stage7_result.json")
