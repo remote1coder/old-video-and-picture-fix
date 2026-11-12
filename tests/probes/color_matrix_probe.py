@@ -175,6 +175,70 @@ def psnr_rgb(a, b, expected_frames=None):
             "seq": seq, "problems": problems}
 
 
+def _raw_rgb48(path):
+    """把视频解成 rgb48le 原始字节（**不做**任何 8-bit 归一）。
+
+    注意：这里**不能**用 `sh()` —— 它是 text 模式（`text=True`），
+    二进制帧会被当字符串返回，`array.frombytes` 立刻 TypeError。
+    这条曾经让"精确比较"在真正跑起来时直接崩（不是判错，是崩）。
+    """
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-v", "error", "-i",
+                        str(path), "-f", "rawvideo", "-pix_fmt", "rgb48le",
+                        "-"], capture_output=True, timeout=600, shell=False)
+    if r.returncode != 0:
+        return None, ("decode rc=%s: %s"
+                      % (r.returncode,
+                         (r.stderr or b"")[-200:].decode("utf-8", "replace")))
+    return r.stdout or b"", ""
+
+
+def rgb48_exact_diff(a, b):
+    """**16-bit 精确比较**：两侧都解成 rgb48le，逐样本比。
+
+    审核 R22-B11 的真实反例：两张 16×16 的 16-bit PPM 只差一个 R 码值，
+    `psnr` 滤镜把两边都 `format=rgb24` 之后得到全 inf —— 于是"原始 16-bit
+    相同"被判成立。**在 rgb24 下相同是可能的，但不能据此宣称 16-bit 相同。**
+
+    Returns:
+        ``{ok, samples, differing, max_code_diff, problems}``；
+        ``ok=True`` 才表示"在这条表示上逐样本相同"。
+    """
+    out = {"ok": False, "samples": 0, "differing": 0, "max_code_diff": 0,
+           "problems": []}
+    da, ea = _raw_rgb48(a)
+    db, eb = _raw_rgb48(b)
+    if da is None or db is None:
+        out["problems"].append(f"cannot decode: {ea or eb}")
+        return out
+    if not da or not db:
+        out["problems"].append("decoded stream is empty")
+        return out
+    if len(da) != len(db):
+        out["problems"].append(
+            f"byte length differs: {len(da)} vs {len(db)} (frame count or "
+            f"size differs; an exact comparison is impossible)")
+        return out
+    import array
+    aa = array.array("H")
+    aa.frombytes(da)
+    bb = array.array("H")
+    bb.frombytes(db)
+    if sys.byteorder != "little":       # pragma: no cover - Windows 都是 LE
+        aa.byteswap()
+        bb.byteswap()
+    diff = 0
+    mx = 0
+    for x, y in zip(aa, bb):
+        if x != y:
+            diff += 1
+            d = abs(int(x) - int(y))
+            if d > mx:
+                mx = d
+    out.update(samples=len(aa), differing=diff, max_code_diff=mx,
+               ok=(diff == 0))
+    return out
+
+
 def _num(tok, *, zero_means=None):
     """解析统计值。
 
@@ -247,7 +311,16 @@ def aggregate(res):
                 exact = False
                 continue
             if ps is None:
-                # PSNR=inf ⇒ 该帧**确实**零误差
+                # R23-B11：PSNR=inf 与"MSE 是一个正数"互相矛盾。
+                # 旧实现无条件按"零误差"记 0，于是伪造的
+                # `mse_r:1 psnr_r:inf` 被判成 exact_zero=True。
+                if m is not None and float(m) > 0:
+                    out["problems"].append(
+                        f"plane {p}: contradictory statistics "
+                        f"(mse={row.get('mse_' + p)} but psnr=inf)")
+                    bad += 1
+                    exact = False
+                    continue
                 mses.append(0.0)
                 continue
             exact = False
@@ -300,6 +373,57 @@ def evaluate(results, expected_frames=None, expected_combos=None):
     rt = results.get("roundtrip", [])
     if expected_combos is not None and len(rt) != expected_combos:
         reasons.append(f"only {len(rt)} of {expected_combos} combos ran")
+        return "INVALID", reasons
+
+    # ---- R23-B11：组合必须是**唯一身份**的完整集合 ----
+    # 审核反例：8 份同名、零帧、空平面的 420 组合 + 空 mismatch，
+    # `evaluate(expected_frames=6, expected_combos=8)` 仍然 OK ——
+    # 旧实现只看"条数对不对"，不看这些条目到底是什么。
+    _ids = [str(r.get("combo") or "") for r in rt]
+    if any(not i for i in _ids):
+        reasons.append("a roundtrip row has no combo identity")
+    if len(set(_ids)) != len(_ids):
+        reasons.append("duplicate combo identities (the same combo was "
+                       "counted more than once)")
+    for row in rt:
+        _pl = row.get("planes") or {}
+        for p in ("r", "g", "b"):
+            _p = _pl.get(p) or {}
+            if _p.get("mse") is None:
+                reasons.append(f"{row.get('combo')}: plane {p} has no usable "
+                               f"measurement")
+                continue
+            if expected_frames is not None and \
+                    int(_p.get("frames") or 0) != int(expected_frames):
+                reasons.append(
+                    f"{row.get('combo')}: plane {p} compared "
+                    f"{_p.get('frames')} of {expected_frames} frames")
+        # 声称"精确相等"必须有 16-bit 原始比较支撑
+        _claims_exact = any(((_pl.get(p) or {}).get("exact_zero"))
+                            for p in ("r", "g", "b"))
+        if _claims_exact:
+            _ex = row.get("exact16") or {}
+            if not _ex:
+                reasons.append(
+                    f"{row.get('combo')}: claims exact equality but no "
+                    f"16-bit comparison was performed")
+            elif not _ex.get("ok"):
+                reasons.append(
+                    f"{row.get('combo')}: claims exact equality but the "
+                    f"16-bit comparison differs "
+                    f"({_ex.get('differing')} sample(s), max code diff "
+                    f"{_ex.get('max_code_diff')})")
+    if reasons:
+        return "INVALID", reasons
+
+    # ---- 错配组合必须**真的检出**差异 ----
+    for row in results.get("mismatch", []):
+        _g = ((row.get("planes") or {}).get("g") or {})
+        if float(_g.get("mse") or 0.0) <= 0.0:
+            reasons.append(
+                f"{row.get('combo')}: the mismatched decode produced no "
+                f"measurable difference; the case did not exercise anything")
+    if reasons:
         return "INVALID", reasons
 
     # ---- 444 往返：按**误差预算**判，不是"必须精确相等" ----
@@ -380,8 +504,11 @@ def main():
             print(f"  [失败] {tag}: {exc}")
             results["roundtrip"].append({"combo": tag, "error": str(exc)})
             continue
+        # R23-B11：**16-bit 精确比较**。`psnr` 滤镜两边都降到 rgb24，
+        # 那只能证明"在 8-bit 表示上相同"，不能证明原始高位深相同。
+        _ex = rgb48_exact_diff(ref, back)
         row = {"combo": tag, "chroma": chroma, "matrix": matrix,
-               "range": rng, **m,
+               "range": rng, "exact16": _ex, **m,
                "rmse8": {p: (None if m["planes"][p]["rmse"] is None
                              else round(m["planes"][p]["rmse"], 4))
                          for p in ("r", "g", "b")}}

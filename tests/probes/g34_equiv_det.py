@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -521,11 +522,22 @@ def evaluate(classic, fused, info_c, info_f, cmp_result, frames):
                 reasons.append(
                     f"{k} differs: {info_c.get(k)} vs {info_f.get(k)}")
 
-    # ---- 4b) 时间轴：PTS、末帧覆盖、帧号连续性（R21-C08）----
-    # 审核："未核对实际 PTS、尾帧覆盖和时间映射。受控输入中，
-    #       声明时间不同仍判 IDENTICAL。"
-    # 容差按时间基给：MKV 的 packet 时间戳是毫秒量化，取 max(2ms, 2×tb)。
+    # ---- 4b) 时间轴：数值有限、长度完整、末帧覆盖（R23-B10）----
+    # 审核用原 evaluator 的受控输入复现四类"仍然 IDENTICAL"：
+    #   * 一侧中段 PTS = NaN（`abs(nan - x) > tol` 恒为 False，从不报差异）
+    #   * 两侧 PTS 数组**都为空**却声称 5 帧
+    #   * 两侧 durations 数组缺失
+    #   * 尾帧 duration 均为 0
+    # 现在逐条变成判据：先证明**观测本身完整**，再谈相等。
     _tol = 0.002
+
+    def _all_finite(seq):
+        try:
+            return all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                       and math.isfinite(float(x)) for x in seq)
+        except (TypeError, ValueError):
+            return False
+
     if "error" not in info_c and "error" not in info_f:
         for key in ("frames", "first_pts", "last_pts", "last_end"):
             a, b = info_c.get(key), info_f.get(key)
@@ -536,20 +548,30 @@ def evaluate(classic, fused, info_c, info_f, cmp_result, frames):
                 if int(a) != int(b):
                     reasons.append(f"timing frame count differs: {a} vs {b}")
                 continue
+            if not (_all_finite([a]) and _all_finite([b])):
+                reasons.append(f"timing field {key} is not finite: "
+                               f"classic={a!r} fused={b!r}")
+                continue
             if abs(float(a) - float(b)) > _tol:
                 reasons.append(
                     f"{key} differs: classic={a} fused={b} "
                     f"(tolerance {_tol}s)")
 
-        # ---- 逐帧 PTS（R22-A07）----
-        # 只比首尾/中位会被"中段错位"骗过：
-        #   0,.04,.08,.12,.16  vs  0,.04,.10,.12,.16  → 摘要完全相同
-        # 所以这里逐点比；缺数组（旧样本）时明确报"未证明"，不放行。
+        # ---- 逐帧 PTS：长度必须等于解码帧数，数值必须有限 ----
         _pc, _pf = info_c.get("pts"), info_f.get("pts")
         if not isinstance(_pc, list) or not isinstance(_pf, list):
             reasons.append(
                 "per-frame PTS arrays are missing; timing equality is "
                 "unproven (a summary is not evidence)")
+        elif not _pc or not _pf:
+            reasons.append("per-frame PTS arrays are empty; timing equality "
+                           "is unproven (an empty table is not evidence)")
+        elif not _all_finite(_pc) or not _all_finite(_pf):
+            reasons.append("per-frame PTS contains non-finite values")
+        elif n_c and (len(_pc) != n_c or len(_pf) != n_c):
+            reasons.append(
+                f"per-frame PTS length {len(_pc)}/{len(_pf)} != decoded "
+                f"frames {n_c}")
         elif len(_pc) != len(_pf):
             reasons.append(
                 f"per-frame PTS length differs: {len(_pc)} vs {len(_pf)}")
@@ -560,14 +582,30 @@ def evaluate(classic, fused, info_c, info_f, cmp_result, frames):
                         f"per-frame PTS differs at frame {_i}: "
                         f"classic={_x} fused={_y} (tolerance {_tol}s)")
                     break
-            # 末帧时长也要逐点对上（末帧被重复填充会体现在这里）
-            _dc, _df = info_c.get("durations"), info_f.get("durations")
-            if isinstance(_dc, list) and isinstance(_df, list) \
-                    and len(_dc) == len(_df) and len(_dc) > 0:
-                if abs(float(_dc[-1]) - float(_df[-1])) > _tol:
-                    reasons.append(
-                        f"the last frame duration differs: "
-                        f"classic={_dc[-1]} fused={_df[-1]}")
+
+        # ---- 逐帧时长：必须存在、长度一致、数值有限、尾帧 > 0 ----
+        _dc, _df = info_c.get("durations"), info_f.get("durations")
+        if not isinstance(_dc, list) or not isinstance(_df, list):
+            reasons.append(
+                "per-frame durations are missing; the last-frame coverage "
+                "cannot be proven")
+        elif not _dc or not _df:
+            reasons.append("per-frame durations are empty")
+        elif not _all_finite(_dc) or not _all_finite(_df):
+            reasons.append("per-frame durations contain non-finite values")
+        elif n_c and (len(_dc) != n_c or len(_df) != n_c):
+            reasons.append(
+                f"per-frame durations length {len(_dc)}/{len(_df)} != decoded "
+                f"frames {n_c}")
+        else:
+            if not (float(_dc[-1]) > 0) or not (float(_df[-1]) > 0):
+                reasons.append(
+                    "the last frame duration is zero on at least one side; "
+                    "the tail is not covered")
+            elif abs(float(_dc[-1]) - float(_df[-1])) > _tol:
+                reasons.append(
+                    f"the last frame duration differs: "
+                    f"classic={_dc[-1]} fused={_df[-1]}")
 
     # ---- 5) 比较本身必须成功且覆盖全部帧 ----
     if cmp_result.get("returncode") != 0:

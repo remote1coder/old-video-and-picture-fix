@@ -134,10 +134,31 @@ class _VramSampler:
 
 
 def _psnr_rows(a, b):
+    """返回 ``(rc, rows)`` —— **rc 不能丢**（R23-B12）。
+
+    审核反例：工具失败（rc≠0）却留下 1 行 `inf`，旧实现只看那行，
+    于是"比较失败"被当成"完全相同"。
+    """
     r = s3probe._run(["ffmpeg", "-hide_banner", "-v", "info", "-i", a,
                       "-i", b, "-lavfi", "[0:v][1:v]psnr=stats_file=-",
                       "-f", "null", "-"], timeout=600)
-    return [ln for ln in (r.stdout or "").splitlines() if ln.startswith("n:")]
+    rows = [ln for ln in (r.stdout or "").splitlines() if ln.startswith("n:")]
+    return r.returncode, rows
+
+
+def _comparison_complete(rc, rows, expected_frames):
+    """一次逐帧比较是否"跑完且覆盖全部帧"（R23-B12）。
+
+    三条缺一不可：工具成功、有结果行、行数等于预期帧数。
+    审核反例：工具 rc≠0 但留下一行 `inf` → 旧实现当成"完全相同"；
+    8 帧的样本只比了 1 帧也一样。
+    """
+    try:
+        n = int(expected_frames)
+    except (TypeError, ValueError):
+        return False
+    return (int(rc) == 0 and isinstance(rows, list)
+            and len(rows) == n and n > 0)
 
 
 def _one_run(root, idx, chroma_mode, encoder, pix_fmt, frames, size,
@@ -335,14 +356,20 @@ def main():
                               runs[k]["final"][0]["file"])
             if not (os.path.exists(pa) and os.path.exists(pb)):
                 continue
-            rows = _psnr_rows(pa, pb)
+            rc, rows = _psnr_rows(pa, pb)
             identical = bool(rows) and all(
                 "psnr_y:inf" in ln and "psnr_u:inf" in ln
                 and "psnr_v:inf" in ln for ln in rows)
+            # R23-B12：比较必须**跑完且覆盖全部帧**。1 行 inf 不是 8 帧。
+            complete = _comparison_complete(rc, rows, args.frames)
             psnrs.append({"run": f"0-vs-{k}", "frames": len(rows),
+                          "rc": rc, "expected_frames": int(args.frames),
+                          "complete": complete,
                           "identical": identical,
+                          "rows": rows,
                           "first_row": rows[0] if rows else None})
-            print(f"[s5] run0 vs run{k}: {len(rows)} 帧, 逐像素相同={identical}")
+            print(f"[s5] run0 vs run{k}: rc={rc} {len(rows)}/"
+                  f"{args.frames} 帧, 逐像素相同={identical}")
     ok = True
     shas = [tuple(f["sha256"] for f in ev.get("final") or [])
             for ev in runs]
@@ -363,6 +390,22 @@ def main():
     pixel_identical = None
     if psnrs:
         pixel_identical = all(bool(p.get("identical")) for p in psnrs)
+
+    # ---- R23-B12：**没有可比对的东西**不能算通过 ----
+    _incomplete = [p for p in psnrs if not p.get("complete")]
+    if _incomplete:
+        for p in _incomplete:
+            print(f"[FAIL] {p['run']}: 比较不完整 rc={p.get('rc')} "
+                  f"行数={p['frames']}/{p.get('expected_frames')}")
+        ok = False
+    if args.runs > 1:
+        if not runs or any(not (ev.get("final") or []) for ev in runs):
+            print("[FAIL] 有运行没有成品；重复性无从比较")
+            ok = False
+        elif not psnrs:
+            print("[FAIL] 没有任何可比对的成品对")
+            ok = False
+
     if args.deterministic:
         if pixel_identical is False:
             print("[FAIL] deterministic 组逐帧不相同 —— 上游仍有未固定的随机源")

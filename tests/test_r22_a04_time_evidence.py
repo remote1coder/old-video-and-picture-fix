@@ -175,10 +175,24 @@ def test_probe_timeline_single_frame_without_duration_is_unknown(monkeypatch):
 # ------------------------------------------------ 判据接线
 
 def test_final_timeline_gate_consumes_coverage():
-    """门禁必须消费 `coverage_complete`，不能只看 measured。"""
+    """门禁必须消费 `coverage_complete`，不能只看 measured。
+
+    R23-B04 把判定收敛到 `stage7.final_timeline_status()`，所以这里改成
+    **调用那个判据**（行为断言），不再 grep 源码字面量 —— 源码搬一次家
+    就失效的断言，保护的不是行为。
+    """
+    import stage7_encode as _s7
+    good = {"measured": True, "coverage_complete": True, "duration": 0.4,
+            "basis": "video-packet-span"}
+    assert _s7.final_timeline_status(good)[0] == "PASS"
+    status, why = _s7.final_timeline_status(
+        dict(good, coverage_complete=False))
+    assert status == "UNVERIFIED"
+    assert "coverage" in why.lower(), why
+
+    # 门禁本身必须调用这个判据（否则上面测的是"另一个函数"）
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage7_encode.py"),
                encoding="utf-8", errors="replace").read()
-    i = src.index('_ftl_cov_ok = bool(')
-    j = src.index('if _final_tl.get("measured") and _ftl_cov_ok:', i)
-    assert j > i, "final_timeline 的 PASS 分支没有消费 coverage_complete"
+    assert "final_timeline_status(_final_tl)" in src, \
+        "final_timeline 的判定没有走单一来源"
