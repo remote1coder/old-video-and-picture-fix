@@ -200,11 +200,15 @@ def ffmpeg_encoder_formats(encoder: str, timeout: int = 20) -> Set[str]:
     return set()
 
 
-_VS_RX = re.compile(r"^yuv(420|422|444)p(8|10|12|16)", re.IGNORECASE)
+_VS_RX = re.compile(r"^yuv(420|422|444)p(?:(8|10|12|16))?", re.IGNORECASE)
 
 
 def vs_format_of(pix_fmt: str) -> str:
     """ffmpeg 像素格式 → VapourSynth 格式名（``yuv444p16le`` → ``vs.YUV444P16``）。
+
+    R23-B09：8-bit 平面格式**没有数字位深后缀**（`yuv444p`），旧正则要求
+    必须有一位数字，于是 `yuv444p` 认不出来 → 空串 → 调用方退回 420P8。
+    审核用 stage6 的赋值 AST 复现了这个分支（`444 + vs_bit_depth=8`）。
 
     认不出返回空串 —— 调用方据此决定"保持原样"还是"报错"，
     不要在这里猜一个默认值。
@@ -212,12 +216,46 @@ def vs_format_of(pix_fmt: str) -> str:
     m = _VS_RX.match(str(pix_fmt or ""))
     if not m:
         return ""
-    return f"vs.YUV{m.group(1)}P{m.group(2)}"
+    return "vs.YUV%sP%s" % (m.group(1), m.group(2) or "8")
 
 
-def _norm_mode(value) -> str:
-    s = str(value or "").strip().lower()
-    return s if s in MODES else "auto"
+def _norm_mode(value):
+    """把配置值归一成模式。**非法值不静默变 auto**（R23-B09）。
+
+    Returns:
+        ``(mode, error)``；``error`` 非空表示这个值不合法（调用方必须拒绝）。
+        没写（空值）是合法的，按 `auto` 处理。
+    """
+    s = str(value if value is not None else "").strip().lower()
+    if not s:
+        return "auto", ""
+    if s in MODES:
+        return s, ""
+    return "auto", (f"unknown chroma_mode {value!r}; valid values are "
+                    f"{list(MODES)} (refusing to fall back silently)")
+
+
+def _parse_strict_bool(value, *, default=False):
+    """严格布尔解析（R23-B09）。返回 ``(ok, value)``。
+
+    审核反例：`chroma_mode_accept_degraded="false"` 被 `bool("false")` 读成
+    True —— 用户写的是"不接受"，程序读成"接受"。这里只接受真布尔与
+    明确的文本形式（true/false/yes/no/1/0）；其他值一律报错。
+    """
+    if value is None:
+        return True, bool(default)
+    if isinstance(value, bool):
+        return True, value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if float(value) in (0.0, 1.0):
+            return True, bool(value)
+        return False, bool(default)
+    t = str(value).strip().lower()
+    if t in ("true", "yes", "on", "1"):
+        return True, True
+    if t in ("false", "no", "off", "0"):
+        return True, False
+    return False, bool(default)
 
 
 def _probe_source_pix_fmt(path: str) -> str:
@@ -239,22 +277,40 @@ def _probe_source_pix_fmt(path: str) -> str:
 
 def resolve(params: Dict[str, Any], *, source_path: str = "",
             source_pix_fmt: str = "", logger=None) -> Dict[str, Any]:
-    """把模式解析成**一张边界格式表 + 一份能力结论**。
+    """解析工作表示与交付格式，并给出能力结论（R23-B09 / M2）。
+
+    ## 与 R22 的区别（审核逐条复现过）
+
+    R22 只有**一个** `resolved`，于是把"444 工作 + 420 交付"判成冲突；
+    `accept_degraded` 只把 `ok` 翻成 True，**不生成可执行替代**；
+    非法枚举静默变 auto；`preserve` 遇到 422/RGB 说"源未知"。
+
+    现在明确三层：
+
+    | 层 | 字段 | 由什么决定 |
+    |---|---|---|
+    | 模型输入 | `model_input` | 固定 RGB（模型内部无色度子采样）|
+    | 工作表示 | `working` / `boundaries` | `chroma_mode`（stage1–stage6 的落盘格式）|
+    | 交付格式 | `delivery` | `pix_fmt`（最终编码器实际接受的格式）|
+
+    **444 工作 + 420 交付是合法组合**：stage7 末尾做一次明确下采样，
+    计划里写成 `conversion`（含损失说明），不是冲突。
 
     Args:
-        params: 任务参数（读 `chroma_mode` / `chroma_mode_accept_degraded`
-            / `video_encoder` / `encoder` / `vs_bit_depth`）。
-        source_path: 源素材路径；给了就现场探测它的 pix_fmt。
-        source_pix_fmt: 已知源 pix_fmt（优先于探测）。
-        logger: 可选日志器。
+        params: 读 `chroma_mode` / `chroma_mode_accept_degraded` /
+            `pix_fmt` / `video_encoder` / `encoder`。
+        source_path: 源素材路径（现场探测 pix_fmt）。
+        source_pix_fmt: 已知源 pix_fmt（优先）。
+        logger: 可选。
 
     Returns:
-        计划 dict（见模块 docstring）。``ok=False`` 时调用方必须**明确失败**，
-        除非 ``accepted_degraded`` 为真（用户显式接受降级）。
+        计划 dict。``ok=False`` 时调用方必须明确失败；``accepted_degraded``
+        为真时计划里一定带一个**实际可执行**的替代（`degraded` 字段）。
     """
     p = params or {}
-    mode = _norm_mode(p.get("chroma_mode"))
-    accept = bool(p.get("chroma_mode_accept_degraded"))
+    mode, mode_err = _norm_mode(p.get("chroma_mode"))
+    _acc_ok, accept = _parse_strict_bool(p.get("chroma_mode_accept_degraded"),
+                                         default=False)
     src_fmt = str(source_pix_fmt or "").strip()
     if not src_fmt and source_path:
         src_fmt = _probe_source_pix_fmt(source_path)
@@ -263,41 +319,69 @@ def resolve(params: Dict[str, Any], *, source_path: str = "",
     blockers: List[Dict[str, Any]] = []
     warnings: List[str] = []
     recommendation, reason = "420", ""
-    resolved = "420"
-    declared = str(p.get("pix_fmt") or "").strip()
-    declared_chroma = chroma_of_pix_fmt(declared)
+    working = "420"
+
+    if mode_err:
+        blockers.append({
+            "boundary": "config",
+            "kind": "invalid_mode",
+            "detail": mode_err,
+            "cost": ("silently treating it as 'auto' means the user's explicit "
+                     "request is replaced by a default they never chose"),
+        })
 
     if mode == "420":
-        resolved, reason = "420", "explicitly requested 4:2:0"
+        working, reason = "420", "explicitly requested 4:2:0"
     elif mode == "444":
-        resolved, reason = "444", "explicitly requested 4:4:4"
+        working, reason = "444", "explicitly requested 4:4:4"
     elif mode == "preserve":
         if src_chroma == "444":
-            resolved = "444"
-            reason = "preserve: the source is 4:4:4"
+            working, reason = "444", "preserve: the source is 4:4:4"
         elif src_chroma == "420":
-            resolved = "420"
-            reason = "preserve: the source is 4:2:0"
+            working, reason = "420", "preserve: the source is 4:2:0"
+        elif src_chroma == "422":
+            # 已知格式，但项目没有 422 工作表示 —— 这与"读不出来"是两回事。
+            working = "444"
+            reason = ("preserve: the source is 4:2:2. This project has no 4:2:2 "
+                      "working representation, so the closest lossless-in-chroma "
+                      "choice is 4:4:4")
+            blockers.append({
+                "boundary": "source",
+                "kind": "source_chroma_unsupported",
+                "detail": ("source pix_fmt=%r is 4:2:2; only 420/444 working "
+                           "representations exist" % src_fmt),
+                "cost": ("4:4:4 does not recover the vertical half-resolution "
+                         "the source already lost, and 4:2:0 would reduce the "
+                         "horizontal resolution as well"),
+                "suggest": ["chroma_mode=444 (closest), or chroma_mode=420 if "
+                            "you accept the extra reduction"],
+            })
+        elif src_chroma == "rgb-or-gray":
+            working = "444"
+            reason = ("preserve: the source is RGB/gray (no chroma "
+                      "subsampling); 4:4:4 is the only working representation "
+                      "that does not subsample")
+            warnings.append("the source carries no chroma subsampling; a YUV "
+                            "pipeline still applies a matrix conversion")
         else:
-            resolved = "420"
+            working = "420"
             reason = ("preserve was requested but the source chroma could not "
                       "be read; falling back to 4:2:0 is NOT equivalent")
             blockers.append({
                 "boundary": "source",
                 "kind": "source_chroma_unknown",
-                "detail": (f"source pix_fmt={src_fmt!r} → chroma="
-                           f"{src_chroma!r}; 'preserve' cannot be honored"),
-                "cost": "a silent 4:2:0 fallback would destroy real chroma "
-                        "detail, so this must fail instead",
+                "detail": ("source pix_fmt=%r → chroma=%r; 'preserve' cannot "
+                           "be honored" % (src_fmt, src_chroma)),
+                "cost": ("a silent 4:2:0 fallback would destroy real chroma "
+                         "detail, so this must fail instead"),
             })
     else:  # auto
-        if declared_chroma == "444":
-            # 用户已经把成品格式写成 444。**不能**只在最后一步换标签 ——
-            # 那正是审核说的"静默转换后仍称 444 保真"。整链跟着走。
-            resolved = "444"
-            reason = (f"auto: pix_fmt={declared!r} asks for 4:4:4, so the whole "
-                      f"chain follows it (relabeling only the last stage would "
-                      f"not bring chroma detail back)")
+        if chroma_of_pix_fmt(str(p.get("pix_fmt") or "")) == "444":
+            working = "444"
+            reason = ("auto: pix_fmt=%r asks for 4:4:4 delivery, and the whole "
+                      "chain follows it (relabeling only the last stage would "
+                      "not bring chroma detail back)"
+                      % (p.get("pix_fmt"),))
         elif src_chroma == "444":
             recommendation = "444"
             reason = ("auto: the source carries 4:4:4 chroma, so preserving it "
@@ -307,84 +391,151 @@ def resolve(params: Dict[str, Any], *, source_path: str = "",
             reason = ("auto: source chroma unknown; staying on the compatible "
                       "4:2:0 path")
         else:
-            reason = (f"auto: source chroma is {src_chroma}; 4:2:0 loses nothing "
-                      f"that the source actually has")
+            reason = ("auto: source chroma is %s; 4:2:0 loses nothing that "
+                      "the source actually has" % src_chroma)
 
-    # 显式模式与 `pix_fmt` 冲突 → 必须报出来，不能悄悄改一边
-    if mode != "auto" and declared_chroma in ("420", "444") \
-            and declared_chroma != resolved:
-        blockers.append({
-            "boundary": "stage7_final",
-            "kind": "pix_fmt_conflict",
-            "detail": (f"chroma_mode={mode} resolves to {resolved}, but "
-                       f"pix_fmt={declared!r} is {declared_chroma}"),
-            "cost": ("one of the two would have to be ignored; silently "
-                     "ignoring either produces a run whose label and content "
-                     "disagree"),
-        })
+    # ---- 交付格式：可以由 pix_fmt 指定，**与工作表示无关** ----
+    declared = str(p.get("pix_fmt") or "").strip()
+    declared_chroma = chroma_of_pix_fmt(declared)
+    boundaries = dict(_BOUNDARIES[working])
+    if declared_chroma in ("420", "444"):
+        delivery_fmt = declared
+        delivery_chroma = declared_chroma
+    else:
+        delivery_chroma = working
+        delivery_fmt = boundaries["stage7_final"]
 
-    boundaries = dict(_BOUNDARIES[resolved])
+    conversion = None
+    if delivery_chroma != working:
+        if working == "444" and delivery_chroma == "420":
+            conversion = {
+                "from": "444", "to": "420", "stage": "stage7_final",
+                "operation": "single chroma down-sample at delivery",
+                "loss": ("chroma resolution is halved once, at the very end; "
+                         "the 4:4:4 work before it is not undone, but the "
+                         "delivered file will not carry 4:4:4 chroma"),
+            }
+            reason += ("; delivery is 4:2:0, so the chain subsamples once at "
+                       "stage7_final (this is a delivery choice, not a conflict)")
+        else:
+            conversion = {
+                "from": working, "to": delivery_chroma, "stage": "stage7_final",
+                "operation": "chroma up-sample at delivery",
+                "loss": ("none in the delivered file, but nothing is recovered "
+                         "either: the working representation already discarded "
+                         "this detail"),
+            }
+            warnings.append("delivery format has more chroma resolution than "
+                            "the working representation; that is an up-convert "
+                            "and recovers nothing")
+    boundaries["stage7_final"] = delivery_fmt
 
-    # ---- 能力前置核验：编码器必须真的接受这个格式 ----
-    enc = str(p.get("video_encoder") or p.get("encoder") or "").strip()
-    final_fmt = boundaries["stage7_final"]
-    if resolved == "444":
-        fmts = ffmpeg_encoder_formats(enc) if enc else set()
-        if not enc:
-            blockers.append({
-                "boundary": "stage7_final",
-                "kind": "encoder_unknown",
-                "detail": "no encoder configured; cannot verify 4:4:4 support",
-                "cost": "the encoder may silently pick another format",
-            })
-        elif final_fmt not in fmts:
-            blockers.append({
-                "boundary": "stage7_final",
-                "kind": "encoder_unsupported",
-                "detail": (f"{enc} does not list {final_fmt} in its supported "
-                           f"pixel formats ({', '.join(sorted(fmts)) or 'none read'})"),
-                "cost": ("the encoder would either fail or silently subsample "
-                         "to 4:2:0 while the run still claims 4:4:4"),
-                "suggest": [e for e in ("libx265", "libaom-av1")
-                            if final_fmt in ffmpeg_encoder_formats(e)],
-            })
-    # 未声明位深时只提示，不拦（项目默认 16 处理 / 10 成品）
     if str(p.get("chroma_mode") or "") and mode != "auto" and not src_fmt:
         warnings.append("source pix_fmt was not probed; the resolution cannot "
                         "cite what the source actually carried")
 
-    ok = not blockers or accept
+    # ---- 能力核验：看**交付格式**，不是看工作表示 ----
+    # 审核点名："能力核验使用真正的最终编码器/格式/位深"。libsvtav1 不支持
+    # 4:4:4，但"444 工作 + 420 交付"完全可用 —— 旧实现把它一起拦了。
+    enc = str(p.get("video_encoder") or p.get("encoder") or "").strip()
+    degraded = None
+    fmts = ffmpeg_encoder_formats(enc) if enc else set()
+    if not enc:
+        blockers.append({
+            "boundary": "delivery",
+            "kind": "encoder_unknown",
+            "detail": "no encoder configured; cannot verify the delivery format",
+            "cost": "the encoder may silently pick another format",
+        })
+    elif delivery_fmt not in fmts:
+        _alt = [f for f in ("yuv444p10le", "yuv420p10le", "yuv420p")
+                if f in fmts]
+        blockers.append({
+            "boundary": "delivery",
+            "kind": "encoder_unsupported",
+            "detail": ("%s does not list %s in its supported pixel formats "
+                       "(%s)" % (enc, delivery_fmt,
+                                 ", ".join(sorted(fmts)) or "none read")),
+            "cost": ("the encoder would either fail or silently convert while "
+                     "the run still claims the requested delivery format"),
+            "suggest": _alt,
+        })
+        if accept and _alt:
+            # 接受降级 → 生成**具体可执行**的替代计划，而不是只把 ok 翻真
+            _new = _alt[0]
+            degraded = {"from": delivery_fmt, "to": _new,
+                        "reason": "the encoder does not support the requested "
+                                  "delivery format"}
+            blocks_left = [b for b in blockers if b["kind"] != "encoder_unsupported"]
+            blockers = blocks_left
+            delivery_fmt = _new
+            delivery_chroma = chroma_of_pix_fmt(_new)
+            boundaries["stage7_final"] = _new
+            if delivery_chroma != working:
+                conversion = {
+                    "from": working, "to": delivery_chroma,
+                    "stage": "stage7_final",
+                    "operation": "chroma down-sample at delivery (degraded)",
+                    "loss": "requested delivery format unsupported by encoder",
+                }
+            else:
+                conversion = None
+            warnings.append("delivery format degraded to %s (user accepted)"
+                            % _new)
+
+    # 接受降级时，其余 blocker 也必须有可执行替代；没有替代的仍然失败
+    if accept and blockers:
+        for b in blockers:
+            if b.get("suggest"):
+                b["accepted_without_effect"] = True
+
+    ok = (not blockers) or (accept and all(b.get("suggest") for b in blockers))
     plan = {
         "schema": SCHEMA,
         "mode": mode,
-        "resolved": resolved,
+        "mode_error": mode_err,
+        "resolved": working,
+        "working": {
+            "chroma": working,
+            "bit_depth": 16,
+            "boundaries": boundaries,
+        },
+        "delivery": {
+            "pix_fmt": delivery_fmt,
+            "chroma": delivery_chroma,
+            "bit_depth": bit_depth_of(delivery_fmt),
+        },
+        "model_input": {"pix_fmt": "rgb48le", "bit_depth": 16,
+                        "note": "models take RGB; this layer is not subsampled"},
+        "conversion": conversion,
+        "degraded": degraded,
         "reason": reason,
         "recommendation": recommendation,
-        "accepted_degraded": accept,
+        "accepted_degraded": bool(accept),
         "source": {"pix_fmt": src_fmt, "chroma": src_chroma,
                    "probed": bool(src_fmt)},
-        "model_rgb": {"pix_fmt": "rgb48le", "bit_depth": 16,
-                      "note": "models take RGB; this layer is not subsampled"},
         "boundaries": boundaries,
         "blockers": blockers,
         "warnings": warnings,
         "encoder": enc,
-        "ok": ok,
+        "ok": bool(ok),
     }
     if logger:
-        if blockers and not accept:
+        if blockers and not ok:
             logger.error("WORK_FORMAT_UNSUPPORTED",
-                         "The requested working representation cannot be "
-                         "honored by this chain", mode=mode,
-                         resolved=resolved, blockers=blockers)
-        elif blockers and accept:
+                         "The requested working/delivery representation cannot "
+                         "be honored by this chain", mode=mode,
+                         working=working, delivery=delivery_fmt,
+                         blockers=blockers)
+        elif degraded or (blockers and ok):
             logger.warning("WORK_FORMAT_DEGRADED",
-                           "Proceeding after the user accepted a degraded "
-                           "working representation", mode=mode,
-                           resolved=resolved, blockers=blockers)
+                           "Proceeding with a concrete degraded plan",
+                           mode=mode, working=working, delivery=delivery_fmt,
+                           degraded=degraded, blockers=blockers)
         else:
-            logger.info("WORK_FORMAT", "Working representation resolved",
-                        mode=mode, resolved=resolved, reason=reason)
+            logger.info("WORK_FORMAT", "Working/delivery representation resolved",
+                        mode=mode, working=working, delivery=delivery_fmt,
+                        reason=reason)
     return plan
 
 
@@ -419,6 +570,11 @@ def param_keys() -> Tuple[str, ...]:
 
 
 def describe(plan: Dict[str, Any]) -> str:
-    """一行摘要（日志/报告用）。"""
-    return (f"chroma_mode={plan.get('mode')} → {plan.get('resolved')} "
-            f"({plan.get('reason')})")
+    """一行摘要（日志/报告用）：工作表示 → 交付格式。"""
+    _d = (plan.get("delivery") or {}).get("pix_fmt") or "?"
+    _conv = plan.get("conversion")
+    _tail = f" → deliver {_d}" if _d else ""
+    if _conv:
+        _tail += f" (conversion {_conv.get('from')}→{_conv.get('to')})"
+    return (f"chroma_mode={plan.get('mode')} → work {plan.get('resolved')}"
+            f"{_tail} ({plan.get('reason')})")

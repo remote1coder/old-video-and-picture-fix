@@ -115,6 +115,13 @@ CORE_QUALITY_PARAMS = frozenset([
     "g1str", "g2str", "g3str", "grain_strength",
     # Bit depth / pix fmt
     "vs_bit_depth", "pix_fmt",
+    # R23-B03：工作表示与颗粒种子也必须进 param_hash。
+    # 审核用生产函数复现：只改 `chroma_mode: 420→444` 或 `grain_seed: 1→2`，
+    # `compute_param_hash` 都得到同一个 `2ce0b6184dfc3d00` —— 于是
+    # "换了工作表示/换了种子"可以复用上一代中间产物。stage_deps 认为它们
+    # 分别影响全链/仅 stage6，两套身份规则不一致。
+    "chroma_mode", "chroma_mode_accept_degraded",
+    "grain_seed",
     # Encoding
     "crf", "preset", "preset_max_quality",
     # Face restoration

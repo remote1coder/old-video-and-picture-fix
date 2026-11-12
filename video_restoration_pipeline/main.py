@@ -2583,10 +2583,16 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         params["_work_format"] = _wf_plan
         job_logger.info("WORK_FORMAT_PLAN", _wf_desc(_wf_plan),
                         mode=_wf_plan.get("mode"),
-                        resolved=_wf_plan.get("resolved"),
+                        working=_wf_plan.get("resolved"),
+                        delivery=(_wf_plan.get("delivery") or {}).get("pix_fmt"),
                         recommendation=_wf_plan.get("recommendation"),
+                        conversion=_wf_plan.get("conversion"),
+                        degraded=_wf_plan.get("degraded"),
                         boundaries=_wf_plan.get("boundaries"))
-        if _wf_plan.get("blockers") and not _wf_plan.get("accepted_degraded"):
+        # R23-B09：判据收敛到计划自己的 `ok`（它已经要求"接受降级时必须
+        # 给出可执行替代"）。`blockers and not accepted` 会让"接受了但没
+        # 替代"悄悄跑起来。
+        if not _wf_plan.get("ok"):
             job_logger.error(
                 "WORK_FORMAT_REFUSED",
                 "The requested working representation cannot be produced by "

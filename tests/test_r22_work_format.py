@@ -180,25 +180,98 @@ def test_444_with_a_capable_encoder_passes():
     assert p["ok"] is True and p["blockers"] == []
 
 
-def test_accepted_degradation_turns_ok_true_but_is_recorded():
-    p = wf.resolve({"chroma_mode": "444", "video_encoder": "libsvtav1",
+def test_accepted_degradation_produces_a_concrete_plan():
+    """接受降级 ≠ 只把 ok 翻成 True（R23-B09）。
+
+    审核："即使传真正的 True，也只是把 ok 改成 True，resolved/boundaries
+    仍要求不支持的444，没有生成实际可执行的降级方案。"
+    现在必须给出**具体的交付格式替换**，并且计划里保留原因。
+    """
+    p = wf.resolve({"chroma_mode": "444", "pix_fmt": "yuv444p10le",
+                    "video_encoder": "libsvtav1",
                     "chroma_mode_accept_degraded": True},
                    source_pix_fmt="yuv444p10le")
     if not wf.ffmpeg_encoder_formats("libsvtav1"):
         pytest.skip("本机没有 libsvtav1")
     assert p["ok"] is True
     assert p["accepted_degraded"] is True
-    assert p["blockers"], "接受降级也要把降级原因留在计划里"
+    assert p["degraded"], "接受降级必须给出具体替代（不是只改 ok）"
+    assert p["degraded"]["from"] == "yuv444p10le"
+    assert p["degraded"]["to"] == p["delivery"]["pix_fmt"]
+    assert p["degraded"]["to"] in wf.ffmpeg_encoder_formats("libsvtav1")
 
 
-def test_explicit_mode_conflicting_with_pix_fmt_is_reported():
-    """`chroma_mode: 444` + `pix_fmt: yuv420p10le` → 必须报冲突。
+def test_accept_degraded_as_the_string_false_is_not_accepted():
+    """`"false"` 被 `bool()` 读成 True —— 用户写"不接受"，程序读成"接受"。"""
+    p = wf.resolve({"chroma_mode": "444", "pix_fmt": "yuv444p10le",
+                    "video_encoder": "libsvtav1",
+                    "chroma_mode_accept_degraded": "false"},
+                   source_pix_fmt="yuv444p10le")
+    if not wf.ffmpeg_encoder_formats("libsvtav1"):
+        pytest.skip("本机没有 libsvtav1")
+    assert p["accepted_degraded"] is False
+    assert p["ok"] is False
 
-    悄悄听一边的，都会得到"标签与内容不一致"的一代。
+
+def test_444_working_with_420_delivery_is_allowed():
+    """**444 工作 + 420 交付是合法组合**（R23-B09）。
+
+    审核："`chroma_mode=444`、最终 `pix_fmt=yuv420p10le` 被判冲突；
+    处理中保持 444、最后才 420 交付是合理且应保留的组合。"
+    计划要把它写成"末尾一次明确下采样"，并保留损失说明。
     """
     p = wf.resolve({"chroma_mode": "444", "pix_fmt": "yuv420p10le",
                     "video_encoder": "libx265"})
-    assert any(b["kind"] == "pix_fmt_conflict" for b in p["blockers"])
+    assert p["ok"] is True, p["blockers"]
+    assert p["working"]["chroma"] == "444"
+    assert p["delivery"]["pix_fmt"] == "yuv420p10le"
+    assert p["conversion"]["from"] == "444"
+    assert p["conversion"]["to"] == "420"
+    assert "down-sample" in p["conversion"]["operation"]
+    # 工作表示仍然全程 444（stage1–stage6），只有交付是 420
+    assert p["boundaries"]["stage1_render"] == "yuv444p16le"
+    assert p["boundaries"]["stage6_out"] == "yuv444p10le"
+    assert p["boundaries"]["stage7_final"] == "yuv420p10le"
+
+
+def test_invalid_mode_is_rejected_instead_of_silently_auto():
+    p = wf.resolve({"chroma_mode": "bogus", "video_encoder": "libx265"})
+    assert p["ok"] is False
+    assert any(b["kind"] == "invalid_mode" for b in p["blockers"])
+    assert p["mode_error"]
+
+
+def test_preserve_distinguishes_known_unsupported_from_unknown():
+    """4:2:2 是**已知**格式，不能说成"源未知"（审核 B09）。"""
+    p422 = wf.resolve({"chroma_mode": "preserve", "video_encoder": "libx265"},
+                      source_pix_fmt="yuv422p10le")
+    kinds422 = [b["kind"] for b in p422["blockers"]]
+    assert "source_chroma_unsupported" in kinds422, kinds422
+    assert "source_chroma_unknown" not in kinds422
+    # 给出"最接近、不再降低色度分辨率"的候选
+    assert p422["working"]["chroma"] == "444"
+
+    p_unknown = wf.resolve({"chroma_mode": "preserve",
+                            "video_encoder": "libx265"})
+    assert any(b["kind"] == "source_chroma_unknown"
+               for b in p_unknown["blockers"])
+
+
+def test_rgb_source_preserves_without_subsampling():
+    p = wf.resolve({"chroma_mode": "preserve", "video_encoder": "libx265"},
+                   source_pix_fmt="rgb48le")
+    assert p["ok"] is True, p["blockers"]
+    assert p["working"]["chroma"] == "444"
+
+
+@pytest.mark.parametrize("fmt,expect", [
+    ("yuv444p", "vs.YUV444P8"),
+    ("yuv420p", "vs.YUV420P8"),
+    ("yuv444p16le", "vs.YUV444P16"),
+])
+def test_vs_format_understands_8bit_planar(fmt, expect):
+    """8-bit 平面格式没有数字位深后缀，旧正则因此认不出（B09 分支反例）。"""
+    assert wf.vs_format_of(fmt) == expect
 
 
 # ------------------------------------------------ 边界表
