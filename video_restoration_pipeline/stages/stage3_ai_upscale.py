@@ -91,6 +91,28 @@ def _resolve_ai_python(logger=None) -> Optional[str]:
     return py
 
 
+def gpu_fallback_allowed(params) -> bool:
+    """显存不足时是否允许自动降级（R23-13）。
+
+    关掉它意味着"宁可失败，也不要在 CPU 上悄悄跑几个小时"。
+    """
+    return _bool_param((params or {}).get("gpu_memory_fallback"), True)
+
+
+def _bool_param(value, default: bool) -> bool:
+    """严格布尔解析（R23-13）：`"false"` 不能被 `bool()` 读成 True。"""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    t = str(value).strip().lower()
+    if t in ("true", "yes", "on", "1"):
+        return True
+    if t in ("false", "no", "off", "0"):
+        return False
+    return bool(default)
+
+
 def estimate_gpu_memory(width: int, height: int, scale: int,
                         model_name: str) -> int:
     """Estimate GPU memory requirement in bytes."""
@@ -2657,6 +2679,18 @@ def main():
     sufficient, backend = check_gpu_memory(mem_required, logger)
 
     if not sufficient and backend == "cpu":
+        # ---- R23-13：`gpu_memory_fallback` 此前只在 config 里出现 ----
+        # 它描述的是"显存不够时是否允许自动降级（先降倍数、再退 CPU）"。
+        # 写死的行为是"总是降级"，于是用户把开关关掉也没用 —— 关掉应当
+        # **快速失败**，而不是悄悄在 CPU 上跑几个小时。
+        if not gpu_fallback_allowed(params):
+            logger.error(
+                "STAGE3_GPU_NO_MEMORY_NO_FALLBACK",
+                "GPU memory is insufficient and gpu_memory_fallback is "
+                "disabled; refusing to silently fall back to a slower "
+                "backend.", required_mb=round(mem_required / 2 ** 20, 1),
+                scale=scale, model=model)
+            return 83
         # Try 2x if requested 4x, preserving model family
         if scale == 4:
             logger.warning("STAGE3_DOWNSCALE",

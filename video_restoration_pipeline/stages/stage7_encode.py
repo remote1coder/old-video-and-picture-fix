@@ -340,10 +340,32 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
                            f"Hum frequency detection failed: {e}. "
                            "hum_freq stays null (auto), bandreject skipped per v7.32 §3.10.22")
     
+    # ---- R23-13：hum 滤镜改为调用**共用的**构建器 ----
+    # 这里原来复制了一份 `audio_utils.build_hum_filters` 的逻辑，并把
+    # `hum_harmonics` / `hum_bandwidth` / `hum_width_type` 写死成 3/2/h ——
+    # 三个 config 键从未生效（改它们只改 param_hash，音频一个字节不变）。
+    # 现在只有一份实现：`audio_utils.build_hum_filters()`，它读有效计划。
+    def _hum_filters(primary: int, dual: bool):
+        try:
+            from audio_utils import build_hum_filters as _bhf
+            return _bhf(primary, bool(dual), params)
+        except Exception as exc:            # pragma: no cover - 部署异常
+            logger.error("STAGE7_HUM_BUILDER_FAIL",
+                         "Could not build hum filters; falling back to the "
+                         "default 3-harmonic / 2 Hz plan", error=str(exc))
+            return [f"bandreject=f={primary * i}:width_type=h:width=2"
+                    for i in (1, 2, 3)]
+
     if detected_freq and ffmpeg_version_ok:
-        # Fundamental + 2nd + 3rd harmonic, all width=2Hz
-        for f in [detected_freq, detected_freq * 2, detected_freq * 3]:
-            audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
+        _primary_filters = _hum_filters(detected_freq, False)
+        audio_filters.extend(_primary_filters)
+        logger.info("STAGE7_HUM_FILTER_PLAN",
+                    "Hum removal plan resolved from the effective plan",
+                    fundamental=detected_freq,
+                    harmonics=params.get("hum_harmonics", 3),
+                    bandwidth_hz=params.get("hum_bandwidth", 2),
+                    width_type=params.get("hum_width_type", "h"),
+                    filters=_primary_filters)
         
         # Dual hum support
         # FIX-P7-9: Per v7.32 §3.10.22: dual hum must be detected AND user-enabled.
@@ -352,8 +374,7 @@ def _build_audio_filter(audio_path: str, params: dict, logger=None,
         if hum_dual and is_dual_hum:
             # User explicitly enabled + actual dual hum detected
             other = 60 if detected_freq == 50 else 50
-            for f in [other, other * 2, other * 3]:
-                audio_filters.append(f"bandreject=f={f}:width_type=h:width=2")
+            audio_filters.extend(_hum_filters(other, bool(hum_dual)))
             logger.critical("STAGE7_DUAL_HUM_RISK",
                             "Processing BOTH 50Hz+60Hz hum groups per "
                             "hum_dual=true. Audio quality risk — dual "
@@ -3432,6 +3453,8 @@ def main():
                                        "run; this generation carries NO "
                                        "full-chain evidence"),
                             "attempt_id": _attempt_id,
+                            "degraded_inputs": list(
+                                params.get("_degraded_inputs") or []),
                         }, _f2, ensure_ascii=False, indent=2)
                     _fc_pending = (_fc_na_tmp, _fc_na)
                 except Exception as _nae:
@@ -3449,6 +3472,11 @@ def main():
                 try:
                     from artifact_verify import verify_output as _fc_verify
                     _fc = _fc_verify(args.input, _publish_tmp, params)
+                    # R23-08：把"这一代消费了降级中间产物"写进全链报告，
+                    # 让报告读者（而不是只有翻日志的人）能看到。
+                    if isinstance(_fc, dict):
+                        _fc["degraded_inputs"] = list(
+                            params.get("_degraded_inputs") or [])
                     try:
                         import json as _fcj
                         # GATE-03：先写 **attempt 专属**路径。
@@ -4205,6 +4233,11 @@ def main():
                     "Publishing with warnings retained in the report",
                     attempt_id=_attempt_id, warnings=_dec["warnings"])
             _ver_doc["media_sha256"] = _cand_digest
+            # R23-08：这一代是否消费了**降级中间产物**（stage6 回退等）。
+            # 放在 verify 侧车里 —— 它是必需对象，完成验证会读它，
+            # fullchain 报告也会把它带给读者。
+            _ver_doc["degraded_inputs"] = list(
+                params.get("_degraded_inputs") or [])
             _ver_doc["media_bytes"] = _cand_stat.st_size
             _ver_doc["report_scope"] = (
                 "measured on the attempt's private candidate before publish; "

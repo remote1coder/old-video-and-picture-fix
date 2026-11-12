@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 __all__ = [
@@ -43,6 +44,9 @@ __all__ = [
     "param_affects_stage",
     "stage_scope_keys",
     "stage_identity",
+    "degraded_note_path",
+    "read_degraded_note",
+    "degraded_note_is_current",
     "build_reuse_plan",
     "render_reuse_plan",
 ]
@@ -62,13 +66,12 @@ STAGE_NAMES: Dict[int, str] = {
 #: 前缀匹配见 `_STAGE_PREFIXES`。
 _STAGE_KEYS: Dict[int, Set[str]] = {
     0: {"audio_extract_codec", "audio_extract_enabled"},
-    1: {"target_fps", "target_resolution", "vs_bit_depth",
+    1: {"target_resolution", "vs_bit_depth",
         "frame_rate_mode", "progressive_threshold",
         # R18-A04：确定性渲染只改变 stage1（TemporalDegrain / Stab）
         # 与 stage6（GrainFactory3）的输出，不该让其他阶段失效。
         "vs_deterministic"},
-    2: {"deblock", "deblock_alt", "psf_handling", "psf_handling_alt",
-        "traditional_strength", "degrain_enabled"},
+    2: {"deblock", "traditional_strength", "degrain_enabled"},
     3: {"ai_enabled", "ai_force_allow_banned_upscale",
         # R18-A04：执行组模式只改变 stage3+4 的**执行方式**（是否融合），
         # 不影响其他阶段。改它不该让 stage0/1/2 重算。
@@ -109,6 +112,26 @@ _STAGE_PREFIXES: Dict[int, Tuple[str, ...]] = {
         "audio_", "bitrate"),
 }
 
+#: **声明了但没有任何读取点**的键（R23-13 静态扫描 + 逐条人工核对）。
+#:
+#: 它们出现在 config.yaml 里、可能还在文档中，但代码**从不读取**。
+#: 处理方式：
+#:   * 从 `CORE_QUALITY_PARAMS` 与 `_STAGE_KEYS` 中移除 —— 否则改它们只会
+#:     产生**无谓的失效**（重算一遍，输出一模一样）；
+#:   * 保留在这里，让 `tests/probes/param_capability_matrix.py` 与
+#:     `tests/test_r23_param_capability.py` 能区分"已知未实现"与"新出现的死键"。
+#:
+#: 要"实现"其中任何一个时，把它从这里删掉、加进 `_STAGE_KEYS` 与
+#: `CORE_QUALITY_PARAMS`，并补一条**行为**测试（不是 grep）。
+DECLARED_NOT_IMPLEMENTED = frozenset({
+    "target_fps",            # 时间轴改帧率：stage1 只认 fps_interpret/original_fps
+    "psf_handling",          # PSF 处理策略：stage1 用 psf_use_input_type1 决定
+    "psf_handling_alt",
+    "deblock_alt",           # 备选去块：只实现了 deblock（DeblockPP7 分支未接）
+    "qtgmc_input_type_rule", # 规则文本；实际由 qtgmc_input_type 直接决定
+    "qtgmc_tff_required",
+})
+
 #: 影响**所有** stage 的参数（处理位深、像素格式等贯穿全链）。
 GLOBAL_PARAMS: Set[str] = {
     "vs_bit_depth", "pix_fmt", "color_range", "platform",
@@ -124,6 +147,22 @@ NON_SEMANTIC_PARAMS: Set[str] = {
     "keep_steps", "retry_count", "publish_lock_timeout",
     "output_dir", "temp_dir", "output_path", "input_path",
     "duration", "job_id", "run_id", "attempt_id",
+    # ---- R23-13：下面这些**会被读**，但不改变媒体像素/音频 ----------
+    # 它们控制"怎么跑"和"门禁多严"，不是"跑出什么"。
+    # 放进这里而不是 CORE_QUALITY_PARAMS：改它们不该让中间产物重算
+    # （跑一次几十分钟，只为换个超时值，纯属浪费）。
+    "stage_inactivity_timeout",     # 看门狗：多久没进展算卡死
+    "stage_hard_timeout_hours",     # 硬超时
+    "ai_frame_transport",           # 帧传输方式（共享内存/PNG）
+    "ai_stream_raw",                # 零落盘流式
+    "ai_frame_buffer_frames",
+    "ai_frame_memory_fraction",
+    "ai_frame_min_buffer_frames",
+    "ai_frame_min_free_bytes",
+    "color_drift_threshold",        # 颜色漂移门禁阈值（只影响是否拒绝）
+    "color_drift_enforce",
+    "full_chain_verify",            # 是否要求 fullchain 报告（对象集合，不是媒体）
+    "full_chain_verify_mode",
 }
 
 
@@ -199,6 +238,57 @@ def stage_identity(params: Dict[str, Any], stage: int) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def degraded_note_path(artifact: str) -> str:
+    """降级侧车路径（stage6 写的就是这个名字）。"""
+    return str(artifact) + ".degraded.json"
+
+
+def read_degraded_note(artifact: str) -> Optional[Dict[str, Any]]:
+    """读取降级侧车；不存在 / 读不出来返回 None。
+
+    R23-08：侧车此前**只写不读** —— 检查点不知道"这份中间产物是降级货"，
+    最终报告也不提。于是"换了插件、强度减半"这件事只留在会轮转的日志里。
+    """
+    import json
+    p = degraded_note_path(artifact)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def degraded_note_is_current(artifact: str) -> Tuple[bool, str]:
+    """侧车是否**描述当前这份字节**。
+
+    Returns:
+        ``(ok, reason)``。侧车缺失 → ``(False, "no sidecar")``；
+        有侧车但摘要不符 → ``(False, "sidecar belongs to other bytes")``。
+        "缺失"与"过时"在调用方那里含义不同，所以这里都要区分。
+    """
+    note = read_degraded_note(artifact)
+    if note is None:
+        return False, "no sidecar"
+    want = str(note.get("output_sha256") or "")
+    if not want:
+        return False, "sidecar records no content digest"
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with open(artifact, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        got = h.hexdigest()
+    except OSError:
+        return False, "artifact is unreadable"
+    if got != want:
+        return False, "sidecar belongs to other bytes"
+    return True, "ok"
+
+
 def build_reuse_plan(
     params: Dict[str, Any],
     recorded_by_stage: Dict[int, Optional[Dict[str, Any]]],
@@ -261,9 +351,35 @@ def build_reuse_plan(
 
         cur_id = stage_identity(params, stage)
         if cur_id == prev_id:
-            reusable.append({"stage": stage,
-                             "path": rec.get("artifact") or rec.get("path"),
-                             "reason": "identity-match"})
+            _art = rec.get("artifact") or rec.get("path") or ""
+            # ---- R23-08：降级侧车必须被**消费** ----
+            # 侧车存在但描述的是别的字节 → 这份产物在降级记录之后被换过，
+            # 不能复用（否则"已降级"的说明会挂到一份没降级的产物上）。
+            _note = read_degraded_note(_art) if _art else None
+            if _note is not None:
+                _ok, _why = degraded_note_is_current(_art)
+                if not _ok:
+                    invalidated.append({
+                        "stage": stage,
+                        "reason": "stale-degraded-sidecar",
+                        "changed_keys": [],
+                        "detail": _why,
+                    })
+                    first_invalid = (first_invalid
+                                     if first_invalid is not None else stage)
+                    stale.append(_art)
+                    continue
+            _entry = {"stage": stage, "path": _art,
+                      "reason": "identity-match"}
+            if _note is not None:
+                # 复用的是**降级产物** —— 这件事必须跟着复用结论走，
+                # 否则下游会以为拿到的是完整 GrainFactory3 的颗粒。
+                _entry["degraded"] = True
+                _entry["degraded_plugin"] = str(
+                    _note.get("plugin_used") or "unknown")
+                notes.append(f"stage{stage}: reusing a DEGRADED artifact "
+                             f"({_entry['degraded_plugin']})")
+            reusable.append(_entry)
         else:
             # 找出到底哪些键变了（便于人看，也避免"不知道为什么重算"）
             prev_scope = rec.get("stage_scope") or {}

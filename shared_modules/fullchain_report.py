@@ -101,6 +101,9 @@ def collect(json_files: list, outputs_dir: str) -> list:
             "frames_ok": (checks.get("frames") or {}).get("ok"),
             "duration_ok": (checks.get("duration") or {}).get("ok"),
             "ok": (d or {}).get("ok"),
+            # R23-08：降级信息要进**报告**，不能只留在日志
+            "degraded_inputs": (d or {}).get("degraded_inputs") or [],
+            "degraded": bool((d or {}).get("degraded_inputs")),
         })
     return rows
 

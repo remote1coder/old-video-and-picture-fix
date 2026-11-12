@@ -113,6 +113,21 @@ CORE_QUALITY_PARAMS = frozenset([
     "upscale_scale", "upscale_model", "face_restore",
     # Grain
     "g1str", "g2str", "g3str", "grain_strength",
+    # ---- R23-13：这些键**会被代码读取并改变输出**，此前不在白名单里 ----
+    # 后果：改它们不改变 param_hash → 旧的中间产物被直接复用。
+    # 由 `tests/probes/param_capability_matrix.py` 扫出来、逐条核对过。
+    "stabilize",                     # stage1：是否做抖动稳定
+    "shake_probe_samples",           # stage1：抖动探测采样（决定要不要稳）
+    "shake_probe_frames",
+    "shake_probe_threshold_px",
+    "tff_bff_percent",               # stage2：隔行判定阈值
+    "progressive_percent",
+    "psf_use_input_type1",           # stage1：QTGMC 的 PSF 分支
+    "temp_avg",                      # stage6：颗粒时域平均（改变像素）
+    "hum_width_type",                # stage7：bandreject 宽度类型
+    "hum_auto_detect_seconds",       # stage7：hum 探测窗口
+    "arnndn_model",                  # stage7：降噪模型（换模型=换实现）
+    "multichannel_preserve",         # stage7：多声道布局
     # Bit depth / pix fmt
     "vs_bit_depth", "pix_fmt",
     # R23-B03：工作表示与颗粒种子也必须进 param_hash。
@@ -150,9 +165,12 @@ CORE_QUALITY_PARAMS = frozenset([
     "channel_correction_float_precision",
     "archival_mode", "local_mask_denoise",
     # QTGMC / field order behavior
-    "qtgmc_input_type", "qtgmc_input_type_rule", "qtgmc_tff_required", "qtgmc_clear_fieldbased",
+    # R23-13：`qtgmc_input_type_rule` / `qtgmc_tff_required` 全仓库无人读取，
+    # 已移出白名单（它们只会让改配置产生无谓的失效）。
+    "qtgmc_input_type", "qtgmc_clear_fieldbased",
     # IVTC / PSF / deblock / deinterlace method selection
-    "ivtc_auto_fallback", "psf_handling", "deblock", "deinterlace",
+    "ivtc_auto_fallback", "deblock", "deinterlace",
+    # `psf_handling` 同样无人读取（见 stage_deps.DECLARED_NOT_IMPLEMENTED）
     # AI upscale banning and gating
     "max_scale", "force_traditional_first", "force_allow_banned_upscale",
     "ban_original_input_pixels", "ban_intermediate_pixels",

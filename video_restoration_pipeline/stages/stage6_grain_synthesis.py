@@ -1145,8 +1145,16 @@ def main() -> int:
         if _cancel_guard is not None:
             _cancel_guard.release_outputs()
         if _degraded is not None:
-            _write_degraded_note(output_path, result, _degraded,
-                                 g1str, g2str, g3str, addgrainc_ratio, logger)
+            # R23-08：侧车写失败不能只告警 —— 这一代明明是降级产物，
+            # 却没有任何消费者能读到这件事。宁可让阶段失败，也不留一份
+            # "看起来完整、实际换了插件"的产物。
+            if not _write_degraded_note(output_path, result, _degraded,
+                                        g1str, g2str, g3str,
+                                        addgrainc_ratio, logger):
+                return 84
+        else:
+            # 正常重跑**不继承**旧侧车：这一代没用降级插件，旧说明必须消失。
+            _clear_degraded_note(output_path, logger)
     return rc
 
 
@@ -1259,10 +1267,33 @@ def dispatch_result(result: "GrainPipelineResult", addgrainc_enabled: bool,
     return 84, None
 
 
+def _clear_degraded_note(output_path: str, logger) -> None:
+    """删掉**上一代遗留**的降级侧车（R23-08）。
+
+    正常重跑写出的是完整 GrainFactory3 产物，旧侧车继续留着就是在说谎：
+    检查点会把它当成"降级产物"，最终报告也会这么写。
+    """
+    p = str(output_path) + ".degraded.json"
+    if not os.path.exists(p):
+        return
+    try:
+        os.remove(p)
+        if logger:
+            logger.info("STAGE6_DEGRADED_NOTE_CLEARED",
+                        "Removed a stale degraded-output sidecar from a "
+                        "previous generation", path=p)
+    except OSError as exc:              # pragma: no cover - 权限/占用
+        if logger:
+            logger.warning("STAGE6_DEGRADED_NOTE_CLEAR_FAIL",
+                           "A stale degraded-output sidecar could not be "
+                           "removed; it may describe a previous generation",
+                           path=p, error=str(exc))
+
+
 def _write_degraded_note(output_path: str, first: "GrainPipelineResult",
                          second: "GrainPipelineResult",
                          g1str: float, g2str: float, g3str: float,
-                         addgrainc_ratio: float, logger) -> None:
+                         addgrainc_ratio: float, logger) -> bool:
     """把"这一代是降级产物"落成侧车文件（R21-C01）。
 
     审核要求：回退成功必须验证实际输出，**并记录降级**。
@@ -1315,13 +1346,18 @@ def _write_degraded_note(output_path: str, first: "GrainPipelineResult",
         with open(_tmp, "w", encoding="utf-8") as f:
             _json.dump(_note, f, ensure_ascii=False, indent=2)
         os.replace(_tmp, output_path + ".degraded.json")
-    except Exception as exc:            # 诊断失败不改变阶段结论
+        return True
+    except Exception as exc:
+        # 写不出来 → 调用方必须让阶段失败（见上方调用点）。
         try:
-            logger.warning("STAGE6_DEGRADED_NOTE_FAIL",
-                           "Could not write the degraded-output sidecar; the "
-                           "degradation is only in the log", error=str(exc))
+            logger.error("STAGE6_DEGRADED_NOTE_FAIL",
+                         "This generation used a fallback plugin but its "
+                         "degraded-output sidecar could not be written; no "
+                         "consumer could learn that, so the stage fails",
+                         error=str(exc))
         except Exception:
             pass
+        return False
 
 
 if __name__ == "__main__":

@@ -2720,6 +2720,24 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                             continue
                 _recorded[_sn] = _rec
             _reuse_plan = build_reuse_plan(params, _recorded)
+            # ---- R23-08：降级侧车必须被**这一代**记住 ----
+            # 复用计划已经读过侧车；这里把"复用的是降级产物"落到 params，
+            # stage7 会写进 verify 侧车（必需对象），完成验证与读报告的人
+            # 都能看到 —— 而不是只留在会轮转的日志里。
+            try:
+                _deg = [{"stage": r["stage"], "path": r.get("path"),
+                         "plugin": r.get("degraded_plugin")}
+                        for r in (_reuse_plan.get("reusable") or [])
+                        if r.get("degraded")]
+                if _deg:
+                    params["_degraded_inputs"] = _deg
+                    job_logger.warning(
+                        "STAGE_REUSE_DEGRADED",
+                        "This run reuses a degraded intermediate artifact; "
+                        "the degradation will be recorded in this "
+                        "generation's verify sidecar", degraded=_deg)
+            except Exception:
+                pass
             job_logger.info(
                 "STAGE_REUSE_PLAN",
                 "Computed a per-stage reuse plan before running",

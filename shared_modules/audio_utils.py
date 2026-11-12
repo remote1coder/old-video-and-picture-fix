@@ -247,25 +247,41 @@ def get_audio_info(audio_path: str) -> Dict[str, Any]:
 def build_hum_filters(freq: int, dual_hum: bool = False,
                       config: Dict[str, Any] = None) -> List[str]:
     """Build bandreject filter chain for hum removal.
-    
-    Covers fundamental + second harmonic + third harmonic.
-    All filters use width_type=h:width=2 (two Hz total bandwidth).
+
+    R23-13：谐波数 / 带宽 / 宽度类型改为读计划（默认值与旧硬编码一致：
+    3 个谐波、2 Hz、`h`）。三个键此前只写在 config.yaml 里 —— 改成它们
+    只会让 param_hash 变，音频滤镜一个字节都不变。
+
+    Args:
+        freq: 基频（50/60）。
+        dual_hum: 是否处理双频群（还需 `hum_dual` 为真）。
+        config: 有效参数（顶层键；通常就是合并后的 params）。
+
+    Returns:
+        ``["bandreject=f=50:width_type=h:width=2", ...]``。
     """
     if config is None:
         config = {}
-    
-    filters = []
-    
-    # Primary frequency: fundamental + second + third harmonic, all width=2
-    for f in [freq, freq * 2, freq * 3]:
-        filters.append(f"bandreject=f={f}:width_type=h:width=2")
-    
-    # Dual hum: only if explicitly enabled
+    try:
+        n = max(1, min(8, int(config.get("hum_harmonics", 3))))
+    except (TypeError, ValueError):
+        n = 3
+    try:
+        bw = max(0.1, min(100.0, float(config.get("hum_bandwidth", 2))))
+    except (TypeError, ValueError):
+        bw = 2.0
+    wt = str(config.get("hum_width_type") or "h").strip().lower()
+    if wt not in ("h", "q", "o", "s", "t"):
+        wt = "h"
+
+    def _group(f: int):
+        return [f"bandreject=f={f * i}:width_type={wt}:width={bw:g}"
+                for i in range(1, n + 1)]
+
+    filters = _group(int(freq))
     if dual_hum and config.get("hum_dual", False):
         other_freq = 60 if freq == 50 else 50
-        for f in [other_freq, other_freq * 2, other_freq * 3]:
-            filters.append(f"bandreject=f={f}:width_type=h:width=2")
-    
+        filters.extend(_group(other_freq))
     return filters
 
 
