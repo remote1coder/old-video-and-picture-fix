@@ -1044,6 +1044,9 @@ def main() -> int:
         return 81
 
     logger.info("STAGE6_START", "Grain synthesis", input=input_source,
+                    # R23-12：把实际用到的种子写进日志 —— 排查"改了
+                    # grain_seed 但输出不变"时，第一件事就是看它到没到。
+                    seed=params.get("grain_seed"),
                 g1str=g1str, g2str=g2str, g3str=g3str,
                 temp_avg=temp_avg, material_key=material_key)
 
