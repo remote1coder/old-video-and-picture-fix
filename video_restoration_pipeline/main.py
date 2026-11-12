@@ -505,17 +505,50 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
 
     # ISSUE-V-MAIN-003: avoid command-line length limits by using params file when long
     import json
-    import tempfile
     params_json = json.dumps(params, default=str)
     params_file = None
-    # Windows cmd limit is 32767; leave safety margin. Also use file for any long dict.
-    if len(params_json) > 30000:
+    # ---- R23-LONG-01：命令行长度必须按**转义后**的总长判断 ----
+    #
+    # Windows 的 CreateProcess 上限是 **32767 个字符**。这里有两个坑，旧的
+    # `len(params_json) > 30000` 两个都踩：
+    #
+    # 坑 1：`len(params_json)` **不是**命令行里的实际占用。params 是 JSON，
+    #   里面全是 `"` 和 Windows 路径的 `\`；`subprocess.list2cmdline()` 会把
+    #   它们再转义一遍。**实测增幅 1.13–1.30 倍**（内容相关：纯数字 1.16、
+    #   Windows 路径 1.13、路径+中文+引号 1.30）。
+    #   再叠加 head/tail 与安全余量（约 1.5 千字符），`len(params_json)` 到
+    #   **2.5 万以上就可能越界**；而旧判据要到 3 万才切文件 ——
+    #   中间那 5000 字符是"看着安全、实际必炸"的区间。
+    # 坑 2：失败形态极难查。Popen 抛
+    #   `[WinError 206] The filename or extension is too long`，被下面那个
+    #   `except Exception: return 82` 吞成 "Stage 1 failed: 82"；失败发生在
+    #   10 毫秒内、temp 一个字节都没写 —— 只会让人去怀疑素材或滤镜。
+    #
+    # 实测（2026-11-12，16 分钟 1080p 真实素材，962.295s/28840 帧）：stage1 必中。
+    # params 里现在有 `_work_format` 计划（boundaries 表）、`_frozen_param_digest`
+    # 等结构化字段，比旧版大得多。
+    #
+    # 现在按 list2cmdline 的真实结果判断；写文件失败时**明确报错**，
+    # 不再回落 inline（回落只会二次触发 206，再被吞成看不懂的 82）。
+    _CMDLINE_LIMIT = 32767      # Windows CreateProcess 硬上限（字符）
+    _SAFETY_MARGIN = 1024       # 环境块 / CreateProcess 自身开销
+    _head_len = len(subprocess.list2cmdline(cmd))
+    # 后面固定还会追加 --config，可能还有 --no-wsl-redirect / --cleanup-intermediates
+    _tail_len = (len(subprocess.list2cmdline(["--config", str(config_path)]))
+                 + 64)
+    _quoted_params = subprocess.list2cmdline([params_json])
+    _need = _head_len + len(_quoted_params) + _tail_len + _SAFETY_MARGIN
+    if _need > _CMDLINE_LIMIT:
         try:
             params_file = _write_stage_params_file(params, params_json)
             cmd.extend(["--params-file", params_file])
-        except Exception:
-            # Fallback to inline JSON if temp file fails
-            cmd.extend(["--params", params_json])
+        except Exception as exc:
+            return 80, (
+                "cannot pass stage parameters: the inlined arguments would need "
+                "%d characters (Windows limit %d; params %d chars -> %d after "
+                "escaping) and the params file could not be written: %s"
+                % (_need, _CMDLINE_LIMIT, len(params_json),
+                   len(_quoted_params), exc))
     else:
         cmd.extend(["--params", params_json])
 
@@ -657,6 +690,17 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
                     f"(last marker={e.last_progress})")
     except subprocess.TimeoutExpired:
         return 87, f"Stage exceeded the final safety limit ({timeout}s)"
+    except OSError as e:
+        # R23-LONG-01：命令行越界在 Python 侧是 OSError(WinError 206)，
+        # 必须单独说清楚。否则它落进下面的 `except Exception` 变成
+        # "Stage 1 failed: 82"，运维只会去怀疑素材/滤镜，查不到真因。
+        if getattr(e, "winerror", None) == 206:
+            return 80, (
+                "command line too long for CreateProcess (WinError 206): the "
+                "stage arguments exceed the Windows 32767-character limit "
+                "(%d characters of params were inlined)"
+                % len(params_json))
+        return 82, str(e)
     except Exception as e:
         return 82, str(e)  # IO error
     finally:
