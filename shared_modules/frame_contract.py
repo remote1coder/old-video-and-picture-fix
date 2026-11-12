@@ -102,6 +102,8 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
                    frames_digest: Optional[str] = None,
                    frames_digest_proven: Optional[bool] = None,
                    frames_digest_domain: str = "",
+                   pix_fmt_proven: Optional[bool] = None,
+                   execution: Optional[Dict[str, Any]] = None,
                    source: str = "") -> Dict[str, Any]:
     """构造帧边界合同。
 
@@ -127,6 +129,8 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
     bit_depth, order = pix_fmt_info(pix_fmt)
     if frames_digest_proven is None:
         frames_digest_proven = bool(frames_digest)
+    if pix_fmt_proven is None:
+        pix_fmt_proven = bool(pix_fmt)
     return {
         "schema": SCHEMA,
         "frames": int(frames),
@@ -138,8 +142,16 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
         "frames_digest": frames_digest or None,
         "frames_digest_proven": bool(frames_digest_proven),
         "frames_digest_domain": str(frames_digest_domain or ""),
+        # R23-B08：格式是**探测到的**还是**请求值回填**的，必须分开。
+        # 审核：模拟 probe 失败时，生产写入器把请求的尺寸/格式填进去，
+        # 虽然写了 gaps，`contract_problems` 仍然返回空 → 合同"看起来完整"。
+        "pix_fmt_proven": bool(pix_fmt_proven),
         # 这一串帧是谁产的：模型 / 冻结帧源 / PNG 中转
         "source": str(source),
+        # R23-B08：`ai` 只放**模型/实现身份**；"这条链怎么跑的"（经典/融合）
+        # 放 `execution`。两者混在一起会让"经典 vs 融合"的合法差异被当成
+        # 模型身份差异 —— 反之也会让真正的模型替换躲在执行差异后面。
+        "execution": dict(execution or {}),
         "timeline": dict(timeline or {}),
         "color": dict(color or {}),
         "ai": dict(ai or {}),
@@ -168,9 +180,29 @@ def contract_problems(contract: Dict[str, Any]) -> List[str]:
     elif contract.get("bit_depth") is None:
         p.append(f"pix_fmt {contract.get('pix_fmt')!r} is not a known format; "
                  f"bit_depth is unknown")
+    if contract.get("pix_fmt_proven") is False:
+        p.append("the output pixel format was not probed; the recorded value "
+                 "is the requested one, not a measured fact")
     if not contract.get("frames_digest_proven"):
         p.append("frames_digest is not proven (this boundary cannot be used "
                  "as evidence that both paths consumed the same frames)")
+    elif not str(contract.get("frames_digest") or ""):
+        # R23-B08：`proven=True` 但摘要为空 —— 旧实现返回空问题列表。
+        p.append("frames_digest is marked proven but no digest is recorded")
+    _tl = contract.get("timeline")
+    if not isinstance(_tl, dict) or not _tl:
+        p.append("no timeline reference (this boundary cannot prove when the "
+                 "frames are supposed to be shown)")
+    elif not any(str(_tl.get(k) or "") for k in
+                 ("path", "plan_path", "digest", "content_digest")):
+        p.append("timeline reference has no content identity (a file name, "
+                 "fps and frame count are not a reference)")
+    if not isinstance(contract.get("color"), dict) or not contract.get("color"):
+        p.append("no colour contract recorded for this boundary")
+    if not isinstance(contract.get("ai"), dict) or not contract.get("ai"):
+        p.append("no implementation/model fingerprint recorded")
+    for gap in (contract.get("gaps") or []):
+        p.append(f"recorded gap: {gap}")
     return p
 
 
@@ -195,6 +227,19 @@ def compare_contracts(a: Dict[str, Any], b: Dict[str, Any],
             continue
         if va != vb:
             p.append(f"{k} differs: {va!r} vs {vb!r}")
+    # ---- R23-B08：声明层（时间/颜色/模型）也要比，且**分开报** ----
+    # 审核反例：同摘要、域/时间/颜色/模型都不同，`compare_contracts` 仍为空。
+    # 它们不属于"像素差异"，但也绝不能"完全不比较"。
+    for _k, _label in (("timeline", "timeline reference"),
+                       ("color", "colour contract"),
+                       ("ai", "implementation/model fingerprint")):
+        _va, _vb = a.get(_k), b.get(_k)
+        if _va != _vb:
+            if not _va or not _vb:
+                p.append(f"{_label} is missing on one side")
+            else:
+                p.append(f"{_label} differs (declaration layer, not pixels)")
+
     da, db = a.get("frames_digest"), b.get("frames_digest")
     if not a.get("frames_digest_proven") or not b.get("frames_digest_proven"):
         p.append("frames_digest is unproven on at least one side; "

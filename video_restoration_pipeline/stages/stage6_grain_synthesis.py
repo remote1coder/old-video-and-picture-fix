@@ -288,6 +288,23 @@ class GrainPipelineResult:
         "haf.", "name 'haf'",
         "not found in the plugin", "unknown function")
 
+    #: 编码器侧**独立**故障的典型措辞（R23-B06）。
+    #:
+    #: 审核受控例：双进程都失败、顺序不可辨，vspipe 留
+    #: `havsfunc.GrainFactory3 / BrokenPipeError`，ffmpeg 留
+    #: `No space left on device` —— 旧实现按"生产者留了日志"判成插件能力失败，
+    #: 于是调用一次**救不了磁盘**的回退。磁盘满/权限/只读/OOM 这些原因
+    #: 与插件无关，必须先认出来。
+    _INDEPENDENT_ENCODER_CAUSES: Tuple[str, ...] = (
+        "no space left on device", "disk full", "read-only file system",
+        "permission denied", "cannot allocate memory", "out of memory",
+        "input/output error", "no such file or directory")
+
+    def encoder_failure_is_independent(self) -> bool:
+        """编码器侧的失败是否有**与插件无关**的独立原因。"""
+        tail = (self.encoder_tail or "").lower()
+        return any(k in tail for k in self._INDEPENDENT_ENCODER_CAUSES)
+
     def is_plugin_capability_failure(self) -> bool:
         """是否属于"插件能力缺失"，可按配置尝试 AddGrainC 回退。
 
@@ -315,13 +332,22 @@ class GrainPipelineResult:
         _prod = (self.vspipe_tail or "").lower()
         _hit = any(k in _prod for k in self._PLUGIN_TOKENS)
 
-        # ② 生产者侧失败 → 看它自己的尾部
+        # ② **独立原因优先**（R23-B06）。磁盘满/权限/只读/OOM 与插件无关：
+        #    这时无论生产者留下什么措辞，都不能判成"插件缺失"去回退 ——
+        #    换插件救不了磁盘，只会把真原因盖住。
+        if self.encoder_failure_is_independent():
+            return False
+
+        # ③ 生产者侧失败 → 看它自己的尾部
         if self.failed_stage == "vspipe":
             return _hit
-        # ③ 编码器失败：只有**确认生产者先退出**的级联才算插件问题。
-        #    R22-A06：审核指出"一次轮询同时看到两个进程结束时，固定先遍历
-        #    vspipe，于是把它记在前面" —— 那是观察顺序，不是因果。
-        #    所以 `first_exit` 为空（顺序不明）时一律**不认**插件失败。
+        # ④ 顺序不可辨（两边都非零、同轮观察到）：
+        #    审核明确"先后顺序只是观测信息，不能充当唯一根因证据"。
+        #    所以这里不靠顺序，而是要求**生产者尾部有硬插件信号**
+        #    且编码器没有独立原因（上面已排除）。
+        if self.failed_stage == "ambiguous":
+            return _hit
+        # ⑤ 编码器失败：需要确认生产者先退出才算级联插件问题
         if self.failed_stage in ("ffmpeg", "wait"):
             return _hit and self.first_exit == "vspipe"
         return False
@@ -631,12 +657,15 @@ def _run_grain_pipeline(vs_script_str: str, vs_path: str,
                           f"(vspipe rc={vs_rc}, ffmpeg rc={enc_rc}): "
                           f"{vs_log.tail_text()[-800:]}")
             elif (vs_log.tail_text() or "").strip():
-                # 同一轮轮询里双双退出、顺序不可辨 → 退回"谁留下了报错"
-                status, stage_name = 84, "vspipe"
-                detail = (f"both processes failed; exit order indistinguishable, "
-                          f"the producer left a message "
+                # 同一轮轮询里双双退出、顺序不可辨。
+                # R23-B06：**不能**因为"生产者留下了日志"就把 failed_stage
+                # 写成 vspipe —— 那是观察，不是归因。这里如实记"ambiguous"，
+                # 由分类器按"硬插件信号 + 编码器无独立原因"判断。
+                status, stage_name = 84, "ambiguous"
+                detail = (f"both processes failed; exit order indistinguishable "
                           f"(vspipe rc={vs_rc}, ffmpeg rc={enc_rc}): "
-                          f"{vs_log.tail_text()[-800:]}")
+                          f"vspipe_tail={(vs_log.tail_text() or '')[-400:]} | "
+                          f"encoder_tail={(enc_log.tail_text() or '')[-400:]}")
             else:
                 status, stage_name = 84, "ffmpeg"
                 detail = (f"both processes failed; exit order indistinguishable "

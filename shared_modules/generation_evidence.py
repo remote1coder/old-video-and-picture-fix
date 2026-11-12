@@ -155,11 +155,22 @@ def collect(src: str, out: str, stage: str,
     """
     oc = color_group(out)
     sc = color_group(src)
+    _changed = _changed_tags(sc, oc)
     return {"color": oc,
             "color_source": sc,
             "color_lost_tags": _lost_tags(sc, oc),
             # R21-C06：源与产物都有值但不同 → 必须报出来
-            "color_changed_tags": _changed_tags(sc, oc),
+            "color_changed_tags": _changed,
+            # R23-B07：本函数**不执行**颜色转换（那是 ffmpeg 滤镜做的），
+            # 所以它不能声明 `applied`，更不能编一份合同。如实写"未记录"，
+            # 让消费方把"改了标签但没合同"判成未验证 —— 这比自证安全。
+            "color_conversion": {
+                "applied": [],
+                "contract": None,
+                "evidence_state": ("no conversion recorded by this producer; "
+                                   "changed tags therefore cannot be explained "
+                                   "by this receipt"),
+            },
             "bounds": bounds_report(src, out, stage, params, logger)}
 
 
@@ -194,6 +205,81 @@ def derive_color_relations(src_color: Dict[str, Any],
         elif a and b and str(a) != str(b):
             changed.append({"field": k, "source": a, "output": b})
     return lost, changed
+
+
+#: 一次颜色转换合同必须写清的字段（R23-B07）。
+_CONTRACT_SCHEMA = "color-conversion/1"
+
+
+def _color_contract_problems(contract, applied, changed_rows):
+    """校验"颜色转换合同"是否**能证明**这次转换（R23-B07）。
+
+    合法转换不能一律拒绝（BT.601→BT.709 是真实需求），但也不能由
+    "一段非空文字"来自证。要求：
+
+    - 是 dict，`schema` 为 `color-conversion/1`；
+    - `from` / `to` 都给出四元组（matrix/range/primaries/transfer）；
+    - `operations` 非空，且**覆盖** `applied` 里的每一项；
+    - `implementation` 非空（哪个工具/滤镜做的）；
+    - `binding` 绑定输入与输出的内容摘要（不能是"我做了"这种声明）；
+    - `from`/`to` 的取值必须与观测到的 changed 行一致 —— 否则合同描述的
+      是另一次转换。
+
+    Returns:
+        list[str]；空列表表示这份合同可以作为证据。
+    """
+    p = []
+    if contract is None:
+        p.append("colour conversion was applied but no contract is recorded; "
+                 "re-labelling alone is not a conversion")
+        return p
+    if isinstance(contract, str):
+        p.append("colour conversion contract is a bare string; a free-text "
+                 "claim cannot prove which conversion happened")
+        return p
+    if not isinstance(contract, dict):
+        p.append(f"colour conversion contract has type "
+                 f"{type(contract).__name__}, expected an object")
+        return p
+    if str(contract.get("schema") or "") != _CONTRACT_SCHEMA:
+        p.append(f"colour conversion contract schema is "
+                 f"{contract.get('schema')!r}, expected {_CONTRACT_SCHEMA!r}")
+    _from, _to = contract.get("from"), contract.get("to")
+    for _side, _v in (("from", _from), ("to", _to)):
+        if not isinstance(_v, dict):
+            p.append(f"colour conversion contract has no {_side} description")
+            continue
+        for _k in _COLOR_FIELDS:
+            if str(_v.get(_k) or "") == "":
+                p.append(f"colour conversion contract {_side}.{_k} is empty")
+    _ops = [str(x) for x in (contract.get("operations") or [])]
+    if not _ops:
+        p.append("colour conversion contract lists no operations")
+    else:
+        _missing = sorted(set(applied) - set(_ops))
+        if _missing:
+            p.append("colour conversion contract does not list the applied "
+                     f"operation(s): {_missing}")
+    if not str(contract.get("implementation") or "").strip():
+        p.append("colour conversion contract does not say which implementation "
+                 "performed the conversion")
+    _bind = contract.get("binding") or {}
+    if not isinstance(_bind, dict) or not str(_bind.get("input_digest") or "")             or not str(_bind.get("output_digest") or ""):
+        p.append("colour conversion contract is not bound to the input/output "
+                 "content (no digests)")
+    if isinstance(_from, dict) and isinstance(_to, dict):
+        for row in changed_rows or []:
+            _f = str(_from.get(row["field"]) or "")
+            _t = str(_to.get(row["field"]) or "")
+            if _f and str(row["source"]) != _f:
+                p.append(f"colour conversion contract says {row['field']} came "
+                         f"from {_f!r} but the source recorded "
+                         f"{row['source']!r}")
+            if _t and str(row["output"]) != _t:
+                p.append(f"colour conversion contract says {row['field']} went "
+                         f"to {_t!r} but the output recorded "
+                         f"{row['output']!r}")
+    return p
 
 
 def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
@@ -250,17 +336,21 @@ def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
         if d_changed:
             _conv = (rcpt or {}).get("color_conversion") or {}
             _applied = set(str(x) for x in (_conv.get("applied") or []))
-            _contract = str(_conv.get("contract") or "").strip()
             _unexplained = [c for c in d_changed if c["field"] not in _applied]
             if _unexplained:
                 problems.append(
                     "colour fields changed without a declared conversion: "
                     + ",".join(f"{c['field']}={c['source']}->{c['output']}"
                                for c in _unexplained))
-            elif not _contract:
-                problems.append(
-                    "colour conversion was applied but no conversion contract "
-                    "is recorded; re-labelling alone is not a conversion")
+            else:
+                # R23-B07：合同必须**结构化**且与观测值一致。
+                # 审核复现：`contract="not-a-conversion-contract"` 与
+                # `contract={"nonsense": True}` 都返回空问题列表 ——
+                # "声明做了转换"、字符串非空、标签正确，三者都不能单独
+                # 证明像素经过了正确变换。
+                problems.extend(
+                    _color_contract_problems(_conv.get("contract"),
+                                             _applied, d_changed))
     bounds = (rcpt or {}).get("bounds")
     if not isinstance(bounds, dict):
         problems.append("no bounds evidence (legacy receipt)")

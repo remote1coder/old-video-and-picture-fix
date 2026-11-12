@@ -276,7 +276,14 @@ def test_production_path_writes_a_provable_frame_contract(tmp_path):
     assert os.path.exists(sidecar), "生产路径没有写帧边界合同"
     c = fc.read_contract(sidecar)
     assert c is not None
-    assert fc.contract_problems(c) == [], fc.contract_problems(c)
+    # R23-B08：完整性的判据变严了 —— 时间/颜色/实现指纹也要有声明。
+    # 这里的生产调用没传 `timeline_ref`（直接调 `_stream_raw_upscale`），
+    # 所以时间引用缺内容身份是**如实记录**的缺口，不是缺陷。
+    _probs = fc.contract_problems(c)
+    assert not [x for x in _probs if "frames_digest" in x
+                or "pixel format" in x], _probs
+    assert any("timeline" in x for x in _probs), (
+        "缺时间引用时必须报出来，而不是静默当作完整：" + str(_probs))
     assert c["frames"] == 5
     assert c["pix_fmt"] == "yuv420p16le", c["pix_fmt"]
     assert c["bit_depth"] == 16
@@ -435,8 +442,13 @@ def test_same_ai_output_feeds_both_back_halves(tmp_path):
     digest = fc.digest_ordered_frames(paths)
     contract = fc.build_contract(
         frames=len(paths), width=IN_W * SCALE, height=IN_H * SCALE,
-        pix_fmt="rgb48le", frames_digest=digest, source="model")
-    assert fc.contract_problems(contract) == []
+        pix_fmt="rgb48le", frames_digest=digest, source="model",
+        # R23-B08：合同要能证明"这一串帧在什么时候显示、什么颜色、谁产的"
+        timeline={"plan_path": str(tmp_path / "timeline.json"),
+                  "fps": "10"},
+        color={"probed": True, "pix_fmt": "rgb48le"},
+        ai={"impl": "realesrgan", "model": "RealESRGAN_x2plus"})
+    assert fc.contract_problems(contract) == [], fc.contract_problems(contract)
 
     classic = _run_classic(tmp_path, src, fz)
     fused = _run_fused(tmp_path, src, fz)

@@ -122,7 +122,12 @@ def test_relations_are_derived_not_trusted():
 # ------------------------------------------------ 合法转换
 
 def test_declared_conversion_passes():
-    """有 applied + contract 的转换是合法的，不能一律拒绝。"""
+    """有 applied + **结构化且绑定内容**的 contract 才合法（R23-B07）。
+
+    R22 这里用的是一句自由文字 `"bt601 -> bt709 (declared)"` —— 审核正是
+    以它为例证明"任意非空文字都能自证"。合同现在必须写清源/目标四元组、
+    操作、实现和输入输出摘要。
+    """
     problems = ge.receipt_evidence_problems(
         _receipt(src=_probed(matrix="bt601", primaries="bt601"),
                  out=_probed(matrix="bt709", primaries="bt709"),
@@ -131,7 +136,17 @@ def test_declared_conversion_passes():
                           {"field": "primaries", "source": "bt601",
                            "output": "bt709"}],
                  conv={"applied": ["matrix", "primaries"],
-                       "contract": "bt601 -> bt709 (declared)"}))
+                       "contract": {
+                           "schema": "color-conversion/1",
+                           "from": {"matrix": "bt601", "range": "limited",
+                                    "primaries": "bt601", "transfer": "bt709"},
+                           "to": {"matrix": "bt709", "range": "limited",
+                                  "primaries": "bt709", "transfer": "bt709"},
+                           "operations": ["matrix", "primaries"],
+                           "implementation": "ffmpeg zscale 2023-11-13",
+                           "binding": {"input_digest": "a" * 64,
+                                       "output_digest": "b" * 64},
+                       }}))
     assert problems == [], problems
 
 
@@ -143,7 +158,9 @@ def test_relabelling_without_a_contract_is_rejected():
                  changed=[{"field": "matrix", "source": "bt601",
                            "output": "bt709"}],
                  conv={"applied": ["matrix"], "contract": ""}))
-    assert any("no conversion contract" in p for p in problems), problems
+    # R23-B07：空字符串也走"不是合同"这条；措辞随实现变，判据不变。
+    assert any(("no conversion contract" in p) or ("bare string" in p)
+               for p in problems), problems
 
 
 def test_conversion_must_cover_every_changed_field():

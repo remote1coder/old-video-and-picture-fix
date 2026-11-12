@@ -1317,11 +1317,17 @@ def _write_stream_frame_contract(*, output_mkv, out_w, out_h, requested_fmt,
           "scale": int(scale),
           "native_scale": (2 if "x2plus" in str(model).lower() else 4)
           if source == "model" else None,
-          "in_px": f"{in_w}x{in_h}", "out_px": f"{out_w}x{out_h}",
-          "fused_stage4": bool(fused)}
+          "in_px": f"{in_w}x{in_h}", "out_px": f"{out_w}x{out_h}"}
+    # 执行方式与模型身份分开记（R23-B08）：融合只是"怎么跑"，
+    # 不改变"这串帧是谁产的"。
+    execution = {"fused_stage4": bool(fused)}
     c = build_contract(
         frames=int(frames or 0), width=width, height=height,
         pix_fmt=pix_fmt or str(requested_fmt),
+        # R23-B08：格式有没有**探测到**必须单独记。回填请求值本身没问题，
+        # 把回填值当"观测到的事实"才是问题。
+        pix_fmt_proven=bool(pix_fmt),
+        execution=execution,
         timeline=timeline, color=color, ai=ai,
         frames_digest=frames_digest or None,
         frames_digest_proven=bool(frames_digest),
