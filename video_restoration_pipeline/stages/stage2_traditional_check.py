@@ -35,6 +35,43 @@ def _load_params(args):
     return json.loads(args.params) if args.params else {}
 
 
+def _materialise_step2(src: str, dst: str) -> str:
+    """把 stage1 产物挂成 step2 名字，**优先硬链接**。
+
+    R23-LONG-02（2026-11-13，16 分钟 1080p 实跑）
+
+    stage2 是**检查型**阶段：它只跑 idet 判断是否真的逐行、校验帧率，
+    一个像素都不改。产物的唯一作用是给下游一个符合 `step2` 命名的路径
+    （main 用 `{job}_{stem}_step2*` glob 校验，stage3 也可能 glob 兜底）。
+
+    旧实现用 `shutil.copyfile`，对 16 分钟 1080p 意味着**再写 82 GB**
+    （stage1 产物实测 82.4 GB）—— 整条链凭空多出一份全片写入，纯 I/O
+    浪费，还多占 82 GB 空间。
+
+    同卷时改用硬链接：**同一 inode 的第二个名字**，毫秒完成、零额外空间。
+    下游按名字读、ffprobe 解码、哈希摘要全部照常；删掉 step1 也不会
+    影响 step2（数据等两个名字都消失才释放），比复制更安全。
+
+    Returns:
+        ``"linked"`` 或 ``"copied"`` —— 让日志能证明到底走了哪条路，
+        不要"看起来优化了"却没人能验证。
+    """
+    import shutil as _shutil
+
+    try:
+        os.link(src, dst)
+        return "linked"
+    except OSError:
+        # 这些都属于"本机/本卷就是不支持硬链接"，不是缺陷 —— 老实复制，
+        # 行为与改动前完全一致。绝不因为优化失败而让 stage 挂掉：
+        #   WinError 1    ERROR_INVALID_FUNCTION    （FAT32/exFAT 等）
+        #   WinError 17   ERROR_NOT_SAME_DEVICE     （跨卷）
+        #   WinError 1314 ERROR_PRIVILEGE_NOT_HELD  （无权限）
+        #   POSIX: EXDEV / EPERM / EOPNOTSUPP
+        _shutil.copyfile(src, dst)
+        return "copied"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -245,16 +282,21 @@ def main():
     #
     # 只有"真的低质量并 return 86"那条路才不需要复制（stage1 会被 fallback
     # 重做）。
+    #
+    # R23-LONG-02：**这里不该 copyfile**。见 `_materialise_step2()` ——
+    # stage2 一个像素都不改，产物只是换个名字给下游；同卷硬链接是同一
+    # inode 的第二个名字，省掉一次全片写入（16 分钟 1080p = 82 GB）。
     try:
-        import shutil
         from checkpoint import compute_param_hash
         param_hash = compute_param_hash(stage1_output, params)
         step2_name = (f"{job_id}_{Path(input_name).stem}"
                       f"_step2_traditional_p{param_hash}.mkv")
         step2_path = os.path.join(temp_dir, step2_name)
         if not os.path.exists(step2_path):
-            shutil.copyfile(stage1_output, step2_path)
-            logger.info("STAGE2_COPY", f"Copied stage1 output to {step2_path}")
+            _how = _materialise_step2(stage1_output, step2_path)
+            logger.info("STAGE2_ARTIFACT",
+                        f"step2 artifact ready ({_how}): {step2_path}",
+                        materialise=_how, source=stage1_output)
     except Exception as copy_err:
         logger.warning("STAGE2_COPY_WARN", f"Failed to copy stage1 to step2 path: {copy_err}")
 
