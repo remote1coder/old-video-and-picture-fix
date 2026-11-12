@@ -868,6 +868,30 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
                 failed.append({"path": fin,
                                "error": "restored copy digest mismatch"})
                 continue
+            # ---- R23-B09：复制期间目标可能被**外部写入** ----
+            # 审核用真实小文件在"备份复制结束后、replace 之前"注入陌生内容：
+            # 旧实现直接 replace，把别人的内容覆盖成 OLD，还报告 rolled_back。
+            # 这里在动手前**再核一次目标**；不一致就停手并保留现场。
+            # 注意：这只能把窗口缩到最小，**不能**承诺"不存在跨进程任意写入"——
+            # 真正遵守协议的进程本来就被目标锁互斥，这里防的是不遵守协议的写入。
+            kind2, _st2, _dig2 = _classify_target(fin, snap)
+            if kind2 != plans[fin][0] or _dig2 != plans[fin][2]:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                failed.append({"target": fin,
+                               "reason": "content changed during the restore "
+                                         "copy; kept in place",
+                               "before": plans[fin][0], "now": kind2})
+                if logger:
+                    logger.error(
+                        "PUBLISH_RESTORE_TARGET_CHANGED",
+                        "The target changed while the backup was being copied; "
+                        "refusing to overwrite it. The generation stays "
+                        "recovery_required.", target=fin,
+                        before=plans[fin][0], now=kind2)
+                continue
             os.replace(tmp, fin)
             _fst, _fdig = file_state(fin)
             if _fst == "PRESENT" and _fdig == snap["old_digest"]:
