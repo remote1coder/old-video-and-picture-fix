@@ -51,6 +51,12 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+_PROJ = os.path.dirname(os.path.dirname(HERE))
+for _p in (os.path.join(_PROJ, "shared_modules"),
+           os.path.join(_PROJ, "video_restoration_pipeline"),
+           os.path.join(_PROJ, "video_restoration_pipeline", "stages")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import r22_444_classic_path as s3probe  # noqa: E402
 
 PY = s3probe.PY
@@ -124,10 +130,19 @@ def make_reference(path, w=320, h=240):
 
 
 def _read_rgb48(path, w, h):
-    r = s3probe._run(["ffmpeg", "-hide_banner", "-v", "error", "-i", path,
-                      "-f", "rawvideo", "-pix_fmt", "rgb48le", "-"])
+    """解成 rgb48le 原始字节并 reshape。
+
+    **必须用 bytes 模式的 subprocess**：`s3probe._run` 是 `text=True`，
+    拿到的 `stdout` 是 str，`np.frombuffer` 会直接 TypeError。
+    这个坑已经在三个探针上各踩过一次了。
+    """
+    import subprocess
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-v", "error", "-i",
+                        str(path), "-f", "rawvideo", "-pix_fmt", "rgb48le",
+                        "-"], capture_output=True, timeout=600)
     if r.returncode != 0:
-        raise SystemExit("解码失败: %s" % (r.stderr or "")[-300:])
+        raise SystemExit("解码失败: %s"
+                         % (r.stderr or b"")[-300:].decode("utf-8", "replace"))
     a = np.frombuffer(r.stdout, dtype="<u2")
     return a.reshape(-1, h, w, 3).astype(np.int32)
 
@@ -164,7 +179,9 @@ def part_combos(work):
         tag = "%s_%s_%s" % (matrix, rng, chroma)
         mid = os.path.join(work, "mid_%s.mkv" % tag)
         back = os.path.join(work, "back_%s.mkv" % tag)
-        pix = "yuv%d0p10le" % (444 if chroma == "444" else 420)
+        # 注意：不能拼成 "yuv%d0p10le" —— 420 会变成 "yuv4200p10le"（实测被
+        # ffmpeg 直接拒绝）。直接写字面量最不容易错。
+        pix = "yuv444p10le" if chroma == "444" else "yuv420p10le"
         r1 = _ff("-i", ref_path, "-vf",
                  "scale=in_color_matrix=%s:in_range=%s:out_color_matrix=%s:"
                  "out_range=%s,format=%s"
@@ -240,7 +257,10 @@ def part_model(work):
     if r1.returncode == 0 and r2.returncode == 0:
         h, w = after["size"]
         got = _read_rgb48(back, w, h)[0]
-        conv = [round(float(x), 4) for x in got.reshape(-1, 3).mean(0)]
+        # 16-bit 码值 → 8-bit 刻度（与 `_mean_of_png` 同口径）。
+        # 不除这一步会得到 3 万多，看着像"转换偏色 30000 码值"。
+        conv = [round(float(x) / 257.0, 4)
+                for x in got.reshape(-1, 3).mean(0)]
 
     def _delta(a, b):
         if not a or not b:

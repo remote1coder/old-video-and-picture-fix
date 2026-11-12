@@ -45,6 +45,12 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+_PROJ = os.path.dirname(os.path.dirname(HERE))
+for _p in (os.path.join(_PROJ, "shared_modules"),
+           os.path.join(_PROJ, "video_restoration_pipeline"),
+           os.path.join(_PROJ, "video_restoration_pipeline", "stages")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import r22_444_classic_path as s3probe  # noqa: E402
 
 IN_W, IN_H, SCALE, FPS = 320, 240, 2, 10
