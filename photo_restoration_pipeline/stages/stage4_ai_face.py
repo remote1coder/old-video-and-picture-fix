@@ -64,81 +64,139 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
     Uses per-pixel absolute difference to detect modified regions,
     then applies Gaussian blur to the mask edge for smooth transition.
 
-    FIX-M12-11: When bit_depth==16, the blended result is saved as a 16-bit
-    TIFF container (8bit value × 257 → 16bit) to preserve the 16bit chain
-    through stage1-stage5 per the photo-pipeline bit-depth rule. GFPGAN/
-    CodeFormer outputs are 8bit; upconverting at save avoids downstream
-    re-read downgrading.
+    ## 16bit 必须**全程**在 16bit 域里混合（P4）
+
+    旧实现（到 R25 为止）这一段是这样写的：
+
+        orig = Image.open(original_path).convert("RGB")      # ← 8bit!
+        ...
+        blended = mask * rest8 + (1 - mask) * orig8
+        blended_16 = blended.astype(np.uint16) * 257          # ← 再抬回去
+
+    于是**整张图**先被压成 8bit 再抬回 16bit：ROI 外那些本来完好的
+    16bit 像素（stage3 超分的成果）被砍成 8bit 量级，人眼可能看不出，
+    但"16bit 链路"在这一步事实上断了。它是本函数里最隐蔽的一处降位深。
+
+    另外两个分支也是同一类问题：
+      * `mask_ratio < 0.01 → copyfile(restored)` —— 一张 6000×4000 的
+        照片里人脸只占 0.4% 是**常态**，这个分支会把整张 8bit 的修复图
+        当成结果，ROI 外全部降位深；
+      * 异常兜底 `copyfile(restored)` 同理（且不留痕）。
+
+    现在：ROI 内用修复结果（它本来就是 8bit，抬到 16bit 是它的上限），
+    ROI 外**逐像素保留原 16bit 值**；mask 为 0 的地方 `1.0*x` 在 float32
+    里对 16bit 整数是精确的，抬回 uint16 与原值**逐位相同**。
     """
     try:
         import numpy as np
+
+        # ---- 1) 读原图：保位深 ----
+        _orig16 = None
+        if bit_depth == 16:
+            try:
+                from media_io import read_image_array as _ria
+                _arr, _meta = _ria(original_path)
+                if getattr(_arr, "dtype", None) == np.uint16:
+                    _orig16 = _arr if _arr.ndim == 3 else np.stack(
+                        [_arr] * 3, axis=2)
+                # 声明 16bit 但文件其实是 8bit：按 8bit 处理，不假装
+            except Exception:
+                _orig16 = None        # 交给下面的 8bit 路径，绝不静默抬位深
+
         from PIL import Image, ImageFilter
 
-        orig = Image.open(original_path).convert("RGB")
-        rest = Image.open(restored_path).convert("RGB")
+        # ---- 2) 读修复图（模型输出恒为 8bit）----
+        rest_img = Image.open(restored_path).convert("RGB")
+        if _orig16 is not None:
+            _h, _w = _orig16.shape[:2]
+            if (rest_img.width, rest_img.height) != (_w, _h):
+                rest_img = rest_img.resize((_w, _h), Image.LANCZOS)
+            orig_arr = (_orig16.astype(np.float32) / 257.0)   # 只为算 mask
+            rest8 = np.array(rest_img, dtype=np.float32)
+        else:
+            orig_img = Image.open(original_path).convert("RGB")
+            if orig_img.size != rest_img.size:
+                rest_img = rest_img.resize(orig_img.size, Image.LANCZOS)
+            orig_arr = np.array(orig_img, dtype=np.float32)
+            rest8 = np.array(rest_img, dtype=np.float32)
 
-        # Ensure same size
-        if orig.size != rest.size:
-            rest = rest.resize(orig.size, Image.LANCZOS)
-
-        orig_arr = np.array(orig, dtype=np.float32)
-        rest_arr = np.array(rest, dtype=np.float32)
-
-        # Compute per-pixel absolute difference (average across RGB)
-        diff = np.mean(np.abs(rest_arr - orig_arr), axis=2)
-
-        # Threshold: consider pixels with >5% of max difference as modified
+        # ---- 3) mask：一律在 8bit 量纲（0..255）上算，与位深无关 ----
+        diff = np.mean(np.abs(rest8 - orig_arr), axis=2)
         threshold = 255.0 * 0.05
         mask = (diff > threshold).astype(np.float32)
+        mask_ratio = float(np.mean(mask))
 
-        # If mask covers the whole image (extreme case), skip blending
-        mask_ratio = np.mean(mask)
-        if mask_ratio > 0.95 or mask_ratio < 0.01:
-            # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
+        # 一帧都没改：正确答案是**原图**，不是修复图。
+        # （旧实现在这里 copy 修复图，等于把整张 8bit 结果当成 16bit 交付。）
+        if not mask.any():
+            shutil.copyfile(original_path, output_path)
+            return True
+
+        if mask_ratio > 0.95:
+            # 差一点全改：模型确实重写了整幅，保留修复结果并按目标位深写出
+            if bit_depth == 16:
+                return _save_uint16(rest8 * 257.0, output_path)
             shutil.copyfile(restored_path, output_path)
             return True
 
-        # Convert mask to PIL image for Gaussian blur
+        # ---- 4) 羽化 + 混合 ----
         mask_img = Image.fromarray((mask * 255).astype(np.uint8))
         mask_blurred = mask_img.filter(
             ImageFilter.GaussianBlur(radius=feather_width))
         mask_smooth = np.array(mask_blurred, dtype=np.float32) / 255.0
         mask_smooth = np.clip(mask_smooth, 0.0, 1.0)
-        # Expand to 3 channels
         mask_smooth = np.stack([mask_smooth] * 3, axis=2)
 
-        # Alpha blending
-        blended = mask_smooth * rest_arr + (1.0 - mask_smooth) * orig_arr
-        blended = np.clip(blended, 0, 255).astype(np.uint8)
+        if _orig16 is not None:
+            # 关键：在 **16bit 域**混合。mask 为 0 处逐位保留原值。
+            _o = _orig16.astype(np.float32)
+            _r = rest8 * 257.0
+            blended16 = mask_smooth * _r + (1.0 - mask_smooth) * _o
+            return _save_uint16(blended16, output_path)
 
-        # FIX-M12-11: Save as 16-bit TIFF container when bit_depth==16 to
-        # preserve the 16bit chain (8bit × 257 → 16bit). ORIGINAL: always
-        # saved 8bit PNG, breaking the 16bit chain at stage4.
+        blended = mask_smooth * rest8 + (1.0 - mask_smooth) * orig_arr
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
         if bit_depth == 16:
-            blended_16 = (blended.astype(np.uint16) * 257).astype(np.uint16)
-            try:
-                import tifffile
-                tifffile.imwrite(output_path, blended_16)
-            except Exception:
-                # Fallback: per-channel I;16 via PIL (single channel only)
-                Image.fromarray(blended_16[:, :, 0], mode='I;16').save(
-                    output_path)
-        else:
-            # FIX-NEW-V-18 / R21: 不用裸 PIL `.save(path)`——对 .tif 会
-            # 默认选 LZW，而 tifffile 解 LZW 需要未安装的 imagecodecs，
-            # 下游 stage5 就读不回来（MediaPrecisionError → rc=86）。
-            try:
-                from media_io import write_tiff as _wt
-                _wt(output_path, blended)
-            except Exception:
-                result = Image.fromarray(blended)
-                result.save(output_path)
+            # 源本来就是 8bit，但调用方要求 16bit 容器：照样写 uint16
+            # （×257 是"8bit → 16bit 容器"的既有约定）。不这么做，
+            # 下游 stage5 的位深核对会看到 8bit 而判 MediaPrecisionError。
+            return _save_uint16(blended.astype(np.float32) * 257.0,
+                                output_path)
+        # FIX-NEW-V-18 / R21: 不用裸 PIL `.save(path)`——对 .tif 会
+        # 默认选 LZW，而 tifffile 解 LZW 需要未安装的 imagecodecs，
+        # 下游 stage5 就读不回来（MediaPrecisionError → rc=86）。
+        try:
+            from media_io import write_tiff as _wt
+            _wt(output_path, blended)
+        except Exception:
+            result = Image.fromarray(blended)
+            result.save(output_path)
         return True
     except Exception:
-        # Fallback: direct copy if blending fails
+        # 兜底必须是**原图**：写修复图等于偷偷降位深（8bit）且没有回执。
         try:
-            # FIX-P12-10: Use copyfile (not copy2) per v7.32 §3.10.10
-            shutil.copyfile(restored_path, output_path)
+            shutil.copyfile(original_path, output_path)
+            return True
+        except Exception:
+            return False
+
+
+def _save_uint16(arr16, output_path: str) -> bool:
+    """把 0..65535 的浮点数组写成 **zlib 压缩的 uint16 TIFF**。
+
+    压缩必须是 zlib：PIL 对 `.tif` 默认 LZW，而读侧（tifffile）需要
+    未安装的 imagecodecs —— 写得出、读不回来的自造依赖（R21 教训）。
+    """
+    import numpy as _np
+    out = _np.clip(_np.rint(arr16), 0, 65535).astype(_np.uint16)
+    try:
+        import tifffile
+        tifffile.imwrite(output_path, out, compression="zlib")
+        return True
+    except Exception:
+        try:
+            from media_io import write_tiff as _wt
+            _wt(output_path, out)
             return True
         except Exception:
             return False

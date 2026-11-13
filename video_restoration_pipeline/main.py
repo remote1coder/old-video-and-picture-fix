@@ -2932,7 +2932,59 @@ def _s67_published_path(params) -> str:
     return planned
 
 
-def _s67_unanchored_source(output_path: str, job, config, logger):
+def _s67_intermediate_provenance(path: str, job, logger):
+    """这份中间产物**是不是本 job 的、字节有没有被换过**。返回 ``(ok, why)``。
+
+    为什么不用 `intermediate_identity_matches()` 全家桶：
+    它还要求"**有效参数**没变"，而 `chain_mode` 在它眼里算参数的一部分。
+    实测（2026-11-14）：上一轮用 `--chain stage67` 跑出的 step2 中间产物，
+    这一轮改用 `--chain both` 续跑 → 复用计划判定"可复用"（对，`chain_mode`
+    只改**怎么执行**，不改 stage2 的像素），但锚定判据说"effective
+    parameters changed" → 一份正确的续跑被判未完成。两个判据自相矛盾。
+
+    这里只锚定三件与**产物出处**有关的事：
+      * `job_id` 一致（不是别的任务的遗留）；
+      * 内容摘要一致（没被换过 —— 同大小替换也能发现）；
+      * 源素材身份一致（还是从那份原始素材做出来的）。
+    "参数"这一层**不在**这里重复判：组回执自己的 `param_digest` 已经要和
+    本次运行的 `_frozen_param_digest` 对上，那是更强的一次检查。
+    """
+    try:
+        with open(intermediate_identity_path(path), "r", encoding="utf-8") as fh:
+            side = json.load(fh) or {}
+    except FileNotFoundError:
+        return False, "intermediate has no identity sidecar"
+    except (OSError, ValueError) as exc:
+        return False, f"unreadable identity sidecar: {exc}"
+    want_job = str((job or {}).get("job_id") or "")
+    got_job = str(side.get("job_id") or "")
+    if want_job and got_job and want_job != got_job:
+        return False, f"produced by job {got_job!r}, not {want_job!r}"
+    rec = str(side.get("artifact_digest") or "")
+    cur = _artifact_digest(path)
+    if not rec or not cur:
+        return False, "artifact digest unavailable on one side"
+    if rec != cur:
+        return False, "intermediate bytes changed since it was recorded"
+    want_src = build_input_identity((job or {}).get("input_path", ""))
+    got_src = side.get("source_identity") or {}
+    # 两边都必须有**内容摘要**才谈得上"同一个源"。
+    # 缺失 = 没查过 ≠ 没问题（`build_input_identity` 在文件不存在时给 None）。
+    a_dig, b_dig = (want_src or {}).get("digest"), (got_src or {}).get("digest")
+    if not a_dig or not b_dig:
+        return False, ("source identity is unavailable on one side (the "
+                       "intermediate's provenance cannot be established)")
+    if a_dig != b_dig:
+        return False, ("intermediate was produced from a different source "
+                       f"(digest {str(b_dig)[:16]} != {str(a_dig)[:16]})")
+    a_sz, b_sz = (want_src or {}).get("size"), (got_src or {}).get("size")
+    if a_sz is not None and b_sz is not None and a_sz != b_sz:
+        return False, (f"intermediate was produced from a different source "
+                       f"(size {b_sz} != {a_sz})")
+    return True, ""
+
+
+def _s67_unanchored_source(output_path: str, job, logger):
     """resume 到 stage6/7 时，用**中间产物的身份侧车**确定组消费了哪一份。
 
     为什么需要这条：正常流程里 main 在把 stage6 派下去时会记下
@@ -2965,8 +3017,7 @@ def _s67_unanchored_source(output_path: str, job, config, logger):
                          "group's source identity cannot be anchored",
                          input=cand)
         return ""
-    ok, why = intermediate_identity_matches(
-        cand, job or {}, config or {}, logger=logger)
+    ok, why = _s67_intermediate_provenance(cand, job or {}, logger)
     if not ok:
         if logger:
             logger.error("STAGE7_FUSED_RECEIPT_INPUT_UNPROVEN",
@@ -2983,8 +3034,7 @@ def _s67_unanchored_source(output_path: str, job, config, logger):
     return cand
 
 
-def _s67_verify_receipt(params, input_path: str, logger,
-                        job=None, config=None):
+def _s67_verify_receipt(params, input_path: str, logger, job=None):
     """核对 S6→S7 的组回执。返回 ``(ok, reason)``。
 
     为什么编排器也要核：stage7 自己写回执、自己说"写好了"，那是自证。
@@ -3010,7 +3060,7 @@ def _s67_verify_receipt(params, input_path: str, logger,
     src = str(_cfg.get("probe_expected") or "")
     if not src:
         # 正常流程一定有 pin；没有 = resume 进了 6/7，改用身份侧车定基准。
-        src = _s67_unanchored_source(out, job, config, logger)
+        src = _s67_unanchored_source(out, job, logger)
     if not src:
         return False, ("the group's input cannot be anchored to this run "
                        "(no pin and no identity sidecar)")
@@ -3793,8 +3843,7 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             # 教训：自证不能替代核对。
             if stage_num == 7 and _chain67_on(params):
                 _s67_ok, _s67_why = _s67_verify_receipt(
-                    params, str(input_path or ""), job_logger,
-                    job=job, config=config)
+                    params, str(input_path or ""), job_logger, job=job)
                 if not _s67_ok:
                     return (82, "S6->S7 execution group is not provable: "
                                 f"{_s67_why}")

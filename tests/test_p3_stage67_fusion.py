@@ -341,13 +341,13 @@ def test_unanchored_source_requires_identity_sidecar(tmp_path, monkeypatch):
     rc = {"group": "stage67", "stages": [6, 7], "input_path": src}
     S.write_receipt(S.receipt_path(out), rc)
 
-    monkeypatch.setattr(vmain, "intermediate_identity_matches",
+    monkeypatch.setattr(vmain, "_s67_intermediate_provenance",
                         lambda *a, **k: (True, ""))
-    assert vmain._s67_unanchored_source(out, {}, {}, None) == src
+    assert vmain._s67_unanchored_source(out, {}, None) == src
 
-    monkeypatch.setattr(vmain, "intermediate_identity_matches",
+    monkeypatch.setattr(vmain, "_s67_intermediate_provenance",
                         lambda *a, **k: (False, "identity sidecar missing"))
-    assert vmain._s67_unanchored_source(out, {}, {}, None) == ""
+    assert vmain._s67_unanchored_source(out, {}, None) == ""
 
 
 def test_unanchored_source_rejects_missing_input(tmp_path):
@@ -355,10 +355,81 @@ def test_unanchored_source_rejects_missing_input(tmp_path):
     out = _write(tmp_path / "final.mkv", b"OUT" * 8)
     S.write_receipt(S.receipt_path(out),
                     {"group": "stage67", "input_path": str(tmp_path / "gone.mkv")})
-    assert vmain._s67_unanchored_source(out, {}, {}, None) == ""
+    assert vmain._s67_unanchored_source(out, {}, None) == ""
 
 
 def test_unanchored_source_rejects_unreadable_receipt(tmp_path):
     import main as vmain
     out = _write(tmp_path / "final.mkv", b"OUT" * 8)
-    assert vmain._s67_unanchored_source(out, {}, {}, None) == ""
+    assert vmain._s67_unanchored_source(out, {}, None) == ""
+
+
+# --------------------------------------------------------------------------
+# 6) 产物出处判据：只认 job / 字节 / 源素材，**不**把 chain_mode 算进去
+# --------------------------------------------------------------------------
+def _sidecar(tmp_path, *, job_id="jobX", tamper_digest=False,
+             other_source=False):
+    import main as vmain
+    src = _write(tmp_path / "in" / "src.mov", b"SRC" * 32)
+    other = _write(tmp_path / "in" / "other.mov", b"OTHER" * 32)
+    mid = _write(tmp_path / "step2.mkv", b"MID" * 32)
+    dig = vmain._artifact_digest(mid)
+    side = {
+        "job_id": job_id,
+        "artifact_digest": ("0" * 64) if tamper_digest else dig,
+        "source_identity": vmain.build_input_identity(
+            other if other_source else src),
+    }
+    with open(vmain.intermediate_identity_path(mid), "w",
+              encoding="utf-8") as fh:
+        json.dump(side, fh)
+    job = {"job_id": "jobX", "input_path": src}
+    return mid, job
+
+
+def test_provenance_accepts_own_intermediate(tmp_path):
+    import main as vmain
+    mid, job = _sidecar(tmp_path)
+    ok, why = vmain._s67_intermediate_provenance(mid, job, None)
+    assert ok, why
+
+
+def test_provenance_rejects_tampered_bytes(tmp_path):
+    import main as vmain
+    mid, job = _sidecar(tmp_path, tamper_digest=True)
+    ok, why = vmain._s67_intermediate_provenance(mid, job, None)
+    assert not ok and "changed" in why, why
+
+
+def test_provenance_rejects_other_job(tmp_path):
+    import main as vmain
+    mid, job = _sidecar(tmp_path, job_id="jobOTHER")
+    ok, why = vmain._s67_intermediate_provenance(mid, job, None)
+    assert not ok and "jobOTHER" in why, why
+
+
+def test_provenance_rejects_other_source(tmp_path):
+    import main as vmain
+    mid, job = _sidecar(tmp_path, other_source=True)
+    ok, why = vmain._s67_intermediate_provenance(mid, job, None)
+    assert not ok and "different source" in why, why
+
+
+def test_provenance_missing_sidecar_is_not_a_pass(tmp_path):
+    import main as vmain
+    mid = _write(tmp_path / "mid.mkv", b"MID")
+    ok, why = vmain._s67_intermediate_provenance(mid, {"job_id": "j"}, None)
+    assert not ok and "no identity sidecar" in why, why
+
+
+def test_provenance_ignores_chain_mode(tmp_path):
+    """`chain_mode` 只改**怎么执行**，不该让一份好的中间产物失效。
+
+    反例（2026-11-14 真实续跑）：上一轮 `--chain stage67` 产出的 step2，
+    这一轮 `--chain both` 续跑 —— 复用计划说"可复用"，而
+    `intermediate_identity_matches()` 说"effective parameters changed"，
+    两个判据互相矛盾。出处判据只看 job / 字节 / 源素材。
+    """
+    import main as vmain
+    mid, job = _sidecar(tmp_path)
+    assert vmain._s67_intermediate_provenance(mid, job, None)[0]
