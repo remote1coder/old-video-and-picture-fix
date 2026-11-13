@@ -264,3 +264,101 @@ def test_build_receipt_records_source_only_digest(tmp_path):
     from fused_receipt import source_digest
     assert r["input_digest"] == source_digest(spec["probe_source"])
     assert json.dumps(r)  # 必须可序列化（会被写进 temp 供下一轮读）
+
+
+# --------------------------------------------------------------------------
+# 4) 组边界的守恒判据必须用**视频流**口径
+# --------------------------------------------------------------------------
+def _load_stage7():
+    import sys
+    vstages = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "video_restoration_pipeline", "stages")
+    if vstages not in sys.path:
+        sys.path.insert(0, vstages)
+    import stage7_encode as s7                      # noqa: E402
+    return s7
+
+
+def test_group_bounds_uses_video_stream_semantics():
+    """音轨比视频长时，"容器时长变了"**不能**判成视频被拉伸。
+
+    这是真实跑批抓到的（2026-11-14）：40 帧 25fps 的中间产物 1.600s，
+    成品带 1.642s 的 AAC → 容器时长 1.642s，`check_conservation` 报
+    "duration changed 1.600s -> 1.642s (2.6%)" 并把一次完全正确的融合判成
+    未完成。视频一帧都没动。
+    """
+    s7 = _load_stage7()
+    pre = {
+        "source": {"frames": 40, "duration": 1.600},
+        "output": {"frames": 40, "duration": 1.642},
+        "checks": {
+            # verify_output 用 video_duration 比，所以这里是"通过"
+            "frames": {"src": 40, "out": 40, "allowed": [40], "ok": True},
+            "duration": {"src": 1.600, "out": 1.600, "ok": True},
+        },
+    }
+    b = s7._group_bounds(pre)
+    assert b["ok"] is True, b
+    assert b["performed"] is True
+    assert "video-stream" in b["basis"], b["basis"]
+
+
+def test_group_bounds_fails_on_frame_loss():
+    s7 = _load_stage7()
+    pre = {"source": {"frames": 40}, "output": {"frames": 39},
+           "checks": {"frames": {"src": 40, "out": 39, "ok": False,
+                                 "allowed": [40]},
+                      "duration": {"ok": True}}}
+    b = s7._group_bounds(pre)
+    assert b["ok"] is False
+    assert "frames" in b["reason"], b
+
+
+def test_group_bounds_unperformed_is_not_a_pass():
+    """两侧都量不到 → 未验证，不是通过。"""
+    s7 = _load_stage7()
+    b = s7._group_bounds({"checks": {"frames": {"ok": None},
+                                     "duration": {"ok": None}}})
+    assert b["performed"] is False
+    assert b["ok"] is False
+    assert b["reason"]
+
+
+# --------------------------------------------------------------------------
+# 5) resume 时（没有 pin）必须靠身份侧车锚定，不能拿原始素材顶替
+# --------------------------------------------------------------------------
+def test_unanchored_source_requires_identity_sidecar(tmp_path, monkeypatch):
+    """resume 到 6/7 时 pin 不存在；此时**只能**用身份侧车定基准。
+
+    反例（必须被拒）：回执里的 input 是别人/上一代的中间产物 —— 侧车
+    对不上就不给基准，最终判"未证明"，而不是拿用户原始素材去凑一个
+    "通过"（原始素材本来就不是组读的东西）。
+    """
+    import main as vmain
+
+    out = _write(tmp_path / "final.mkv", b"OUT" * 8)
+    src = _write(tmp_path / "step2.mkv", b"MID" * 8)
+    rc = {"group": "stage67", "stages": [6, 7], "input_path": src}
+    S.write_receipt(S.receipt_path(out), rc)
+
+    monkeypatch.setattr(vmain, "intermediate_identity_matches",
+                        lambda *a, **k: (True, ""))
+    assert vmain._s67_unanchored_source(out, {}, {}, None) == src
+
+    monkeypatch.setattr(vmain, "intermediate_identity_matches",
+                        lambda *a, **k: (False, "identity sidecar missing"))
+    assert vmain._s67_unanchored_source(out, {}, {}, None) == ""
+
+
+def test_unanchored_source_rejects_missing_input(tmp_path):
+    import main as vmain
+    out = _write(tmp_path / "final.mkv", b"OUT" * 8)
+    S.write_receipt(S.receipt_path(out),
+                    {"group": "stage67", "input_path": str(tmp_path / "gone.mkv")})
+    assert vmain._s67_unanchored_source(out, {}, {}, None) == ""
+
+
+def test_unanchored_source_rejects_unreadable_receipt(tmp_path):
+    import main as vmain
+    out = _write(tmp_path / "final.mkv", b"OUT" * 8)
+    assert vmain._s67_unanchored_source(out, {}, {}, None) == ""

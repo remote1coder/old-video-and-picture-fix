@@ -2932,13 +2932,72 @@ def _s67_published_path(params) -> str:
     return planned
 
 
-def _s67_verify_receipt(params, input_path: str, logger):
+def _s67_unanchored_source(output_path: str, job, config, logger):
+    """resume 到 stage6/7 时，用**中间产物的身份侧车**确定组消费了哪一份。
+
+    为什么需要这条：正常流程里 main 在把 stage6 派下去时会记下
+    `probe_expected`（它 pin 的那一份上游）。可是 resume 时上游 stage 被
+    复用、本轮 `_last_produced` 是空的，pin 不存在 —— 此时如果退回"用户的
+    原始素材"，比对必然失败（组本来就不读原始素材），于是**一次正常的
+    续跑被判成未完成**。
+
+    这里改用中间产物自己的身份侧车：它绑定了 job / 源素材 / 参数 / 实现
+    指纹 / 上游摘要。侧车说"这份中间产物是本 job 本参数产出的"，就能支撑
+    "组读的就是本代上游"这个结论；侧车缺失或对不上则**不给**基准，
+    由调用方按未证明处理（不猜、不放行）。
+    """
+    try:
+        import json as _json
+        from stage67_fusion import receipt_path as _rp
+        with open(_rp(output_path), "r", encoding="utf-8") as fh:
+            rc = _json.load(fh) or {}
+        cand = str(rc.get("input_path") or "")
+    except (OSError, ValueError) as exc:
+        if logger:
+            logger.error("STAGE7_FUSED_RECEIPT_UNREADABLE",
+                         "Cannot read the group receipt to determine which "
+                         "upstream it claims to have consumed", error=str(exc))
+        return ""
+    if not cand or not os.path.exists(cand):
+        if logger:
+            logger.error("STAGE7_FUSED_RECEIPT_INPUT_MISSING",
+                         "The group receipt names an input that is gone; the "
+                         "group's source identity cannot be anchored",
+                         input=cand)
+        return ""
+    ok, why = intermediate_identity_matches(
+        cand, job or {}, config or {}, logger=logger)
+    if not ok:
+        if logger:
+            logger.error("STAGE7_FUSED_RECEIPT_INPUT_UNPROVEN",
+                         "The receipt's input is not provably this job's own "
+                         "intermediate; refusing to treat the group as verified",
+                         input=cand, reason=why)
+        return ""
+    if logger:
+        logger.info("STAGE7_FUSED_RECEIPT_INPUT_ANCHORED",
+                    "No pin existed for this run (resumed into stage6/7); the "
+                    "group's input was anchored by its identity sidecar "
+                    "instead of the original source",
+                    input=cand)
+    return cand
+
+
+def _s67_verify_receipt(params, input_path: str, logger,
+                        job=None, config=None):
     """核对 S6→S7 的组回执。返回 ``(ok, reason)``。
 
     为什么编排器也要核：stage7 自己写回执、自己说"写好了"，那是自证。
     编排器要回答的是另一个问题 —— **这一次执行**有没有留下可核对物证。
     两者用的是同一个共享验证器（`stage67_fusion.verify_group_receipt`），
     所以不会出现"stage7 说行、main 说不行"的口径分裂。
+
+    **核对基准是"组真正消费的那份上游"，不是用户的原始素材**：
+    融合组的输入是 stage6 读的中间产物（stage2/4/5 的输出）。拿原始
+    素材去比对必然不一致 —— 而且那种不一致毫无意义（组本来就不读它）。
+    这里用 main 在**交给 stage6 时**记下的 `probe_expected`，于是这个
+    检查回答的是"main 以为它读 A，回执说它也读了 A 吗"，而不是
+    "回执自己说自己读了什么"（那等于没查）。
     """
     try:
         from stage67_fusion import find_group_receipt as _find
@@ -2947,17 +3006,25 @@ def _s67_verify_receipt(params, input_path: str, logger):
     out = _s67_published_path(params)
     if not out:
         return False, "no published path is known for this job"
+    _cfg = (params or {}).get("_fused_stage67") or {}
+    src = str(_cfg.get("probe_expected") or "")
+    if not src:
+        # 正常流程一定有 pin；没有 = resume 进了 6/7，改用身份侧车定基准。
+        src = _s67_unanchored_source(out, job, config, logger)
+    if not src:
+        return False, ("the group's input cannot be anchored to this run "
+                       "(no pin and no identity sidecar)")
     rcpt, path, why = _find(
         out, params or {},
         expected_attempt=str((params or {}).get("attempt_id") or ""),
-        src_path=str(input_path or ""))
+        src_path=src)
     if rcpt is None:
         if logger:
             logger.error(
                 "STAGE7_FUSED_RECEIPT_MISSING",
                 "The S6→S7 execution group produced no usable group receipt; "
                 "this generation cannot be shown to have run stage6 at all",
-                output=out, receipt=path, reason=why)
+                output=out, receipt=path, reason=why, expected_input=src)
         return False, why
     if logger:
         logger.info(
@@ -2967,7 +3034,8 @@ def _s67_verify_receipt(params, input_path: str, logger):
             "conserves frames/duration",
             output=out, receipt=path,
             frames=rcpt.get("frames"),
-            bounds_ok=(rcpt.get("bounds") or {}).get("ok"))
+            bounds_ok=(rcpt.get("bounds") or {}).get("ok"),
+            group_input=src)
     return True, ""
 
 
@@ -3662,12 +3730,16 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 params["_fused_stage67"] = {
                     "role": "producer", "emit_only": True,
                     "spec_path": _s67_spec,
+                    # 组**真正**消费的那一份上游（供成品后核对回执用）。
+                    # 不记它就只能回退到"原始素材"，而组本来就不读原始素材。
+                    "probe_expected": str(params.get("upstream_artifact") or ""),
                 }
                 job_logger.info(
                     "STAGE6_FUSED_PRODUCER",
                     "stage6 will emit the grain script only; stage7 pipes it "
                     "straight into its encoder (no lossless intermediate)",
-                    spec=_s67_spec, chain_mode=params.get("chain_mode"))
+                    spec=_s67_spec, chain_mode=params.get("chain_mode"),
+                    probe_expected=params["_fused_stage67"]["probe_expected"])
             elif stage_num == 7:
                 _s67_role = str((params.get("_fused_stage67") or {})
                                 .get("role") or "")
@@ -3705,18 +3777,24 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                                   .get("spec_path") or "")
                 params["_fused_stage67"] = {
                     "role": "consumer", "spec_path": _s67_spec_p,
+                    "probe_expected": str(
+                        (params.get("_fused_stage67") or {})
+                        .get("probe_expected") or ""),
                 }
                 job_logger.info(
                     "STAGE7_FUSED_CONSUMER",
                     "Handing the grain script over to stage7; it will be piped "
-                    "into the encoder directly", spec=_s67_spec_p)
+                    "into the encoder directly", spec=_s67_spec_p,
+                    probe_expected=(params.get("_fused_stage67") or {})
+                    .get("probe_expected"))
             # ---- S6→S7：成品发布了，回执必须在 ----
             # 这一步只看"本次执行有没有留下物证"。stage7 已经写过一次自证，
             # 编排器用**同一个共享验证器**再核一遍 —— 这正是 R19-A03 的
             # 教训：自证不能替代核对。
             if stage_num == 7 and _chain67_on(params):
                 _s67_ok, _s67_why = _s67_verify_receipt(
-                    params, str(input_path or ""), job_logger)
+                    params, str(input_path or ""), job_logger,
+                    job=job, config=config)
                 if not _s67_ok:
                     return (82, "S6->S7 execution group is not provable: "
                                 f"{_s67_why}")

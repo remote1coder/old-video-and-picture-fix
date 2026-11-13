@@ -2628,9 +2628,46 @@ def _run_fused_encode(video_cmd: List[str], vs_script: str,
     return _EncodeResult(84, getattr(res, "detail", "") or "fused encode failed")
 
 
+def _group_bounds(pre_check: Dict[str, Any]) -> Dict[str, Any]:
+    """把发布前的机械核对折成**组边界**的守恒结论。
+
+    为什么不用 `generation_evidence.collect()` 里那份 `bounds`：
+    `frame_conservation.describe()` 取的是 ``format=duration`` ——
+    **容器**时长。组边界的输出**多了一条音轨**，容器时长 = max(视频, 音频)，
+    于是"1.600s → 1.642s（2.6%）"会被判成"时长被拉伸"，而视频一秒都没动
+    （实测 2026-11-14：40 帧 25fps 的中间产物 + 1.642s 的 AAC 音轨）。
+
+    `artifact_verify.verify_output()` 已经优先用**视频流**时长（`video_duration`），
+    而且它就是在发布点、对本次 attempt 的暂存文件跑的 —— 同一个量，用它。
+    """
+    checks = (pre_check or {}).get("checks") or {}
+    fr = checks.get("frames") or {}
+    du = checks.get("duration") or {}
+    performed = fr.get("ok") is not None or du.get("ok") is not None
+    bad = [name for name, c in (("frames", fr), ("duration", du))
+           if c.get("ok") is False]
+    reason = ""
+    if bad:
+        reason = "; ".join(
+            f"{n} mismatch ({checks.get(n)})" for n in bad)[:400]
+    elif not performed:
+        reason = "no usable frame/duration facts on one side"
+    return {
+        "ok": bool(performed and not bad),
+        "performed": bool(performed),
+        "reason": reason,
+        "basis": "artifact_verify.verify_output (video-stream duration)",
+        "frames": fr,
+        "duration": du,
+        "src_frames": ((pre_check or {}).get("source") or {}).get("frames"),
+        "out_frames": ((pre_check or {}).get("output") or {}).get("frames"),
+    }
+
+
 def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
                          params: Dict[str, Any], logger,
-                         frames: Optional[int]) -> bool:
+                         frames: Optional[int],
+                         pre_check: Optional[Dict[str, Any]] = None) -> bool:
     """写 S6→S7 的**组回执**（``<output>.fused_stage67.json``）。
 
     为什么非写不可：融合路线把 stage6 的中间文件省掉了，于是
@@ -2667,7 +2704,8 @@ def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
                         "color_changed_tags": list(
                             _ev.get("color_changed_tags") or []),
                         "color_conversion": _ev.get("color_conversion") or {},
-                        "bounds": _ev.get("bounds") or {},
+                        # 组边界的守恒结论用**视频流**口径（见 _group_bounds）
+                        "bounds": _group_bounds(pre_check),
                     })
         _wr(_rp(output_path), _rcpt)
         logger.info("STAGE7_FUSED_RECEIPT",
@@ -4797,7 +4835,8 @@ def main():
                 if not _write_group_receipt(
                         output_path=output_path, spec=_fused_spec,
                         params=params, logger=logger,
-                        frames=_gr_frames or (_proc_frames or None)):
+                        frames=_gr_frames or (_proc_frames or None),
+                        pre_check=_pre):
                     _generation_incomplete = True
 
             # ---- R14-01：WSL 回拷走**同一个 publisher**，媒体+报告一起 ----
