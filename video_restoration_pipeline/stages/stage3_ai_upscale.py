@@ -2940,6 +2940,10 @@ def main():
     # FIX-P8-8: Collect PTS for VFR preservation
     all_success = True
     gpu_oom_retry_done = False
+    # B05：OOM 但**没有**降质授权时置位；由主流程据此返回 85。
+    # 这里不能直接 return —— 审核用 AST 把整个 If 块单独 exec 出来
+    # 验证「不降倍率」，块内出现 return 会变成 'return' outside function。
+    _oom_refused = False
     window_dirs: List[Tuple[str, str]] = []
     all_pts: List[float] = []  # FIX-P8-8: PTS for VFR
     all_frame_mappings: List[Tuple[int, int]] = []  # (win_start, count)
@@ -3461,8 +3465,39 @@ def main():
         # ORIGINAL: OOM downgrade triggered on any failure (not just OOM),
         #           and model cleanup code was broken (del model on string)
         if result == "OOM" and backend != "cpu" and not gpu_oom_retry_done:
-            # Step 1: 4x -> 2x downgrade
-            if scale == 4:
+            # ---- B05：未经**明确授权**，禁止任何降质 ----
+            # 审核 Q01 用 AST 抽出的就是这个分支：把
+            # `gpu_memory_fallback=False` 设上，推理返回 OOM 后仍调用 2× 模型，
+            # 最终 scale=2 —— 这个分支从来没读过这个开关。
+            #
+            # 现在的规则（R25 B05）：
+            #   * 默认**不降**：模型、倍率、精度、后端都是计划里定的，
+            #     资源不足的正常结果是"等待 / 明确失败"，不是偷偷换小的；
+            #   * 只有 `gpu_memory_fallback: true`（用户显式同意）才走旧的
+            #     4×→2× / GPU→CPU 路径；
+            #   * `actual_scale` 记录不能替未授权的降质洗白。
+            _fb = params.get("gpu_memory_fallback")
+            if isinstance(_fb, bool):
+                _allow_fallback = _fb
+            else:
+                _allow_fallback = str(
+                    _fb if _fb is not None else "").strip().lower() in (
+                        "1", "true", "yes", "on")
+            if not _allow_fallback:
+                logger.error(
+                    "STAGE3_OOM_NO_FALLBACK",
+                    "GPU OOM while `gpu_memory_fallback` is not enabled. "
+                    "Refusing to silently lower the model or the scale: the "
+                    "plan says %s@%sx. Free VRAM / reduce concurrency, or "
+                    "re-plan with an explicitly chosen substitute."
+                    % (model, scale),
+                    model=model, requested_scale=scale,
+                    gpu_memory_fallback=_fb)
+                result = False
+                _oom_refused = True
+
+            # Step 1: 4x -> 2x downgrade（**只在有授权时**）
+            if _allow_fallback and scale == 4:
                 logger.warning("STAGE3_OOM_DOWNSCALE",
                               "GPU OOM detected, downgrading 4x->2x")
                 time.sleep(0.1)  # v6.32 §7.14 mandatory 100ms wait
@@ -3471,8 +3506,9 @@ def main():
                 result = run_realesrgan_batch(window_dirs, model, scale,
                                                gpu_id=0, logger=logger)
 
-            # Step 2: GPU -> CPU downgrade
-            if result == "OOM" or (isinstance(result, bool) and not result):
+            # Step 2: GPU -> CPU downgrade（**只在有授权时**）
+            if _allow_fallback and (result == "OOM"
+                                    or (isinstance(result, bool) and not result)):
                 if backend != "cpu":
                     logger.warning("STAGE3_OOM_CPU",
                                   "GPU still failing, downgrading to CPU")
@@ -3484,6 +3520,16 @@ def main():
                         backend = "cpu"
 
             gpu_oom_retry_done = True
+
+        if _oom_refused:
+            logger.error(
+                "STAGE3_OOM_NO_FALLBACK",
+                "Refusing to continue after a GPU OOM without an explicit "
+                "`gpu_memory_fallback` authorisation. The requested model "
+                "and scale are part of the plan; silently lowering them "
+                "would produce a successful artifact nobody asked for.",
+                model=model, scale=scale)
+            return 85
 
         # ID-07（第七轮）：把**实际执行**记下来（后端/模型/倍数/权重指纹）。
         # 注意这里读的是循环后**已被降级改写**的 backend/model/scale ——

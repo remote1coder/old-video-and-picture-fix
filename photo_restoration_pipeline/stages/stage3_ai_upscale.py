@@ -794,9 +794,38 @@ def main():
     actual_scale = scale
     actual_model = model
 
+    # ---- B05：降质必须**事前授权** ----
+    # 审核：照片侧包含"显存不足降倍率""换模型家族""全部失败后复制传统结果
+    # 当成功"三条隐式通道，不能只补一个 OOM 条件。
+    #
+    # `gpu_memory_fallback: true` 是**旧的粗粒度授权**，本轮保留兼容，
+    # 但它不能成为"任意换模型/倍率"的无限授权 —— 只要它没开，
+    # 倍率、模型家族、后端一个都不许改。
+    _fb = params.get("gpu_memory_fallback")
+    if isinstance(_fb, bool):
+        _allow_fallback = _fb
+    else:
+        _allow_fallback = str(
+            _fb if _fb is not None else "").strip().lower() in (
+                "1", "true", "yes", "on")
+
     if not sufficient:
         logger.warning("STAGE3_VRAM_LOW",
                        f"GPU VRAM insufficient for {scale}x (need ~{vram_required_mb}MiB)")
+        if not _allow_fallback:
+            # 计划里写的是 scale/model/backend，资源不足的正常结果是
+            # "等待或明确失败"，不是偷偷换成 2× 或 CPU。
+            logger.error(
+                "STAGE3_VRAM_LOW_NO_FALLBACK",
+                "GPU VRAM is insufficient and `gpu_memory_fallback` is not "
+                "enabled. Refusing to lower the scale or switch the backend "
+                "silently: %s@%sx is what the plan says. Free VRAM or "
+                "re-plan with an explicitly chosen substitute."
+                % (actual_model, scale),
+                model=actual_model, requested_scale=scale,
+                vram_required_mb=vram_required_mb,
+                gpu_memory_fallback=_fb)
+            return 85
         # Try downgrade, preserving model family
         if scale == 4:
             actual_scale = 2
@@ -843,7 +872,17 @@ def main():
     )
 
     # Model fallback: if primary model fails, try alternatives in priority order
-    if not success:
+    if not success and not _allow_fallback:
+        # 换模型家族 = 换语义。没有事前授权就不换：
+        # 直接落到下面的失败处理（由它决定"AI 强制开启时该失败"）。
+        logger.error(
+            "STAGE3_MODEL_NO_FALLBACK",
+            "The primary model failed and `gpu_memory_fallback` is not "
+            "enabled; refusing to substitute a different model family. "
+            "The run must fail (or wait) rather than silently produce a "
+            "different algorithm's output.",
+            model=actual_model)
+    elif not success:
         primary_family = _get_model_basename(actual_model)
         fallback_families = _PHOTO_MODEL_FALLBACK.get(primary_family,
                                                        ["RealESRGAN", "DAT"])
@@ -902,6 +941,21 @@ def main():
     # failing the job with exit 83. Return 3 (skip) so the main loop treats
     # this stage as skipped and downstream stages consume the traditional
     # output. Only fall back to 83 if even the traditional copy fails.
+    # ---- B05：AI 被**强制开启**时，全失败不能变成"跳过" ----
+    # 审核："AI强制on时失败不能复制传统结果当成功/skip；原计划off或不适用的
+    # 跳过仍然合法。" 这里只在 ai_enabled 为真（用户明确要 AI）时拦截；
+    # `auto` / `off` 的跳过维持原语义。
+    if bool(params.get("ai_enabled")) and not _allow_fallback:
+        logger.error(
+            "STAGE3_AI_REQUIRED_BUT_FAILED",
+            "AI upscaling was explicitly enabled and every backend failed. "
+            "Refusing to emit the traditional result as a successful skip: "
+            "the plan asked for AI output, and copying the input would be a "
+            "silent quality substitution.",
+            model=actual_model, requested_scale=scale,
+            gpu_memory_fallback=_fb)
+        return 85
+
     logger.warning("STAGE3_AI_SKIP_TRADITIONAL",
                    "All AI backends failed (incl. CPU); emitting traditional "
                    "stage1 output and skipping AI per v7.32 §3.10.23")
