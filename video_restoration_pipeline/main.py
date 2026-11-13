@@ -1051,6 +1051,74 @@ def build_params_identity(config: Dict[str, Any], job: Dict[str, Any],
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+#: 模型文件的候选扩展名（只用于"给了名字没给路径"时定位）。
+_MODEL_EXTS = (".pth", ".onnx", ".bin", ".pt", ".safetensors")
+
+
+def _resolve_model_path(name_or_path: Any,
+                        params: Optional[Dict[str, Any]] = None) -> str:
+    """把 `upscale_model` / `face_restore` 这类值解析成**实际文件路径**。
+
+    两个来源都可能：
+      * 用户直接给了绝对/相对路径（审核 A04 的复现脚本就是这么做的）；
+      * 用户给的是模型名（`realesr-general-x4v3`），实际文件在
+        `params["model_dir"]` 或项目 `models/` 下，扩展名见 `_MODEL_EXTS`。
+
+    解析不出来返回空串 —— **不抛异常**：模型名对不上文件是常见情况
+    （走内置默认或下载缓存），那不该让身份计算失败。
+    """
+    raw = str(name_or_path or "").strip()
+    if not raw:
+        return ""
+    if os.path.isfile(raw):
+        return os.path.abspath(raw)
+
+    roots: List[str] = []
+    _md = str((params or {}).get("model_dir") or "").strip()
+    if _md:
+        roots.append(_md)
+    roots.append(str(SCRIPT_DIR.parent / "models"))
+
+    base = os.path.basename(raw)
+    cands = [base]
+    if not os.path.splitext(base)[1]:
+        cands = [base + ext for ext in _MODEL_EXTS]
+    for root in roots:
+        for c in cands:
+            p = os.path.join(root, c)
+            if os.path.isfile(p):
+                return os.path.abspath(p)
+    return ""
+
+
+def _model_file_digest(path: str) -> str:
+    """模型文件的**内容**摘要。
+
+    为什么需要它：`_impl_fingerprint` 原来只记模型**名字**。审核 R23-A04
+    用独立反例证明——把同一路径的权重从 `WEIGHT-A` 换成 `WEIGHT-B`，
+    RunIdentity **完全相同**。也就是说"换了权重"在身份里不可见，
+    旧中间产物会被错误复用。
+
+    **故意不做 `(size, mtime)` 缓存**。审核允许缓存，但要求"保守失效"：
+    同一秒内替换成**同样大小**的另一份权重（审核的复现脚本就是
+    `WEIGHT-A` → `WEIGHT-B`，字节数相同）会让 `(size, mtime)` 完全一致，
+    缓存命中 → 正是要检出的场景被漏掉。而身份计算是低频操作
+    （每个 job 1–3 次），一次全文件 sha256 对 140 MB 权重约 0.3 秒，
+    相比整链几小时可以忽略 —— 用确定性换这点 I/O 是划算的。
+    """
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    h = hashlib.sha256()
+    try:
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()[:32]
+
+
 def _impl_fingerprint(params: Optional[Dict[str, Any]] = None) -> str:
     """实现 / 模型 / 工具指纹（R22-A02）。
 
@@ -1058,13 +1126,23 @@ def _impl_fingerprint(params: Optional[Dict[str, Any]] = None) -> str:
     `.digest`，实际传空串。回执类严格要求身份，生产调用却没按它需要的
     形状提供 —— 这里补上"实现"这一维。
 
-    只吃**稳定的**东西：实现版本、Python 主次版本、模型名、人脸后端。
-    时间戳、路径、随机数一律不进（否则每次运行身份都不同）。
+    只吃**稳定的**东西：实现版本、Python 主次版本、模型名 + **模型字节**、
+    人脸后端。时间戳、路径、随机数一律不进（否则每次运行身份都不同）。
+
+    R24-04 / R23-A04：原来只记模型名，同路径换权重身份不变。现在把模型
+    文件的字节摘要并进来（解析不到文件时退回"只有名字"，行为同旧版）。
     """
     parts = [str(VIDEO_IMPL_VERSION), "py" + sys.version.split()[0]]
     if isinstance(params, dict):
-        parts.append(str(params.get("upscale_model") or ""))
-        parts.append(str(params.get("face_restore") or ""))
+        _um = str(params.get("upscale_model") or "")
+        _fr = str(params.get("face_restore") or "")
+        parts.append(_um)
+        parts.append(_fr)
+        # 模型**字节**身份（不是路径，不是 mtime）—— 内容变了身份才变
+        for _label, _val in (("upscale", _um), ("face", _fr)):
+            _fp = _resolve_model_path(_val, params)
+            _d = _model_file_digest(_fp) if _fp else ""
+            parts.append(f"{_label}-bytes:{_d or '-'}")
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
@@ -2879,6 +2957,76 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         params["chain_mode"] = "none"
         params.setdefault("vs_deterministic", False)
 
+    # ---- R22 §5.2：工作表示（色度/位深）必须在**动手之前**解析并核验 ----
+    # 审核要求"手动选择通过前置能力核验后执行"、"无法满足的要求应明确
+    # 失败/降级，用户决定是否接受"。所以这一步放在计划冻结之前：
+    #   * 解析结果冻结进 `params["_work_format"]`（下划线开头，不进身份）；
+    #   * 有 blocker 且用户没显式接受降级 → 直接停，不跑任何 stage。
+    try:
+        from work_format import resolve as _wf_resolve, describe as _wf_desc
+        _wf_plan = _wf_resolve(
+            params, source_path=str(job.get("input_path") or ""),
+            logger=job_logger)
+        params["_work_format"] = _wf_plan
+        # ---- R24-04 / R23-A04：把**解析结论**并入参与身份的语义视图 ----
+        # `_work_format` 以下划线开头，会被 `_identity_semantics` 过滤掉；
+        # 而"同一份用户请求解析出不同表示"（编码器能力变了、源色度读法不同）
+        # 必须让旧产物失效 —— 所以另写一份**不带下划线**的最小结论。
+        #
+        # 只放**决定性**字段。boundaries 表、reason 文本这些会随代码措辞变化，
+        # 放进去每次升级都会让所有旧产物失效 —— 那是噪声，不是语义。
+        _deliv = (_wf_plan.get("delivery") or {})
+        _conv = _wf_plan.get("conversion")
+        _degr = _wf_plan.get("degraded")
+        params["work_format_resolved"] = {
+            "schema": 1,
+            "working_chroma": str(_wf_plan.get("resolved") or ""),
+            "delivery_pix_fmt": str(_deliv.get("pix_fmt") or ""),
+            "delivery_chroma": str(_deliv.get("chroma") or ""),
+            "conversion": (f"{_conv.get('from')}->{_conv.get('to')}"
+                           if isinstance(_conv, dict) else ""),
+            "degraded": (f"{_degr.get('from')}->{_degr.get('to')}"
+                         if isinstance(_degr, dict) else ""),
+            "encoder": str(_wf_plan.get("encoder") or ""),
+        }
+        # `compute_param_hash` 的白名单是**扁平键**且对 dict 值递归过滤
+        # （`checkpoint._extract_quality`），所以上面那份可读结构进不了
+        # 阶段身份。再压一个摘要键 —— 阶段身份用这个，人读用上面那份。
+        try:
+            params["work_format_digest"] = hashlib.sha256(
+                json.dumps(params["work_format_resolved"], sort_keys=True,
+                           ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+        except (TypeError, ValueError):
+            params["work_format_digest"] = ""
+        job_logger.info("WORK_FORMAT_PLAN", _wf_desc(_wf_plan),
+                        mode=_wf_plan.get("mode"),
+                        working=_wf_plan.get("resolved"),
+                        delivery=(_wf_plan.get("delivery") or {}).get("pix_fmt"),
+                        recommendation=_wf_plan.get("recommendation"),
+                        conversion=_wf_plan.get("conversion"),
+                        degraded=_wf_plan.get("degraded"),
+                        boundaries=_wf_plan.get("boundaries"))
+        # R23-B09：判据收敛到计划自己的 `ok`（它已经要求"接受降级时必须
+        # 给出可执行替代"）。`blockers and not accepted` 会让"接受了但没
+        # 替代"悄悄跑起来。
+        if not _wf_plan.get("ok"):
+            job_logger.error(
+                "WORK_FORMAT_REFUSED",
+                "The requested working representation cannot be produced by "
+                "this chain. Nothing was executed. Either change "
+                "`chroma_mode` / `pix_fmt` / `video_encoder`, or set "
+                "`chroma_mode_accept_degraded: true` to accept the stated "
+                "degradation.", blockers=_wf_plan.get("blockers"))
+            return 86, ("work format unsupported: "
+                        f"{_wf_plan.get('blockers')}")
+    except Exception as _wfe:
+        # 解析本身失败不等于"能力不足"——不能因此静默跑默认路径
+        job_logger.error("WORK_FORMAT_RESOLVE_FAIL",
+                         "Cannot resolve the working representation; refusing "
+                         "to run a generation whose chroma/bit depth is "
+                         "undetermined", error=str(_wfe))
+        return 86, f"work format resolve failed: {_wfe}"
+
     # ---- R17-01：把"本次 run 的身份"随 params 传给 stage ----
     # 审核要求：marker 不能只比对"当前 verify 与当前媒体彼此一致" —— 只要
     # B 把媒体和报告一起换掉，两者仍然自洽，A 无法察觉这份报告已不是自己那代。
@@ -2935,45 +3083,6 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             "generation whose identity cannot be established", error=str(_fz))
         return 82, f"cannot freeze the param digest: {_fz}"
 
-    # ---- R22 §5.2：工作表示（色度/位深）必须在**动手之前**解析并核验 ----
-    # 审核要求"手动选择通过前置能力核验后执行"、"无法满足的要求应明确
-    # 失败/降级，用户决定是否接受"。所以这一步放在计划冻结之前：
-    #   * 解析结果冻结进 `params["_work_format"]`（下划线开头，不进身份）；
-    #   * 有 blocker 且用户没显式接受降级 → 直接停，不跑任何 stage。
-    try:
-        from work_format import resolve as _wf_resolve, describe as _wf_desc
-        _wf_plan = _wf_resolve(
-            params, source_path=str(job.get("input_path") or ""),
-            logger=job_logger)
-        params["_work_format"] = _wf_plan
-        job_logger.info("WORK_FORMAT_PLAN", _wf_desc(_wf_plan),
-                        mode=_wf_plan.get("mode"),
-                        working=_wf_plan.get("resolved"),
-                        delivery=(_wf_plan.get("delivery") or {}).get("pix_fmt"),
-                        recommendation=_wf_plan.get("recommendation"),
-                        conversion=_wf_plan.get("conversion"),
-                        degraded=_wf_plan.get("degraded"),
-                        boundaries=_wf_plan.get("boundaries"))
-        # R23-B09：判据收敛到计划自己的 `ok`（它已经要求"接受降级时必须
-        # 给出可执行替代"）。`blockers and not accepted` 会让"接受了但没
-        # 替代"悄悄跑起来。
-        if not _wf_plan.get("ok"):
-            job_logger.error(
-                "WORK_FORMAT_REFUSED",
-                "The requested working representation cannot be produced by "
-                "this chain. Nothing was executed. Either change "
-                "`chroma_mode` / `pix_fmt` / `video_encoder`, or set "
-                "`chroma_mode_accept_degraded: true` to accept the stated "
-                "degradation.", blockers=_wf_plan.get("blockers"))
-            return 86, ("work format unsupported: "
-                        f"{_wf_plan.get('blockers')}")
-    except Exception as _wfe:
-        # 解析本身失败不等于"能力不足"——不能因此静默跑默认路径
-        job_logger.error("WORK_FORMAT_RESOLVE_FAIL",
-                         "Cannot resolve the working representation; refusing "
-                         "to run a generation whose chroma/bit depth is "
-                         "undetermined", error=str(_wfe))
-        return 86, f"work format resolve failed: {_wfe}"
 
     # ---- R21-C02 / R21-C06：marker 的身份字段在**这里**冻结 ----
     # 审核 §4.1 第 2–3 步：stage7 负责"媒体 + 必需报告"的不可变清单，

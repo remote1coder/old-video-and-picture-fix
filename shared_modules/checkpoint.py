@@ -136,6 +136,12 @@ CORE_QUALITY_PARAMS = frozenset([
     # "换了工作表示/换了种子"可以复用上一代中间产物。stage_deps 认为它们
     # 分别影响全链/仅 stage6，两套身份规则不一致。
     "chroma_mode", "chroma_mode_accept_degraded",
+    # R24-04 / R23-A04：**解析结论**也要进阶段身份。
+    # 只记用户输入（chroma_mode/pix_fmt）不够 —— 同一份请求在不同能力/
+    # 不同源色度下可能解析出不同工作或交付表示（编码器不支持 444 而转
+    # 420、preserve 读到 422 而退 444）。那时输入没变、结论变了，旧产物
+    # 仍会被复用。`work_format_digest` 是 main 在计划冻结阶段算的摘要。
+    "work_format_digest",
     "grain_seed",
     # Encoding
     "crf", "preset", "preset_max_quality",
