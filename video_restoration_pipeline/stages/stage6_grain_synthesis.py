@@ -131,6 +131,30 @@ def _build_vs_script(input_source: str, vs_format: str,
     return script
 
 
+def _fused_preflight(vs_path: str, params) -> tuple:
+    """融合模式下的**单帧预检**：脚本到底能不能出帧。
+
+    为什么需要：经典路线里 stage6 一跑就知道插件在不在；融合路线把 vspipe
+    挪到了 stage7，插件缺失要等到 `stage7` 已经起好编码器才暴露 —— 而
+    经典路线有一个 AddGrainC 回退，融合路线如果不在 stage6 先判一次，
+    这个回退就**用不上了**（同一个配置，换个 chain.mode 能力就不一样）。
+
+    只出 1 帧（`--start 0 --end 0`），代价可忽略。
+
+    Returns:
+        ``(ok, stderr_text)``。
+    """
+    cmd = ["vspipe", "-c", "y4m", "--start", "0", "--end", "0",
+           str(vs_path), "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=300, shell=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"vspipe could not start: {type(exc).__name__}: {exc}"
+    if r.returncode == 0 and (r.stdout or b""):
+        return True, ""
+    return False, (r.stderr or b"").decode("utf-8", "replace")[-1500:]
+
+
 def _seed_arg(seed, _for_gf3):
     """把颗粒随机种子拼成 vapoursynth 脚本片段。
 
@@ -1135,6 +1159,44 @@ def main() -> int:
                          "execution group cannot start", error=str(_we))
             return 84
 
+        # ---- 预检 + AddGrainC 回退（与经典路线**同能力**）----
+        _pre_ok, _pre_err = _fused_preflight(vs_path, params)
+        _fused_degraded = False
+        if not _pre_ok:
+            _probe_res = GrainPipelineResult(
+                ok=False, failed_stage="vspipe", vspipe_rc=1, ffmpeg_rc=0,
+                vspipe_tail=_pre_err)
+            if addgrainc_enabled and _probe_res.is_plugin_capability_failure():
+                logger.warning(
+                    "STAGE6_FUSED_GF3_UNAVAILABLE",
+                    "GrainFactory3 is not usable in this environment; falling "
+                    "back to AddGrainC **inside the execution group** so that "
+                    "chain.mode does not change what this run can do",
+                    vspipe_tail=_pre_err[-400:])
+                vs_script = _build_vs_script(
+                    input_source, vs_format,
+                    g1str * 0.5, g2str * 0.5, g3str * 0.5,
+                    addgrainc_ratio, use_addgrainc=True,
+                    temp_avg=temp_avg,
+                    deterministic=_vs_deterministic(params),
+                    seed=params.get("grain_seed"))
+                try:
+                    with open(vs_path, "w", encoding="utf-8") as _vf2:
+                        _vf2.write(vs_script)
+                except OSError as _we2:
+                    logger.error("STAGE6_FUSED_VS_WRITE_FAIL", str(_we2))
+                    return 84
+                _pre_ok, _pre_err = _fused_preflight(vs_path, params)
+                _fused_degraded = True
+        if not _pre_ok:
+            # 预检不过就**不能**把脚本交给 stage7：那时 stage7 已经把编码器
+            # 拉起来了，失败点更靠后、更难归因，而且没有回退空间。
+            logger.error(
+                "STAGE6_FUSED_PREFLIGHT_FAIL",
+                "The grain script cannot produce even one frame; refusing to "
+                "hand it to stage7", vspipe_tail=_pre_err[-800:])
+            return 84
+
         try:
             from stage67_fusion import (build_spec as _bs,
                                         spec_path as _sp,
@@ -1151,7 +1213,8 @@ def main() -> int:
                     "temp_avg": temp_avg,
                     "addgrainc_enabled": addgrainc_enabled,
                     "addgrainc_ratio": addgrainc_ratio,
-                    "use_addgrainc": False,
+                    "use_addgrainc": bool(_fused_degraded),
+                    "degraded": bool(_fused_degraded),
                     "seed": params.get("grain_seed"),
                 },
                 vs_format=vs_format,
@@ -1171,7 +1234,7 @@ def main() -> int:
                     vs_script=vs_path, spec=_spec_file,
                     vs_script_sha256=_spec.get("vs_script_sha256"),
                     g1str=g1str, g2str=g2str, g3str=g3str, temp_avg=temp_avg,
-                    pix_fmt=pix_fmt)
+                    pix_fmt=pix_fmt, degraded=bool(_fused_degraded))
         return 0
 
 
