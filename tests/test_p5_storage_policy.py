@@ -291,3 +291,40 @@ def test_no_stage_can_turn_on_lossy_by_itself():
     assert not offenders, (
         "这些文件自己碰了存储策略配置 —— 有损必须只有一个决策点：\n  "
         + "\n  ".join(offenders))
+
+
+# --------------------------------------------------------------------------
+# 7) 低磁盘不得成为"启用有损"的理由（G10 的负半，行为级）
+# --------------------------------------------------------------------------
+def test_low_disk_refuses_instead_of_switching_to_lossy(tmp_path, monkeypatch):
+    """磁盘不够时只能**停下**（87），不能自己换成有损中间件继续跑。
+
+    G10：「无显式许可时模拟OOM/低磁盘/编码失败，确认不会启用有损或物化」。
+    这条把"低磁盘"这条真实路径走一遍：磁盘门在策略之前，返回 87，
+    而且**一个 stage 都没启动**、策略仍是 lossless。
+    """
+    import main as vmain
+
+    monkeypatch.setattr(vmain, "check_wsl_space", lambda *a, **k: False)
+    started = []
+    monkeypatch.setattr(vmain, "run_stage",
+                        lambda *a, **k: (started.append(a[0] if a else ""),
+                                         (0, ""))[1])
+
+    src = tmp_path / "src.mov"
+    src.write_bytes(b"SRC" * 64)
+    job = {"job_id": "jobDisk", "input_path": str(src),
+           "output_path": str(tmp_path / "out.mkv")}
+
+    class _Log:
+        def info(self, *a, **k): pass
+        def warning(self, *a, **k): pass
+        def error(self, *a, **k): pass
+        def critical(self, *a, **k): pass
+        def debug(self, *a, **k): pass
+
+    cfg = {"global": {"video_encoder": "libsvtav1"}, "ai": {}}
+    rc, err = vmain.process_job(job, cfg, {"chain": None, "stage": None}, _Log())
+    assert rc == 87, (rc, err)
+    assert "disk" in (err or "").lower(), err
+    assert started == [], f"低磁盘时还在跑 stage：{started}"
