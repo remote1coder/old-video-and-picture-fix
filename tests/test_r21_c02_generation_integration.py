@@ -80,7 +80,9 @@ def _publish_generation(tmp_path, job, *, media=b"NEW-MEDIA-BYTES",
     stage = str(tmp_path / "staging")
     _w(os.path.join(stage, "media.bin"), media)
     _w(os.path.join(stage, "verify.json"),
-       json.dumps({"media_sha256": _digest(os.path.join(stage, "media.bin")),
+       json.dumps({"attempt_id": "att1",
+                   "run_identity": {"schema": "run-identity/1", "digest": "0" * 64},
+                   "media_sha256": _digest(os.path.join(stage, "media.bin")),
                    # R24-02：完成验证读报告结论，夹具必须与生产同构
                    "checks": {
                        "mechanical": {"name": "mechanical", "status": "PASS",
@@ -93,7 +95,8 @@ def _publish_generation(tmp_path, job, *, media=b"NEW-MEDIA-BYTES",
                                      "required": True},
                    },
                    "publish_decision": {"publish": True, "verified": True}}))
-    _w(os.path.join(stage, "fullchain.json"), json.dumps({"ok": True}))
+    _w(os.path.join(stage, "fullchain.json"),
+       json.dumps({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
 
     arts = [
         P.Artifact("media", os.path.join(stage, "media.bin"), out),

@@ -92,6 +92,8 @@ def _prepare(tmp_path, media_bytes=b"GEN-A", verify_sha=None):
                     },
                     "publish_decision": {"publish": True, "verified": True},
                     "run_identity": {
+                        "schema": "run-identity/1",
+                        "digest": "0" * 64,
                         "input": vmain.build_input_identity(str(inp))}}),
         encoding="utf-8")
     return media, inp
@@ -125,6 +127,9 @@ def _publish_full(tmp_path, media_bytes=b"GEN-A", input_bytes=b"src"):
     with open(os.path.join(stage, "verify.json"), "w", encoding="utf-8") as f:
         json.dump({"media_sha256": vmain._plain_sha256(
             os.path.join(stage, "media.bin")),
+            # B02：真实 stage7 报告带执行编号与 RunIdentity（C02/C03）
+            "attempt_id": "att1",
+            "run_identity": {"schema": "run-identity/1", "digest": "0" * 64},
             "checks": {
                 "mechanical": {"name": "mechanical", "status": "PASS",
                                "required": True},
@@ -139,7 +144,7 @@ def _publish_full(tmp_path, media_bytes=b"GEN-A", input_bytes=b"src"):
         }, f)
     with open(os.path.join(stage, "fullchain.json"), "w",
               encoding="utf-8") as f:
-        json.dump({"ok": True}, f)
+        json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
 
     arts = [
         _P.Artifact("media", os.path.join(stage, "media.bin"), out),

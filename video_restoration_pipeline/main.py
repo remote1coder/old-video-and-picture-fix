@@ -1186,7 +1186,9 @@ def completion_marker_path(final_path: str) -> str:
 
 def write_completion_marker(final_path: str, job: Dict[str, Any],
                             config: Dict[str, Any], logger=None,
-                            params: Optional[Dict[str, Any]] = None) -> bool:
+                            params: Optional[Dict[str, Any]] = None,
+                            verdict_out: Optional[Dict[str, Any]] = None
+                            ) -> bool:
     """验证本代是否可判"完成"（R22-A01 起**只验证，不再写标记**）。
 
     名字没改，是因为调用点和既有测试都用它；但**行为**变了。
@@ -1211,8 +1213,13 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
     """
     _expect = str((params or {}).get("attempt_id") or "")
     ok, why = verify_generation_completion(
-        final_path, job, config, params, logger, expect_attempt=_expect)
+        final_path, job, config, params, logger, expect_attempt=_expect,
+        verdict_out=verdict_out)
     if ok:
+        # ---- B02：强制导出不能标"已验证完成" ----
+        # 审核 C10：`publish_decision.verified=False` 时这里仍返回 True，
+        # 于是 finish_job_completion 记 COMPLETION_VERIFIED / JOB_DONE。
+        # 现在：产物完整仍 ok，但**未验证**的走独立诊断分支，不标 DONE。
         if logger:
             logger.info(
                 "COMPLETION_VERIFIED",
@@ -1221,6 +1228,19 @@ def write_completion_marker(final_path: str, job: Dict[str, Any],
                 "objects all agree.",
                 output_path=str(final_path))
         return True
+    # ---- B02：未验证导出与"未证完成"必须分开记 ----
+    if str((verdict_out or {}).get("verdict") or "") == VERDICT_UNVERIFIED:
+        if logger:
+            logger.error(
+                "COMPLETION_UNVERIFIED_EXPORT",
+                "This generation was published but is NOT verified. It is a "
+                "diagnostic export: it must not count as a normal DONE, and "
+                "it must not replace a previous verified generation.",
+                output_path=str(final_path),
+                reasons=(verdict_out or {}).get("reasons"),
+                publish_verified_field=(
+                    (verdict_out or {}).get("publish_verified_field")))
+        return False
     if logger:
         logger.error(
             "COMPLETION_UNPROVEN",
@@ -1743,7 +1763,8 @@ def verify_generation_completion(final_path: str, job: Dict[str, Any],
                                  config: Dict[str, Any],
                                  params: Optional[Dict[str, Any]] = None,
                                  logger=None,
-                                 expect_attempt: Optional[str] = None
+                                 expect_attempt: Optional[str] = None,
+                                 verdict_out: Optional[Dict[str, Any]] = None
                                  ) -> Tuple[bool, str]:
     """**唯一**的整代完成证明入口（R23-B01/B02 重写）。
 
@@ -1787,7 +1808,8 @@ def verify_generation_completion(final_path: str, job: Dict[str, Any],
     try:
         with _acq_final(p, logger):
             return _verify_generation_locked(p, job, config, params, logger,
-                                             expect_attempt, planned)
+                                             expect_attempt, planned,
+                                             verdict_out=verdict_out)
     except _LockUnavailable as exc:
         # 锁不可用 = **未验证**。不能返回同一个成功（R23-B02）。
         if logger:
@@ -1804,8 +1826,17 @@ def _verify_generation_locked(p: str, job: Dict[str, Any],
                               config: Dict[str, Any],
                               params: Optional[Dict[str, Any]], logger,
                               expect_attempt: Optional[str],
-                              planned: Dict[str, Any]) -> Tuple[bool, str]:
-    """锁内执行的实际核对（拆出来只是为了在 `with` 里保持一段直线代码）。"""
+                              planned: Dict[str, Any],
+                              verdict_out: Optional[Dict[str, Any]] = None
+                              ) -> Tuple[bool, str]:
+    """锁内执行的实际核对（拆出来只是为了在 `with` 里保持一段直线代码）。
+
+    Args:
+        verdict_out: 传入 dict 时，写入三态结论
+            （`verdict` / `reasons` / `verified_fact` / `forced` /
+            `required_digest`）。调用方**必须**消费它 —— R24 的错误就是
+            "算了不用"。
+    """
     # ---- 当前计划身份（唯一来源：main 冻结的那份；退化时才现算）----
     _cur = (params or {}).get("_run_identity")
     if not isinstance(_cur, dict) or not str(_cur.get("digest") or ""):
@@ -1995,11 +2026,68 @@ def _verify_generation_locked(p: str, job: Dict[str, Any],
                         f"match the marker/disk")
 
     # ---- 7) 整代磁盘事实 ----
-    return verify_generation_objects(p, job, logger,
-                                     expected_objects=objects,
-                                     marker=mdata,
-                                     config=config, params=params,
-                                     planned=planned)
+    _ok, _why = verify_generation_objects(p, job, logger,
+                                          expected_objects=objects,
+                                          marker=mdata,
+                                          config=config, params=params,
+                                          planned=planned)
+    if not _ok:
+        return _ok, _why
+
+    # ---- 8) B02：三态结论 —— "产物完整"不等于"已验证" ----
+    # 审核 C10：报告 `verified=False`（可选检查 UNVERIFIED + 用户强制发布）时，
+    # `finish_job_completion` 仍返回 0 并记 COMPLETION_VERIFIED / JOB_DONE。
+    # 这里把两件事分开：
+    #   * 返回值仍 True（这一代**确实完整地发布了**）；
+    #   * "是否已验证"写进 verdict_out，由上层决定标 DONE 还是诊断导出。
+    #
+    # 注意位置：必须在 `verify_generation_objects` **之后** —— 那个函数才
+    # 真正读报告；而 `verdict_out` 是这一个函数的参数。
+    try:
+        import required_checks as _rc2
+        _ver_doc: Dict[str, Any] = {}
+        _vp = str(p) + ".verify.json"
+        try:
+            with open(_vp, "r", encoding="utf-8") as _vf:
+                _ver_doc = json.load(_vf) or {}
+        except (OSError, ValueError):
+            _ver_doc = {}
+        _dec_final = ((_ver_doc.get("publish_decision")
+                       if isinstance(_ver_doc, dict) else {}) or {})
+        _forced: set = set()
+        for _fk in ("allow_verify_fail_publish", "allow_sync_fail_publish"):
+            try:
+                if _strict_bool((params or {}).get(_fk), default=False):
+                    _forced.add(_fk)
+            except Exception:
+                pass
+        _pl2 = planned if isinstance(planned, dict) else \
+            _planned_generation_roles(p, config, params)
+        _req2 = _rc2.derive(_pl2, params, config)
+        _vres = _rc2.decide(_req2, [], _dec_final, forced_keys=_forced)
+        if verdict_out is not None:
+            verdict_out.clear()
+            verdict_out.update(_vres)
+            verdict_out["required_digest"] = str(_req2.get("digest") or "")
+            verdict_out["publish_verified_field"] = _dec_final.get("verified")
+        if _vres.get("verdict") == _rc2.UNVERIFIED:
+            # 审核 A02：强制导出的产物**不是已完成代**。
+            # 返回 False 是语义决定，不是"没通过检查"：产物完整、已发布，
+            # 但它的检查事实仍 FAIL/UNVERIFIED，不能按已验证代复用。
+            # 上层用 `verdict_out` 区分"该重跑"与"该保留为诊断产物"。
+            return False, ("this generation was published but is explicitly "
+                           "NOT verified (forced export); it is not a "
+                           "completed generation")
+    except Exception as _ve:                 # pragma: no cover - 部署异常
+        if verdict_out is not None:
+            verdict_out.clear()
+            verdict_out.update({"verdict": VERDICT_FAILED,
+                                "reasons": [f"cannot decide the completion "
+                                            f"state: {_ve}"],
+                                "verified_fact": False, "forced": False})
+        return False, f"cannot decide the completion state: {_ve}"
+
+    return True, _why
 
 
 def _load_result_for_consistency(result_path: str, final_path: str
@@ -2018,174 +2106,233 @@ def _load_result_for_consistency(result_path: str, final_path: str
     return data
 
 
-#: verify 报告里**必须存在**的检查项（R24-02 / R23-A02 修订）。
+#: 完成结论三态（B02 / R25）。
 #:
-#: 这两项是发布前**必然**做过的：机械核对（媒体/报告/可解码性）与
-#: 最终时间轴测量。缺任何一项，报告就不完整。
+#: 审核 A02：`verified=False` 的强制导出仍进普通 DONE，所谓"上层会记录
+#: 未验证"根本没有形成状态传播。三者必须**从验证器一路传到 manifest/日志**：
 #:
-#: ⚠️ **不要**把 `frame_order` 也放进来。第一版就是这么写的，结果
-#: **误杀正常完成**：实测（N22，真实 stage7）`frame_order` 的状态是
-#: `UNVERIFIED`（采样点不足），而 `required=None` —— 发布决策允许这种情形
-#: （`publish=True`）。硬性要求它合格会让一批正常 job 变成 rc=82。
+#: * VERIFIED   —— 全部必需检查满足、整代正式发布、可按身份复用；
+#: * UNVERIFIED —— 检查事实仍 FAIL/UNVERIFIED，有明确授权，属**诊断导出**，
+#:                 不覆盖旧正式代，不计入普通已验证 DONE；
+#: * FAILED     —— 失败/取消/待恢复。
+VERDICT_VERIFIED = "verified"
+VERDICT_UNVERIFIED = "unverified"
+VERDICT_FAILED = "failed"
+
+#: "明确未验证的诊断导出"退出码。与 82（未证完成）区分：82 表示**不该采信**，
+#: 89 表示**产物在那里、但明确标注未验证**。
+EXIT_UNVERIFIED_EXPORT = 89
+
+#: verify 报告认识的 schema 版本。
 #:
-#: 分工：
-#:   * **存在性**由这里管（外部底线，不能靠报告自报）；
-#:   * **状态**由报告自己的 `required` 字段 + `publish_decision` 管 ——
-#:     生产者最清楚"这一项在本计划下是否必须合格"。
-_ALWAYS_REQUIRED_CHECKS = ("mechanical", "final_timeline")
+#: **没有 `schema` 字段的老报告仍然接受** —— 真实 stage7 至今不写这个字段
+#: （实测 N22 产物：有 attempt_id/run_identity/checks/publish_decision，
+#: 唯独没有 schema）。但一旦写了就必须认识：C01 的"未知 schema 通过"
+#: 正是因为旧实现完全不看它。
+_VERIFY_SCHEMA_VERSIONS = frozenset({"1", "verify-report/1", "verify/1"})
 
-#: 只有计划要求时才必需的检查项：检查名 → `_planned_generation_roles()`
-#: 里的角色名。角色在 `required` 里才要求报告必须有这一项。
-_PLAN_REQUIRED_CHECKS = {
-    "fullchain": "fullchain",
-}
-
-#: 检查结论里**算合格**的状态。`SKIP` 不算 —— 跳过不等于通过；
-#: `UNVERIFIED` 也不算（它是"没验到"，不是"验过了"）。
-_CHECK_PASSING = frozenset({"PASS", "NOT_APPLICABLE"})
-
-#: 检查结论里**认识**的状态。认不出的状态按问题上报，不静默忽略。
-_CHECK_KNOWN = frozenset({"PASS", "FAIL", "UNVERIFIED", "NOT_APPLICABLE",
-                          "SKIP", "ERROR", "WARN"})
+#: fullchain 报告认识的 schema 版本（真实产物写 "fullchain/1"）。
+_FULLCHAIN_SCHEMA_VERSIONS = frozenset({"1", "fullchain/1"})
 
 
 def _verify_report_problems(doc: Dict[str, Any], *,
                             media_digest: str = "",
                             identity_digest: str = "",
+                            execution_attempt: str = "",
                             publication_attempt: str = "",
-                            planned: Optional[Dict[str, Any]] = None
+                            required: Optional[Dict[str, Any]] = None
                             ) -> List[str]:
-    """`<media>.verify.json` 的**语义**问题（R24-02）。
+    """`<media>.verify.json` 的语义问题（B02 / R25，取代 R24 的版本）。
 
-    为什么不能只验字节
-    ------------------
-    审核 R23-A02 用生产 publisher 造了一整代：摘要完全正确，但报告里写着
-    错误 schema、外来 run/attempt、`required=True/status=FAIL`、
-    `publish=False`，fullchain 也 `ok=False`。正式完成入口仍返回
+    ## R24 的错
 
-        True: media + planned reports + COMMITTED journal (3 objects)
+    R24 只查"报告里有没有 mechanical/final_timeline"，合格与否却听报告
+    自己的 `required` 字段。审核用它打出 8 个假通过（C01–C09），其中
+    最刺眼的是 `final_timeline=FAIL, required=False` 也能完成。
 
-    也就是说，最后一道验证**没有验证它声称要验证的结果**。摘要只能证明
-    "这份报告属于这个文件"，不能证明"报告说这一代合格"。
+    ## 现在的分工
+
+    * **必需性由计划派生**（`required_checks.derive()`），报告只提供 `status`；
+    * 报告自称的 `required` 与计划不符时**单独记一条**，但判定以计划为准
+      （报告不能给自己降标准）；
+    * `attempt_id` 必须存在，且等于**执行编号**（C02）；
+    * `run_identity` 必须有 `digest`（C03）；
+    * `schema` 若存在必须被认识（C01）。
+
+    ## 关于"执行编号 vs 发布编号"
+
+    回拷场景（B03）里 verify 报告记的是**执行**编号 `att1`，而 marker /
+    publish_result 记的是**发布**编号 `att1-wsl`。两者属于不同字段，
+    不能要求同一个字符串承担两者 —— 这是 R24-A03 的原话。
+    所以这里用 `execution_attempt` 校验报告，`publication_attempt` 只在
+    "既不是执行也不是发布"时用于报错说明。
+
+    Args:
+        doc: 报告内容。
+        media_digest: 当前媒体的摘要（空表示无法核对，仍要求报告有值）。
+        identity_digest: 当前 RunIdentity 摘要（空表示无法核对）。
+        execution_attempt: 本次**执行**编号。
+        publication_attempt: 本次**发布**编号（= marker 的 attempt）。
+        required: `required_checks.derive()` 的结果。
 
     Returns:
-        问题列表；空列表才表示报告的语义也成立。
+        问题列表；空表示报告的语义也成立。
     """
     probs: List[str] = []
     if not isinstance(doc, dict) or not doc:
         return ["verify report is empty"]
 
-    # ---- 关联身份：报告必须属于**这次执行/这次计划** ----
-    _att = str(doc.get("attempt_id") or "")
-    if publication_attempt and _att and _att != publication_attempt:
+    # ---- 1) schema（C01）----
+    _sc = doc.get("schema")
+    if _sc is not None and str(_sc) not in _VERIFY_SCHEMA_VERSIONS:
         probs.append(
-            f"verify report belongs to attempt {_att!r}, not the final "
-            f"publication {publication_attempt!r}")
+            f"verify report schema is {_sc!r}; this consumer only "
+            f"understands {sorted(_VERIFY_SCHEMA_VERSIONS)}")
+
+    # ---- 2) 执行身份（C02）----
+    _att = str(doc.get("attempt_id") or "")
+    if not _att:
+        probs.append("verify report carries no attempt_id; it cannot be "
+                     "bound to an execution")
+    elif execution_attempt and _att != str(execution_attempt):
+        # 回拷时报告记执行编号；如果它连发布编号都不是，说明这份报告
+        # 来自别的代 —— 下面第 7 条会再单独说一次，便于定位。
+        if publication_attempt and _att == str(publication_attempt):
+            # 报告记的是发布编号：这是"派生目标报告"的实现方式，
+            # 本轮不采用（推荐保持冻结报告字节），但要允许，
+            # 因为它仍是本代的身份之一。
+            pass
+        else:
+            probs.append(
+                f"verify report belongs to execution {_att!r}, not "
+                f"{execution_attempt!r}")
+
+    # ---- 3) 计划身份（C03）----
     _ri = doc.get("run_identity")
-    if isinstance(_ri, dict):
+    if not isinstance(_ri, dict) or not _ri:
+        probs.append("verify report carries no run identity; it cannot be "
+                     "bound to a plan")
+    else:
         _rid = str(_ri.get("digest") or "")
-        if identity_digest and _rid and _rid != identity_digest:
+        if not _rid:
+            probs.append("verify report's run identity has no digest; it "
+                         "cannot be compared with the current plan")
+        elif identity_digest and _rid != str(identity_digest):
             probs.append("verify report was written for a different run "
                          "identity than the current plan")
-    elif identity_digest:
-        probs.append("verify report carries no run identity; it cannot be "
-                     "bound to the plan that produced this media")
 
-    # ---- 媒体身份 ----
+    # ---- 4) 媒体身份 ----
     _md = str(doc.get("media_sha256") or "")
-    if media_digest and _md and _md != media_digest:
+    if not _md:
+        probs.append("verify report does not record media_sha256; it cannot "
+                     "prove which bytes it describes")
+    elif media_digest and _md != str(media_digest):
         probs.append("verify report describes different media bytes")
 
-    # ---- 检查项：集合、状态、必需性 ----
-    raw_checks = doc.get("checks")
-    if not isinstance(raw_checks, dict) or not raw_checks:
-        probs.append("verify report carries no check results; it does not "
-                     "show that anything was actually checked")
-        raw_checks = {}
+    # ---- 5) 检查结论（C04/C05）：**按计划**核验 ----
+    try:
+        import required_checks as _rc
+        probs.extend(_rc.evaluate_checks(doc.get("checks"),
+                                         required or {}))
+    except Exception as exc:                 # pragma: no cover - 部署异常
+        probs.append(f"cannot evaluate the required checks: {exc}")
 
-    seen: Dict[str, str] = {}
-    for name, row in raw_checks.items():
-        if not isinstance(row, dict):
-            probs.append(f"check {name!r} is not an object")
-            continue
-        st = str(row.get("status") or "").upper()
-        seen[str(name)] = st
-        if st not in _CHECK_KNOWN:
-            probs.append(f"check {name!r} has an unknown status {st!r}")
-        # 报告自己声明 required 的项，必须真的合格
-        if row.get("required") is True and st not in _CHECK_PASSING:
-            probs.append(f"check {name!r} is required but reports {st!r}")
-
-    _roles = (planned or {}).get("required") or {}
-    must = list(_ALWAYS_REQUIRED_CHECKS)
-    for chk, role in _PLAN_REQUIRED_CHECKS.items():
-        if role in _roles:
-            must.append(chk)
-    for name in must:
-        if name not in seen:
-            # R24-02 修订：`must` 只包含"报告里必须有"的项（`mechanical`，
-            # 以及计划要求全链时的 `fullchain`）。**存在性**由这里管，
-            # **状态**由下面的 `required` 规则与 `publish_decision` 管 ——
-            # 两者分开，才不会把"生产认可的 UNVERIFIED"误判成不合格。
-            probs.append(f"the report lacks the {name!r} check entirely; it "
-                         f"does not show that it was performed")
-        elif name == "mechanical" and seen[name] == "FAIL":
-            probs.append("the mechanical pre-publish check failed")
-
-    # ---- 报告自己的发布决定 ----
+    # ---- 6) 发布决定 ----
     dec = doc.get("publish_decision")
     if not isinstance(dec, dict):
         probs.append("verify report carries no publish decision; the "
                      "conclusion it reached cannot be checked")
-    else:
-        if dec.get("publish") is not True:
-            probs.append("the report's own publish decision is "
-                         f"{dec.get('publish')!r}, not True")
-        # `verified=False` 不在这里拦：它是"用户显式强制发布"的合法结果
-        # （`allow_verify_fail_publish`）。但它必须被上层看到 —— 由
-        # `_verify_generation_locked` 记进 verdict，而不是包装成"已验证"。
+    elif dec.get("publish") is not True:
+        probs.append("the report's own publish decision is "
+                     f"{dec.get('publish')!r}, not True")
+
+    # ---- 7) 身份归属（说明用）----
+    if (_att and execution_attempt and publication_attempt
+            and _att not in (str(execution_attempt), str(publication_attempt))):
+        probs.append(
+            f"verify report attempt {_att!r} matches neither the execution "
+            f"{execution_attempt!r} nor the publication "
+            f"{publication_attempt!r}")
     return probs
 
 
 def _fullchain_report_problems(doc: Dict[str, Any], *,
-                               publication_attempt: str = ""
+                               execution_attempt: str = "",
+                               publication_attempt: str = "",
+                               required: Optional[Dict[str, Any]] = None
                                ) -> List[str]:
-    """`<media>.fullchain.json` 的语义问题（R24-02）。
+    """`<media>.fullchain.json` 的语义问题（B02 / R25）。
 
-    两种合法形态：
+    两种形态：
 
-    * `status="NOT_APPLICABLE"` —— 用户关掉了全链检查，报告**明确**说这一代
-      没有全链证据。允许（与"计划里 fullchain 可选"一致），但不算通过。
-    * 真实检查结果 —— `ok` 必须是 True，且每一项 `checks[*].ok` 不能是 False。
+    * `status="NOT_APPLICABLE"` —— 只有**计划允许**不适用时才合法
+      （C06：计划要求全链时，报告不能自称不适用）。
+    * 真实检查结果 —— `ok` 必须是 True、**必须有 checks**（C08）、
+      每项 `checks[*].ok` 不能是 False。
 
-    审核反例给的是 `{'ok': False, 'run_identity': 'foreign', ...}`，
-    旧实现照样放行。这里 `ok is not True` 直接报问题。
+    `schema` 若存在必须被认识（C09）；`attempt_id` 若存在必须属于本代（C07）。
+
+    **注意**：fullchain 报告是 stage7 在**执行时**写的，回拷时被
+    `stage_generation_copy` 逐字节复制 —— 所以它的 `attempt_id` 是
+    **执行**编号（`att1`），不是目标发布编号（`att1-wsl`）。
+    R24 把它当发布编号校验，把正常回拷拒掉了（C11）。这里与 verify 报告
+    用同一口径：等于执行编号即可，等于发布编号也接受。
     """
     probs: List[str] = []
     if not isinstance(doc, dict) or not doc:
         return ["fullchain report is empty"]
 
-    if str(doc.get("status") or "").upper() == "NOT_APPLICABLE":
-        _att = str(doc.get("attempt_id") or "")
-        if publication_attempt and _att and _att != publication_attempt:
+    # ---- schema（C09）----
+    _sc = doc.get("schema")
+    if _sc is not None and str(_sc) not in _FULLCHAIN_SCHEMA_VERSIONS:
+        probs.append(
+            f"fullchain report schema is {_sc!r}; this consumer only "
+            f"understands {sorted(_FULLCHAIN_SCHEMA_VERSIONS)}")
+
+    # ---- 归属（C07）：执行编号或发布编号都可以，别的都不行 ----
+    _att = str(doc.get("attempt_id") or "")
+    if _att:
+        _ok_att = {x for x in (str(execution_attempt or ""),
+                               str(publication_attempt or "")) if x}
+        if _ok_att and _att not in _ok_att:
             probs.append(
-                f"fullchain report belongs to attempt {_att!r}, not the final "
+                f"fullchain report belongs to attempt {_att!r}, which is "
+                f"neither the execution {execution_attempt!r} nor the "
                 f"publication {publication_attempt!r}")
+
+    _fc_rule = (((required or {}).get("checks") or {})
+                .get("fullchain") or {})
+
+    # ---- 不适用（C06）----
+    if str(doc.get("status") or "").upper() == "NOT_APPLICABLE":
+        if _fc_rule.get("required"):
+            probs.append(
+                "the plan requires a full-chain comparison, but the report "
+                "claims NOT_APPLICABLE; a report may not decide that a "
+                "planned check was unnecessary")
+        elif not _fc_rule.get("not_applicable_allowed", True):
+            probs.append(
+                "the plan does not allow the full-chain check to be "
+                "inapplicable")
         return probs
 
     if doc.get("hard_error"):
-        probs.append(f"fullchain report records a hard error "
+        probs.append("fullchain report records a hard error "
                      f"({doc.get('hard_error')!r})")
     if doc.get("ok") is not True:
-        probs.append("fullchain report says ok="
-                     f"{doc.get('ok')!r}, not True")
+        probs.append(f"fullchain report says ok={doc.get('ok')!r}, not True")
+
+    # ---- checks 必须存在（C08）----
     checks = doc.get("checks")
-    if isinstance(checks, dict):
+    if checks is None:
+        probs.append("fullchain report carries no checks; it does not show "
+                     "that the chain was actually compared")
+    elif not isinstance(checks, dict):
+        probs.append("fullchain report's checks is not an object")
+    else:
         for name, row in checks.items():
             if isinstance(row, dict) and row.get("ok") is False:
                 probs.append(f"fullchain check {name!r} failed")
-    elif checks is not None:
-        probs.append("fullchain report's checks is not an object")
     return probs
 
 
@@ -2293,10 +2440,26 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
     if not _pub_att:
         _pub_att = str((params or {}).get("attempt_id") or "")
 
+    # ---- B02：必需检查由**计划**派生，报告只提供观测 ----
+    try:
+        import required_checks as _rc
+        _required = _rc.derive(pl, params)
+    except Exception as _rce:                # pragma: no cover - 部署异常
+        return (False, f"cannot derive the required checks: {_rce}")
+
+    # ---- B03：verify 报告记**执行**编号；marker/publish_result 记**发布**编号 ----
+    # 回拷时两者不同（att1 vs att1-wsl）。R24 要求它们相等，把正常回拷拒掉了。
+    #
+    # 注意：这个函数拿不到 `_verify_generation_locked` 的私有 result，所以
+    # 执行编号只能从 `params` 取（main 在计划阶段会把它冻结进去）。
+    # 取不到时留空 —— 判据里"非空才比对"，但**报告自身必须有 attempt**（C02）。
+    _exec_att = str((params or {}).get("attempt_id") or "")
+
     _sem = _verify_report_problems(
         _v, media_digest=str(media_digest or ""),
         identity_digest=_ident_digest,
-        publication_attempt=_pub_att, planned=pl)
+        execution_attempt=_exec_att,
+        publication_attempt=_pub_att, required=_required)
     if _sem:
         return (False,
                 "the verify report does not support completion: "
@@ -2311,7 +2474,9 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
         except (OSError, ValueError) as exc:
             return False, f"fullchain report is unreadable: {exc}"
         _fcp = _fullchain_report_problems(_fc_doc,
-                                          publication_attempt=_pub_att)
+                                          execution_attempt=_exec_att,
+                                          publication_attempt=_pub_att,
+                                          required=_required)
         if _fcp:
             return (False,
                     "the fullchain report does not support completion: "
@@ -3616,6 +3781,8 @@ def finish_job_completion(job: Dict[str, Any], config: Dict[str, Any], args,
     _marker_ok = False
     _marker_path = ""
     _marker_why = ""
+    # B02：三态结论（由验证器写入，收尾按它决定 DONE / 未验证导出 / 未证完成）
+    _verdict: Dict[str, Any] = {}
     try:
         finals = find_final_output(job, config, args,
                                    plan=params.get("_run_plan_obj"))
@@ -3627,7 +3794,8 @@ def finish_job_completion(job: Dict[str, Any], config: Dict[str, Any], args,
             _marker_path = cand
             try:
                 _marker_ok = bool(write_completion_marker(
-                    cand, job, config, job_logger, params=params))
+                    cand, job, config, job_logger, params=params,
+                    verdict_out=_verdict))
             except Exception as e:      # 写标记抛异常也算失败，不能算完成
                 _marker_ok = False
                 _marker_why = f"write_completion_marker raised: {e}"
@@ -3636,11 +3804,28 @@ def finish_job_completion(job: Dict[str, Any], config: Dict[str, Any], args,
         _marker_why = _marker_why or "no finished output candidate was found"
 
     if not _marker_ok:
+        # ---- B02：三态传播到任务收尾 ----
+        # `unverified` 不是"没完成"，而是"完成了但明确未验证"：
+        # 用独立退出码与独立事件，避免与 82（未证完成）混在一起。
+        if str((_verdict or {}).get("verdict") or "") == VERDICT_UNVERIFIED:
+            job_logger.error(
+                "JOB_UNVERIFIED",
+                "The job published a generation that is explicitly NOT "
+                "verified (forced export). It is kept as a diagnostic "
+                "artifact, not counted as a normal DONE.",
+                output=_marker_path,
+                reasons=(_verdict or {}).get("reasons"),
+                forced=(_verdict or {}).get("forced"))
+            return EXIT_UNVERIFIED_EXPORT, (
+                "published but unverified (forced export): "
+                + "; ".join(str(x) for x in
+                            ((_verdict or {}).get("reasons") or []))[:200])
         job_logger.error(
             "JOB_COMPLETION_UNPROVEN",
             "The job produced output but its completion could not be proven "
             "(marker/identity/generation). This is NOT a successful job.",
-            output=_marker_path, reason=_marker_why)
+            output=_marker_path, reason=_marker_why,
+            verdict=(_verdict or {}).get("verdict"))
         return 82, (_marker_why or "completion could not be proven")
 
     logger.info("JOB_DONE", f"Job {job.get('job_id', '')} complete")

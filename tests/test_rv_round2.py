@@ -515,7 +515,10 @@ def _write_receipt(final, src):
     with open(str(final) + ".verify.json", "w", encoding="utf-8") as f:
         # R24-02：完成验证读报告结论（必需检查 + 发布决定）。
         # 只写 media_sha256 的夹具已经不能代表生产 writer 的产物。
-        _json.dump({"media_sha256": vmain._plain_sha256(str(final)),
+        _json.dump({"attempt_id": "att1",
+                    "run_identity": {"schema": "run-identity/1",
+                                     "digest": "0" * 64},
+                    "media_sha256": vmain._plain_sha256(str(final)),
                     "checks": {
                         "mechanical": {"name": "mechanical",
                                        "status": "PASS", "required": True},
@@ -529,9 +532,12 @@ def _write_receipt(final, src):
                     "publish_decision": {"publish": True,
                                          "verified": True},
                     "run_identity": {
+                        # B02：真实报告带 digest；没有它无法与当前计划比对（C03）
+                        "schema": "run-identity/1",
+                        "digest": "0" * 64,
                         "input": vmain.build_input_identity(str(src))}}, f)
     with open(str(final) + ".fullchain.json", "w", encoding="utf-8") as f:
-        _json.dump({"ok": True}, f)
+        _json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
     import publish_journal as _pj
     # R23-B01：journal 必须与 marker 绑定同一个 attempt（生产 publisher 会写）
     _pj.write_journal(str(final) + ".journal.json",

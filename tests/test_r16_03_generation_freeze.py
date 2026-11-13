@@ -60,7 +60,9 @@ def _publish_full(tmp_path, *, media=b"GENUINE", attempt="att1",
         f.write(media)
     with open(os.path.join(stage, "verify.json"), "w", encoding="utf-8") as f:
         # R24-02：报告要带检查结论与发布决定（真实 stage7 就是这么写的）
-        json.dump({"media_sha256": vmain._plain_sha256(
+        json.dump({"attempt_id": "att1",
+            "run_identity": {"schema": "run-identity/1", "digest": "0" * 64},
+            "media_sha256": vmain._plain_sha256(
             os.path.join(stage, "media.bin")),
             "checks": {
                 "mechanical": {"name": "mechanical", "status": "PASS",
@@ -76,7 +78,7 @@ def _publish_full(tmp_path, *, media=b"GENUINE", attempt="att1",
         }, f)
     with open(os.path.join(stage, "fullchain.json"), "w",
               encoding="utf-8") as f:
-        json.dump({"ok": True}, f)
+        json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
 
     arts = [
         _P.Artifact("media", os.path.join(stage, "media.bin"), out),
@@ -263,7 +265,9 @@ def test_two_attempts_do_not_corrupt_the_marker(tmp_path):
             f.write(b"GEN-" + attempt.encode())
         with open(os.path.join(stage, "verify.json"), "w",
                   encoding="utf-8") as f:
-            json.dump({"media_sha256": vmain._plain_sha256(
+            json.dump({"attempt_id": "att1",
+                "run_identity": {"schema": "run-identity/1", "digest": "0" * 64},
+                "media_sha256": vmain._plain_sha256(
                 os.path.join(stage, "media.bin")),
                 "checks": {
                     "mechanical": {"name": "mechanical", "status": "PASS",
@@ -279,7 +283,7 @@ def test_two_attempts_do_not_corrupt_the_marker(tmp_path):
             }, f)
         with open(os.path.join(stage, "fullchain.json"), "w",
                   encoding="utf-8") as f:
-            json.dump({"ok": True}, f)
+            json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
         arts = [
             _P.Artifact("media", os.path.join(stage, "media.bin"), out),
             _P.Artifact("verify", os.path.join(stage, "verify.json"),

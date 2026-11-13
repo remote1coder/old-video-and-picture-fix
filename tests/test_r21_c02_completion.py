@@ -71,6 +71,11 @@ def _gen(tmp_path, *, with_reports=True, with_journal=True,
         # 旧夹具只写 media_sha256 —— 那不是真实 stage7 会产出的报告，
         # 也会让"报告说失败却判完成"这条判据在夹具上永远测不出来。
         _write(final + ".verify.json", json.dumps({
+            # B02：真实 stage7 的 verify 报告带执行编号与 RunIdentity；
+            # 缺这两项的报告不能被绑定到某次执行（C02/C03）。
+            "attempt_id": "att1",
+            "run_identity": {"schema": "run-identity/1",
+                             "digest": "0" * 64},
             "media_sha256": vmain._plain_sha256(final),
             "checks": {
                 "mechanical": {"name": "mechanical", "status": "PASS",
@@ -86,7 +91,7 @@ def _gen(tmp_path, *, with_reports=True, with_journal=True,
                                  "blocked_by": [], "forced": False,
                                  "reasons": {}},
         }))
-        _write(final + ".fullchain.json", json.dumps({"ok": True}))
+        _write(final + ".fullchain.json", json.dumps({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
     if with_journal:
         # R22-A01：journal 的 targets 必须覆盖**同一代**的全部对象。
         # 真实 publisher 就是 `sorted(set(finals))`；旧夹具只写媒体，

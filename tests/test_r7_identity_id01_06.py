@@ -175,7 +175,9 @@ def _complete_generation(final_path, job=None, config=None):
     with open(p + ".verify.json", "w", encoding="utf-8") as f:
         # R24-02：完成验证读报告结论（必需检查 + 发布决定），
         # 夹具必须产出与真实 stage7 同构的报告。
-        json.dump({"media_sha256": M._plain_sha256(p),
+        json.dump({"attempt_id": "att1",
+                   "run_identity": {"schema": "run-identity/1", "digest": "0" * 64},
+                   "media_sha256": M._plain_sha256(p),
                    "checks": {
                        "mechanical": {"name": "mechanical", "status": "PASS",
                                       "required": True},
@@ -188,7 +190,7 @@ def _complete_generation(final_path, job=None, config=None):
                    },
                    "publish_decision": {"publish": True, "verified": True}}, f)
     with open(p + ".fullchain.json", "w", encoding="utf-8") as f:
-        json.dump({"ok": True}, f)
+        json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
     # R23-B01：journal 必须写明**是哪一次执行**（生产 publisher 就是这么写的）。
     # 缺 attempt_id 时，marker 与 journal 无法证明是同一代 → 拒绝。
     _pj.write_journal(p + ".journal.json",
