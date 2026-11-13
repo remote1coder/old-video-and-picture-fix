@@ -67,7 +67,18 @@ def _build_and_publish(root, job, media=b"GENERATION-BYTES", attempt="att1"):
     stage = root / "staging"
     _w(str(stage / "media.bin"), media)
     _w(str(stage / "verify.json"),
-       json.dumps({"media_sha256": _digest(str(stage / "media.bin"))}))
+       # R24-02：完成验证读报告结论（必需检查 + 发布决定）。
+       # 只写 media_sha256 的夹具已不代表生产 writer 的产物。
+       json.dumps({"media_sha256": _digest(str(stage / "media.bin")),
+                   "checks": {
+                       "mechanical": {"name": "mechanical", "status": "PASS",
+                                      "required": True},
+                       "final_timeline": {"name": "final_timeline",
+                                          "status": "PASS", "required": True},
+                       "fullchain": {"name": "fullchain", "status": "PASS",
+                                     "required": True},
+                   },
+                   "publish_decision": {"publish": True, "verified": True}}))
     _w(str(stage / "fullchain.json"), json.dumps({"ok": True}))
     arts = [
         P.Artifact("media", str(stage / "media.bin"), out),

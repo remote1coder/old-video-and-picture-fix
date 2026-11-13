@@ -159,6 +159,17 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
         frames_digest_proven = bool(frames_digest)
     if pix_fmt_proven is None:
         pix_fmt_proven = bool(pix_fmt)
+    # ---- R24-06：摘要域不能留空 ----
+    # 审核要求"摘要域必填"，而 `compare_contracts` 现在把"摘要相同但域
+    # 未声明"判为不可信（那是**对的**：两个不同表示上算出同一个摘要文本，
+    # 恰恰最危险）。所以生产者必须给出域。
+    #
+    # 没显式给时按**像素格式**推：同一格式的两份合同可比，不同格式的两份
+    # 会被判"域不同、不可比" —— 正是我们要的语义。不写 "unspecified"
+    # 之类的占位符，那样等于把"没声明"伪装成"已声明"。
+    _domain = str(frames_digest_domain or "").strip()
+    if not _domain:
+        _domain = ("pix:" + str(pix_fmt)) if str(pix_fmt or "") else ""
     return {
         "schema": SCHEMA,
         "frames": int(frames),
@@ -169,7 +180,7 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
         "channel_order": order,
         "frames_digest": frames_digest or None,
         "frames_digest_proven": bool(frames_digest_proven),
-        "frames_digest_domain": str(frames_digest_domain or ""),
+        "frames_digest_domain": _domain,
         # R23-B08：格式是**探测到的**还是**请求值回填**的，必须分开。
         # 审核：模拟 probe 失败时，生产写入器把请求的尺寸/格式填进去，
         # 虽然写了 gaps，`contract_problems` 仍然返回空 → 合同"看起来完整"。
