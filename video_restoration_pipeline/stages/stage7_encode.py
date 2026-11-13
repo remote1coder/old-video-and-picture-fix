@@ -989,6 +989,13 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
         "first_pts": None, "last_pts": None, "varies": None,
         "median_interval": 0.0, "min_interval": 0.0, "max_interval": 0.0,
         "problem": "",
+        # ---- B07：解析失败的**行数**必须留痕 ----
+        # 审核 T02：三条 packet 观测里一条 PTS=N/A 被静默丢弃，剩下两条
+        # 算出 0.12 秒，仍然判"完整覆盖"。丢行不是"没有这一行"，
+        # 而是"有数据但没读懂" —— 两者对覆盖的含义完全不同。
+        "dropped_rows": 0,
+        "dropped_examples": [],
+        "rows_total": 0,
         # ---- R24-03 / R23-A03：观测的**四态**，不能只用一个 ok 布尔 ----
         #   observed       —— 拿到了可用且自洽的时间信息
         #   unavailable    —— 没拿到（无 packet / 空文件）；这不是"坏了"
@@ -1020,10 +1027,15 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
         line = line.strip()
         if not line:
             continue
+        out["rows_total"] += 1
         parts = line.split(",")
         try:
             pts = float(parts[0])
         except (TypeError, ValueError):
+            # 有数据但读不懂 → **计数并留样**，不静默丢弃
+            out["dropped_rows"] += 1
+            if len(out["dropped_examples"]) < 8:
+                out["dropped_examples"].append(line[:80])
             continue
         dur = 0.0
         if len(parts) > 1:
@@ -1093,6 +1105,20 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
                  and not _dups)
     if out["ok"]:
         out["state"] = "observed"
+
+    # ---- B07：有丢行就不能宣称"完整覆盖" ----
+    if out["dropped_rows"]:
+        _msg = ("%d of %d packet row(s) could not be parsed (PTS/duration "
+                "unknown); the span only covers the rows that could be read"
+                % (out["dropped_rows"], out["rows_total"]))
+        _prev = str(out.get("problem") or "")
+        if _msg not in _prev:
+            out["problem"] = (_prev + "; " + _msg) if _prev else _msg
+        if out["state"] == "observed":
+            # 观测本身成立，但覆盖率不完整 → 归到 incomplete
+            out["state"] = "incomplete"
+            out["ok"] = False
+        out["problem"] = out["problem"] or _msg
 
     if len(starts) >= 3:
         d = [b - a for a, b in zip(starts, starts[1:]) if b > a]
@@ -1216,7 +1242,14 @@ def measure_final_candidate(candidate: str, logger=None,
             _got = True
             if _tl.get("problem"):
                 info["problems"].append(_tl["problem"])
-        elif _scan_state in ("contradictory", "failed"):
+        elif (_scan_state in ("contradictory", "failed")
+              # ---- B07 / T01：**必需扫描**没结果也不能退回 ----
+              # retime 之后时间轴按设计会变，这时扫描是"必须做"的。
+              # 它返回 unavailable（没拿到 packet）或 incomplete（丢行/
+              # 缺尾帧时长）时，流头时长是**另一个边界**的证据，
+              # 不能拿来宣称"最终时间轴已完整覆盖"。
+              or (_needs_accuracy
+                  and _scan_state in ("unavailable", "incomplete"))):
             # ---- R24-03 / R23-A03：否定观测不能被 ① 的流头时长盖住 ----
             # 审核反例（AST 受控探测）：stream duration 先拿到正值把
             # `coverage_complete` 设成 True；随后扫描发现重复显示时刻 /
