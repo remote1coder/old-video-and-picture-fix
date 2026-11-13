@@ -268,6 +268,10 @@ def test_no_stage_can_turn_on_lossy_by_itself():
         os.path.join(root, "video_restoration_pipeline", "main.py"),
         os.path.join(root, "photo_restoration_pipeline", "main.py"),
         os.path.join(root, "shared_modules", "write_ledger.py"),
+        # `stage_deps` 只是把这些键**声明**为非语义（不进参数身份），
+        # 它不解析策略、更不能开启有损 —— 真正的决策点仍只有
+        # `storage_policy` 与两个 main。把它排除在外是准确的，不是放水。
+        os.path.join(root, "shared_modules", "stage_deps.py"),
     }
     offenders = []
     for sub in ("video_restoration_pipeline", "photo_restoration_pipeline",

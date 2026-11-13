@@ -142,6 +142,20 @@ GLOBAL_PARAMS: Set[str] = {
 #: 注意：`output_dir` / `temp_dir` 已在 `_identity_semantics` 里剔除，
 #: 这里列出的是仍会进 params 但不影响媒体的键。
 NON_SEMANTIC_PARAMS: Set[str] = {
+    # ---- P5 / G6：存储策略与资源上限的**子键** ----
+    # 它们只被 `storage_policy` / `resource_limits` 两个解析器读取，
+    # 真实身份**另有承载**：
+    #   * 存储：每个中间产物的侧车里写 `storage` 块（mode/codec/quality/
+    #     代数），复用判定看它（`storage_policy.cache_mismatch`）；
+    #   * 资源：线程数在计划阶段冻结，并且按《设计 v1》§3"线程可能影响
+    #     结果"，真要换线程数应当重算 —— 这里不给"改一个百分比就全链失效"
+    #     的假精确，改上限后由计划快照与新 attempt 承担。
+    # 放进 name 级的 hash 反而危险：`quality`/`codec`/`enabled`/`mode`
+    # 这些名字在别处也出现，加进 CORE_QUALITY_PARAMS 会误伤无关配置。
+    "intermediate_storage", "resource_limits",
+    "lossy_allowed", "max_lossy_generations", "reuse_identity", "quality",
+    "codec", "pix_fmt", "mode",
+    "purge_stale", "max_fraction", "reserve_cores", "min_threads",
     "log_level", "log_dir", "log_max_lines", "log_max_line_bytes",
     "log_backup_count", "manifest_format", "cleanup_intermediates",
     "keep_steps", "retry_count", "publish_lock_timeout",

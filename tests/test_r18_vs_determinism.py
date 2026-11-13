@@ -145,10 +145,8 @@ def test_stage1_script_contains_single_thread_when_enabled():
     assert i_nt < i_src, "num_threads 必须在第一个 filter 之前"
 
 
-def test_stage1_script_has_no_thread_override_by_default():
-    import stage1_preprocess as s1
-
-    params = {
+def _base_params(**kw):
+    p = {
         "denoise": "", "deblock": "", "stabilize": "",
         "denoise_strength": 16, "denoise_bs": 16,
         "deblock_quant": 24, "deblock_auto": False,
@@ -156,9 +154,39 @@ def test_stage1_script_has_no_thread_override_by_default():
         "color_matrix_in": "170m", "color_matrix_out": "709",
         "crop_auto": False, "ivtc_auto": False,
     }
-    script = s1.generate_vs_script("E:/fake/in.mp4", params, "job1")
-    assert "core.num_threads" not in script, \
-        "默认不得限制线程（否则生产无端慢 4.78 倍）"
+    p.update(kw)
+    return p
+
+
+def test_stage1_script_does_not_single_thread_by_default():
+    """默认**不得**因为"确定性"把 VS 压成单线程（那会慢 4.78 倍）。
+
+    R25 起默认改为按资源上限（整机 80%）限制线程数 —— 这是用户明确要求的
+    "任何一项不超过 80%，慢一点可以接受"。所以判据从"不得出现
+    core.num_threads"改成"不得等于 1，且必须等于资源上限"：
+    只要它还是多线程，就不存在"无端慢 4.78 倍"这条风险。
+    """
+    import os as _os
+    import re as _re
+    import stage1_preprocess as s1
+
+    script = s1.generate_vs_script("E:/fake/in.mp4", _base_params(), "job1")
+    m = _re.search(r"core\.num_threads = (\d+)", script)
+    assert m, "默认应当按资源上限写入线程数（见 resource_limits）"
+    n = int(m.group(1))
+    assert n >= 2, f"默认不得单线程化（实测会是 4.78 倍慢）：{n}"
+    expect = max(1, int((_os.cpu_count() or 4) * 0.8))
+    assert n == expect, f"线程数应等于整机 80% 上限：{n} != {expect}"
+
+
+def test_stage1_script_has_no_thread_override_when_limits_disabled():
+    """关掉资源限幅 = 回到旧行为（完全不写 num_threads）。"""
+    import stage1_preprocess as s1
+
+    script = s1.generate_vs_script(
+        "E:/fake/in.mp4",
+        _base_params(resource_limits={"enabled": False}), "job1")
+    assert "core.num_threads" not in script
 
 
 def test_stage6_determinism_block_toggles():
