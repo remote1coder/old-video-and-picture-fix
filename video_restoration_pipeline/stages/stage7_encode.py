@@ -894,6 +894,42 @@ def _duration_is_usable(value) -> bool:
     return math.isfinite(v) and v > 0
 
 
+def _scan_state_from(result: Dict[str, Any]) -> str:
+    """把一次时间扫描的结果归成四态（R24-03）。
+
+    优先用 `state`；**没有时按 `problem` 文本判断**。
+
+    为什么必须兼容"只回 ok/problem"的调用方：审核用于证明 R23-A03 的探针
+    就是这么 stub 的（`{'ok': False, 'problem': '1 duplicate display
+    timestamp'}`）。如果这里只认新字段，那种输入会被归成 "unavailable"
+    —— 于是"矛盾"被当成"没测到"，门禁继续 PASS，缺陷原样保留。
+    判据不能依赖调用方先升级。
+    """
+    st = str((result or {}).get("state") or "")
+    if st:
+        return st
+    txt = str((result or {}).get("problem") or "").lower()
+    if not txt:
+        return "unavailable"
+    # ① **明确矛盾**：出现了不该出现的坏数据。优先级最高 —— 这类问题
+    #    即使同时带着 `coverage="unknown"` 也必须算否定（审核的两个反例
+    #    就是这种形态，它们的 coverage 也是 unknown）。
+    if ("duplicate" in txt or "non-finite" in txt or "contradict" in txt
+            or "never shown" in txt):
+        return "contradictory"
+    # ② 没拿到时间信息
+    if "no packet" in txt or "no timestamps" in txt:
+        return "unavailable"
+    # ③ **拿到了但不完整**（单帧缺末帧时长、末帧无 duration）。
+    #    这不是"坏了"，也不是"没测到" —— 是"覆盖少一块"，由 coverage
+    #    字段自己表达（unknown / derived）。判成 failed 会把它误杀。
+    if ("no duration" in txt or "excludes" in txt
+            or "without duration" in txt):
+        return "incomplete"
+    # ④ 其余带文本的否定结果按"扫描失败"处理 —— 保守：不把未知当成没问题。
+    return "failed"
+
+
 def final_timeline_status(ftl: Dict[str, Any]) -> Tuple[str, str]:
     """最终时间轴这一条检查的结论（R23-B04：单一判定点）。
 
@@ -908,6 +944,16 @@ def final_timeline_status(ftl: Dict[str, Any]) -> Tuple[str, str]:
     Returns:
         ``("PASS"|"UNVERIFIED", reason)``。
     """
+    # ---- R24-03 / R23-A03：否定观测优先于一切 ----
+    # 审核反例：流头先拿到正值 → `coverage_complete=True`；随后**必须执行**的
+    # 扫描发现重复显示时刻 / 非有限数并返回 ok=False，旧实现只把它记进
+    # attempts，于是这里仍判 PASS。矛盾或扫描失败的结论不能被"别处有个
+    # 正数时长"推翻 —— 那是两件不同的证据。
+    if ftl.get("negative_observation"):
+        return ("UNVERIFIED",
+                "a mandatory timeline scan returned a negative observation "
+                f"({ftl.get('scan_state') or 'contradictory/failed'}); an "
+                "earlier stream duration cannot overrule it")
     if not ftl.get("measured"):
         return ("UNVERIFIED",
                 "the final candidate's duration could not be measured after "
@@ -943,6 +989,15 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
         "first_pts": None, "last_pts": None, "varies": None,
         "median_interval": 0.0, "min_interval": 0.0, "max_interval": 0.0,
         "problem": "",
+        # ---- R24-03 / R23-A03：观测的**四态**，不能只用一个 ok 布尔 ----
+        #   observed       —— 拿到了可用且自洽的时间信息
+        #   unavailable    —— 没拿到（无 packet / 空文件）；这不是"坏了"
+        #   contradictory  —— 拿到了**且互相矛盾**（重复显示时刻、非有限数）；
+        #                    这是"明确否定"，不能被别处的 stream duration 盖住
+        #   failed         —— 探测本身失败（ffprobe rc≠0 / 异常）
+        # 旧实现只回 ok，调用方无法区分"没测到"与"测到并发现坏了"，
+        # 于是后者的否定结论被 ① 的流头时长静默覆盖，门禁仍判 PASS。
+        "state": "unavailable",
     }
     try:
         r = subprocess.run(
@@ -953,9 +1008,11 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
             timeout=timeout, shell=False)
         if r.returncode != 0:
             out["problem"] = f"ffprobe rc={r.returncode}"
+            out["state"] = "failed"
             return out
     except Exception as exc:
         out["problem"] = f"ffprobe failed: {exc}"
+        out["state"] = "failed"
         return out
 
     packets: List[tuple] = []          # [(pts, duration), ...]
@@ -983,6 +1040,7 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
                               f"{parts[1] if len(parts) > 1 else None!r})")
             out["coverage"] = "unknown"
             out["ok"] = False
+            out["state"] = "contradictory"
             return out
         packets.append((pts, dur))
 
@@ -1006,6 +1064,7 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
                           f"each pair is never shown")
         out["coverage"] = "unknown"
         out["ok"] = False
+        out["state"] = "contradictory"
 
     # ---- R22-A04：末帧覆盖必须**逐帧**判断，不能用 `end > first` ----
     # 审核反例：PTS 0/0.04/0.08、**所有** duration 都是 N/A 时，
@@ -1032,6 +1091,8 @@ def _probe_final_timeline(path: str, stream_type: str = "v",
     # `ok` 只表示"拿到了**有限且可用**的时间信息"；是否完整覆盖看 `coverage`。
     out["ok"] = (math.isfinite(float(out["span"])) and out["span"] > 0
                  and not _dups)
+    if out["ok"]:
+        out["state"] = "observed"
 
     if len(starts) >= 3:
         d = [b - a for a, b in zip(starts, starts[1:]) if b > a]
@@ -1099,6 +1160,11 @@ def measure_final_candidate(candidate: str, logger=None,
         "changed": False,
         "attempts": [],
         "problems": [],
+        # ---- R24-03：扫描的**否定结论**必须能传到最终门 ----
+        # `problems` 里混有"容器时长可能含音轨"这类非致命提示，不能拿它当
+        # 否定判据；单独开一个字段，语义明确。
+        "negative_observation": False,
+        "scan_state": "",
     }
 
     # ---- 取值顺序（R21-C05 重排）----
@@ -1129,8 +1195,11 @@ def measure_final_candidate(candidate: str, logger=None,
     _needs_accuracy = bool(_rt.get("action") in ("retimed", "skipped"))
     if not _got or _needs_accuracy:
         _tl = _probe_final_timeline(candidate)
+        _scan_state = _scan_state_from(_tl)
+        info["scan_state"] = _scan_state
         info["attempts"].append({
             "source": "packet-scan", "ok": bool(_tl.get("ok")),
+            "state": _scan_state,
             "duration": _tl.get("span"), "problem": _tl.get("problem") or ""})
         if _tl.get("ok"):
             # R22-A04：`coverage_complete` 由**末帧是否有 duration** 决定，
@@ -1147,6 +1216,26 @@ def measure_final_candidate(candidate: str, logger=None,
             _got = True
             if _tl.get("problem"):
                 info["problems"].append(_tl["problem"])
+        elif _scan_state in ("contradictory", "failed"):
+            # ---- R24-03 / R23-A03：否定观测不能被 ① 的流头时长盖住 ----
+            # 审核反例（AST 受控探测）：stream duration 先拿到正值把
+            # `coverage_complete` 设成 True；随后扫描发现重复显示时刻 /
+            # 非有限数，返回 ok=False —— 旧实现只把它记进 `attempts`，
+            # `problems` 仍是空的，`final_timeline_status` 于是判 PASS。
+            #
+            # 现在：**扫描给出否定结论**（矛盾或执行失败）时，
+            #   1. 撤销"完整覆盖"（流头时长不代表末帧覆盖）；
+            #   2. 单独置 `negative_observation`，让它进最终门；
+            #   3. 原因写进 problems（保留原文，便于定位）。
+            # 区分"没拿到"(unavailable)：那种情况允许退回 ① 的值，
+            # 因为流头时长是**独立**的证据，不是被否定推翻的结论。
+            info["coverage_complete"] = False
+            info["coverage"] = ("contradictory" if _scan_state == "contradictory"
+                                else "scan-failed")
+            info["negative_observation"] = True
+            info["problems"].append(
+                "the mandatory timeline scan returned a negative observation "
+                f"({_scan_state}): {_tl.get('problem') or 'no detail'}")
 
     # ③ 容器总时长（可能包含音轨末端/起点 —— 如实标注）
     if not _got:
