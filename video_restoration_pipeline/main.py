@@ -1005,17 +1005,18 @@ def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 #: 允许的执行组模式。未知值**不得静默归零**（审核 R19-B06）。
-_KNOWN_CHAIN_MODES = frozenset({"none", "stage34"})
-
-#: CLI 上**声明了但尚未实现**的执行组模式。
 #:
-#: 审核 P3 要求「先接 S6→S7 及现有 G34」。`--chain` 的 choices 早就写了
-#: ``stage67`` / ``both``，但实现里只认 ``stage34`` —— 于是用户明确要求
-#: 「颗粒+编码融合」时，代码会把它当成**未知模式**并**静默回退到 none**，
-#: 跑完还报成功。那等于"用户要的东西没做，但结果看起来一样"。
+#: * ``none``     —— 经典逐 stage 执行；
+#: * ``stage34``  —— stage3 顺带做完 stage4（G34，默认关闭，见架构文档）；
+#: * ``stage67``  —— stage6 只出 vpy、stage7 用 vspipe 直连编码（省掉
+#:                   lossless FFV1 中间文件）；
+#: * ``both``     —— 两个执行组同时启用。
 #:
-#: 现在：这两种模式**明确拒绝**（85 + 说明），不静默降级。
-_DECLARED_UNIMPLEMENTED_CHAIN_MODES = frozenset({"stage67", "both"})
+#: 审核 P3 要求「先接 S6→S7 及现有 G34」。此前 ``stage67`` / ``both``
+#: 只在 argparse 的 choices 里存在、实现里被当成"未知模式"静默回退到
+#: none —— 用户明确要求"颗粒+编码融合"时，跑完还报成功。现在四种都真有
+#: 实现，选择什么就执行什么。
+_KNOWN_CHAIN_MODES = frozenset({"none", "stage34", "stage67", "both"})
 
 
 def _strict_bool(value, default: bool = False) -> bool:
@@ -2894,6 +2895,82 @@ def _chain_mode_on(params) -> bool:
         return False
 
 
+def _chain67_on(params) -> bool:
+    """当前是否启用了 S6→S7 融合执行组（`chain.mode: stage67` / `both`）。"""
+    try:
+        return str((params or {}).get("chain_mode") or "none").lower() in (
+            "stage67", "both")
+    except Exception:
+        return False
+
+
+def _s67_spec_path(params, job_id: str, input_path: str) -> str:
+    """S6→S7 交接单的确定路径（两端必须看同一个文件）。"""
+    from stage67_fusion import spec_path as _sp
+    return _sp(str((params or {}).get("temp_dir") or "./temp"),
+               str(job_id), Path(str(input_path or "in")).stem)
+
+
+def _s67_published_path(params) -> str:
+    """stage7 实际发布的路径（WSL 回拷时它不等于计划路径）。
+
+    **不能**直接用 `params["output_path"]`：重定向场景下回执写在目标侧，
+    计划的输出路径上什么都没有 —— 于是"回执缺失"会把一次完全正常的
+    回拷判成未完成。
+    """
+    planned = str((params or {}).get("output_path") or "")
+    rp = str((params or {}).get("_stage7_result_path") or "")
+    if rp and os.path.exists(rp):
+        try:
+            with open(rp, "r", encoding="utf-8") as fh:
+                doc = json.load(fh) or {}
+            fin = str(doc.get("final_output_path") or "")
+            if fin:
+                return fin
+        except (OSError, ValueError):
+            pass
+    return planned
+
+
+def _s67_verify_receipt(params, input_path: str, logger):
+    """核对 S6→S7 的组回执。返回 ``(ok, reason)``。
+
+    为什么编排器也要核：stage7 自己写回执、自己说"写好了"，那是自证。
+    编排器要回答的是另一个问题 —— **这一次执行**有没有留下可核对物证。
+    两者用的是同一个共享验证器（`stage67_fusion.verify_group_receipt`），
+    所以不会出现"stage7 说行、main 说不行"的口径分裂。
+    """
+    try:
+        from stage67_fusion import find_group_receipt as _find
+    except Exception as exc:                     # pragma: no cover
+        return False, f"stage67 verifier unavailable: {exc}"
+    out = _s67_published_path(params)
+    if not out:
+        return False, "no published path is known for this job"
+    rcpt, path, why = _find(
+        out, params or {},
+        expected_attempt=str((params or {}).get("attempt_id") or ""),
+        src_path=str(input_path or ""))
+    if rcpt is None:
+        if logger:
+            logger.error(
+                "STAGE7_FUSED_RECEIPT_MISSING",
+                "The S6→S7 execution group produced no usable group receipt; "
+                "this generation cannot be shown to have run stage6 at all",
+                output=out, receipt=path, reason=why)
+        return False, why
+    if logger:
+        logger.info(
+            "STAGE7_FUSED_RECEIPT_OK",
+            "The S6→S7 execution group left a verifiable receipt: no "
+            "intermediate was written, the script matches, and the boundary "
+            "conserves frames/duration",
+            output=out, receipt=path,
+            frames=rcpt.get("frames"),
+            bounds_ok=(rcpt.get("bounds") or {}).get("ok"))
+    return True, ""
+
+
 def _fused_step34(params, job, logger=None):
     """找 stage3 留下的 G34 融合回执，返回被融合产出的 step4 路径或 None。
 
@@ -3145,19 +3222,6 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 (args.get("chain") if isinstance(args, dict)
                  else getattr(args, "chain", None))
                 or _cfg_chain.get("mode") or "none").strip().lower()
-            if _raw_mode in _DECLARED_UNIMPLEMENTED_CHAIN_MODES:
-                # 明确拒绝：不能"回退到 classic 然后报成功"
-                job_logger.error(
-                    "CHAIN_MODE_UNIMPLEMENTED",
-                    "This execution-group mode is accepted by the command "
-                    "line but not implemented yet. Refusing instead of "
-                    "silently running the classic path and reporting "
-                    "success.",
-                    requested=_raw_mode,
-                    implemented=sorted(_KNOWN_CHAIN_MODES))
-                return (85, f"chain mode {_raw_mode!r} is declared but not "
-                            f"implemented; implemented modes are "
-                            f"{sorted(_KNOWN_CHAIN_MODES)}")
             if _raw_mode not in _KNOWN_CHAIN_MODES:
                 job_logger.warning(
                     "CHAIN_MODE_UNKNOWN",
@@ -3516,6 +3580,22 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     _last_produced: Dict[int, List[str]] = {}
 
 
+    # ---- S6→S7 执行组：stage7 不能单独跑 ----
+    # 融合路线下 stage7 的输入是 stage6 生成的 vpy。resume 到 7、或
+    # `--stage 7` 时列表里只剩 stage7，没有脚本它只能报 NO_INPUT。
+    # 融合模式下的 stage6 **只写一个脚本**（毫秒级、零媒体、不编码），
+    # 所以这里直接把它插回去 —— 比"拒绝运行"和"悄悄退回经典"都更符合
+    # 用户的意图。位置必须在 resume/复用过滤**之后**，否则会被再滤掉。
+    if _chain67_on(params):
+        _s67_nums = [n for n, _ in stages]
+        if 7 in _s67_nums and 6 not in _s67_nums:
+            stages.insert(_s67_nums.index(7), (6, "stage6_grain_synthesis.py"))
+            job_logger.info(
+                "STAGE6_REINSTATED_FOR_FUSION",
+                "stage7 consumes stage6's VapourSynth script instead of a "
+                "file, so stage6 is reinstated to emit it (it writes a script "
+                "only, no media)", chain_mode=params.get("chain_mode"))
+
     for stage_num, script_name in stages:
         # ---- G34：stage3 已经把 stage4 一起做完了吗 ----
         # 融合模式下 stage3 直接产出 step4 并留下回执；这里必须**跳过**
@@ -3569,6 +3649,41 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         else:
             params.pop("upstream_artifact", None)
 
+        # ---- S6→S7 执行组：本轮谁出脚本、谁消费脚本 ----
+        # stage6 需要一个**确定**的交接单路径；stage7 只认这一个文件。
+        # 用 glob 选"最新的"会在上一轮残留 + 本轮重跑时选错（R20-A03 病根）。
+        if _chain67_on(params):
+            if stage_num == 6:
+                try:
+                    _s67_spec = _s67_spec_path(params, str(job_id),
+                                               str(input_path or ""))
+                except Exception as _s67e:        # pragma: no cover
+                    return (84, f"cannot build the S6->S7 spec path: {_s67e}")
+                params["_fused_stage67"] = {
+                    "role": "producer", "emit_only": True,
+                    "spec_path": _s67_spec,
+                }
+                job_logger.info(
+                    "STAGE6_FUSED_PRODUCER",
+                    "stage6 will emit the grain script only; stage7 pipes it "
+                    "straight into its encoder (no lossless intermediate)",
+                    spec=_s67_spec, chain_mode=params.get("chain_mode"))
+            elif stage_num == 7:
+                _s67_role = str((params.get("_fused_stage67") or {})
+                                .get("role") or "")
+                if _s67_role != "consumer":
+                    # **不能**就这么跑：经典路线会去 glob step6 文件，
+                    # 一个上一轮残留的同名文件会让它"成功"，而本轮的
+                    # 颗粒参数根本没生效 —— 静默降质，正是最坏的结局。
+                    job_logger.error(
+                        "STAGE7_FUSED_STATE_MISSING",
+                        "chain.mode asks for the S6→S7 execution group but no "
+                        "hand-off was produced by stage6 in this run; refusing "
+                        "to fall back to a classic encode that could silently "
+                        "skip the grain step",
+                        chain_mode=params.get("chain_mode"), role=_s67_role)
+                    return (82, "S6->S7 execution group has no hand-off spec")
+
         job_logger.info("STAGE_START", f"Stage {stage_num}: {script_name}")
         # ID-05（第七轮）：stage 执行**前**拍一次产物指纹，执行后只登记
         # 真正变了的那些。旧实现直接遍历 find_stage_artifacts() 的整个
@@ -3582,6 +3697,29 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
+            # ---- S6→S7：stage6 交出了脚本，把接力棒交给 stage7 ----
+            # 交接单由 stage6 **自己**写（它才是颗粒参数的唯一权威）；
+            # 这里只把"接下来该由 stage7 消费"这件事登记进 params。
+            if stage_num == 6 and _chain67_on(params):
+                _s67_spec_p = str((params.get("_fused_stage67") or {})
+                                  .get("spec_path") or "")
+                params["_fused_stage67"] = {
+                    "role": "consumer", "spec_path": _s67_spec_p,
+                }
+                job_logger.info(
+                    "STAGE7_FUSED_CONSUMER",
+                    "Handing the grain script over to stage7; it will be piped "
+                    "into the encoder directly", spec=_s67_spec_p)
+            # ---- S6→S7：成品发布了，回执必须在 ----
+            # 这一步只看"本次执行有没有留下物证"。stage7 已经写过一次自证，
+            # 编排器用**同一个共享验证器**再核一遍 —— 这正是 R19-A03 的
+            # 教训：自证不能替代核对。
+            if stage_num == 7 and _chain67_on(params):
+                _s67_ok, _s67_why = _s67_verify_receipt(
+                    params, str(input_path or ""), job_logger)
+                if not _s67_ok:
+                    return (82, "S6->S7 execution group is not provable: "
+                                f"{_s67_why}")
             # R2-07 补完：给本 stage 刚产出的中间产物登记身份（源 + 参数 + 实现）。
             # stage7 的最终产物另有 completion marker，不重复登记。
             if stage_num != 7:

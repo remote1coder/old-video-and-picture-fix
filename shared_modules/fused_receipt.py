@@ -68,7 +68,9 @@ def source_digest(src_path: str) -> Optional[str]:
 
 def verify_fused_receipt(rcpt_path: str, params: Dict[str, Any],
                          expected_attempt: str = "",
-                         src_path: str = "") -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+                         src_path: str = "",
+                         require_evidence: bool = True,
+                         ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     """校验一份融合回执是否可用于**本次**执行。
 
     Args:
@@ -80,6 +82,16 @@ def verify_fused_receipt(rcpt_path: str, params: Dict[str, Any],
         src_path: 源素材路径。为空时按
             ``params["input_path"]`` → ``params["_input_path"]`` →
             ``rcpt["input_path"]`` 三级兜底。
+        require_evidence: 是否连带校验第 4 步的证据块（颜色成组 +
+            边界核对）。默认 True，行为与改动前完全一致。
+
+            只有 **S6→S7 执行组**会传 False，理由不是"这条检查别做了"，
+            而是它**在这个边界上不成立**：组的输入是加颗粒之前的那一份、
+            输出是终版编码，stage7 自己的 BT.601→BT.709 转换合法地发生在
+            中间 —— 要求它在"组回执"里再出具一份颜色转换合同，等于让
+            同一件事有两个权威。颜色转换由 stage7 的 `.verify.json` 与
+            `color_probe.check_color_drift` 负责；组回执只查
+            **标签有没有丢**（丢了就是组级缺陷）与**帧数/时长守不守恒**。
 
     Returns:
         ``(ok, reason, rcpt)``。``ok`` 为真时 ``rcpt`` 是已解析的回执 dict。
@@ -159,6 +171,8 @@ def verify_fused_receipt(rcpt_path: str, params: Dict[str, Any],
 
     # ---- 4) 颜色与边界的证据块（R20-A03）----
     # 「没查过」和「查过了没问题」必须分开：前者是未证明，后者才是通过。
+    if not require_evidence:
+        return True, "", rcpt
     try:
         from generation_evidence import receipt_evidence_problems as _ev_problems
     except Exception as exc:                      # pragma: no cover - 部署异常

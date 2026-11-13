@@ -2550,6 +2550,142 @@ def _has_timing_transform(params) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------
+# S6→S7 融合：把 stage6 的 grain vpy 直接喂给**本 stage 的**编码器
+# --------------------------------------------------------------------------
+_S6_RUNNER_CACHE: Dict[str, Any] = {}
+
+
+def _grain_pipeline_runner():
+    """按文件路径取 stage6 的 ``_run_grain_pipeline``（两份实现必然漂移）。
+
+    为什么复用而不是在这里重写一份"创建两个进程、把 stdout 接过去"：
+
+    * 那套编排在 R19/R21 被反复修过 —— 任一侧启动失败都要回收另一侧、
+      必须检查**每一个**进程的返回码（生产者 rc=9 + 编码器 rc=0 曾报成功）、
+      失败要清半成品、卡死按心跳判而不是按总时长；
+    * 融合路径若另写一份，两条路线的故障语义就会漂移，而漂移方向
+      多半是"融合更宽松" —— 那正是最难发现的一类。
+
+    用 importlib 按路径加载（而不是 `import stages.stage6...`）：stage 脚本
+    不是包的一部分，运行期也可能被当独立 CLI 调用，路径推导只在
+    ``__file__`` 上做一次，不依赖 cwd。
+    """
+    mod = _S6_RUNNER_CACHE.get("m")
+    if mod is not None:
+        return mod
+    import importlib.util as _ilu
+    path = Path(__file__).with_name("stage6_grain_synthesis.py")
+    spec = _ilu.spec_from_file_location("_stage6_for_s67_fusion", str(path))
+    if spec is None or spec.loader is None:            # pragma: no cover
+        raise ImportError(f"cannot load {path}")
+    m = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    _S6_RUNNER_CACHE["m"] = m
+    return m
+
+
+class _EncodeResult(object):
+    """把融合管道的结论折成 ``subprocess.run`` 的形状。
+
+    下游只用到 ``returncode`` 与 ``stderr``；把 stderr 换成管道两端的
+    **有界尾部**（stage6 已经分好 vspipe / encoder 两侧），这样
+    ``STAGE7_FAILED`` 里那句报错仍然能指向真正失败的那一端。
+    """
+
+    __slots__ = ("returncode", "stderr")
+
+    def __init__(self, returncode: int, stderr: str = "") -> None:
+        self.returncode = int(returncode)
+        self.stderr = str(stderr or "")
+
+
+def _run_fused_encode(video_cmd: List[str], vs_script: str,
+                      publish_tmp: str, logger, inactivity_s: float):
+    """跑「vspipe(grain vpy) → 本 stage 的编码命令」。
+
+    `video_cmd` 必须已经是**完整**命令（含 ``-f yuv4mpegpipe -i pipe:0``
+    与输出路径）。这里的职责只有一件：把两个进程接起来，并把
+    "谁失败了"如实带回去。
+    """
+    mod = _grain_pipeline_runner()
+    try:
+        with open(vs_script, "r", encoding="utf-8") as fh:
+            script_text = fh.read()
+    except OSError as exc:
+        return _EncodeResult(86, f"cannot read the fused vs script: {exc}")
+    vspipe_cmd = ["vspipe", "-c", "y4m", vs_script, "-"]
+    res = mod._run_grain_pipeline(
+        script_text, vs_script, vspipe_cmd, list(video_cmd),
+        str(publish_tmp), logger,
+        fallback_label="fused-stage67",
+        inactivity_s=float(inactivity_s))
+    if getattr(res, "ok", False):
+        return _EncodeResult(0, "")
+    # 取消不能被折成"编码失败"（上层会当普通失败去重试/降级）
+    if getattr(res, "cancelled", False):
+        return _EncodeResult(88, getattr(res, "detail", "") or "cancelled")
+    return _EncodeResult(84, getattr(res, "detail", "") or "fused encode failed")
+
+
+def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
+                         params: Dict[str, Any], logger,
+                         frames: Optional[int]) -> bool:
+    """写 S6→S7 的**组回执**（``<output>.fused_stage67.json``）。
+
+    为什么非写不可：融合路线把 stage6 的中间文件省掉了，于是
+    "stage6 到底跑没跑"没有任何物证 —— 只有这条回执能回答。
+    没有它，下一轮/编排器只能靠"文件不在 = 应该跑过"来猜。
+
+    返回 False 表示写不出来。调用方**必须**把它当成本代不完整
+    （``_generation_incomplete``）而不是忽略：媒体已经在正式路径上了，
+    但它对应的一次执行没有凭证。
+    """
+    try:
+        from stage67_fusion import (build_receipt as _br,
+                                    receipt_path as _rp,
+                                    write_receipt as _wr)
+        from generation_evidence import collect as _collect
+        _src = str(spec.get("probe_source") or "")
+        try:
+            _ev = _collect(_src, output_path, "stage67", params, logger)
+        except Exception as _ee:              # pragma: no cover - 探测异常
+            _ev = {
+                "color": {"probed": False, "complete": False,
+                          "error": str(_ee)},
+                "color_source": {"probed": False, "error": str(_ee)},
+                "color_lost_tags": [],
+                "color_changed_tags": [],
+                "bounds": {"ok": False, "performed": False,
+                           "reason": str(_ee)},
+            }
+        _rcpt = _br(spec=spec, params=params, output_path=output_path,
+                    frames=frames, extra={
+                        "color": _ev.get("color") or {},
+                        "color_source": _ev.get("color_source") or {},
+                        "color_lost_tags": list(_ev.get("color_lost_tags") or []),
+                        "color_changed_tags": list(
+                            _ev.get("color_changed_tags") or []),
+                        "color_conversion": _ev.get("color_conversion") or {},
+                        "bounds": _ev.get("bounds") or {},
+                    })
+        _wr(_rp(output_path), _rcpt)
+        logger.info("STAGE7_FUSED_RECEIPT",
+                    "Recorded that stage6 and stage7 ran as one execution "
+                    "group and that no lossless intermediate was written",
+                    receipt=_rp(output_path),
+                    vs_script_sha256=_rcpt.get("group_evidence", {})
+                    .get("vs_script_sha256"),
+                    bounds_ok=(_rcpt.get("bounds") or {}).get("ok"))
+        return True
+    except Exception as exc:
+        logger.error("STAGE7_FUSED_RECEIPT_FAIL",
+                     "The fused generation is live but its group receipt could "
+                     "not be written; this generation is therefore NOT "
+                     "provably complete", error=str(exc))
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -2622,6 +2758,60 @@ def main():
     if not input_source:
         logger.error("STAGE7_NO_INPUT", "No input found")
         return 82
+
+    # ---- S6→S7 执行组（`chain.mode: stage67`）----
+    # 融合时 stage6 没写中间文件，交给这里的是**它的 vpy 脚本**。
+    # 本 stage 拿到脚本后用 `vspipe -c y4m` 直接喂自己的编码器：滤镜不变、
+    # 编码参数不变，变的只是"帧从哪来"（管道 vs 读盘）。
+    #
+    # 探测基准 `_probe_source` 是**加颗粒之前**的那一份（stage5/4 产物）：
+    # 颗粒不改变几何、色彩标签、帧数、时间轴，所以这些事实从它身上读是
+    # 正确的；而"颗粒有没有加进去"由组回执 + 等价性探针负责，不在这里
+    # 用一个 pHash 假装证明。
+    _fused_cfg = params.get("_fused_stage67") or {}
+    _fused_mode = str(_fused_cfg.get("role") or "") == "consumer"
+    _fused_spec: Dict[str, Any] = {}
+    _fused_vs_script = ""
+    _probe_source = input_source
+    if _fused_mode:
+        try:
+            from stage67_fusion import (load_spec as _ls,
+                                        validate_spec as _vs,
+                                        spec_path as _sp)
+            # 路径优先取 main 下发的（它就是 stage6 写的那个）；
+            # 裸跑/测试时按确定规则推出来。
+            _spec_file = str(_fused_cfg.get("spec_path") or "") or _sp(
+                temp_dir, job_id, input_name)
+            _fused_spec = _ls(_spec_file)
+            _ok_spec, _why_spec = _vs(
+                _fused_spec,
+                expected_attempt=str(params.get("attempt_id") or ""))
+        except Exception as _fe:
+            logger.error("STAGE7_FUSED_SPEC_INVALID",
+                         "The S6→S7 hand-off spec cannot be read; refusing to "
+                         "encode, because the alternative would be silently "
+                         "dropping the grain stage", error=str(_fe),
+                         spec=str(_fused_cfg.get("spec_path") or ""))
+            return 86
+        if not _ok_spec:
+            # **不能**回退成"直接编码上游文件"：那样 rc=0、成品也有，
+            # 但颗粒这一步根本没做 —— 静默降质正是本项目反复栽的坑。
+            logger.error("STAGE7_FUSED_SPEC_INVALID",
+                         "The S6→S7 hand-off spec does not validate; refusing "
+                         "to encode without the grain step",
+                         reason=_why_spec,
+                         spec=str(_fused_cfg.get("spec_path") or ""))
+            return 86
+        _fused_vs_script = str(_fused_spec.get("vs_script") or "")
+        _probe_source = str(_fused_spec.get("probe_source") or input_source)
+        logger.info("STAGE7_FUSED_INPUT",
+                    "Encoding the grain script's frames straight from vspipe; "
+                    "no lossless intermediate is read",
+                    vs_script=_fused_vs_script,
+                    vs_script_sha256=_fused_spec.get("vs_script_sha256"),
+                    probe_source=_probe_source,
+                    vs_format=_fused_spec.get("vs_format"),
+                    pix_fmt=_fused_spec.get("pix_fmt"))
 
     output_path = params.get("output_path", "")
     if not output_path:
@@ -2763,7 +2953,7 @@ def main():
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
-             "-of", "json", input_source],
+             "-of", "json", _probe_source],
             capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
@@ -2841,7 +3031,16 @@ def main():
     # **紧随其后的输入文件**生效，放在 `-i` 之后等于没写。
     # 后果：本意是"封装时重建一份干净的容器 PTS"，实际从未执行，
     # 输入里被摊薄/不均的时间戳被原样交给 muxer。
-    video_cmd = common_prefix + ["-fflags", "+genpts", "-i", input_source]
+    if _fused_mode:
+        # 融合输入端：`vspipe -c y4m` 的输出从 stdin 进来。
+        #   * `-f yuv4mpegpipe` 必须在 `-i` **之前**（它是输入侧格式声明）；
+        #   * 不写 `-fflags +genpts`：那是"从容器时间戳重建 PTS"，
+        #     y4m 没有容器时间戳，PTS 由 y4m 头里的帧率给出，重建无意义；
+        #   * 不加 `-s/-framerate`：y4m 头自带尺寸与帧率，重复指定反而
+        #     会和真实值冲突（y4m 的帧率是分数，手填的十进制会漂）。
+        video_cmd = common_prefix + ["-f", "yuv4mpegpipe", "-i", "pipe:0"]
+    else:
+        video_cmd = common_prefix + ["-fflags", "+genpts", "-i", input_source]
     output_opts: List[str] = []
     # FIX-2026-10-23：显式指定 passthrough，禁止 ffmpeg 为了凑恒定
     # 帧率而复制/丢弃帧。默认值 `auto` 会按 muxer 能力选 cfr 或 vfr，
@@ -2858,10 +3057,12 @@ def main():
                             "-preset", str(preset), "-pix_fmt", pix_fmt])
 
     # FIX-P7-1: BT.601→BT.709 color space conversion with range handling
-    # FIX-P7-3: Probe stage output (input_source), not original input (args.input)
+    # FIX-P7-3: Probe stage output, not original input (args.input)
     # per v7.32 §3.10.3: conversion should be based on the video being encoded
     # ORIGINAL: _get_source_color_info(args.input) probed original input
-    source_color_range, color_standard, range_known, primaries_known = _get_source_color_info(input_source, logger)
+    # 融合模式下 `_probe_source` 是加颗粒之前的那一份 —— 颗粒不带色彩语义，
+    # 而 y4m 管道里根本没有可探测的容器，只能从这里读。
+    source_color_range, color_standard, range_known, primaries_known = _get_source_color_info(_probe_source, logger)
 
     # FIX-B7（画质关键）：中间产物可能**丢了色彩元数据**，此时必须回退到
     # 原始输入再探一次，而不是直接默认 BT.601。
@@ -2882,7 +3083,7 @@ def main():
     # （上游产物），不是 args.input。
     _orig_input = args.input or ""
     if not (range_known and primaries_known) and _orig_input \
-            and os.path.abspath(_orig_input) != os.path.abspath(input_source):
+            and os.path.abspath(_orig_input) != os.path.abspath(_probe_source):
         # COL-04（第七轮）：继承**必须有证据**，不能盲目。
         #
         # 任务书 §4.3：「原片标签只能在有保持表示的证据时补未知中间标签，
@@ -2899,7 +3100,7 @@ def main():
         _evidence = "no-matrix-change"
         try:
             from media_io import probe_color as _pc
-            _mid = _pc(input_source) or {}
+            _mid = _pc(_probe_source) or {}
             _srcp = _pc(_orig_input) or {}
             if _mid.get("probed") and _srcp.get("probed"):
                 _mid_family = str(_mid.get("pix_fmt") or "").split("p")[0]
@@ -2918,7 +3119,7 @@ def main():
                            "conversion happened somewhere. Refusing to "
                            "inherit the source's tags (that would label the "
                            "pixels wrongly); treating colour as unknown.",
-                           intermediate=input_source, original=_orig_input,
+                           intermediate=_probe_source, original=_orig_input,
                            evidence=_evidence)
         else:
             _o_range, _o_std, _o_rk, _o_pk = _get_source_color_info(
@@ -2928,7 +3129,7 @@ def main():
                             "Intermediate lost color metadata; inheriting the "
                             "original input's description (evidence: the "
                             "pixel family did not change)",
-                            intermediate=input_source, original=_orig_input,
+                            intermediate=_probe_source, original=_orig_input,
                             orig_range=_o_range if _o_rk else None,
                             orig_standard=_o_std if _o_pk else None,
                             evidence=_evidence)
@@ -2951,7 +3152,7 @@ def main():
     # per v7.32 §3.10.3 ("色域转换前应先自动检测并裁剪黑边,转换完成后还原黑边").
     # ORIGINAL vf_parts only had zscale+dither, no crop/restore — black bars got
     # color-converted and ended up at the wrong black level.
-    bar_info = _detect_black_bars_stage7(input_source, logger)
+    bar_info = _detect_black_bars_stage7(_probe_source, logger)
     _crop_filter = None
     _pad_filter = None
     if bar_info["has_bars"]:
@@ -3099,7 +3300,7 @@ def main():
         _src_frames = 0
     if _src_frames <= 0 and args is not None:
         _src_frames = _count_frames_quietly(getattr(args, "input", ""), logger)
-    _proc_frames = _count_frames_quietly(input_source, logger)
+    _proc_frames = _count_frames_quietly(_probe_source, logger)
     # R12-07：**先实测，再估算。**
     #
     # 帧数比例 `orig * proc/src` 只在"帧间隔恒定"时成立。反例：
@@ -3110,7 +3311,7 @@ def main():
     # 优先用中间产物自己的 packet 时间戳（真实时间轴，能反映变速/倍帧）；
     # 只有测不出时才退回比例，并且**明确标成估计**，不冒充已验证。
     _timing_basis = "packet-span"
-    _measured_span = _probe_packet_span(input_source, "v")
+    _measured_span = _probe_packet_span(_probe_source, "v")
     if _measured_span > 0:
         processed_duration = float(_measured_span)
         if logger:
@@ -3136,7 +3337,7 @@ def main():
         _timing_basis = "unknown"
     if processed_duration <= 0:
         # 兜底：仍用流式探测，但明确标注它可能受容器默认 fps 影响
-        processed_duration = _get_stream_duration(input_source, "v")
+        processed_duration = _get_stream_duration(_probe_source, "v")
         if processed_duration > 0 and logger:
             logger.warning(
                 "STAGE7_TIMING_PROBE_FALLBACK_TO_SOURCE",
@@ -3366,7 +3567,13 @@ def main():
         _enc_inactivity = float(params.get("stage_inactivity_timeout", 1800.0))
         _enc_hb = (lambda: (os.path.getsize(_publish_tmp)
                             if os.path.exists(_publish_tmp) else 0))
-        if _cancel_guard is not None:
+        if _fused_mode:
+            # 融合：vspipe 的 stdout 就是本 stage 编码器的 stdin。
+            # 心跳看 `_publish_tmp` 是否还在增长 —— 与经典路线同一个判据，
+            # 所以"卡死"的定义在两条路线上一致。
+            r = _run_fused_encode(video_cmd, _fused_vs_script, _publish_tmp,
+                                  logger, _enc_inactivity)
+        elif _cancel_guard is not None:
             r = _cancel_guard.run_managed(video_cmd, capture_output=True,
                                           text=True, timeout=None,
                                           progress_watch=_enc_hb,
@@ -3847,7 +4054,7 @@ def main():
                     verify_output as _vo_pre,
                     render_verdict as _rv_pre,
                 )
-                _pre = _vo_pre(input_source, _publish_tmp, {})
+                _pre = _vo_pre(_probe_source, _publish_tmp, {})
             except Exception as _pe:
                 logger.error("STAGE7_PREPUBLISH_VERIFY_ERROR",
                              f"pre-publish check raised: {_pe}")
@@ -3927,7 +4134,7 @@ def main():
                     render_alignment as _ra_pre,
                 )
                 _align_pre = _vfa_pre(
-                    input_source, _publish_tmp, samples=4)
+                    _probe_source, _publish_tmp, samples=4)
             except Exception as _ae:
                 logger.error("STAGE7_PREPUBLISH_ALIGN_ERROR",
                              f"pre-publish alignment raised: {_ae}")
@@ -4575,6 +4782,23 @@ def main():
                 output=output_path, attempt_id=_attempt_id,
                 published=_pres.published,
                 cleanup_pending=_pres.cleanup_pending or None)
+
+            # ---- S6→S7：组回执（融合路线唯一的"stage6 真的跑过"的物证）----
+            # 放在发布**之后**而不是塞进 publisher 事务：publisher 的
+            # marker/清单按固定的四个角色（media/verify/fullchain/marker）
+            # 枚举，多塞一个角色会改变完成语义；而回执本身有内容摘要、
+            # 内容不对会被消费方拒掉，冒认不了。写不出来则整代判不完整。
+            if _fused_mode:
+                _gr_frames = None
+                try:
+                    _gr_frames = int((_final_tl or {}).get("frames") or 0) or None
+                except (TypeError, ValueError):
+                    _gr_frames = None
+                if not _write_group_receipt(
+                        output_path=output_path, spec=_fused_spec,
+                        params=params, logger=logger,
+                        frames=_gr_frames or (_proc_frames or None)):
+                    _generation_incomplete = True
 
             # ---- R14-01：WSL 回拷走**同一个 publisher**，媒体+报告一起 ----
             # 原来这里只拷媒体、且发生在发布之后，报告留在重定向区；

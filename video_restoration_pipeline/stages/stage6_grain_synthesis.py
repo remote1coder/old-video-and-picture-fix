@@ -796,6 +796,21 @@ def main() -> int:
     # Use args.input stem for pattern matching (consistent with other stages)
     input_name = Path(args.input).stem
 
+    # ---- S6→S7 执行组（`chain.mode: stage67`）----
+    # 融合时 stage6 **不写** FFV1 中间文件，只把 vpy 脚本与交接单留下，
+    # 由 stage7 用 `vspipe -c y4m` 直接喂它自己的编码器。
+    #
+    # 为什么由 stage6 产出 vpy 而不是由 main 现算：颗粒参数的解析规则
+    # （config 分型 → params 扁平覆盖 → 默认值）全部住在这个文件里，
+    # 在别处再实现一遍就是"同一个量两端各算一次"（R20 病族）。
+    _fused_cfg = params.get("_fused_stage67") or {}
+    _fused_mode = bool(_fused_cfg.get("emit_only"))
+    if _fused_mode:
+        logger.info("STAGE6_FUSED_EMIT_ONLY",
+                    "S6→S7 execution group is on: emitting the grain VapourSynth "
+                    "script only; no intermediate file will be written",
+                    vs_script_target=_fused_cfg.get("spec_path") or "")
+
     # FIX-W9-09: log ai_upscale_banned flag per checkproject rule F. Grain
     # synthesis is not AI so the flag doesn't change grain behavior; logged
     # for traceability. When banned, F9-02 fallback ensures stage4 input.
@@ -957,12 +972,18 @@ def main() -> int:
         )
     )
 
-    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+    # 融合模式下**不看**这个缓存：本轮根本不会产出它，一个上一轮残留的
+    # step6 文件让这里 return 3，stage7 就会拿到"本次没有 vpy"的组，
+    # 悄悄退回经典路线（用户以为省了盘，其实没省）。
+    if not _fused_mode and os.path.exists(output_path) \
+            and os.path.getsize(output_path) > 0:
         return 3
 
     # NEW-V-06: 写任何字节之前登记产物——取消时删掉半截 mkv，
     # 否则上面的 exists()>0 缓存检查会把它当成功产物复用。
-    if _cancel_guard is not None:
+    # 融合模式不产出这个文件，登记了就等于给取消守卫一个"删别人的东西"
+    # 的授权 —— 上一轮成功留下的 step6 会被一次取消带走。
+    if _cancel_guard is not None and not _fused_mode:
         _cancel_guard.watch_outputs(output_path, logger=logger, stage=6)
 
     # Load grain parameters from config
@@ -1098,6 +1119,61 @@ def main() -> int:
         # R22：`grain_seed` 给了才固定随机种子（不给 = 历史行为，每次随机）
         seed=params.get("grain_seed"))
     # FIX-P9-11: removed redundant write here — _run_grain_pipeline writes vs_path internally
+
+    if _fused_mode:
+        # ---- 融合：只落 vpy + 交接单，不落媒体 ----
+        # 这里**必须**用 `_build_vs_script()` 的产物本身，而不是再拼一份
+        # 等价脚本：任何一处拼错都会让"融合结果 = 经典结果"这条结论失效，
+        # 而那种错误不会体现在 rc 上。
+        try:
+            os.makedirs(os.path.dirname(vs_path) or ".", exist_ok=True)
+            with open(vs_path, "w", encoding="utf-8") as _vf:
+                _vf.write(vs_script)
+        except OSError as _we:
+            logger.error("STAGE6_FUSED_VS_WRITE_FAIL",
+                         "Cannot write the grain VapourSynth script; the "
+                         "execution group cannot start", error=str(_we))
+            return 84
+
+        try:
+            from stage67_fusion import (build_spec as _bs,
+                                        spec_path as _sp,
+                                        write_spec as _ws)
+            _spec_file = str(_fused_cfg.get("spec_path") or "") or _sp(
+                temp_dir, job_id, input_name)
+            _spec = _bs(
+                attempt_id=str(params.get("attempt_id") or ""),
+                chain_mode=str(params.get("chain_mode") or ""),
+                vs_script=vs_path,
+                probe_source=input_source,
+                grain={
+                    "g1str": g1str, "g2str": g2str, "g3str": g3str,
+                    "temp_avg": temp_avg,
+                    "addgrainc_enabled": addgrainc_enabled,
+                    "addgrainc_ratio": addgrainc_ratio,
+                    "use_addgrainc": False,
+                    "seed": params.get("grain_seed"),
+                },
+                vs_format=vs_format,
+                pix_fmt=pix_fmt,
+                deterministic=_vs_deterministic(params),
+            )
+            _ws(_spec_file, _spec)
+        except Exception as _se:                       # pragma: no cover
+            logger.error("STAGE6_FUSED_SPEC_FAIL",
+                         "Cannot record the S6→S7 hand-off spec; refusing to "
+                         "leave a script nobody can attribute", error=str(_se))
+            return 84
+
+        logger.info("STAGE6_FUSED_VS_READY",
+                    "Grain script handed to stage7 for direct piping; the "
+                    "lossless intermediate was skipped",
+                    vs_script=vs_path, spec=_spec_file,
+                    vs_script_sha256=_spec.get("vs_script_sha256"),
+                    g1str=g1str, g2str=g2str, g3str=g3str, temp_avg=temp_avg,
+                    pix_fmt=pix_fmt)
+        return 0
+
 
     # Fix: Use vspipe directly (standard VapourSynth CLI tool)
     vspipe_cmd = [
