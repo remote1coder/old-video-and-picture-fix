@@ -896,7 +896,8 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                          color_opts=None, post_filter_chain=None,
                          out_pix_fmt=None, frame_source_dir=None,
                          chain_input_fmt=None,
-                         timeline_ref=None, contract_path=None, meta=None):
+                         timeline_ref=None, contract_path=None, meta=None,
+                         stream_src_cmd=None):
     """零落盘超分：ffmpeg(解码) → AI → ffmpeg(ffv1编码)，全程 rawvideo 管道。
 
     为什么这样做
@@ -972,9 +973,20 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     except Exception as e:
         return False, f"cannot write AI script: {e}", 0
 
-    dec_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin",
-               "-i", str(input_video),
-               "-f", "rawvideo", "-pix_fmt", "rgb48le", "-vsync", "0", "-"]
+    # ---- stream_full：上游不是文件，而是 vspipe 的 y4m 管道 ----
+    # 这样 step1 整片媒体就完全不需要存在（G8："不出现 stage1 全片临时视频"）。
+    # 注意 `-f yuv4mpegpipe` 必须写在 `-i pipe:0` **之前**（输入侧格式声明），
+    # 而且这条分支下不能再用 `-i <file>`。
+    if stream_src_cmd:
+        dec_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin",
+                   "-f", "yuv4mpegpipe", "-i", "pipe:0",
+                   "-f", "rawvideo", "-pix_fmt", "rgb48le", "-vsync", "0",
+                   "-"]
+    else:
+        dec_cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin",
+                   "-i", str(input_video),
+                   "-f", "rawvideo", "-pix_fmt", "rgb48le", "-vsync", "0",
+                   "-"]
     # 帧率必须用 `-framerate`（rawvideo 输入的专用选项）。
     # 实测用 `-r 25` 放在 -i 之前，输出被写成 48.52s（≈6.18fps）而不是
     # 300/25=12.0s —— 时间戳整个错掉。输出侧再加一个 `-r` 兜底。
@@ -1076,17 +1088,33 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 再 communicate() 会 "read of closed file"；而 stderr=PIPE 又不读
     # 会有缓冲区打满导致子进程阻塞的风险。落文件最稳。
     err_paths = {}
-    for _tag in ("dec", "ai", "enc"):
+    # `src` 只在 stream_full 下存在（vspipe 那把 stage1 的 vpy 变成 y4m）
+    for _tag in ("src", "dec", "ai", "enc"):
         err_paths[_tag] = os.path.join(tmpd, f"{_tag}.err")
 
     # 失败原因在这里累积，**收尾统一交给下面的 finally**。
     # 不在 except 里直接 return：那样会绕过公共清理路径（见下方注释）。
     _failed = None
     try:
+        src = None
+        if stream_src_cmd:
+            # 生产者先起：它的 stdout 接给解码器的 stdin。
+            # 顺序不能反 —— 先起 dec 再起 src 时，dec 会因为 stdin 尚未
+            # 连上而立刻读到 EOF（"Invalid data found"）。
+            with open(err_paths["src"], "wb") as _fs:
+                src = subprocess.Popen(list(stream_src_cmd),
+                                       stdout=subprocess.PIPE,
+                                       stderr=_fs,
+                                       stdin=subprocess.DEVNULL,
+                                       bufsize=10 ** 8)
         with open(err_paths["dec"], "wb") as _fe:
-            dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE,
-                                   stderr=_fe, stdin=subprocess.DEVNULL,
-                                   bufsize=10 ** 8)
+            dec = subprocess.Popen(
+                dec_cmd, stdout=subprocess.PIPE, stderr=_fe,
+                stdin=(src.stdout if src is not None
+                       else subprocess.DEVNULL),
+                bufsize=10 ** 8)
+        if src is not None:
+            src.stdout.close()      # 让 src→dec 直接连通
         env = os.environ.copy()
         for k in list(env):
             if k.upper().startswith(("PYTHONPATH", "PYTHONHOME")):
@@ -1108,7 +1136,7 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
         if cancel_guard is not None:
             try:
                 import cancel_guard as _cg_mod  # noqa: F401
-                for _p in (dec, ai, enc):
+                for _p in (src, dec, ai, enc):
                     if _p is not None:
                         _cg_mod.watch_process(_p)
             except Exception:
@@ -1125,7 +1153,8 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                             if os.path.exists(output_mkv) else 0))
             if _cg_mod is not None and hasattr(_cg_mod, "wait_with_heartbeat"):
                 _cg_mod.wait_with_heartbeat(
-                    [dec, ai, enc], heartbeat=_hw,
+                    [p for p in (src, dec, ai, enc) if p is not None],
+                    heartbeat=_hw,
                     inactivity_timeout=inactivity_s,
                     logger=logger, label="stage3-stream")
             elif timeout_s is not None:     # 守卫缺失时的退路（旧行为）
@@ -1136,9 +1165,11 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                 enc.wait()
                 ai.wait()
                 dec.wait()
+                if src is not None:
+                    src.wait()
         finally:
             if _cg_mod is not None:
-                for _p in (dec, ai, enc):
+                for _p in (src, dec, ai, enc):
                     if _p is not None:
                         try: _cg_mod.unwatch_process(_p)
                         except Exception: pass
@@ -1161,8 +1192,9 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                        f"{type(_exc).__name__}: {_exc}")
     finally:
         # 统一收尾。成功路径下三个进程已自然退出，这里的操作都是无害的。
-        _reap_stream_pipeline([dec, ai, enc], logger=logger,
-                              label="stage3-stream")
+        _reap_stream_pipeline(
+            [p for p in (src, dec, ai, enc) if p is not None],
+            logger=logger, label="stage3-stream")
 
     if _failed is not None:
         return False, _failed, 0
@@ -1182,13 +1214,16 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
             except ValueError: pass
         elif ln.startswith("FRAMES_DIGEST="):
             ai_digest = ln.split("=", 1)[1].strip()
-    rc_ok = (dec.returncode == 0 and ai.returncode == 0 and enc.returncode == 0)
+    _src_rc = 0 if src is None else src.returncode
+    rc_ok = (dec.returncode == 0 and ai.returncode == 0
+             and enc.returncode == 0 and _src_rc == 0)
     if ai.returncode == 83:
         return False, "OOM in AI process (exit 83)", ai_frames
     if not rc_ok:
         # 把三方的 stderr 尾巴都带上——否则"启动失败"会被误当成 OOM
-        return False, (f"rc dec={dec.returncode} ai={ai.returncode} "
-                       f"enc={enc.returncode} | ai_err={ai_txt[-500:]} "
+        return False, (f"rc src={_src_rc} dec={dec.returncode} "
+                       f"ai={ai.returncode} enc={enc.returncode} "
+                       f"| ai_err={ai_txt[-500:]} "
                        f"| dec_err={dec_txt[-200:]} "
                        f"| enc_err={enc_txt[-200:]} "
                        f"| script_kept_at={tmpd}"), ai_frames
