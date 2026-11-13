@@ -211,7 +211,8 @@ def derive_color_relations(src_color: Dict[str, Any],
 _CONTRACT_SCHEMA = "color-conversion/1"
 
 
-def _color_contract_problems(contract, applied, changed_rows):
+def _color_contract_problems(contract, applied, changed_rows,
+                             rcpt=None, src_color=None, out_color=None):
     """校验"颜色转换合同"是否**能证明**这次转换（R23-B07）。
 
     合法转换不能一律拒绝（BT.601→BT.709 是真实需求），但也不能由
@@ -264,9 +265,61 @@ def _color_contract_problems(contract, applied, changed_rows):
         p.append("colour conversion contract does not say which implementation "
                  "performed the conversion")
     _bind = contract.get("binding") or {}
-    if not isinstance(_bind, dict) or not str(_bind.get("input_digest") or "")             or not str(_bind.get("output_digest") or ""):
+    _bind_in = str(_bind.get("input_digest") or "") if isinstance(_bind, dict) else ""
+    _bind_out = str(_bind.get("output_digest") or "") if isinstance(_bind, dict) else ""
+    if not _bind_in or not _bind_out:
         p.append("colour conversion contract is not bound to the input/output "
                  "content (no digests)")
+    else:
+        # ---- R24-06 / R23-A06：必须与**真实对象身份**比对 ----
+        # 审核反例：`binding={'input_digest':'wrong-input',
+        # 'output_digest':'wrong-output'}` 只检查非空就通过。
+        # 结构正确不等于"这次转换确实作用于这份媒体"—— 摘要只绑对象，
+        # 但**绑的是不是这个对象**必须由回执里的真实身份说了算。
+        _real_in = str((rcpt or {}).get("input_digest") or "")
+        _real_out = str((rcpt or {}).get("output_digest") or "")
+        if not _real_in or not _real_out:
+            p.append("the receipt does not record the real input/output "
+                     "digests; the conversion contract cannot be bound to "
+                     "this media")
+        else:
+            if _bind_in != _real_in:
+                p.append("colour conversion contract is bound to a different "
+                         f"input ({_bind_in[:16]} != {_real_in[:16]})")
+            if _bind_out != _real_out:
+                p.append("colour conversion contract is bound to a different "
+                         f"output ({_bind_out[:16]} != {_real_out[:16]})")
+
+    # ---- R24-06 / R23-A06：**全四元组**核对，不只 changed 的那些 ----
+    # 审核反例：from/to 的 primaries/transfer 写成 arbitrary-wrong，且这两个
+    # 字段没出现在 changed 列表里 —— 旧实现只比对 changed 行，于是无问题通过。
+    # "没变"也必须与观测一致：没说它变，那它就该等于各自那一侧的真实值。
+    _FIELDS = ("matrix", "range", "primaries", "transfer")
+    if isinstance(_from, dict):
+        for _f in _FIELDS:
+            _v = str(_from.get(_f) or "").strip()
+            _real = str((src_color or {}).get(_f) or "").strip()
+            if _v and _real and _v != _real:
+                p.append(f"colour conversion contract says the conversion "
+                         f"started from {_f}={_v!r} but the source recorded "
+                         f"{_real!r}")
+    if isinstance(_to, dict):
+        for _f in _FIELDS:
+            _v = str(_to.get(_f) or "").strip()
+            _real = str((out_color or {}).get(_f) or "").strip()
+            if _v and _real and _v != _real:
+                p.append(f"colour conversion contract says the conversion "
+                         f"produced {_f}={_v!r} but the output recorded "
+                         f"{_real!r}")
+    if isinstance(_from, dict) and isinstance(_to, dict):
+        _changed_names = {str(r.get("field") or "") for r in (changed_rows or [])}
+        for _f in _FIELDS:
+            _a = str(_from.get(_f) or "").strip()
+            _b = str(_to.get(_f) or "").strip()
+            if _a and _b and _a == _b and _f in _changed_names:
+                p.append(f"colour conversion contract lists {_f} as changed "
+                         f"but records the same value {_a!r} on both sides")
+
     if isinstance(_from, dict) and isinstance(_to, dict):
         for row in changed_rows or []:
             _f = str(_from.get(row["field"]) or "")
@@ -350,7 +403,10 @@ def receipt_evidence_problems(rcpt: Dict[str, Any]) -> list:
                 # 证明像素经过了正确变换。
                 problems.extend(
                     _color_contract_problems(_conv.get("contract"),
-                                             _applied, d_changed))
+                                             _applied, d_changed,
+                                             rcpt=rcpt,
+                                             src_color=src_color,
+                                             out_color=color))
     bounds = (rcpt or {}).get("bounds")
     if not isinstance(bounds, dict):
         problems.append("no bounds evidence (legacy receipt)")

@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SCHEMA = "frame-boundary/1"
@@ -44,7 +45,8 @@ SCHEMA = "frame-boundary/1"
 #: 允许的通道顺序（只写实际用到的两种）。
 CHANNEL_ORDERS = ("rgb", "bgr")
 
-#: 像素格式 → (位深, 通道顺序)。只列本项目实际产出的格式。
+#: 像素格式 → (位深, 通道顺序)。只列**需要显式指定通道顺序**的格式；
+#: 其余按命名规则推导（见 `pix_fmt_info`）。
 _PIX_FMT_INFO = {
     "rgb48le": (16, "rgb"),
     "gbrp16le": (16, "rgb"),
@@ -53,13 +55,39 @@ _PIX_FMT_INFO = {
     "yuv420p": (8, None),
 }
 
+#: 位深后缀（`yuv444p16le` / `gbrp10le` / `gray16le` 里的 16/10/16）。
+#: R24-06 / R23-A05：格式表原来只有 420 那几项，`yuv444p16le` 落进
+#: "未知格式" → `bit_depth=None` → 反而被新规则当成非法。444 现在是
+#: 合法的工作表示，必须能识别。
+_DEPTH_RX = re.compile(r"(?:p|gray|ya|rgb)(8|9|10|12|14|16)(?:le|be)?$")
+
+#: 没有位深后缀 = 8bit（`yuv420p` / `yuv444p` / `gbrp` / `gray` / `ya8`）。
+_PLAIN8_RX = re.compile(r"^(?:yuv\d{3}p|gbrp|gray|ya8)$")
+
 
 def pix_fmt_info(pix_fmt: str) -> Tuple[Optional[int], Optional[str]]:
     """像素格式 → ``(bit_depth, channel_order)``；未知格式返回 ``(None, None)``。
 
     未知不等于错误 —— 但要如实写 None，让消费者知道"这一项没被识别"。
+
+    R24-06 / R23-A05：优先查显式表（需要指定通道顺序的那几个），
+    其余按**命名规则**推位深。原来只查表，于是 `yuv444p16le` 被判未知、
+    `bit_depth=None`，反而被新规则当成非法格式拒掉 —— 444 明明是现在
+    合法的工作表示。按规则推也避免了"以后每加一种格式就得改表"。
     """
-    return _PIX_FMT_INFO.get(str(pix_fmt or ""), (None, None))
+    s = str(pix_fmt or "").strip().lower()
+    if not s:
+        return (None, None)
+    exact = _PIX_FMT_INFO.get(s)
+    if exact is not None:
+        return exact
+    order = "rgb" if s.startswith(("gbr", "rgb")) else None
+    m = _DEPTH_RX.search(s)
+    if m:
+        return (int(m.group(1)), order)
+    if _PLAIN8_RX.match(s):
+        return (8, order)
+    return (None, None)
 
 
 def digest_ordered_frames(paths: Iterable[str], chunk: int = 1 << 20
@@ -193,10 +221,13 @@ def contract_problems(contract: Dict[str, Any]) -> List[str]:
     if not isinstance(_tl, dict) or not _tl:
         p.append("no timeline reference (this boundary cannot prove when the "
                  "frames are supposed to be shown)")
-    elif not any(str(_tl.get(k) or "") for k in
-                 ("path", "plan_path", "digest", "content_digest")):
-        p.append("timeline reference has no content identity (a file name, "
-                 "fps and frame count are not a reference)")
+    elif not any(str(_tl.get(k) or "") for k in ("digest", "content_digest")):
+        # ---- R24-06 / R23-A05：路径不是内容身份 ----
+        # 审核反例：只给 `timeline.plan_path`，问题列表为空。
+        # 一个路径说明"计划文件在哪"，不说明"这份计划是哪一份" ——
+        # 文件被改写、被同名替换都看不出来。要求内容摘要。
+        p.append("timeline reference carries no content identity "
+                 "(a path, fps or frame count is not a content digest)")
     if not isinstance(contract.get("color"), dict) or not contract.get("color"):
         p.append("no colour contract recorded for this boundary")
     if not isinstance(contract.get("ai"), dict) or not contract.get("ai"):
@@ -241,21 +272,29 @@ def compare_contracts(a: Dict[str, Any], b: Dict[str, Any],
                 p.append(f"{_label} differs (declaration layer, not pixels)")
 
     da, db = a.get("frames_digest"), b.get("frames_digest")
+    dom_a = str(a.get("frames_digest_domain") or "")
+    dom_b = str(b.get("frames_digest_domain") or "")
     if not a.get("frames_digest_proven") or not b.get("frames_digest_proven"):
         p.append("frames_digest is unproven on at least one side; "
                  "cannot claim the two paths consumed the same frames")
+    elif dom_a and dom_b and dom_a != dom_b:
+        # ---- R24-06 / R23-A05：域不同就**不可比**，与摘要是否相同无关 ----
+        # 审核反例：两份合同 `frames_digest` 文本相同、域分别是 raw RGB 与
+        # PNG，旧实现只在"摘要不同"时才比域 → 空问题列表。
+        # 但"两个不同表示上算出同一个摘要文本"恰恰是最危险的情况：
+        # 看着一致，实际量的不是同一个东西。
+        p.append(f"frames_digest domains differ ({dom_a} vs {dom_b}); "
+                 f"summaries over different representations are not "
+                 f"comparable")
     elif da != db:
-        # 域不同（raw bytes vs PNG 字节）时摘要本来就该不同 —— 那是
-        # "没法这样比"，不是"两边帧不一样"。分开报，别混成一条。
-        dom_a = str(a.get("frames_digest_domain") or "")
-        dom_b = str(b.get("frames_digest_domain") or "")
-        if dom_a and dom_b and dom_a != dom_b:
-            p.append(f"frames_digest domains differ ({dom_a} vs {dom_b}); "
-                     f"summaries over different representations are not "
-                     f"comparable")
-        else:
-            p.append(f"frames_digest differs: {str(da)[:16]} vs "
-                     f"{str(db)[:16]} (domain={dom_a or 'unspecified'})")
+        p.append(f"frames_digest differs: {str(da)[:16]} vs "
+                 f"{str(db)[:16]} (domain={dom_a or 'unspecified'})")
+    elif not dom_a or not dom_b:
+        # 摘要相同、但至少一侧没写域 → 无法确认两边量的是同一个东西。
+        # "摘要域必填"是审核的明确要求；缺它时相等不算证据。
+        p.append("frames_digest matches but the digest domain is unspecified "
+                 "on at least one side; equality over unknown domains cannot "
+                 "be trusted")
     return p
 
 

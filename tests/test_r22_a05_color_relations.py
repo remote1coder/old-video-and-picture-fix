@@ -52,6 +52,10 @@ def _receipt(src=None, out=None, lost=None, changed=None, conv=None):
         "color_lost_tags": lost if lost is not None else [],
         "color_changed_tags": changed if changed is not None else [],
         "bounds": {"ok": True, "performed": True, "reason": ""},
+        # R24-06：合同要绑到**真实**对象上，回执必须记真实输入/输出身份。
+        # 夹具缺这两个字段时，"合同绑到了错误的输入输出"永远测不出来。
+        "input_digest": "a" * 64,
+        "output_digest": "b" * 64,
     }
     if conv is not None:
         d["color_conversion"] = conv

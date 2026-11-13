@@ -49,6 +49,11 @@ def _color_receipt(contract):
         "color_lost_tags": [],
         "color_conversion": {"applied": ["matrix"], "contract": contract},
         "bounds": {"performed": True, "ok": True},
+        # R24-06：回执必须记录**真实对象身份**，转换合同才能绑到这份媒体上。
+        # 真实生产者会写这两个字段；夹具缺了它们，就等于让"合同绑到了
+        # 错误的输入输出"这类问题永远测不出来（审核 A06 的复现点）。
+        "input_digest": "a" * 64,
+        "output_digest": "b" * 64,
     }
 
 
@@ -126,7 +131,9 @@ def test_the_producer_does_not_fabricate_a_conversion(tmp_path):
 
 def _contract(**over):
     base = dict(frames=5, width=640, height=480, pix_fmt="yuv420p16le",
-                timeline={"plan_path": "/t/plan.json"},
+                # R24-06：时间引用必须带**内容身份**（digest），
+                # 只有路径不足以证明"这份计划就是这份"。
+                timeline={"plan_path": "/t/plan.json", "digest": "d" * 64},
                 color={"probed": True, "pix_fmt": "yuv420p16le"},
                 ai={"impl": "realesrgan", "model": "x2plus"},
                 frames_digest="a" * 64,

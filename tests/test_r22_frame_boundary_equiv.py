@@ -444,8 +444,10 @@ def test_same_ai_output_feeds_both_back_halves(tmp_path):
         frames=len(paths), width=IN_W * SCALE, height=IN_H * SCALE,
         pix_fmt="rgb48le", frames_digest=digest, source="model",
         # R23-B08：合同要能证明"这一串帧在什么时候显示、什么颜色、谁产的"
+        # R24-06：路径不是内容身份 —— 必须带计划内容的摘要，
+        # 否则"计划文件被改写/同名替换"看不出来。
         timeline={"plan_path": str(tmp_path / "timeline.json"),
-                  "fps": "10"},
+                  "fps": "10", "digest": "d" * 64},
         color={"probed": True, "pix_fmt": "rgb48le"},
         ai={"impl": "realesrgan", "model": "RealESRGAN_x2plus"})
     assert fc.contract_problems(contract) == [], fc.contract_problems(contract)
