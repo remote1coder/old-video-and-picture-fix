@@ -328,6 +328,25 @@ def resolve(params: Dict[str, Any], *, source_path: str = "",
             "detail": mode_err,
             "cost": ("silently treating it as 'auto' means the user's explicit "
                      "request is replaced by a default they never chose"),
+            "suggest": list(MODES),
+        })
+
+    # ---- R24-05 / R23-A07：非法布尔值必须被**消费** ----
+    # 审核：`chroma_mode_accept_degraded='nonsense'` 的非法状态被算出来后
+    # 没有任何分支读它 —— 于是"用户写了个看不懂的值"仍然返回成功。
+    # 这不是措辞问题：这个开关的含义是"允许系统降低交付质量"，
+    # 猜成 True 就等于替用户同意了降画质。
+    if not _acc_ok:
+        blockers.append({
+            "boundary": "config",
+            "kind": "invalid_accept_degraded",
+            "detail": (
+                "chroma_mode_accept_degraded=%r is not a boolean; refusing to "
+                "guess whether a quality substitution was authorized"
+                % (p.get("chroma_mode_accept_degraded"),)),
+            "cost": ("guessing 'true' would let the chain lower the delivered "
+                     "format without the user having agreed to it"),
+            "suggest": ["true", "false"],
         })
 
     if mode == "420":
@@ -350,9 +369,11 @@ def resolve(params: Dict[str, Any], *, source_path: str = "",
                 "kind": "source_chroma_unsupported",
                 "detail": ("source pix_fmt=%r is 4:2:2; only 420/444 working "
                            "representations exist" % src_fmt),
-                "cost": ("4:4:4 does not recover the vertical half-resolution "
-                         "the source already lost, and 4:2:0 would reduce the "
-                         "horizontal resolution as well"),
+                "cost": ("4:4:4 does not recover the **horizontal** "
+                         "half-resolution the source already lost (4:2:2 keeps "
+                         "full vertical chroma but halves horizontal), and "
+                         "4:2:0 would reduce the vertical resolution on top of "
+                         "that"),
                 "suggest": ["chroma_mode=444 (closest), or chroma_mode=420 if "
                             "you accept the extra reduction"],
             })
@@ -395,15 +416,44 @@ def resolve(params: Dict[str, Any], *, source_path: str = "",
                       "the source actually has" % src_chroma)
 
     # ---- 交付格式：可以由 pix_fmt 指定，**与工作表示无关** ----
+    # R24-05 / R23-A07：必须区分**缺省**与**显式给了但不认识**。
+    # 旧实现在两种情况下都走 else，把显式请求静默换成一个用户没选过的默认值：
+    #   `pix_fmt=TYPO`        → ok=True，实际用 yuv444p10le
+    #   `pix_fmt=yuv422p10le` → ok=True，同样被换成默认
+    # 这与"开跑前决定画质"直接冲突。现在：
+    #   缺省        → 跟随工作表示（合法默认，不是改用户请求）
+    #   420/444     → 采用
+    #   其它（拼错 / 本项目不支持 422、RGB、灰度）→ blocker + 可执行替代
     declared = str(p.get("pix_fmt") or "").strip()
     declared_chroma = chroma_of_pix_fmt(declared)
     boundaries = dict(_BOUNDARIES[working])
-    if declared_chroma in ("420", "444"):
+    if not declared:
+        delivery_chroma = working
+        delivery_fmt = boundaries["stage7_final"]
+    elif declared_chroma in ("420", "444"):
         delivery_fmt = declared
         delivery_chroma = declared_chroma
     else:
         delivery_chroma = working
         delivery_fmt = boundaries["stage7_final"]
+        _unknown = declared_chroma not in ("420", "422", "444", "rgb-or-gray")
+        blockers.append({
+            "boundary": "delivery",
+            "kind": ("delivery_pix_fmt_invalid" if _unknown
+                     else "delivery_pix_fmt_unsupported"),
+            "detail": (
+                ("pix_fmt=%r cannot be parsed as a pixel format; this project "
+                 "supports 4:2:0 and 4:4:4 delivery" % declared)
+                if _unknown else
+                ("pix_fmt=%r parses as %s chroma, which this project has no "
+                 "delivery path for (only 4:2:0 and 4:4:4)"
+                 % (declared, declared_chroma))),
+            "cost": ("silently substituting %r would mean the delivered file "
+                     "does not carry the format the user asked for, while the "
+                     "report still claims it does" % delivery_fmt),
+            "suggest": ["yuv420p10le", "yuv444p10le", "omit pix_fmt to follow "
+                        "the working representation"],
+        })
 
     conversion = None
     if delivery_chroma != working:
@@ -483,13 +533,25 @@ def resolve(params: Dict[str, Any], *, source_path: str = "",
             warnings.append("delivery format degraded to %s (user accepted)"
                             % _new)
 
-    # 接受降级时，其余 blocker 也必须有可执行替代；没有替代的仍然失败
-    if accept and blockers:
+    # ---- R24-05 / R23-A07：accept 不能放过"没有实际替代"的 blocker ----
+    # 旧写法 `ok = not blockers or (accept and all(b.get("suggest") ...))`
+    # 把 `suggest`（给人看的候选列表）当成"系统已经决定用哪个"。
+    # 后果：只要用户开一个 accept，任何带建议的 blocker 都被放行，
+    # 而交付格式其实停在默认值上 —— 正是审核说的
+    # "不能仅凭泛化布尔值授权任意降画质"。
+    #
+    # 现在：只有**确实生成了可执行替代**（`degraded`）且没有其它未解决
+    # blocker 时，才允许 accept 放行。`delivery_pix_fmt_*` 这类没有替代方案的
+    # 仍然失败 —— 那是"写错了/选了本项目没有的格式"，不是"能力不足"。
+    _degradable = frozenset({"encoder_unsupported"})
+    _unresolved = [b for b in blockers
+                   if str(b.get("kind") or "") not in _degradable]
+    if accept and blockers and not _unresolved and degraded:
         for b in blockers:
-            if b.get("suggest"):
-                b["accepted_without_effect"] = True
-
-    ok = (not blockers) or (accept and all(b.get("suggest") for b in blockers))
+            if b.get("kind") in _degradable:
+                b["substituted"] = {"to": (degraded or {}).get("to")}
+    ok = (not blockers) or (bool(accept) and bool(degraded)
+                            and not _unresolved)
     plan = {
         "schema": SCHEMA,
         "mode": mode,
