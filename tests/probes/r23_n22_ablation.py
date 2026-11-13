@@ -244,6 +244,10 @@ def _run_once(work, cfg, manifest, label, timeout=3600, fresh=True):
         # 证明"N22 成品重复性"不成立的。
         "output": (_snapshot(work, label, outs[0])
                    if outs else None),
+        # R24-07：`output` 现在是**快照副本**（供跨轮比较）。旁证检查要看
+        # 生产实际写出的位置（下一次 `_run_once` 会把它清掉，所以只在本轮
+        # 返回值里可用）。
+        "output_live": outs[0] if outs else None,
         "output_sha256": _sha(outs[0]) if outs else None,
         "step6": _snapshot(work, label, max(steps, key=os.path.getmtime))
         if steps else None,
@@ -360,7 +364,8 @@ def main():
     fault["rerun"] = rerun
     # 统一完成验证（生产入口）
     verify = {}
-    out = rerun.get("output")
+    # 旁证在**生产实际路径**上，不在快照副本里（快照只有媒体本身）
+    out = rerun.get("output_live")
     if out:
         try:
             vcode = (
