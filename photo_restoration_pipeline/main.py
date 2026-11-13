@@ -750,6 +750,31 @@ def _run_single_job(job: Dict[str, Any],
     # chain internally per v7.32 §3.10.10. No separate WSL redirect block needed.
     temp_dir = params.get("temp_dir", "./temp")
 
+    # ---- P5：中间存储策略（与视频链同一个决策点）----
+    # 必须**早于**任何写/删：策略不成立就该一个字节都不动。
+    try:
+        sys.path.insert(0, str(SCRIPT_DIR.parent / "shared_modules"))
+        from storage_policy import (
+            resolve as _sp_resolve, preview_lines as _sp_preview,
+            describe as _sp_describe)
+        _sp_policy, _sp_problems = _sp_resolve(params, config)
+        for _line in _sp_preview(_sp_policy):
+            logger.info("STORAGE_PREVIEW", _line)
+        if _sp_problems:
+            for _pp in _sp_problems:
+                logger.error("STORAGE_POLICY_REFUSED", _pp)
+            return 85
+        params["_storage_policy"] = _sp_policy
+        logger.info("STORAGE_POLICY",
+                    "Intermediate storage policy resolved",
+                    detail=_sp_describe(_sp_policy))
+    except Exception as _spe:
+        logger.error("STORAGE_POLICY_FAIL",
+                     "Cannot resolve the intermediate storage policy; "
+                     "refusing to run a generation whose materialisation "
+                     "rules are undetermined", error=str(_spe))
+        return 86
+
     # Clean intermediates
     # FIX-NEW-V-12 / R10: 全新运行先清空本 job 的陈旧中间产物
     # （与视频链 main.py 的 STALE_INTERMEDIATES_PURGED 同一处理），

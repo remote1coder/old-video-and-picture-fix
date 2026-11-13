@@ -3449,6 +3449,37 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                          "undetermined", error=str(_wfe))
         return 86, f"work format resolve failed: {_wfe}"
 
+    # ---- P5：中间存储策略（有损必须**显式**授权）----
+    # 放在这里（work_format 之后、身份冻结之前）：
+    #   * 早于任何 stage —— 策略不成立时**一个字节都不该写**；
+    #   * 晚于 work_format —— 预览里要报的 pix_fmt 来自工作表示。
+    try:
+        from storage_policy import (
+            resolve as _sp_resolve, preview_lines as _sp_preview,
+            describe as _sp_describe)
+        _sp_policy, _sp_problems = _sp_resolve(params, config)
+        for _line in _sp_preview(_sp_policy):
+            job_logger.info("STORAGE_PREVIEW", _line,
+                            job_id=job_id)
+        if _sp_problems:
+            # **拒绝**，不是"降级成无损继续跑"：有损一旦发生不可逆，
+            # 静默降级会让人以为自己拿到的是无损链的结论。
+            for _p in _sp_problems:
+                job_logger.error("STORAGE_POLICY_REFUSED", _p, job_id=job_id)
+            return 85, ("intermediate storage policy is not usable: "
+                        + "; ".join(_sp_problems))
+        params["_storage_policy"] = _sp_policy
+        job_logger.info("STORAGE_POLICY",
+                        "Intermediate storage policy resolved",
+                        job_id=job_id, detail=_sp_describe(_sp_policy))
+    except Exception as _spe:
+        job_logger.error(
+            "STORAGE_POLICY_FAIL",
+            "Cannot resolve the intermediate storage policy; refusing to run "
+            "a generation whose materialisation rules are undetermined",
+            error=str(_spe))
+        return 86, f"storage policy resolve failed: {_spe}"
+
     # ---- R17-01：把"本次 run 的身份"随 params 传给 stage ----
     # 审核要求：marker 不能只比对"当前 verify 与当前媒体彼此一致" —— 只要
     # B 把媒体和报告一起换掉，两者仍然自洽，A 无法察觉这份报告已不是自己那代。
@@ -4315,6 +4346,20 @@ def _impl_params_for(job: Dict[str, Any], config: Dict[str, Any],
         return dict(params or {})
 
 
+def _storage_block_for(params) -> Dict[str, Any]:
+    """本次产物所属的存储策略（侧车用）。解析不出来时**如实写"未知"**。"""
+    try:
+        from storage_policy import storage_block as _sb
+        pol = (params or {}).get("_storage_policy")
+        if isinstance(pol, dict):
+            return _sb(pol)
+        return {"mode": "unknown", "codec": "", "quality": None,
+                "pix_fmt": "", "lossy_generations": None}
+    except Exception:                       # pragma: no cover - 部署异常
+        return {"mode": "unknown", "codec": "", "quality": None,
+                "pix_fmt": "", "lossy_generations": None}
+
+
 def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
                                    config: Dict[str, Any], stage_num: int,
                                    input_path: str, logger=None,
@@ -4361,6 +4406,10 @@ def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
         # 换日志级别不失效，换人脸模型不影响传统降噪。
         "stage_identity": _stage_identity_for(params, stage_num),
         "stage_scope": _stage_scope_snapshot(params, stage_num),
+        # ---- P5：这份产物是在什么存储策略下生成的 ----
+        # 复用判定要看**它**，不看文件名：文件名不带质量/代数，而且会被
+        # 后续拼接与覆盖。
+        "storage": _storage_block_for(params),
         # COL-04（第七轮）：记录这一代**实际**的颜色表示。字段分开保留
         # （pix_fmt/range/matrix/primaries/transfer），不塌缩成一个
         # "standard"；探测失败时 probed=False，字段一律 None，
@@ -4386,7 +4435,8 @@ def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
                                   config: Dict[str, Any],
                                   logger=None,
                                   expected_stage: Optional[int] = None,
-                                  expected_upstream: Optional[str] = None
+                                  expected_upstream: Optional[str] = None,
+                                  policy: Optional[Dict[str, Any]] = None
                                   ) -> Tuple[bool, str]:
     """R2-07 补完：这个中间产物**是不是**本次 job / 本次输入 / 本次参数产出的。
 
@@ -4406,6 +4456,19 @@ def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
     if str(data.get("impl", "")) != VIDEO_IMPL_VERSION:
         return False, (f"produced by implementation {data.get('impl')!r}, "
                        f"current is {VIDEO_IMPL_VERSION!r}")
+
+    # ---- P5：存储策略必须与本次计划一致 ----
+    # 有损链与无损链的验收结论**不可互换**：一份用 libx264 写出来的中间
+    # 产物，被无损计划复用时，"无损"这个结论就已经不成立了。
+    try:
+        from storage_policy import (resolve as _sp_res,
+                                    cache_mismatch as _sp_mismatch)
+        _pol = policy if isinstance(policy, dict) else _sp_res(None, config)[0]
+        _why = _sp_mismatch(data.get("storage"), _pol)
+        if _why:
+            return False, _why
+    except Exception as _spe:                    # pragma: no cover
+        return False, f"cannot compare the storage policy: {_spe}"
     # ---- I05：模型/工具**字节**变了就不能复用 ----
     # 只比版本号不够：同一版本下换权重，旧中间产物看着仍然"合规"。
     _rec_impl = str(data.get("impl_fingerprint") or "")

@@ -138,6 +138,30 @@ photo:
   archival_mode: false
 
 # 照片场景不使用 GrainFactory3（使用 G'MIC 颗粒合成），保留空占位以兼容统一配置系统
+# ============================================
+# 中间存储策略（P5）
+# ============================================
+# 物化边界的**唯一决策点**。默认与改动前完全一致：无损、跑完按 keep_steps 清理。
+#
+# 有损中间件必须**显式**授权（`lossy_allowed: true`），否则开跑前直接拒绝 ——
+# 有损一旦发生不可逆，静默降级会让人以为自己拿到的是无损链的结论。
+# 选定有损时，运行预览会**逐边界**列出每一次转换（见日志 STORAGE_PREVIEW）。
+#
+# 注意：本版本只落地"策略解析 + 守卫 + 预览 + 侧车身份"，
+# **没有**把任何 stage 的写出路径接成有损。所以现在能说"无许可不得启用有损"，
+# 不能说"有损备选已实现"。
+intermediate_storage:
+  mode: lossless            # lossless | lossy
+  lossy_allowed: false      # lossy 必须同时为 true，否则开跑前拒绝
+  codec: ""                 # 空 = 跟随各 stage 的默认（FFV1 / TIFF-zlib）
+  quality: null             # 有损才需要（crf / q）
+  pix_fmt: ""               # 空 = 跟随 work_format 的边界
+  max_lossy_generations: 0  # 无损恒为 0；有损至少 1（硬上限）
+  reuse_identity: [plan, source, params, impl]
+  cleanup:
+    keep_steps: 2
+    purge_stale: true
+
 grain_factory3:
   enabled: false
 
