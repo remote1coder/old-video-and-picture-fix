@@ -329,6 +329,27 @@ audio_override:
 # 注意：本版本只落地"策略解析 + 守卫 + 预览 + 侧车身份"，
 # **没有**把任何 stage 的写出路径接成有损。所以现在能说"无许可不得启用有损"，
 # 不能说"有损备选已实现"。
+# ============================================
+# 资源占用的硬上限（用户要求：任何一项都不超过 80%）
+# ============================================
+# 长片跑批会把整机吃满：vspipe 按逻辑核开线程、libsvtav1 占满逻辑核、
+# ffmpeg 解码/滤镜各自再开。多者叠加会超过 100%，轻则拖慢同机其它工作，
+# 重则把内存/显存推到临界点让跑批中途崩掉。
+#
+# 这里限的是**本任务进程树**（线程数），不改全机设置：
+#   * VapourSynth：写进 vpy 的 `core.num_threads`（`vspipe -t` 是 --timecodes，
+#     不是线程数，不能用它限流 —— 已在代码注释里钉住）；
+#   * ffmpeg：`-threads`；
+#   * SVTAV1：`svtav1-params lp=N`；x265 用 `pools=N`。
+#
+# 如实说明：这是"线程与预算在 80% 以内"，不是"物理上绝不可能超过 80%"
+# （单进程峰值内存要靠 cgroup/Job Object，本模块不碰全机配置）。
+resource_limits:
+  enabled: true
+  max_fraction: 0.80      # 线程数 = floor(cpu * max_fraction) - reserve_cores
+  reserve_cores: 0        # 想再让出几个核给桌面/其它程序就调这里
+  min_threads: 1
+
 intermediate_storage:
   mode: lossless            # lossless | lossy
   lossy_allowed: false      # lossy 必须同时为 true，否则开跑前拒绝

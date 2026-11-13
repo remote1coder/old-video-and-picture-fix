@@ -534,6 +534,14 @@ def generate_vs_script(input_path: str, params: dict, job_id: str,
         lines.extend(_det_pre(params))
     except Exception:                # pragma: no cover - 缺模块不影响生产
         pass
+    # ---- 资源限幅：VS 线程数不超过整机上限（默认 80%）----
+    # 同一约束：必须插在任何 filter 创建之前；确定性开启时不再写
+    # （num_threads=1 已低于任何上限）。
+    try:
+        from vs_render import thread_preamble as _thr_pre
+        lines.extend(_thr_pre(params))
+    except Exception:                # pragma: no cover
+        pass
     lines.append("")
 
     # Source
@@ -1325,6 +1333,8 @@ def main():
         # VSPipe R72 与 R81 的 help 都是 `-c, --container <y4m/wav/w64/mkv>`。
         # 原写法让 vspipe 直接 "Unknown argument: --y4m" 退出 1，
         # 无任何 y4m 输出，ffmpeg 读 "-" 拿到无效数据 -> exit 84。
+        # 线程上限走 vpy 里的 `core.num_threads`（见 vs_render.thread_preamble）；
+        # `vspipe -t` 是 --timecodes，不是线程数，不能拿来限流。
         vspipe_cmd = ["vspipe", "-c", "y4m", vs_path, "-"]
         ffmpeg_cmd = [
             "ffmpeg", "-hide_banner", "-v", "error",

@@ -2601,7 +2601,8 @@ class _EncodeResult(object):
 
 
 def _run_fused_encode(video_cmd: List[str], vs_script: str,
-                      publish_tmp: str, logger, inactivity_s: float):
+                      publish_tmp: str, logger, inactivity_s: float,
+                      params: Optional[Dict[str, Any]] = None):
     """跑「vspipe(grain vpy) → 本 stage 的编码命令」。
 
     `video_cmd` 必须已经是**完整**命令（含 ``-f yuv4mpegpipe -i pipe:0``
@@ -2614,6 +2615,8 @@ def _run_fused_encode(video_cmd: List[str], vs_script: str,
             script_text = fh.read()
     except OSError as exc:
         return _EncodeResult(86, f"cannot read the fused vs script: {exc}")
+    # 线程上限已经在 stage6 生成的 vpy 里（core.num_threads），
+    # vspipe 本身不需要额外参数（`-t` 是 --timecodes，不是线程数）。
     vspipe_cmd = ["vspipe", "-c", "y4m", vs_script, "-"]
     res = mod._run_grain_pipeline(
         script_text, vs_script, vspipe_cmd, list(video_cmd),
@@ -3123,6 +3126,14 @@ def main():
     else:
         video_cmd = common_prefix + ["-fflags", "+genpts", "-i", input_source]
     output_opts: List[str] = []
+    # ---- 资源限幅：编码器线程不超过配置上限（默认 80%）----
+    # 见 shared_modules/resource_limits.py。这里只限**本进程树**，
+    # 不动全机设置；宁可慢，也不要因为打满而中途崩。
+    try:
+        from resource_limits import ffmpeg_threads as _rlf_threads
+        output_opts.extend(_rlf_threads(params))
+    except Exception:                                  # pragma: no cover
+        pass
     # FIX-2026-10-23：显式指定 passthrough，禁止 ffmpeg 为了凑恒定
     # 帧率而复制/丢弃帧。默认值 `auto` 会按 muxer 能力选 cfr 或 vfr，
     # 两者都会改变帧数（cfr 复制+丢弃，vfr 丢弃时间戳重复的帧）。
@@ -3617,6 +3628,14 @@ def main():
     # set via -color_primaries/-color_trc/-colorspace above).
     if video_encoder != "libx265":
         svt_params = f"tile-rows={tile_rows}:tile-columns={tile_cols}"
+        # ---- 资源限幅：SVTAV1 的逻辑核数（不写就是"整机")----
+        try:
+            from resource_limits import svt_logical_processors as _rl_lp
+            _lp = _rl_lp(params)
+            if _lp:
+                svt_params += f":{_lp}"
+        except Exception:                              # pragma: no cover
+            pass
         svt_params += f":color-primaries={svt_primaries}:transfer-characteristics={svt_trc}"
         svt_params += f":matrix-coefficients={svt_matrix}:color-range={svt_range}"
         output_opts.extend(["-svtav1-params", svt_params])
@@ -3653,7 +3672,7 @@ def main():
             # 心跳看 `_publish_tmp` 是否还在增长 —— 与经典路线同一个判据，
             # 所以"卡死"的定义在两条路线上一致。
             r = _run_fused_encode(video_cmd, _fused_vs_script, _publish_tmp,
-                                  logger, _enc_inactivity)
+                                  logger, _enc_inactivity, params=params)
         elif _cancel_guard is not None:
             r = _cancel_guard.run_managed(video_cmd, capture_output=True,
                                           text=True, timeout=None,

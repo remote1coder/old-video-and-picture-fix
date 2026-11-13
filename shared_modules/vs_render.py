@@ -132,6 +132,33 @@ def determinism_preamble(params: Any) -> List[str]:
     ]
 
 
+def thread_preamble(params: Any) -> List[str]:
+    """按资源上限给出 `core.num_threads = N`（未启用/不需要时返回空）。
+
+    与 `determinism_preamble` 同一插入位置：`core = vs.core` 之后、
+    **任何 filter 创建之前**。两者同时存在时以确定性为准
+    （`num_threads = 1` 已经低于任何上限，不需要再写一次）。
+    """
+    if wants_deterministic(params):
+        return []
+    try:
+        from resource_limits import get as _rl_get
+        plan = _rl_get(params)
+    except Exception:                                  # pragma: no cover
+        return []
+    if not plan.get("enabled"):
+        return []
+    n = int(plan.get("threads") or 0)
+    if n <= 0 or n >= int(plan.get("cpu_count") or 0):
+        return []
+    return [
+        "",
+        f"# ---- 资源限幅：VS 线程数不超过整机 {plan.get('max_fraction')} ----",
+        f"core.num_threads = {n}",
+        "",
+    ]
+
+
 def render_cost_note() -> str:
     """一句可直接写进日志的代价说明。
 

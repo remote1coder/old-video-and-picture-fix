@@ -64,6 +64,34 @@ def _determinism_block(deterministic: bool) -> str:
     return "".join(line + "\n" for line in lines)
 
 
+def _threads_for(params):
+    """本次运行的 VS 线程上限（资源限幅）；取不到就返回 None（= 不限）。"""
+    try:
+        from resource_limits import num_threads as _nt
+        return _nt(params)
+    except Exception:                                  # pragma: no cover
+        return None
+
+
+def _thread_block(threads, deterministic: bool) -> str:
+    """vpy 里的线程上限（`core.num_threads`）。
+
+    必须在 `core = vs.core` 之后、**任何 filter 之前**才生效 ——
+    与确定性开关同一约束。确定性优先（`num_threads = 1` 已低于任何上限）。
+    """
+    if deterministic or not threads:
+        return ""
+    try:
+        n = int(threads)
+    except (TypeError, ValueError):
+        return ""
+    import os as _os
+    if n <= 0 or n >= (_os.cpu_count() or 0):
+        return ""
+    return (f"# ---- 资源限幅：VS 线程数 ----\n"
+            f"core.num_threads = {n}\n")
+
+
 def _build_vs_script(input_source: str, vs_format: str,
                      g1str: float, g2str: float, g3str: float,
                      addgrainc_ratio: float,
@@ -71,7 +99,8 @@ def _build_vs_script(input_source: str, vs_format: str,
                      addgrainc_after_gf3: bool = False,
                      temp_avg: float = 0.0,
                      deterministic: bool = False,
-                     seed: Optional[int] = None) -> str:
+                     seed: Optional[int] = None,
+                     threads: Optional[int] = None) -> str:
     """Build VapourSynth grain synthesis script.
 
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
@@ -98,6 +127,7 @@ def _build_vs_script(input_source: str, vs_format: str,
             f"import vapoursynth as vs\n"
             f"core = vs.core\n"
             + _determinism_block(deterministic) +
+            _thread_block(threads, deterministic) +
             f"clip = core.ffms2.Source(source={repr(input_source)})\n"
             f"clip = core.resize.Bicubic(clip, format={vs_format})\n"
             f"clip = core.grain.Add(clip, var={var}, uvar={uvar}, "
@@ -110,6 +140,7 @@ def _build_vs_script(input_source: str, vs_format: str,
         f"import vapoursynth as vs\n"
         f"core = vs.core\n"
         + _determinism_block(deterministic) +
+        _thread_block(threads, deterministic) +
         f"import havsfunc as haf\n"
         f"clip = core.ffms2.Source(source={repr(input_source)})\n"
         f"clip = core.resize.Bicubic(clip, format={vs_format})\n"
@@ -1141,7 +1172,9 @@ def main() -> int:
         temp_avg=temp_avg,
         deterministic=_vs_deterministic(params),
         # R22：`grain_seed` 给了才固定随机种子（不给 = 历史行为，每次随机）
-        seed=params.get("grain_seed"))
+        seed=params.get("grain_seed"),
+        # 资源限幅：VS 线程数上限（默认整机 80%）
+        threads=_threads_for(params))
     # FIX-P9-11: removed redundant write here — _run_grain_pipeline writes vs_path internally
 
     if _fused_mode:
@@ -1179,7 +1212,8 @@ def main() -> int:
                     addgrainc_ratio, use_addgrainc=True,
                     temp_avg=temp_avg,
                     deterministic=_vs_deterministic(params),
-                    seed=params.get("grain_seed"))
+                    seed=params.get("grain_seed"),
+                    threads=_threads_for(params))
                 try:
                     with open(vs_path, "w", encoding="utf-8") as _vf2:
                         _vf2.write(vs_script)
@@ -1239,18 +1273,24 @@ def main() -> int:
 
 
     # Fix: Use vspipe directly (standard VapourSynth CLI tool)
-    vspipe_cmd = [
-        "vspipe", "-c", "y4m",
-        vs_path, "-"
-    ]
+    # 线程上限走 vpy 里的 `core.num_threads`（见 _thread_block）；
+    # `vspipe -t` 是 --timecodes，不是线程数。
+    vspipe_cmd = ["vspipe", "-c", "y4m", vs_path, "-"]
 
     # V-P-048 fix: lossless FFV1 intermediate instead of lossy SVT-AV1
+    _rl_th = []
+    try:
+        from resource_limits import ffmpeg_threads as _rl_ft
+        _rl_th = _rl_ft(params)
+    except Exception:                                  # pragma: no cover
+        pass
     ffmpeg_cmd = [
         "ffmpeg", "-hide_banner", "-v", "error", "-y",
         "-i", "-",
         # R15-04：y4m 管道本身是定帧率声明，但上游若是 VFR 素材，
         # 这里再加一道 passthrough，保证不因 vsync 重整而丢帧。
         "-fps_mode", "passthrough",
+    ] + _rl_th + [
         "-c:v", "ffv1",
         "-pix_fmt", pix_fmt,
         output_path
@@ -1273,7 +1313,8 @@ def main() -> int:
             addgrainc_ratio, use_addgrainc=True,
             temp_avg=temp_avg,
             deterministic=_vs_deterministic(params),
-            seed=params.get("grain_seed"))
+            seed=params.get("grain_seed"),
+            threads=_threads_for(params))
         return _run_grain_pipeline(
             addgrain_script, vs_path, vspipe_cmd, ffmpeg_cmd,
             output_path, logger, fallback_label="AddGrainC",

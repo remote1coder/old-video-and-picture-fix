@@ -3449,6 +3449,21 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                          "undetermined", error=str(_wfe))
         return 86, f"work format resolve failed: {_wfe}"
 
+    # ---- 资源限幅：CPU/内存/显存不超过配置上限（默认 80%）----
+    # 用户要求"宁可慢也不要打满"，所以默认**开启**。
+    # 只限本任务进程树（线程数与预算），不改全机设置。
+    try:
+        from resource_limits import (resolve as _rl_res,
+                                     describe as _rl_desc)
+        _rl_plan = _rl_res(params, config)
+        params["_resource_limits"] = _rl_plan
+        job_logger.info("RESOURCE_LIMITS", _rl_desc(_rl_plan),
+                        job_id=job_id)
+    except Exception as _rle:
+        job_logger.warning("RESOURCE_LIMITS_FAIL",
+                           "Could not resolve the resource limits; processes "
+                           "may use every core", error=str(_rle))
+
     # ---- P5：中间存储策略（有损必须**显式**授权）----
     # 放在这里（work_format 之后、身份冻结之前）：
     #   * 早于任何 stage —— 策略不成立时**一个字节都不该写**；
