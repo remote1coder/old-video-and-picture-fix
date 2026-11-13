@@ -433,3 +433,53 @@ def test_provenance_ignores_chain_mode(tmp_path):
     import main as vmain
     mid, job = _sidecar(tmp_path)
     assert vmain._s67_intermediate_provenance(mid, job, None)[0]
+
+
+# --------------------------------------------------------------------------
+# 7) 大 mkv 没有容器帧数时，守恒判定必须用**实测的两个数**兜底
+# --------------------------------------------------------------------------
+def test_group_bounds_falls_back_to_counted_frames():
+    """`verify_output` 读不到帧数时不能直接判"未验证"。
+
+    长片实测（2026-11-14，8160 帧 4.4 GB mkv）：容器里没有 `nb_frames`，
+    `frames.ok=None` → 组回执判"未验证" → 一次完全正确的 48 分钟跑批
+    被判失败并触发整轮重跑。而这两个数其实都测过：
+    源在编码前 `-count_frames`、成品由 `measure_final_candidate()` 实测。
+    """
+    s7 = _load_stage7()
+    pre = {"checks": {"frames": {"ok": None, "note": "无法推算允许帧数，未校验"},
+                      "duration": {"ok": None}}}
+    b = s7._group_bounds(pre, src_frames=8160, out_frames=8160)
+    assert b["performed"] is True, b
+    assert b["ok"] is True, b
+    assert "counted" in b["basis"], b["basis"]
+
+
+def test_group_bounds_counted_fallback_detects_frame_loss():
+    s7 = _load_stage7()
+    pre = {"checks": {"frames": {"ok": None}, "duration": {"ok": None}}}
+    b = s7._group_bounds(pre, src_frames=8160, out_frames=8159)
+    assert b["performed"] is True
+    assert b["ok"] is False, b
+
+
+def test_group_bounds_without_measured_output_stays_unproven():
+    """只给了源帧数、没给成品帧数 → 仍然是"未验证"，不能默认相等。"""
+    s7 = _load_stage7()
+    pre = {"checks": {"frames": {"ok": None}, "duration": {"ok": None}}}
+    b = s7._group_bounds(pre, src_frames=8160, out_frames=None)
+    assert b["performed"] is False
+    assert b["ok"] is False
+
+
+def test_group_bounds_never_compares_a_number_with_itself():
+    """回归：`out_frames` 若被写成带兜底的 `frames`，比较会恒真。
+
+    这个坑很隐蔽 —— 传错一个参数，"源=8160、成品=8160"看着完全正常，
+    但实际比的是同一个变量。所以这里显式钉住：只给 src、不给 out 时，
+    结论必须是"未证明"，而不是"通过"。
+    """
+    s7 = _load_stage7()
+    pre = {"checks": {"frames": {"ok": None}, "duration": {"ok": None}}}
+    assert s7._group_bounds(pre, src_frames=1, out_frames=None)["ok"] is False
+    assert s7._group_bounds(pre, src_frames=1, out_frames=2)["ok"] is False

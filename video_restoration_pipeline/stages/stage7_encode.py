@@ -2628,7 +2628,9 @@ def _run_fused_encode(video_cmd: List[str], vs_script: str,
     return _EncodeResult(84, getattr(res, "detail", "") or "fused encode failed")
 
 
-def _group_bounds(pre_check: Dict[str, Any]) -> Dict[str, Any]:
+def _group_bounds(pre_check: Dict[str, Any],
+                  src_frames: Optional[int] = None,
+                  out_frames: Optional[int] = None) -> Dict[str, Any]:
     """把发布前的机械核对折成**组边界**的守恒结论。
 
     为什么不用 `generation_evidence.collect()` 里那份 `bounds`：
@@ -2641,9 +2643,27 @@ def _group_bounds(pre_check: Dict[str, Any]) -> Dict[str, Any]:
     而且它就是在发布点、对本次 attempt 的暂存文件跑的 —— 同一个量，用它。
     """
     checks = (pre_check or {}).get("checks") or {}
-    fr = checks.get("frames") or {}
+    fr = dict(checks.get("frames") or {})
     du = checks.get("duration") or {}
     performed = fr.get("ok") is not None or du.get("ok") is not None
+    # ---- 兜底：容器里没有帧数时，用**实测过的两个数**判 ----
+    # 大 mkv 的 `nb_frames` 常常缺，`verify_output` 于是只能给出
+    # `frames.ok=None`（"未校验"）。长片实测（2026-11-14，8160 帧 4.4 GB）：
+    # 组回执因此判成"未验证"，把一次完全正确的 48 分钟跑批判失败并触发重跑。
+    # 这两个数是真测出来的，不是猜的：
+    #   * `src_frames` —— stage7 在编码前对中间产物做过 `-count_frames`；
+    #   * `out_frames` —— `measure_final_candidate()` 对**最终候选**的实测。
+    # 口径写明在 `basis` 里，不和 verify_output 的结论混用。
+    _basis = "artifact_verify.verify_output (video-stream duration)"
+    if fr.get("ok") is None and src_frames and out_frames:
+        fr = {"src": int(src_frames), "out": int(out_frames),
+              "allowed": [int(src_frames)],
+              "ok": int(src_frames) == int(out_frames),
+              "note": ("verify_output could not read frame counts from the "
+                       "container; compared the two measured counts instead")}
+        performed = True
+        _basis = "counted frames (source counted pre-encode; output measured "\
+                 "on the final candidate)"
     bad = [name for name, c in (("frames", fr), ("duration", du))
            if c.get("ok") is False]
     reason = ""
@@ -2656,7 +2676,7 @@ def _group_bounds(pre_check: Dict[str, Any]) -> Dict[str, Any]:
         "ok": bool(performed and not bad),
         "performed": bool(performed),
         "reason": reason,
-        "basis": "artifact_verify.verify_output (video-stream duration)",
+        "basis": _basis,
         "frames": fr,
         "duration": du,
         "src_frames": ((pre_check or {}).get("source") or {}).get("frames"),
@@ -2667,7 +2687,9 @@ def _group_bounds(pre_check: Dict[str, Any]) -> Dict[str, Any]:
 def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
                          params: Dict[str, Any], logger,
                          frames: Optional[int],
-                         pre_check: Optional[Dict[str, Any]] = None) -> bool:
+                         pre_check: Optional[Dict[str, Any]] = None,
+                         src_frames: Optional[int] = None,
+                         out_frames: Optional[int] = None) -> bool:
     """写 S6→S7 的**组回执**（``<output>.fused_stage67.json``）。
 
     为什么非写不可：融合路线把 stage6 的中间文件省掉了，于是
@@ -2682,10 +2704,28 @@ def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
         from stage67_fusion import (build_receipt as _br,
                                     receipt_path as _rp,
                                     write_receipt as _wr)
-        from generation_evidence import collect as _collect
+        from generation_evidence import (color_group as _cg,
+                                         _lost_tags as _lt,
+                                         _changed_tags as _ct)
         _src = str(spec.get("probe_source") or "")
         try:
-            _ev = _collect(_src, output_path, "stage67", params, logger)
+            # **不要**用 `collect()`：它内部会跑 `bounds_report()`，
+            # 而那要整片数帧（长片实测多花好几分钟，而且是在发布之后）。
+            # 组边界的守恒结论已经由 `_pre`（发布前、对暂存件）给出，
+            # 这里只需要颜色四元组 —— 那是几次 ffprobe，便宜。
+            _oc, _sc = _cg(output_path), _cg(_src)
+            _ev = {
+                "color": _oc, "color_source": _sc,
+                "color_lost_tags": _lt(_sc, _oc),
+                "color_changed_tags": _ct(_sc, _oc),
+                "color_conversion": {
+                    "applied": [],
+                    "contract": None,
+                    "evidence_state": ("stage7 applies its own colour "
+                                       "conversion; that contract lives in "
+                                       "the verify report, not here"),
+                },
+            }
         except Exception as _ee:              # pragma: no cover - 探测异常
             _ev = {
                 "color": {"probed": False, "complete": False,
@@ -2693,8 +2733,6 @@ def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
                 "color_source": {"probed": False, "error": str(_ee)},
                 "color_lost_tags": [],
                 "color_changed_tags": [],
-                "bounds": {"ok": False, "performed": False,
-                           "reason": str(_ee)},
             }
         _rcpt = _br(spec=spec, params=params, output_path=output_path,
                     frames=frames, extra={
@@ -2705,7 +2743,12 @@ def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
                             _ev.get("color_changed_tags") or []),
                         "color_conversion": _ev.get("color_conversion") or {},
                         # 组边界的守恒结论用**视频流**口径（见 _group_bounds）
-                        "bounds": _group_bounds(pre_check),
+                        # 注意：`out_frames` 必须是**实测**的那个，
+                        # 不能拿 `frames`（它带兜底）—— 否则"源=N、成品=N"
+                        # 会退化成同一串数字，比较恒真。
+                        "bounds": _group_bounds(pre_check,
+                                                src_frames=src_frames,
+                                                out_frames=out_frames),
                     })
         _wr(_rp(output_path), _rcpt)
         logger.info("STAGE7_FUSED_RECEIPT",
@@ -4836,7 +4879,8 @@ def main():
                         output_path=output_path, spec=_fused_spec,
                         params=params, logger=logger,
                         frames=_gr_frames or (_proc_frames or None),
-                        pre_check=_pre):
+                        pre_check=_pre, src_frames=_proc_frames,
+                        out_frames=_gr_frames):
                     _generation_incomplete = True
 
             # ---- R14-01：WSL 回拷走**同一个 publisher**，媒体+报告一起 ----
