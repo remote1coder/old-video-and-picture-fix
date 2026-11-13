@@ -113,26 +113,61 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
     _w(src, b"SOURCE")
     job = {"job_id": "j1", "input_path": src, "output_path": out}
 
-    _w(os.path.join(stage, "media.bin"), media)
-    _w(os.path.join(stage, "verify.json"),
-       json.dumps({"media_sha256": _sha(os.path.join(stage, "media.bin"))}))
-    arts = [
-        P.Artifact("media", os.path.join(stage, "media.bin"), out),
-        P.Artifact("verify", os.path.join(stage, "verify.json"),
-                   out + ".verify.json"),
-    ]
-    if with_fullchain:
-        _w(os.path.join(stage, "fullchain.json"), json.dumps({"ok": True}))
-        arts.append(P.Artifact("fullchain", os.path.join(stage, "fullchain.json"),
-                               out + ".fullchain.json"))
-
-    digests = [(a.name, a.final, _sha(a.staging)) for a in arts]
+    # R24-02：报告要带身份与检查结论，所以先把计划与 RunIdentity 算好，
+    # 再写 verify.json。旧夹具只写 `{"media_sha256": ...}` —— 那**不模拟生产**
+    # （真实 stage7 写 attempt_id / run_identity / checks / publish_decision），
+    # 于是"完成验证消费报告语义"这条在夹具上永远测不出来。
     eff = vmain.merge_params(job, {}, {}, None)
     eff["attempt_id"] = attempt
     # R23-B02：必需对象由**计划**决定。要造"计划说 fullchain 可选"的场景，
     # 必须在算身份**之前**就把这个选择放进计划，否则身份与 marker 对不上。
     if params_over:
         eff.update(params_over)
+    _ri = vmain.build_run_identity({}, job, None, params=eff)
+    # main 在计划阶段会把身份冻结进 params（`params["_run_identity"]`），
+    # 完成验证拿它做"报告是不是这次计划写的"的基准。夹具不写的话，
+    # "外来 run_identity" 这条判据永远拿不到基准 → 少验一层。
+    eff["_run_identity"] = _ri
+
+    _w(os.path.join(stage, "media.bin"), media)
+    _media_sha = _sha(os.path.join(stage, "media.bin"))
+    # 真实 stage7 在 `full_chain_verify` 开启时会写 `_checks["fullchain"]`
+    # （见 stage7_encode.py 的 `_checks["fullchain"] = ...`）。夹具必须一样，
+    # 否则"计划要求 fullchain 检查"这条会被夹具的简陋报告误判成生产问题。
+    _vchecks = {
+        "mechanical": {"name": "mechanical", "status": "PASS",
+                       "required": True, "severity": "info"},
+        "frame_order": {"name": "frame_order", "status": "PASS",
+                        "required": True, "severity": "info"},
+        "final_timeline": {"name": "final_timeline", "status": "PASS",
+                           "required": True, "severity": "info"},
+    }
+    if with_fullchain:
+        _vchecks["fullchain"] = {"name": "fullchain", "status": "PASS",
+                                 "required": True, "severity": "info"}
+    _w(os.path.join(stage, "verify.json"), json.dumps({
+        "media_sha256": _media_sha,
+        "attempt_id": pub,
+        "run_identity": _ri,
+        "checks": _vchecks,
+        "publish_decision": {"publish": True, "verified": True,
+                             "blocked_by": [], "forced": False,
+                             "reasons": {}},
+    }))
+    arts = [
+        P.Artifact("media", os.path.join(stage, "media.bin"), out),
+        P.Artifact("verify", os.path.join(stage, "verify.json"),
+                   out + ".verify.json"),
+    ]
+    if with_fullchain:
+        _w(os.path.join(stage, "fullchain.json"),
+           json.dumps({"schema": "fullchain/1", "ok": True,
+                       "attempt_id": pub, "checks": {
+                           "frames": {"ok": True}, "duration": {"ok": True}}}))
+        arts.append(P.Artifact("fullchain", os.path.join(stage, "fullchain.json"),
+                               out + ".fullchain.json"))
+
+    digests = [(a.name, a.final, _sha(a.staging)) for a in arts]
     seed = {
         "impl": vmain.VIDEO_IMPL_VERSION,
         "job_id": "j1",
@@ -150,7 +185,6 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
     # R23-B01：真实 stage7 会把 RunIdentity 摘要交给 publisher，回执里必须
     # 有它。这个夹具此前没传，于是回执的 `run_identity` 恒为空 ——
     # 既掩盖了生产行为，也让"回执证明这一代"变成空话。
-    _ri = vmain.build_run_identity({}, job, None, params=eff)
     res = P.publish(arts, out + ".journal.json", str(tmp_path / "backup"),
                     attempt_id=pub, decision={"publish": True},
                     allowed_output_roots=[str(tmp_path / "out")],

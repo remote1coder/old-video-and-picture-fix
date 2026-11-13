@@ -79,6 +79,18 @@ def _prepare(tmp_path, media_bytes=b"GEN-A", verify_sha=None):
     sha = verify_sha if verify_sha is not None else vmain._plain_sha256(str(media))
     (tmp_path / "clip_restored.mkv.verify.json").write_text(
         json.dumps({"media_sha256": sha, "attempt_id": "A-1",
+                    # R24-02：完成验证读报告结论，夹具必须与生产同构
+                    "checks": {
+                        "mechanical": {"name": "mechanical", "status": "PASS",
+                                       "required": True},
+                        "frame_order": {"name": "frame_order",
+                                        "status": "PASS", "required": True},
+                        "final_timeline": {"name": "final_timeline",
+                                           "status": "PASS", "required": True},
+                        "fullchain": {"name": "fullchain", "status": "PASS",
+                                      "required": True},
+                    },
+                    "publish_decision": {"publish": True, "verified": True},
                     "run_identity": {
                         "input": vmain.build_input_identity(str(inp))}}),
         encoding="utf-8")
@@ -112,7 +124,19 @@ def _publish_full(tmp_path, media_bytes=b"GEN-A", input_bytes=b"src"):
         f.write(media_bytes)
     with open(os.path.join(stage, "verify.json"), "w", encoding="utf-8") as f:
         json.dump({"media_sha256": vmain._plain_sha256(
-            os.path.join(stage, "media.bin"))}, f)
+            os.path.join(stage, "media.bin")),
+            "checks": {
+                "mechanical": {"name": "mechanical", "status": "PASS",
+                               "required": True},
+                "frame_order": {"name": "frame_order", "status": "PASS",
+                                "required": True},
+                "final_timeline": {"name": "final_timeline", "status": "PASS",
+                                   "required": True},
+                "fullchain": {"name": "fullchain", "status": "PASS",
+                              "required": True},
+            },
+            "publish_decision": {"publish": True, "verified": True},
+        }, f)
     with open(os.path.join(stage, "fullchain.json"), "w",
               encoding="utf-8") as f:
         json.dump({"ok": True}, f)

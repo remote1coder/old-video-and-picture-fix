@@ -80,7 +80,19 @@ def _publish_generation(tmp_path, job, *, media=b"NEW-MEDIA-BYTES",
     stage = str(tmp_path / "staging")
     _w(os.path.join(stage, "media.bin"), media)
     _w(os.path.join(stage, "verify.json"),
-       json.dumps({"media_sha256": _digest(os.path.join(stage, "media.bin"))}))
+       json.dumps({"media_sha256": _digest(os.path.join(stage, "media.bin")),
+                   # R24-02：完成验证读报告结论，夹具必须与生产同构
+                   "checks": {
+                       "mechanical": {"name": "mechanical", "status": "PASS",
+                                      "required": True},
+                       "frame_order": {"name": "frame_order",
+                                       "status": "PASS", "required": True},
+                       "final_timeline": {"name": "final_timeline",
+                                          "status": "PASS", "required": True},
+                       "fullchain": {"name": "fullchain", "status": "PASS",
+                                     "required": True},
+                   },
+                   "publish_decision": {"publish": True, "verified": True}}))
     _w(os.path.join(stage, "fullchain.json"), json.dumps({"ok": True}))
 
     arts = [

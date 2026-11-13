@@ -67,8 +67,25 @@ def _gen(tmp_path, *, with_reports=True, with_journal=True,
     final = str(tmp_path / "out" / "clip_restored.mkv")
     _write(final, media)
     if with_reports:
-        _write(final + ".verify.json",
-               json.dumps({"media_sha256": vmain._plain_sha256(final)}))
+        # R24-02：完成验证现在读报告的**结论**（必需检查 + 发布决定）。
+        # 旧夹具只写 media_sha256 —— 那不是真实 stage7 会产出的报告，
+        # 也会让"报告说失败却判完成"这条判据在夹具上永远测不出来。
+        _write(final + ".verify.json", json.dumps({
+            "media_sha256": vmain._plain_sha256(final),
+            "checks": {
+                "mechanical": {"name": "mechanical", "status": "PASS",
+                               "required": True},
+                "frame_order": {"name": "frame_order", "status": "PASS",
+                                "required": True},
+                "final_timeline": {"name": "final_timeline", "status": "PASS",
+                                   "required": True},
+                "fullchain": {"name": "fullchain", "status": "PASS",
+                              "required": True},
+            },
+            "publish_decision": {"publish": True, "verified": True,
+                                 "blocked_by": [], "forced": False,
+                                 "reasons": {}},
+        }))
         _write(final + ".fullchain.json", json.dumps({"ok": True}))
     if with_journal:
         # R22-A01：journal 的 targets 必须覆盖**同一代**的全部对象。

@@ -59,8 +59,21 @@ def _publish_full(tmp_path, *, media=b"GENUINE", attempt="att1",
     with open(os.path.join(stage, "media.bin"), "wb") as f:
         f.write(media)
     with open(os.path.join(stage, "verify.json"), "w", encoding="utf-8") as f:
+        # R24-02：报告要带检查结论与发布决定（真实 stage7 就是这么写的）
         json.dump({"media_sha256": vmain._plain_sha256(
-            os.path.join(stage, "media.bin"))}, f)
+            os.path.join(stage, "media.bin")),
+            "checks": {
+                "mechanical": {"name": "mechanical", "status": "PASS",
+                               "required": True},
+                "frame_order": {"name": "frame_order", "status": "PASS",
+                                "required": True},
+                "final_timeline": {"name": "final_timeline", "status": "PASS",
+                                   "required": True},
+                "fullchain": {"name": "fullchain", "status": "PASS",
+                              "required": True},
+            },
+            "publish_decision": {"publish": True, "verified": True},
+        }, f)
     with open(os.path.join(stage, "fullchain.json"), "w",
               encoding="utf-8") as f:
         json.dump({"ok": True}, f)
@@ -251,7 +264,19 @@ def test_two_attempts_do_not_corrupt_the_marker(tmp_path):
         with open(os.path.join(stage, "verify.json"), "w",
                   encoding="utf-8") as f:
             json.dump({"media_sha256": vmain._plain_sha256(
-                os.path.join(stage, "media.bin"))}, f)
+                os.path.join(stage, "media.bin")),
+                "checks": {
+                    "mechanical": {"name": "mechanical", "status": "PASS",
+                                   "required": True},
+                    "frame_order": {"name": "frame_order", "status": "PASS",
+                                    "required": True},
+                    "final_timeline": {"name": "final_timeline",
+                                       "status": "PASS", "required": True},
+                    "fullchain": {"name": "fullchain", "status": "PASS",
+                                  "required": True},
+                },
+                "publish_decision": {"publish": True, "verified": True},
+            }, f)
         with open(os.path.join(stage, "fullchain.json"), "w",
                   encoding="utf-8") as f:
             json.dump({"ok": True}, f)

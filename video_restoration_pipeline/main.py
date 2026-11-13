@@ -1940,6 +1940,169 @@ def _load_result_for_consistency(result_path: str, final_path: str
     return data
 
 
+#: verify 报告里**每次发布都必须有**的检查项（R24-02 / R23-A02）。
+#:
+#: 这三项回答的是"这一代到底做没做机械核对、帧顺序核对、最终时间轴测量"。
+#: 缺任何一项，报告就没有证明它声称的事 —— 而旧实现只看"报告非空 +
+#: media_sha256 对得上"，于是一份写着 `required=True/status=FAIL` 的报告
+#: 照样能让完成验证返回 True。
+#:
+#: 名字必须与 stage7 的 `_checks[...]` 赋值点一致（见
+#: `stage7_encode.py` 的 `_checks["mechanical"] / ["frame_order"] /
+#: ["final_timeline"]`）。
+_ALWAYS_REQUIRED_CHECKS = ("mechanical", "frame_order", "final_timeline")
+
+#: 只有计划要求时才必需的检查项：检查名 → `_planned_generation_roles()`
+#: 里的角色名。角色在 `required` 里才要求报告必须有这一项。
+_PLAN_REQUIRED_CHECKS = {
+    "fullchain": "fullchain",
+}
+
+#: 检查结论里**算合格**的状态。`SKIP` 不算 —— 跳过不等于通过；
+#: `UNVERIFIED` 也不算（它是"没验到"，不是"验过了"）。
+_CHECK_PASSING = frozenset({"PASS", "NOT_APPLICABLE"})
+
+#: 检查结论里**认识**的状态。认不出的状态按问题上报，不静默忽略。
+_CHECK_KNOWN = frozenset({"PASS", "FAIL", "UNVERIFIED", "NOT_APPLICABLE",
+                          "SKIP", "ERROR", "WARN"})
+
+
+def _verify_report_problems(doc: Dict[str, Any], *,
+                            media_digest: str = "",
+                            identity_digest: str = "",
+                            publication_attempt: str = "",
+                            planned: Optional[Dict[str, Any]] = None
+                            ) -> List[str]:
+    """`<media>.verify.json` 的**语义**问题（R24-02）。
+
+    为什么不能只验字节
+    ------------------
+    审核 R23-A02 用生产 publisher 造了一整代：摘要完全正确，但报告里写着
+    错误 schema、外来 run/attempt、`required=True/status=FAIL`、
+    `publish=False`，fullchain 也 `ok=False`。正式完成入口仍返回
+
+        True: media + planned reports + COMMITTED journal (3 objects)
+
+    也就是说，最后一道验证**没有验证它声称要验证的结果**。摘要只能证明
+    "这份报告属于这个文件"，不能证明"报告说这一代合格"。
+
+    Returns:
+        问题列表；空列表才表示报告的语义也成立。
+    """
+    probs: List[str] = []
+    if not isinstance(doc, dict) or not doc:
+        return ["verify report is empty"]
+
+    # ---- 关联身份：报告必须属于**这次执行/这次计划** ----
+    _att = str(doc.get("attempt_id") or "")
+    if publication_attempt and _att and _att != publication_attempt:
+        probs.append(
+            f"verify report belongs to attempt {_att!r}, not the final "
+            f"publication {publication_attempt!r}")
+    _ri = doc.get("run_identity")
+    if isinstance(_ri, dict):
+        _rid = str(_ri.get("digest") or "")
+        if identity_digest and _rid and _rid != identity_digest:
+            probs.append("verify report was written for a different run "
+                         "identity than the current plan")
+    elif identity_digest:
+        probs.append("verify report carries no run identity; it cannot be "
+                     "bound to the plan that produced this media")
+
+    # ---- 媒体身份 ----
+    _md = str(doc.get("media_sha256") or "")
+    if media_digest and _md and _md != media_digest:
+        probs.append("verify report describes different media bytes")
+
+    # ---- 检查项：集合、状态、必需性 ----
+    raw_checks = doc.get("checks")
+    if not isinstance(raw_checks, dict) or not raw_checks:
+        probs.append("verify report carries no check results; it does not "
+                     "show that anything was actually checked")
+        raw_checks = {}
+
+    seen: Dict[str, str] = {}
+    for name, row in raw_checks.items():
+        if not isinstance(row, dict):
+            probs.append(f"check {name!r} is not an object")
+            continue
+        st = str(row.get("status") or "").upper()
+        seen[str(name)] = st
+        if st not in _CHECK_KNOWN:
+            probs.append(f"check {name!r} has an unknown status {st!r}")
+        # 报告自己声明 required 的项，必须真的合格
+        if row.get("required") is True and st not in _CHECK_PASSING:
+            probs.append(f"check {name!r} is required but reports {st!r}")
+
+    _roles = (planned or {}).get("required") or {}
+    must = list(_ALWAYS_REQUIRED_CHECKS)
+    for chk, role in _PLAN_REQUIRED_CHECKS.items():
+        if role in _roles:
+            must.append(chk)
+    for name in must:
+        if name not in seen:
+            probs.append(f"required check {name!r} is missing from the report")
+        elif seen[name] not in _CHECK_PASSING:
+            probs.append(f"required check {name!r} did not pass "
+                         f"(status={seen[name]!r})")
+
+    # ---- 报告自己的发布决定 ----
+    dec = doc.get("publish_decision")
+    if not isinstance(dec, dict):
+        probs.append("verify report carries no publish decision; the "
+                     "conclusion it reached cannot be checked")
+    else:
+        if dec.get("publish") is not True:
+            probs.append("the report's own publish decision is "
+                         f"{dec.get('publish')!r}, not True")
+        # `verified=False` 不在这里拦：它是"用户显式强制发布"的合法结果
+        # （`allow_verify_fail_publish`）。但它必须被上层看到 —— 由
+        # `_verify_generation_locked` 记进 verdict，而不是包装成"已验证"。
+    return probs
+
+
+def _fullchain_report_problems(doc: Dict[str, Any], *,
+                               publication_attempt: str = ""
+                               ) -> List[str]:
+    """`<media>.fullchain.json` 的语义问题（R24-02）。
+
+    两种合法形态：
+
+    * `status="NOT_APPLICABLE"` —— 用户关掉了全链检查，报告**明确**说这一代
+      没有全链证据。允许（与"计划里 fullchain 可选"一致），但不算通过。
+    * 真实检查结果 —— `ok` 必须是 True，且每一项 `checks[*].ok` 不能是 False。
+
+    审核反例给的是 `{'ok': False, 'run_identity': 'foreign', ...}`，
+    旧实现照样放行。这里 `ok is not True` 直接报问题。
+    """
+    probs: List[str] = []
+    if not isinstance(doc, dict) or not doc:
+        return ["fullchain report is empty"]
+
+    if str(doc.get("status") or "").upper() == "NOT_APPLICABLE":
+        _att = str(doc.get("attempt_id") or "")
+        if publication_attempt and _att and _att != publication_attempt:
+            probs.append(
+                f"fullchain report belongs to attempt {_att!r}, not the final "
+                f"publication {publication_attempt!r}")
+        return probs
+
+    if doc.get("hard_error"):
+        probs.append(f"fullchain report records a hard error "
+                     f"({doc.get('hard_error')!r})")
+    if doc.get("ok") is not True:
+        probs.append("fullchain report says ok="
+                     f"{doc.get('ok')!r}, not True")
+    checks = doc.get("checks")
+    if isinstance(checks, dict):
+        for name, row in checks.items():
+            if isinstance(row, dict) and row.get("ok") is False:
+                probs.append(f"fullchain check {name!r} failed")
+    elif checks is not None:
+        probs.append("fullchain report's checks is not an object")
+    return probs
+
+
 def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = None,
                               logger=None, expected_objects=None,
                               marker: Optional[Dict[str, Any]] = None,
@@ -2027,6 +2190,46 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
         return False, ("verify report describes different media bytes "
                        f"(recorded {str(recorded)[:16]}, "
                        f"actual {str(media_digest)[:16]})")
+
+    # ---- R24-02：报告的**语义**也要成立 ----
+    # 上面只证明"这份报告属于这个文件"；这里证明"报告说这一代合格"。
+    # 审核反例：摘要正确、内容写着 required=True/status=FAIL、
+    # publish=False，旧实现仍返回 True。
+    _ident_digest = ""
+    try:
+        _ident_digest = str(((params or {}).get("_run_identity") or {})
+                            .get("digest") or "")
+    except AttributeError:
+        _ident_digest = ""
+    _pub_att = ""
+    if isinstance(marker, dict):
+        _pub_att = str(marker.get("attempt_id") or "")
+    if not _pub_att:
+        _pub_att = str((params or {}).get("attempt_id") or "")
+
+    _sem = _verify_report_problems(
+        _v, media_digest=str(media_digest or ""),
+        identity_digest=_ident_digest,
+        publication_attempt=_pub_att, planned=pl)
+    if _sem:
+        return (False,
+                "the verify report does not support completion: "
+                + "; ".join(_sem[:4]))
+
+    # ---- R24-02：全链报告的内容结论 ----
+    _fc_rows = [o for o in objs if o[0] == "fullchain"]
+    if _fc_rows:
+        try:
+            with open(_fc_rows[0][1], "r", encoding="utf-8") as f:
+                _fc_doc = json.load(f) or {}
+        except (OSError, ValueError) as exc:
+            return False, f"fullchain report is unreadable: {exc}"
+        _fcp = _fullchain_report_problems(_fc_doc,
+                                          publication_attempt=_pub_att)
+        if _fcp:
+            return (False,
+                    "the fullchain report does not support completion: "
+                    + "; ".join(_fcp[:4]))
 
     # ---- journal 终态 ----
     try:
