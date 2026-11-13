@@ -324,6 +324,16 @@ def test_hard_exit_leaves_a_provable_generation(tmp_path, point):
                     f"{point}: 判成完整新代，但 {name} 不是新代内容\n"
                     f"  期望 {_want}\n  实际 {after[name]}\n"
                     f"  旧代 {before.get(name)}")
+        else:
+            # ---- B08 / O01：成功必须落在**已知终态**上 ----
+            # 旧写法只有 "all_old/identical" 与 "all_new" 两个分支，
+            # 一个 ok=True 但 generation/action 都不认识的返回值
+            # **两个分支都不进**，于是这个点什么都不检查 —— 直接放行。
+            raise AssertionError(
+                f"{point}: recovery reported success with an unknown "
+                f"generation={gen!r} / action={rep.get('action')!r}; "
+                f"a success must name a known terminal state "
+                f"(report={rep})")
     else:
         # recovery_required：**保留现场**，一个字节都不能动
         assert rep.get("ok") is False

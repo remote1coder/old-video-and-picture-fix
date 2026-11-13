@@ -22,6 +22,7 @@ import json
 import multiprocessing as mp
 import os
 import sys
+from typing import Dict
 
 import pytest
 
@@ -242,6 +243,57 @@ def _run_pair(root):
     return out
 
 
+def _assert_whole_generation(out: str, old_sha: Dict[str, str]) -> None:
+    """整代 oracle：必须是**完整旧代**或**完整新代**，不能混合。
+
+    抽成独立函数是为了能被"自检"直接调用 —— 审核 O01 指出，
+    R24 的判据里写了 `or True` 且算完不用，等于没有 oracle。
+    没有 self-test 的 oracle 迟早会退化成装饰品。
+    """
+    final = {
+        "media": _sha(out),
+        "verify": _sha(out + ".verify.json"),
+        "fullchain": _sha(out + ".fullchain.json"),
+        "marker": _sha(out + ".done.json"),
+    }
+    with open(out + ".journal.json", encoding="utf-8") as f:
+        doc = json.load(f) or {}
+    phase = str(doc.get("phase") or "")
+
+    assert phase in ("COMMITTED", "ROLLED_BACK"), (
+        f"非终态 phase={phase!r}：恢复没有把事务收尾。final={final}")
+
+    _recs = doc.get("records") or {}
+    new_expected = {
+        "media": str((_recs.get(out) or {}).get("new_digest") or ""),
+        "verify": str((_recs.get(out + ".verify.json") or {})
+                      .get("new_digest") or ""),
+        "fullchain": str((_recs.get(out + ".fullchain.json") or {})
+                         .get("new_digest") or ""),
+        "marker": str((_recs.get(out + ".done.json") or {})
+                      .get("new_digest") or ""),
+    }
+
+    with open(out + ".verify.json", encoding="utf-8") as f:
+        vdoc = json.load(f) or {}
+    media_self_consistent = (str(vdoc.get("media_sha256") or "")
+                             == final["media"])
+
+    if phase == "COMMITTED":
+        assert bool(all(new_expected.values())), (
+            "journal 是 COMMITTED，但它没有记录完整的新代摘要；"
+            f"new_expected={new_expected}")
+        assert final == new_expected, (
+            "journal 说 COMMITTED，但目标不是**完整的**新代：\n"
+            f"  期望 {new_expected}\n  实际 {final}")
+        assert media_self_consistent, (
+            "verify 报告描述的不是落盘的媒体（混代）")
+    else:
+        assert final == old_sha, (
+            "journal 说 ROLLED_BACK，但目标不是**完整的**旧代：\n"
+            f"  期望 {old_sha}\n  实际 {final}")
+
+
 def test_publish_and_recover_never_leave_a_mixed_generation(tmp_path):
     root = str(tmp_path)
     old_sha, _new_sha = _seed_interrupted_transaction(root)
@@ -260,27 +312,7 @@ def test_publish_and_recover_never_leave_a_mixed_generation(tmp_path):
         doc = json.load(f) or {}
     phase = str(doc.get("phase") or "")
 
-    # ---- 判据 1：要么整代旧、要么整代新，不能混合 ----
-    new_digests = {
-        (doc.get("records") or {}).get(p, {}).get("new_digest")
-        for p in (out, out + ".verify.json", out + ".fullchain.json",
-                  out + ".done.json")
-    }
-    is_old = all(final[k] == v for k, v in old_sha.items())
-    is_new = (len(new_digests) == 1 and None not in new_digests
-              and all(final[k] == list(new_digests)[0] or True
-                      for k in final))   # 新代摘要由本次 publish 决定
-
-    # 更实用的判据：**对象之间必须自洽** —— verify 的 media_sha256 要等于媒体
-    with open(out + ".verify.json", encoding="utf-8") as f:
-        vdoc = json.load(f) or {}
-    media_self_consistent = (str(vdoc.get("media_sha256") or "")
-                             == final["media"])
-    assert media_self_consistent, (
-        "最终代是**混合**的：verify 报告描述的不是落盘的媒体\n"
-        f"  media={final['media'][:16]}\n"
-        f"  verify.media_sha256={str(vdoc.get('media_sha256'))[:16]}\n"
-        f"  phase={phase} results={results}")
+    _assert_whole_generation(out, old_sha)
 
     # ---- 判据 2：journal 终态与对象一致 ----
     assert phase in ("COMMITTED", "ROLLED_BACK", "RECOVERY_REQUIRED",
@@ -295,3 +327,28 @@ def test_publish_and_recover_never_leave_a_mixed_generation(tmp_path):
     assert final["media"] != "<absent>", "最终没有任何媒体"
     assert final["marker"] != "<absent>", (
         "最终没有 marker —— COMMITTED 的代必须有完成标记")
+
+
+def test_the_oracle_itself_rejects_a_mixed_generation(tmp_path):
+    """O01：把终态换成**明确混代**，上面那个 oracle 必须失败。
+
+    这个测试保护的是**判据本身**。审核的原话是
+    "O01把worker结果替换成明确混代的fullchain/marker，原测试仍通过。
+    此反例证明测试门无效" —— 所以判据必须自己也被检一次。
+    """
+    root = str(tmp_path)
+    old_sha, _ = _seed_interrupted_transaction(root)
+    out = os.path.join(root, "clip_restored.mkv")
+
+    # 先让现场收敛到一个合法终态
+    _run_pair(root)
+    _assert_whole_generation(out, old_sha)      # 合法状态不炸
+
+    # 再把 fullchain 换成**异代内容**（不改 journal / marker）
+    with open(out + ".fullchain.json", "w", encoding="utf-8") as f:
+        json.dump({"generation": "alien", "ok": True,
+                   "checks": {"frames": {"ok": True}}}, f)
+
+    import pytest as _pytest
+    with _pytest.raises(AssertionError):
+        _assert_whole_generation(out, old_sha)
