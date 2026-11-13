@@ -196,3 +196,41 @@ def test_save_uint16_uses_zlib_not_lzw(tmp_path):
     assert s4._save_uint16(arr, out)
     got = _read_tiff16(out)
     assert got.dtype == np.uint16 and int(got[0, 0, 0]) == 1234
+
+
+def test_face_boxes_make_the_roi_boundary_structural(tmp_path):
+    """给了人脸框，框外必须**构造性**地一个像素都不变。
+
+    背景：`face_restore_upscale=2`（默认）会让整幅放大再缩回，
+    重采样振铃能让框外零星像素越过 5% 阈值（实测 2502 个、max 196/65535）。
+    只靠"差异 > 阈值"永远只是**实测**成立；把人脸框作为硬约束，
+    "ROI 外逐位不变"才是结构上成立。
+    """
+    from PIL import Image
+    orig = _scene()
+    op = _write_tiff16(tmp_path / "in.tif", orig)
+    # 修复图：人脸区改暗，**并且**在整个背景上加 60 的偏移（模拟重采样振铃）
+    r8 = (orig.astype(np.float32) / 257.0).round().astype(np.uint8)
+    r8[8:32, 8:32, :] = 40
+    r8 = np.clip(r8.astype(np.int16) + 60, 0, 255).astype(np.uint8)
+    rp = str(tmp_path / "restored.png")
+    Image.fromarray(r8).save(rp)
+
+    out = str(tmp_path / "blended.tif")
+    assert s4.feather_blend(op, rp, out, bit_depth=16,
+                            face_boxes=[(8, 8, 24, 24)])
+
+    got = _read_tiff16(out)
+    # 框 + 3×feather(=24) 之外必须与原图逐位相同
+    m = np.zeros(orig.shape[:2], dtype=bool)
+    m[0:56, 0:56] = True
+    outside = ~m
+    assert np.array_equal(got[outside], orig[outside]), (
+        "人脸框外仍被改动：最大差 "
+        f"{int(np.abs(got[outside].astype(int) - orig[outside].astype(int)).max())}")
+    # 框内确实被改了（否则"没改动"也能通过上面那条）
+    assert not np.array_equal(got[8:32, 8:32, :], orig[8:32, 8:32, :])
+
+
+def test_box_xywh_to_xyxy():
+    assert s4._box_xywh_to_xyxy((10, 20, 30, 40)) == (10.0, 20.0, 40.0, 60.0)

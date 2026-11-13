@@ -57,8 +57,20 @@ def _resolve_ai_python(logger=None):
 from logger import get_logger  # noqa: E402
 
 
+def _box_xywh_to_xyxy(box):
+    """把 ``face_boxes`` 的一项归一成 ``(x1, y1, x2, y2)``。
+
+    stage4 的 `face_boxes` 是 **``(x, y, w, h)``**（facexlib 的 box 约定，
+    见 `_detect_face_boxes` 的返回）。这里只做这一种归一，不猜别的约定 ——
+    猜错会把"只改 ROI"变成"只改一个角"。
+    """
+    x, y, w, h = (float(v) for v in list(box)[:4])
+    return x, y, x + w, y + h
+
+
 def feather_blend(original_path: str, restored_path: str, output_path: str,
-                  feather_width: int = 8, bit_depth: int = 8) -> bool:
+                  feather_width: int = 8, bit_depth: int = 8,
+                  face_boxes=None) -> bool:
     """Blend restored face region back into original image with feathering.
 
     Uses per-pixel absolute difference to detect modified regions,
@@ -124,6 +136,21 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
         diff = np.mean(np.abs(rest8 - orig_arr), axis=2)
         threshold = 255.0 * 0.05
         mask = (diff > threshold).astype(np.float32)
+        # ---- ROI 硬边界：差异掩模必须落在人脸框之内 ----
+        # 只靠"差异 > 5%"是不够的：GFPGAN 的 `face_restore_upscale=2`
+        # 会把**整幅**放大后再被这里缩回 1×，重采样的振铃会让框外零星像素
+        # 越过阈值（实测 2502 个、max 196/65535）。给它一个人脸框的硬约束，
+        # "ROI 外逐位不变"就从"实测成立"变成**结构上成立**。
+        _roi = None
+        if face_boxes:
+            _roi = np.zeros(mask.shape, dtype=bool)
+            # 留 3σ：高斯羽化的支撑约 3×radius，边界要留够才不会切到软边
+            _pad = max(1, 3 * int(feather_width))
+            for _b in face_boxes:
+                _x1, _y1, _x2, _y2 = _box_xywh_to_xyxy(_b)
+                _roi[max(0, int(_y1) - _pad):int(_y2) + _pad,
+                     max(0, int(_x1) - _pad):int(_x2) + _pad] = True
+            mask = mask * _roi.astype(np.float32)
         mask_ratio = float(np.mean(mask))
 
         # 一帧都没改：正确答案是**原图**，不是修复图。
@@ -145,6 +172,11 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
             ImageFilter.GaussianBlur(radius=feather_width))
         mask_smooth = np.array(mask_blurred, dtype=np.float32) / 255.0
         mask_smooth = np.clip(mask_smooth, 0.0, 1.0)
+        if _roi is not None:
+            # **羽化之后再夹一次**：只夹"未羽化"的 mask 没用 —— 高斯核会把
+            # 权重扩散到 ROI 之外，框外还是会变（实测 max 7439/65535）。
+            # 夹在羽化之后，框外是精确 0，框内仍保留软边。
+            mask_smooth = mask_smooth * _roi.astype(np.float32)
         mask_smooth = np.stack([mask_smooth] * 3, axis=2)
 
         if _orig16 is not None:
@@ -932,7 +964,8 @@ def main():
             if face_files:
                 if feather_blend(input_source, str(face_files[0]),
                                  blended_path, feather_width=8,
-                                 bit_depth=bit_depth):
+                                 bit_depth=bit_depth,
+                                 face_boxes=face_boxes):
                     success = True
                 else:
                     logger.error("STAGE4_BLEND_FAIL",
@@ -951,7 +984,8 @@ def main():
             if face_files:
                 if feather_blend(input_source, str(face_files[0]),
                                  blended_path, feather_width=8,
-                                 bit_depth=bit_depth):
+                                 bit_depth=bit_depth,
+                                 face_boxes=face_boxes):
                     success = True
                 else:
                     logger.error("STAGE4_BLEND_FAIL",
