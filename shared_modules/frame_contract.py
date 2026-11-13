@@ -167,9 +167,13 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
     # 没显式给时按**像素格式**推：同一格式的两份合同可比，不同格式的两份
     # 会被判"域不同、不可比" —— 正是我们要的语义。不写 "unspecified"
     # 之类的占位符，那样等于把"没声明"伪装成"已声明"。
+    # ---- I04：**不猜域** ----
+    # R24 这里按 `pix:<fmt>` 补了一个"看起来有效"的域。审核指出：
+    # 同格式不意味着摘要同样基于 AI 原始像素 / PNG 字节 / 容器字节 ——
+    # 补一个猜测值等于把"未声明来源"洗成"已声明"，下游就再也发现不了
+    # 混边界（A07 的 writer 正是靠这个漏洞混摘要）。
+    # 现在：未声明就留空，由 `contract_problems` 明确拒绝。
     _domain = str(frames_digest_domain or "").strip()
-    if not _domain:
-        _domain = ("pix:" + str(pix_fmt)) if str(pix_fmt or "") else ""
     return {
         "schema": SCHEMA,
         "frames": int(frames),
@@ -228,6 +232,12 @@ def contract_problems(contract: Dict[str, Any]) -> List[str]:
     elif not str(contract.get("frames_digest") or ""):
         # R23-B08：`proven=True` 但摘要为空 —— 旧实现返回空问题列表。
         p.append("frames_digest is marked proven but no digest is recorded")
+    elif not str(contract.get("frames_digest_domain") or "").strip():
+        # I04：摘要必须声明它是对**哪种字节表示**算的。
+        # 没有域的摘要不能与另一条边界的摘要比较，也不能证明"两边帧相同"。
+        p.append("frames_digest is declared proven but its domain is not "
+                 "declared; a digest without a domain cannot be compared "
+                 "with any other boundary")
     _tl = contract.get("timeline")
     if not isinstance(_tl, dict) or not _tl:
         p.append("no timeline reference (this boundary cannot prove when the "

@@ -100,6 +100,10 @@ def test_id01_intermediate_without_params_identity_is_rejected(tmp_path):
             "params_identity": "",              # 空身份
             "artifact_digest": M._artifact_digest(str(art)),
             "artifact_size": art.stat().st_size,
+            # B04：侧车现在也记实现/模型指纹；本用例测的是"缺 params identity"，
+            # 所以这里要给出与当前一致的指纹，否则会先被另一条判据拦下。
+            "impl_fingerprint": M._impl_fingerprint(
+                M.merge_params(job, _config(), {}, None)),
         }, f)
     ok, why = M.intermediate_identity_matches(str(art), job, _config(), None)
     assert ok is False

@@ -953,6 +953,12 @@ def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
                 if k not in _IDENTITY_POSITIONAL_KEYS}
 
     out: Dict[str, Any] = {}
+    # ---- I01：必须**深拷贝** ----
+    # 审核用 `params["nested"]["strength"]=1` 复现：浅拷贝时快照与 params
+    # **共享同一个嵌套 dict**，改原参数后"冻结快照"跟着变成 2 ——
+    # 所谓冻结只是一层壳。这里逐值深拷贝；不可拷贝的对象（logger 之类）
+    # 退回原引用并留痕（身份里出现不可序列化对象本身就该被看见）。
+    import copy as _dcopy
     for k, v in src.items():
         if k in _IDENTITY_POSITIONAL_KEYS:
             continue
@@ -962,7 +968,10 @@ def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if k.startswith("_"):          # 内部临时键（_shake_probe 等）
             continue
-        out[k] = v
+        try:
+            out[k] = _dcopy.deepcopy(v)
+        except Exception:
+            out[k] = v
     return out
 
 
@@ -1077,6 +1086,12 @@ def _resolve_model_path(name_or_path: Any,
     _md = str((params or {}).get("model_dir") or "").strip()
     if _md:
         roots.append(_md)
+    # ---- I02：必须查 **worker 实际使用**的目录 ----
+    # 审核复现：main 查项目根 `models/`，而视频 worker 加载的是
+    # `video_restoration_pipeline/models/`。在后一个目录放同名权重 A/B，
+    # main 解析结果为空、全局指纹不变 —— 身份与实际加载脱节。
+    # 顺序：worker 目录优先（真被加载的那个），再退项目根。
+    roots.append(str(SCRIPT_DIR / "models"))
     roots.append(str(SCRIPT_DIR.parent / "models"))
 
     base = os.path.basename(raw)
@@ -3966,6 +3981,23 @@ def _read_exec_fingerprint(artifact: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _impl_params_for(job: Dict[str, Any], config: Dict[str, Any],
+                     params: Optional[Dict[str, Any]] = None
+                     ) -> Dict[str, Any]:
+    """拿到"能算出实现指纹"的那份参数。
+
+    调用方给了 `params` 就用它；没给就用 `merge_params` 重建 —— 但**绝不要**
+    在这里静默返回空 dict：那会让 `_impl_fingerprint` 变成"只有版本号"，
+    等于把 I05 的漏洞原样搬回来。
+    """
+    if isinstance(params, dict) and params:
+        return params
+    try:
+        return merge_params(job, config, {}, None)
+    except Exception:
+        return dict(params or {})
+
+
 def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
                                    config: Dict[str, Any], stage_num: int,
                                    input_path: str, logger=None,
@@ -3997,6 +4029,11 @@ def record_stage_artifact_identity(artifact: str, job: Dict[str, Any],
         # 于是上游换了一版（同参数、同输入、不同中间结果）也察觉不到。
         "upstream_artifact": (str(upstream_artifact)
                               if upstream_artifact else None),
+        # ---- I05：实现/模型**字节**必须进中间件身份 ----
+        # 审核复现：换掉同一路径的权重 A→B 后，生产复用判定仍是
+        # `identity-match` —— 旧侧车只记 impl 版本号与参数，不看模型字节。
+        "impl_fingerprint": _impl_fingerprint(_impl_params_for(job, config,
+                                                               params)),
         "upstream_digest": (_artifact_digest(upstream_artifact)
                             if upstream_artifact else None),
         # ID-07（第七轮）：并入"实际执行"记录（后端/实际模型/权重指纹/工具版本）。
@@ -4052,6 +4089,21 @@ def intermediate_identity_matches(artifact: str, job: Dict[str, Any],
     if str(data.get("impl", "")) != VIDEO_IMPL_VERSION:
         return False, (f"produced by implementation {data.get('impl')!r}, "
                        f"current is {VIDEO_IMPL_VERSION!r}")
+    # ---- I05：模型/工具**字节**变了就不能复用 ----
+    # 只比版本号不够：同一版本下换权重，旧中间产物看着仍然"合规"。
+    _rec_impl = str(data.get("impl_fingerprint") or "")
+    if not _rec_impl:
+        return False, ("identity sidecar carries no implementation fingerprint; "
+                       "cannot prove this intermediate came from the current "
+                       "model/tool bytes (re-run rather than reuse)")
+    try:
+        _cur_impl = _impl_fingerprint(_impl_params_for(job, config, None))
+    except Exception as _ie:
+        return False, (f"cannot recompute the implementation fingerprint: "
+                       f"{_ie}")
+    if _cur_impl and _rec_impl != _cur_impl:
+        return False, ("implementation/model changed since this intermediate "
+                       f"was made ({_rec_impl[:12]} -> {_cur_impl[:12]})")
     if str(data.get("job_id", "")) != str(job.get("job_id", "")):
         return False, f"belongs to job {data.get('job_id')!r}, not this one"
     recorded_src = data.get("source_identity") or {}

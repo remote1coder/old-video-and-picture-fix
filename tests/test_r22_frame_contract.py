@@ -82,7 +82,9 @@ def test_contract_carries_every_required_field():
                           timeline={"path": "/t/plan.json", "digest": "d" * 64},
                           color={"range": "limited"},
                           ai={"model": "x4v3", "scale": 2},
-                          frames_digest="a" * 64, source="model")
+                          frames_digest="a" * 64,
+                          frames_digest_domain="raw-rgb48le",
+                          source="model")
     for k in ("frames", "width", "height", "pix_fmt", "bit_depth",
               "channel_order", "frames_digest", "frames_digest_proven",
               "frames_digest_domain", "timeline", "color", "ai", "source"):
@@ -125,20 +127,23 @@ def test_incomplete_contract_is_reported(bad, fragment):
 
 def test_same_contracts_compare_clean():
     a = fc.build_contract(frames=5, width=640, height=480,
-                          pix_fmt="yuv420p16le", frames_digest="a" * 64)
+                          pix_fmt="yuv420p16le", frames_digest="a" * 64,
+                          frames_digest_domain="raw-rgb48le")
     assert fc.compare_contracts(a, dict(a)) == []
 
 
 def test_frame_count_difference_is_reported():
     a = fc.build_contract(frames=5, width=640, height=480,
-                          pix_fmt="yuv420p16le", frames_digest="a" * 64)
+                          pix_fmt="yuv420p16le", frames_digest="a" * 64,
+                          frames_digest_domain="raw-rgb48le")
     b = dict(a, frames=4)
     assert any("frames differs" in p for p in fc.compare_contracts(a, b))
 
 
 def test_digest_difference_is_reported():
     a = fc.build_contract(frames=5, width=640, height=480,
-                          pix_fmt="yuv420p16le", frames_digest="a" * 64)
+                          pix_fmt="yuv420p16le", frames_digest="a" * 64,
+                          frames_digest_domain="raw-rgb48le")
     b = dict(a, frames_digest="b" * 64)
     assert any("frames_digest differs" in p
                for p in fc.compare_contracts(a, b))

@@ -234,13 +234,30 @@ def stage_scope_keys(params: Dict[str, Any], stage: int) -> List[str]:
     return sorted(k for k in (params or {}) if param_affects_stage(k, stage))
 
 
+#: 身份里必须带上"实现/模型字节"的 stage（I03）。
+#:
+#: 审核复现：显式给了模型路径、全局 fingerprint 也随权重变了，**阶段身份不变**
+#: —— 于是换权重后旧 AI 中间件仍然 `identity-match`（I05）。
+#: 只对真正使用模型/人脸后端的 stage 生效，避免无关 stage 跟着重算。
+_IMPL_SENSITIVE_STAGES = frozenset({3, 5})
+
+
 def stage_identity(params: Dict[str, Any], stage: int) -> str:
     """某个 stage 的**局部**参数身份。
 
     只包含影响它的参数；与全局 `params_identity` 并存，
     用于判断"这个 stage 能否复用"。
+
+    I03：AI 相关 stage 额外带上 `_run_identity.impl_fingerprint`
+    （其中含模型**字节**摘要）。`_` 前缀平时被 `param_affects_stage` 跳过，
+    但这一维是"实现"而不是"运行期观测"，必须进身份 ——
+    否则换权重后旧中间件还能被复用。
     """
     subset = {k: (params or {})[k] for k in stage_scope_keys(params, stage)}
+    if stage in _IMPL_SENSITIVE_STAGES:
+        _ri = (params or {}).get("_run_identity")
+        if isinstance(_ri, dict):
+            subset["_impl_fingerprint"] = str(_ri.get("impl_fingerprint") or "")
     payload = json.dumps(subset, sort_keys=True, ensure_ascii=False,
                          default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

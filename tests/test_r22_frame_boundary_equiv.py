@@ -442,7 +442,9 @@ def test_same_ai_output_feeds_both_back_halves(tmp_path):
     digest = fc.digest_ordered_frames(paths)
     contract = fc.build_contract(
         frames=len(paths), width=IN_W * SCALE, height=IN_H * SCALE,
-        pix_fmt="rgb48le", frames_digest=digest, source="model",
+        pix_fmt="rgb48le", frames_digest=digest,
+        # B04/I04：摘要必须声明域（这里是对 AI 输出的 rgb48le 原始字节算的）
+        frames_digest_domain="raw-rgb48le", source="model",
         # R23-B08：合同要能证明"这一串帧在什么时候显示、什么颜色、谁产的"
         # R24-06：路径不是内容身份 —— 必须带计划内容的摘要，
         # 否则"计划文件被改写/同名替换"看不出来。
