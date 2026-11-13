@@ -335,9 +335,23 @@ def _same_object(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def _decode_cmd(path: str, pix_fmt: str, stream_index: int = 0) -> List[str]:
+    # `-fps_mode passthrough` 是**必需**的，不是可选项。
+    #
+    # ffmpeg 输出 rawvideo 时默认 `-fps_mode cfr`：它会按**容器时长**补齐
+    # 帧率，末尾复制最后一帧凑满。实测（2026-11-14，24 帧 10bit mkv，
+    # 带一条 AAC 音轨）：
+    #
+    #     nb_read_frames=24   packets=24   **解码出 25 帧**
+    #
+    # 那第 25 帧是解码器凭空补的副本。它有两个害处：
+    #   ① 让"解码帧数 == 期望帧数"这条判据把正确结果判成失败；
+    #   ② 更糟的是它**会掩盖末帧差异** —— 两边都补同一个副本，
+    #      比较结果照样"相同"，而真正的末帧可能一边少了一个。
+    # 比较器绝不能比较自己造出来的帧。
     return ["ffmpeg", "-v", "error", "-nostdin",
             "-i", str(path),
             "-map", f"0:v:{stream_index}",
+            "-fps_mode", "passthrough",
             "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"]
 
 

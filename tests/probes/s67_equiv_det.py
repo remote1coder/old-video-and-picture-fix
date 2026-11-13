@@ -88,16 +88,47 @@ def vs_env(repo: str) -> dict:
 
 
 def make_clip(dst_dir: str, frames: int):
-    """造一段**有运动**的测试片（静态画面无法暴露帧序/时间轴问题）。"""
+    """造一段**有运动 + 有音轨**的测试片。
+
+    为什么要带音轨：融合最容易出问题的地方之一就是"第二个 `-i`
+    （音频）与 `-f yuv4mpegpipe` 的顺序"—— `-f` 只对**紧随其后**的
+    输入生效，顺序错了就会把 mka 当成 y4m 读。没有音轨的素材测不出来。
+    """
     os.makedirs(dst_dir, exist_ok=True)
     clip = os.path.join(dst_dir, "src.mp4")
-    r = sh(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "lavfi",
-            "-i", "testsrc2=size=480x270:rate=25:duration=30",
+    r = sh(["ffmpeg", "-hide_banner", "-v", "error", "-y",
+            "-f", "lavfi", "-i",
+            "testsrc2=size=480x270:rate=25:duration=30",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
             "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k", "-shortest",
             "-frames:v", str(frames), clip])
     if r.returncode != 0:
         raise SystemExit("造片失败: " + (r.stderr or "")[-300:])
     return clip
+
+
+def stage0_audio(clip: str, temp_dir: str, job_id: str = "jobS67") -> str:
+    """复刻 stage0 的音频产物（stage7 从 `{temp}/{job}_{stem}.mka` 取音轨）。"""
+    os.makedirs(temp_dir, exist_ok=True)
+    dest = os.path.join(temp_dir,
+                        f"{job_id}_{Path(clip).stem}.mka")
+    r = sh(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", clip,
+            "-vn", "-c:a", "flac", dest])
+    if r.returncode != 0:
+        raise SystemExit("抽音轨失败: " + (r.stderr or "")[-300:])
+    return dest
+
+
+def probe_frames(path: str) -> int:
+    """解码数帧（`-count_frames` 比容器头可靠；mp4 头里的 nb_frames 常缺）。"""
+    r = sh(["ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-count_frames", "-show_entries", "stream=nb_read_frames",
+            "-of", "default=nw=1:nk=1", path])
+    try:
+        return int((r.stdout or "").strip() or 0)
+    except ValueError:
+        return 0
 
 
 def write_config(path: str) -> str:
@@ -305,6 +336,17 @@ def main():
     env = vs_env(repo)
     config = write_config(os.path.join(work, "config.yaml"))
     clip = make_clip(os.path.join(work, "in"), args.frames)
+    # **以实测为准**：`-frames:v N` 与音频 `-shortest` 一起用时，容器可能
+    # 多留一帧；拿"请求的 N"当期望会把一次正确的运行判成失败（本轮实测：
+    # 两路都是 25 帧、max_abs_diff=0，却因为"期望 24"被拒）。
+    actual = probe_frames(clip)
+    if actual < 4:
+        print("  [错误] 测试片帧数不足：%d" % actual)
+        return 2
+    if actual != args.frames:
+        print("  注意    : 请求 %d 帧，实测 %d 帧（以实测为准）"
+              % (args.frames, actual))
+    args.frames = actual
     print("  repo    : %s" % repo)
     print("  work    : %s" % work)
     print("  input   : %s (%d 帧)" % (clip, args.frames))
@@ -318,6 +360,7 @@ def main():
     os.makedirs(ct, exist_ok=True)
     c_out = os.path.join(work, "classic_out", "final.mkv")
     os.makedirs(os.path.dirname(c_out), exist_ok=True)
+    stage0_audio(clip, ct)
     pc = base_params(ct, os.path.join(work, "logs"), c_out, clip, "s67c",
                      upstream=clip)
     s6c = run_stage(repo, "stage6_grain_synthesis.py", pc,
@@ -335,6 +378,7 @@ def main():
     os.makedirs(ft, exist_ok=True)
     f_out = os.path.join(work, "fused_out", "final.mkv")
     os.makedirs(os.path.dirname(f_out), exist_ok=True)
+    stage0_audio(clip, ft)
     spec = os.path.join(ft, "jobS67_src_step67_group.json")
     pf6 = base_params(ft, os.path.join(work, "logs"), f_out, clip, "s67f",
                       upstream=clip,
@@ -362,7 +406,7 @@ def main():
         cmp_res = SC.compare_media(
             c_out, f_out, pix_fmt="yuv420p10le",
             expect_frames=args.frames, require_time=True,
-            require_audio=False)
+            require_audio=True)
     else:
         cmp_res = {"ok": False, "problems": ["one side produced no output"],
                    "frames": {}, "identical": False}
