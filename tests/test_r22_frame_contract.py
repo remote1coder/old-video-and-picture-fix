@@ -83,7 +83,7 @@ def test_contract_carries_every_required_field():
                           color={"range": "limited"},
                           ai={"model": "x4v3", "scale": 2},
                           frames_digest="a" * 64,
-                          frames_digest_domain="raw-rgb48le",
+                          frames_digest_domain="raw-yuv",
                           source="model")
     for k in ("frames", "width", "height", "pix_fmt", "bit_depth",
               "channel_order", "frames_digest", "frames_digest_proven",
@@ -128,14 +128,14 @@ def test_incomplete_contract_is_reported(bad, fragment):
 def test_same_contracts_compare_clean():
     a = fc.build_contract(frames=5, width=640, height=480,
                           pix_fmt="yuv420p16le", frames_digest="a" * 64,
-                          frames_digest_domain="raw-rgb48le")
+                          frames_digest_domain="raw-yuv")
     assert fc.compare_contracts(a, dict(a)) == []
 
 
 def test_frame_count_difference_is_reported():
     a = fc.build_contract(frames=5, width=640, height=480,
                           pix_fmt="yuv420p16le", frames_digest="a" * 64,
-                          frames_digest_domain="raw-rgb48le")
+                          frames_digest_domain="raw-yuv")
     b = dict(a, frames=4)
     assert any("frames differs" in p for p in fc.compare_contracts(a, b))
 
@@ -143,7 +143,7 @@ def test_frame_count_difference_is_reported():
 def test_digest_difference_is_reported():
     a = fc.build_contract(frames=5, width=640, height=480,
                           pix_fmt="yuv420p16le", frames_digest="a" * 64,
-                          frames_digest_domain="raw-rgb48le")
+                          frames_digest_domain="raw-yuv")
     b = dict(a, frames_digest="b" * 64)
     assert any("frames_digest differs" in p
                for p in fc.compare_contracts(a, b))
@@ -176,7 +176,7 @@ def test_different_digest_domains_are_not_a_frame_difference():
     """
     a = fc.build_contract(frames=5, width=640, height=480,
                           pix_fmt="rgb48le", frames_digest="a" * 64,
-                          frames_digest_domain="raw-rgb48le")
+                          frames_digest_domain="raw-yuv")
     b = dict(a, frames_digest="b" * 64, frames_digest_domain="png-bytes")
     problems = fc.compare_contracts(a, b)
     assert any("domains differ" in p for p in problems), problems
@@ -186,7 +186,7 @@ def test_different_digest_domains_are_not_a_frame_difference():
 def test_same_domain_different_digest_is_a_real_difference():
     a = fc.build_contract(frames=5, width=640, height=480,
                           pix_fmt="rgb48le", frames_digest="a" * 64,
-                          frames_digest_domain="raw-rgb48le")
+                          frames_digest_domain="raw-yuv")
     b = dict(a, frames_digest="b" * 64)
     problems = fc.compare_contracts(a, b)
     assert any("frames_digest differs" in p for p in problems), problems

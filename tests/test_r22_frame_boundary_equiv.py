@@ -280,21 +280,40 @@ def test_production_path_writes_a_provable_frame_contract(tmp_path):
     # 这里的生产调用没传 `timeline_ref`（直接调 `_stream_raw_upscale`），
     # 所以时间引用缺内容身份是**如实记录**的缺口，不是缺陷。
     _probs = fc.contract_problems(c)
-    assert not [x for x in _probs if "frames_digest" in x
-                or "pixel format" in x], _probs
+    # B06：交付边界**故意**没有摘要（如实记录在 gaps 里），
+    # "not proven" 那一条是设计事实；但"域缺失/域与格式不匹配"
+    # 这类**真实矛盾**仍然不许出现。
+    _bad = [x for x in _probs
+            if "frames_digest" in x and "not proven" not in x]
+    _bad += [x for x in _probs if "pixel format" in x]
+    assert not _bad, _bad
     assert any("timeline" in x for x in _probs), (
         "缺时间引用时必须报出来，而不是静默当作完整：" + str(_probs))
     assert c["frames"] == 5
     assert c["pix_fmt"] == "yuv420p16le", c["pix_fmt"]
     assert c["bit_depth"] == 16
-    assert c["frames_digest_proven"] is True
-    assert c["frames_digest_domain"] == "raw-rgb48le"
     assert c["source"] == "fixed-frames"
-    assert c["gaps"] == [], c["gaps"]
+
+    # ---- B06：主合同描述的是**交付边界** ----
+    # 它不再借用 AI 输出的摘要（那正是 A07 的混边界）。
+    # "交付边界没有摘要"是**如实记录**：本管道不读回成品逐帧摘要。
+    assert c["boundary"] == "delivery", c.get("boundary")
+    assert c["frames_digest"] is None
+    assert c["frames_digest_proven"] is False
+    assert any("delivery boundary has no frame digest" in g
+               for g in c["gaps"]), c["gaps"]
+
+    # ---- B06：AI 输出边界单独取证（同一份 JSON，不落媒体）----
+    aio = c.get("ai_output_boundary") or {}
+    assert aio.get("boundary") == "ai_output", aio
+    assert aio.get("pix_fmt") == "rgb48le", aio
+    assert aio.get("bit_depth") == 16
+    assert aio.get("frames_digest_proven") is True, aio
+    assert aio.get("frames_digest_domain") == "raw-rgb48le", aio
     # 摘要必须与"按同样顺序读磁盘帧"算出来的一致 —— 否则两条链不可比
     expect = fc.digest_ordered_frames(
         sorted(os.path.join(fz, x) for x in os.listdir(fz)))
-    assert c["frames_digest"] == expect, (c["frames_digest"], expect)
+    assert aio.get("frames_digest") == expect, (aio.get("frames_digest"), expect)
 
 
 def test_both_halves_contracts_prove_the_same_frame_set(tmp_path):
@@ -321,7 +340,21 @@ def test_both_halves_contracts_prove_the_same_frame_set(tmp_path):
     ca = fc.read_contract(st3 + ".frame_contract.json")
     cb = fc.read_contract(fu + ".frame_contract.json")
     assert ca and cb, (ca, cb)
-    assert fc.compare_contracts(ca, cb) == [], fc.compare_contracts(ca, cb)
+
+    # ---- B06：要证明"两条后半链消费同一份帧源"，看的是 **AI 输出边界** ----
+    # 交付边界的摘要当前不计算（设计事实），拿它比只会得到
+    # "unproven on at least one side" —— 那不是"两条链不同"，
+    # 而是"这条边界本来就没有摘要"。
+    assert ca["boundary"] == cb["boundary"] == "delivery"
+    aio_a = ca.get("ai_output_boundary") or {}
+    aio_b = cb.get("ai_output_boundary") or {}
+    assert aio_a and aio_b, (aio_a, aio_b)
+    for k in ("frames_digest", "frames_digest_domain", "frames",
+              "width", "height", "pix_fmt", "bit_depth"):
+        assert aio_a.get(k) == aio_b.get(k), (
+            f"AI 输出边界的 {k} 不同：{aio_a.get(k)!r} vs {aio_b.get(k)!r}")
+    # 交付边界的**像素格式**仍要一致（那是同一份成品规格）
+    assert ca["pix_fmt"] == cb["pix_fmt"], (ca["pix_fmt"], cb["pix_fmt"])
 
 
 def test_requested_pix_fmt_is_not_silently_overridden(tmp_path):

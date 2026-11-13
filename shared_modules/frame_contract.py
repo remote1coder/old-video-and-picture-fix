@@ -42,6 +42,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SCHEMA = "frame-boundary/1"
 
+#: 一份合同描述的**边界**（B06 / R25 A07）。
+#:
+#: 审核原话："每个合同只描述一个边界。AI原始RGB、stage4后输出、最终编码前YUV
+#: 分别取证；不能把RGB摘要与另一个YUV边界的格式拼在一起。"
+#:
+#: 这里不强制写三份媒体 —— 一份 JSON 可以同时承载**多个边界段**，
+#: 但**任何一条 frames_digest 都必须属于它自己的那个边界**。
+BOUNDARIES = ("ai_output", "postprocessed", "delivery")
+
 #: 允许的通道顺序（只写实际用到的两种）。
 CHANNEL_ORDERS = ("rgb", "bgr")
 
@@ -124,6 +133,7 @@ def digest_ordered_frames(paths: Iterable[str], chunk: int = 1 << 20
 
 
 def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
+                   boundary: str = "delivery",
                    timeline: Optional[Dict[str, Any]] = None,
                    color: Optional[Dict[str, Any]] = None,
                    ai: Optional[Dict[str, Any]] = None,
@@ -180,6 +190,8 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
         "width": int(width),
         "height": int(height),
         "pix_fmt": str(pix_fmt),
+        # B06：这份合同描述的是哪个边界（ai_output / postprocessed / delivery）
+        "boundary": str(boundary or "delivery"),
         "bit_depth": bit_depth,
         "channel_order": order,
         "frames_digest": frames_digest or None,
@@ -199,6 +211,45 @@ def build_contract(*, frames: int, width: int, height: int, pix_fmt: str,
         "color": dict(color or {}),
         "ai": dict(ai or {}),
     }
+
+
+def domain_matches_pix_fmt(domain: str, pix_fmt: str) -> Tuple[bool, str]:
+    """摘要的**域**与这个边界的**像素格式**是否相容（B06）。
+
+    为什么需要它：审核 A07 的复现点就是"域说 raw-rgb48le、格式却是编码输出
+    的 yuv444p16le" —— 两个边界的证据被拼进一份合同。只看"域非空"抓不到，
+    因为两边都是合法字符串。
+
+    规则（故意保守，宁严不松）：
+
+    * ``container*`` —— 容器字节，与像素格式无关，直接相容；
+    * 含 ``rgb`` —— 边界必须是 RGB 族（rgb/bgr/gbr）；
+    * 含 ``yuv`` —— 边界必须是 YUV 族；
+    * 其它域（如 ``model-tensor``）—— 不判，由各自的消费者解释。
+
+    Returns:
+        ``(ok, reason)``；``reason`` 非空时可直接并进问题列表。
+    """
+    d = str(domain or "").strip().lower()
+    f = str(pix_fmt or "").strip().lower()
+    if not d or not f:
+        return True, ""
+    if d.startswith("container"):
+        return True, ""
+    if "rgb" in d:
+        if f.startswith(("rgb", "bgr", "gbr")):
+            return True, ""
+        return False, (
+            f"digest domain {domain!r} says the digest was taken over raw RGB "
+            f"bytes, but this boundary's pixel format is {pix_fmt!r}; the "
+            f"two belong to different boundaries")
+    if "yuv" in d:
+        if f.startswith("yuv"):
+            return True, ""
+        return False, (
+            f"digest domain {domain!r} says the digest was taken over YUV "
+            f"samples, but this boundary's pixel format is {pix_fmt!r}")
+    return True, ""
 
 
 def contract_problems(contract: Dict[str, Any]) -> List[str]:
@@ -238,6 +289,21 @@ def contract_problems(contract: Dict[str, Any]) -> List[str]:
         p.append("frames_digest is declared proven but its domain is not "
                  "declared; a digest without a domain cannot be compared "
                  "with any other boundary")
+    else:
+        # B06：域与格式必须属于同一个边界
+        _ok, _why = domain_matches_pix_fmt(contract.get("frames_digest_domain"),
+                                           contract.get("pix_fmt"))
+        if not _ok:
+            p.append(_why)
+
+    # ---- B06：边界必须被声明且已知 ----
+    _bd = str(contract.get("boundary") or "").strip()
+    if not _bd:
+        p.append("contract does not declare which boundary it describes "
+                 "(ai_output / postprocessed / delivery)")
+    elif _bd not in BOUNDARIES:
+        p.append(f"contract declares an unknown boundary {_bd!r}; known "
+                 f"values are {list(BOUNDARIES)}")
     _tl = contract.get("timeline")
     if not isinstance(_tl, dict) or not _tl:
         p.append("no timeline reference (this boundary cannot prove when the "

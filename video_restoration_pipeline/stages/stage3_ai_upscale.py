@@ -1351,15 +1351,50 @@ def _write_stream_frame_contract(*, output_mkv, out_w, out_h, requested_fmt,
         pix_fmt_proven=bool(pix_fmt),
         execution=execution,
         timeline=timeline, color=color, ai=ai,
-        frames_digest=frames_digest or None,
-        frames_digest_proven=bool(frames_digest),
-        frames_digest_domain="raw-rgb48le" if frames_digest else "",
+        # ---- B06 / A07：这份合同描述的是**交付边界** ----
+        # 审核原话：writer 仍从编码输出探测 YUV 格式，同时放入 AI 原始 RGB
+        # 摘要 —— 两个边界的证据拼在一份合同里，域与格式互相矛盾。
+        #
+        # 现在的分工：
+        #   * 主合同 = delivery：`pix_fmt` 是探测到的 YUV，摘要**没有算**
+        #     （本管道不读回成品逐帧摘要）→ 明确写"未证明"，不拿 AI 的顶上；
+        #   * AI 输出边界单独一段（同一份 JSON，**不增加媒体落盘**）。
+        boundary="delivery",
+        frames_digest=None,
+        frames_digest_proven=False,
+        frames_digest_domain="",
         source=source)
+    # ---- B06：AI 输出边界单独取证（不落媒体，只记摘要与格式） ----
+    if frames_digest:
+        c["ai_output_boundary"] = {
+            "boundary": "ai_output",
+            "pix_fmt": "rgb48le",
+            "bit_depth": 16,
+            "channel_order": "rgb",
+            "frames": int(frames or 0),
+            "width": int(out_w), "height": int(out_h),
+            "frames_digest": str(frames_digest),
+            "frames_digest_proven": True,
+            "frames_digest_domain": "raw-rgb48le",
+            "computed": "online, from the AI subprocess output stream",
+            "note": ("this is a DIFFERENT boundary from the delivery file: "
+                     "the digest is over the model's RGB frames, not over "
+                     "the encoded container"),
+        }
+
     # 把自己知道的缺口写进合同（而不是只留在日志里）
     gaps = []
+    # 交付边界的逐帧摘要当前**不计算**（要在编码后读回成品，成本另计）。
+    # 这是设计事实，写进 gaps 让读者知道"这条边界没有摘要"，
+    # 而不是假装它有。
+    gaps.append("the delivery boundary has no frame digest (this pipeline "
+                "does not read the encoded output back); the AI-output "
+                "digest lives in `ai_output_boundary` and MUST NOT be used "
+                "as the delivery digest")
     if not frames_digest:
         gaps.append("the AI subprocess did not report FRAMES_DIGEST; "
-                    "frame content identity is unproven for this boundary")
+                    "frame content identity is unproven for the AI-output "
+                    "boundary as well")
     if not pix_fmt:
         gaps.append("could not probe the output pixel format; the value "
                     "written here is the requested one, not a measured one")

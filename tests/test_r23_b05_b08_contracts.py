@@ -137,7 +137,9 @@ def _contract(**over):
                 color={"probed": True, "pix_fmt": "yuv420p16le"},
                 ai={"impl": "realesrgan", "model": "x2plus"},
                 frames_digest="a" * 64,
-                frames_digest_domain="raw-rgb48le")
+                # B06：pix_fmt 是 yuv420p16le，摘要就是这个边界的
+                # YUV 样本 —— 域必须与格式同族，不能借用 rgb 的域。
+                frames_digest_domain="raw-yuv")
     base.update(over)
     return fc.build_contract(**base)
 
