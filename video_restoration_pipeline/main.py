@@ -2018,17 +2018,21 @@ def _load_result_for_consistency(result_path: str, final_path: str
     return data
 
 
-#: verify 报告里**每次发布都必须有**的检查项（R24-02 / R23-A02）。
+#: verify 报告里**必须存在**的检查项（R24-02 / R23-A02 修订）。
 #:
-#: 这三项回答的是"这一代到底做没做机械核对、帧顺序核对、最终时间轴测量"。
-#: 缺任何一项，报告就没有证明它声称的事 —— 而旧实现只看"报告非空 +
-#: media_sha256 对得上"，于是一份写着 `required=True/status=FAIL` 的报告
-#: 照样能让完成验证返回 True。
+#: 这两项是发布前**必然**做过的：机械核对（媒体/报告/可解码性）与
+#: 最终时间轴测量。缺任何一项，报告就不完整。
 #:
-#: 名字必须与 stage7 的 `_checks[...]` 赋值点一致（见
-#: `stage7_encode.py` 的 `_checks["mechanical"] / ["frame_order"] /
-#: ["final_timeline"]`）。
-_ALWAYS_REQUIRED_CHECKS = ("mechanical", "frame_order", "final_timeline")
+#: ⚠️ **不要**把 `frame_order` 也放进来。第一版就是这么写的，结果
+#: **误杀正常完成**：实测（N22，真实 stage7）`frame_order` 的状态是
+#: `UNVERIFIED`（采样点不足），而 `required=None` —— 发布决策允许这种情形
+#: （`publish=True`）。硬性要求它合格会让一批正常 job 变成 rc=82。
+#:
+#: 分工：
+#:   * **存在性**由这里管（外部底线，不能靠报告自报）；
+#:   * **状态**由报告自己的 `required` 字段 + `publish_decision` 管 ——
+#:     生产者最清楚"这一项在本计划下是否必须合格"。
+_ALWAYS_REQUIRED_CHECKS = ("mechanical", "final_timeline")
 
 #: 只有计划要求时才必需的检查项：检查名 → `_planned_generation_roles()`
 #: 里的角色名。角色在 `required` 里才要求报告必须有这一项。
@@ -2119,10 +2123,14 @@ def _verify_report_problems(doc: Dict[str, Any], *,
             must.append(chk)
     for name in must:
         if name not in seen:
-            probs.append(f"required check {name!r} is missing from the report")
-        elif seen[name] not in _CHECK_PASSING:
-            probs.append(f"required check {name!r} did not pass "
-                         f"(status={seen[name]!r})")
+            # R24-02 修订：`must` 只包含"报告里必须有"的项（`mechanical`，
+            # 以及计划要求全链时的 `fullchain`）。**存在性**由这里管，
+            # **状态**由下面的 `required` 规则与 `publish_decision` 管 ——
+            # 两者分开，才不会把"生产认可的 UNVERIFIED"误判成不合格。
+            probs.append(f"the report lacks the {name!r} check entirely; it "
+                         f"does not show that it was performed")
+        elif name == "mechanical" and seen[name] == "FAIL":
+            probs.append("the mechanical pre-publish check failed")
 
     # ---- 报告自己的发布决定 ----
     dec = doc.get("publish_decision")
