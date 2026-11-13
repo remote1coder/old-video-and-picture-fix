@@ -67,13 +67,33 @@ KNOWN_STATUSES = frozenset({
 _PASSING = frozenset({"PASS", "NOT_APPLICABLE"})
 
 
+#: 只认"**确实有音轨**"的键。
+#:
+#: 教训（R25 实测）：这里原来把 `multichannel_preserve` /
+#: `audio_passthrough` / `audio_sync_tolerance_ms` 也算进来，而它们是
+#: **策略参数**（配置里常有默认值），于是"无音轨素材"也被判成
+#: "计划要求 sync 检查"，报告里当然没有 → 完成验证 82。
+#: 判"有没有音轨"只能看**观测到的事实**，不能看策略开关。
+_AUDIO_PRESENCE_KEYS = ("audio_streams", "audio_stream_count", "has_audio")
+
+
 def _has_audio(params: Optional[Dict[str, Any]]) -> bool:
-    """计划里是否声明了音轨处理。"""
+    """计划里是否**确实有音轨**（只看观测事实，不看策略开关）。"""
     p = params or {}
-    for k in ("audio_streams", "has_audio", "multichannel_preserve",
-              "audio_passthrough", "audio_sync_tolerance_ms"):
-        if p.get(k):
-            return True
+    for k in _AUDIO_PRESENCE_KEYS:
+        v = p.get(k)
+        if isinstance(v, bool):
+            if v:
+                return True
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if v > 0:
+                return True
+            continue
+        if isinstance(v, (list, tuple, dict)):
+            if len(v) > 0:
+                return True
+            continue
     return False
 
 

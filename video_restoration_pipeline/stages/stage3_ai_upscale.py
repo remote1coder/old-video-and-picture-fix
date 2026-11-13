@@ -2877,6 +2877,16 @@ def main():
     # FIX-N8-2: Query all PTS once before window loop (not per-window)
     all_pts_map = _query_all_pts(stage2_output, logger)
 
+    # ---- B07：**源**的时间轴必须单独探 ----
+    # 实测（VFR 5 帧，源间隔 0.1/0.1/0.1/0.2）：
+    #   stage1 之后 = 0.125/0.125/0.125/0.125 —— QTGMC 按**恒定帧率**处理，
+    #   VFR 在这一步就被重采样了。
+    # 于是 stage2 输出看起来是"标准 CFR"，只看它就会放行不携带 PTS 的
+    # rawvideo 路径 —— 那正是审核明令禁止的"用平均帧率冒充原时序"。
+    # 合法性必须由**源**决定；这里探不到就按 unknown 处理（不放行）。
+    _src_pts_map = _query_all_pts(str(args.input), logger)
+    _src_tl = _classify_timeline(_src_pts_map, None)
+
     # R12-10：帧率探测失败**不能静默用默认值**。
     # 真实 30fps 的素材若按 25fps 编码，帧数完全正确但时长变了 20%，
     # 任何"帧数一致"的核对都发现不了。
@@ -3028,6 +3038,18 @@ def main():
                     "lanczos_target is set; the streaming path would bypass "
                     "secondary scaling, so use the PNG path instead",
                     lanczos_target=str(_s_lanczos))
+    elif _src_tl == "vfr":
+        # 源的间隔不一致 → 原时序在 stage1 就已经变了。这里**不允许**走流式：
+        # rawvideo 只能按一个固定帧率编码，那等于用平均帧率掩盖 VFR。
+        logger.info(
+            "STAGE3_STREAM_SKIP_SOURCE_VFR",
+            "The SOURCE has a variable frame rate. stage1 (QTGMC) already "
+            "resampled it to a constant rate, so the intermediate looks CFR "
+            "— but encoding it as rawvideo at that rate would lose the "
+            "original timing. Use the PNG path, which carries per-frame PTS.",
+            source_timeline=_src_tl,
+            src_pts_usable=len(_src_pts_map or {}),
+            intermediate_timeline=_classify_timeline(all_pts_map, total_frames))
     elif _classify_timeline(all_pts_map, total_frames) != "cfr":
         # STR-04 / R12-10：只有**确认是 CFR** 才允许走不携带 PTS 的流式路径。
         # VFR 会被压成 CFR；UNKNOWN（PTS 读不出/非单调/不足）同样不能
