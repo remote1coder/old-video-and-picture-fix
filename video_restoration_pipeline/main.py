@@ -4103,6 +4103,25 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 temp_dir, job_id, keep_steps, current_step=stage_num,
                 current_run_hashes=_current_run_param_hashes(_last_produced))
 
+    # ---- G11：磁盘写入按类型记账 ----
+    # 一次运行结束时报一张表：**现存**（扫描）与**写入过**（调用方记账）
+    # 分开列。合成一个数字会让人把"中间产物被清了"误读成"没写过"。
+    # 提示：加 `--keep-intermediates` 跑时，"现存"就等于中间媒体的全部写入。
+    try:
+        from write_ledger import scan as _wl_scan, render as _wl_render
+        _wl_paths = [str(params.get("temp_dir") or "")]
+        _wl_out = str(params.get("output_path") or "")
+        if _wl_out:
+            _wl_paths.append(os.path.dirname(os.path.abspath(_wl_out)))
+        _wl = _wl_scan(_wl_paths, output_path=_wl_out,
+                       temp_dir=str(params.get("temp_dir") or ""))
+        for _line in _wl_render(_wl):
+            job_logger.info("WRITE_LEDGER", _line, job_id=job_id)
+    except Exception as _wle:            # 记账失败不阻断任务，但必须可见
+        job_logger.warning("WRITE_LEDGER_FAIL",
+                           "Could not account for the bytes this run wrote",
+                           job_id=job_id, error=str(_wle))
+
     # ---- R21-C02：**先证明完成，再说 JOB_DONE** ----
     # 审核：main 先记 JOB_DONE，再调用 write_completion_marker，
     # 且**没有检查它的 False 返回值**。受控调用确认：即使标记写入明确失败，
