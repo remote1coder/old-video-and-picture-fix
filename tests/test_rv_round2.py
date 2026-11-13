@@ -513,7 +513,21 @@ def _write_receipt(final, src):
         sys.path.insert(0, _vstages)
     import stage7_encode as _s7
     with open(str(final) + ".verify.json", "w", encoding="utf-8") as f:
+        # R24-02：完成验证读报告结论（必需检查 + 发布决定）。
+        # 只写 media_sha256 的夹具已经不能代表生产 writer 的产物。
         _json.dump({"media_sha256": vmain._plain_sha256(str(final)),
+                    "checks": {
+                        "mechanical": {"name": "mechanical",
+                                       "status": "PASS", "required": True},
+                        "frame_order": {"name": "frame_order",
+                                        "status": "PASS", "required": True},
+                        "final_timeline": {"name": "final_timeline",
+                                           "status": "PASS", "required": True},
+                        "fullchain": {"name": "fullchain",
+                                      "status": "PASS", "required": True},
+                    },
+                    "publish_decision": {"publish": True,
+                                         "verified": True},
                     "run_identity": {
                         "input": vmain.build_input_identity(str(src))}}, f)
     with open(str(final) + ".fullchain.json", "w", encoding="utf-8") as f:
