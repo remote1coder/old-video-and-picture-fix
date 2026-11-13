@@ -248,3 +248,46 @@ def test_main_accepts_lossless_default(tmp_path, monkeypatch):
     rc, err = vmain.process_job(job, cfg, {"chain": None, "stage": None}, _Log())
     assert rc != 85, (rc, err)
     assert "storage policy" not in (err or ""), err
+
+
+# --------------------------------------------------------------------------
+# 6) 代码级守卫：**没有第二条路**能打开有损
+# --------------------------------------------------------------------------
+def test_no_stage_can_turn_on_lossy_by_itself():
+    """有损只能由 `storage_policy` 判定，stage 里不许出现自己的开关。
+
+    G10 的负半是"无显式许可时……不会启用有损"。光有 `resolve()` 的拒绝
+    还不够 —— 如果某个 stage 自己读 `intermediate_storage` 或写死
+    `mode: lossy`，那它就能绕过守卫。这条用**静态扫描**把这个口子钉住：
+    除 `main.py`（守卫本身）与 `storage_policy.py`（判定实现）之外，
+    任何 stage 文件都不许出现这些关键字。
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    allowed = {
+        os.path.join(root, "shared_modules", "storage_policy.py"),
+        os.path.join(root, "video_restoration_pipeline", "main.py"),
+        os.path.join(root, "photo_restoration_pipeline", "main.py"),
+        os.path.join(root, "shared_modules", "write_ledger.py"),
+    }
+    offenders = []
+    for sub in ("video_restoration_pipeline", "photo_restoration_pipeline",
+                "shared_modules"):
+        base = os.path.join(root, sub)
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                p = os.path.join(dirpath, fn)
+                if os.path.abspath(p) in {os.path.abspath(a) for a in allowed}:
+                    continue
+                try:
+                    src = open(p, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+                for kw in ("intermediate_storage", "lossy_allowed",
+                           "max_lossy_generations"):
+                    if kw in src:
+                        offenders.append(f"{os.path.relpath(p, root)}: {kw}")
+    assert not offenders, (
+        "这些文件自己碰了存储策略配置 —— 有损必须只有一个决策点：\n  "
+        + "\n  ".join(offenders))

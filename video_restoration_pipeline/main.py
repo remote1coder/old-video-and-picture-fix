@@ -4103,6 +4103,26 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 temp_dir, job_id, keep_steps, current_step=stage_num,
                 current_run_hashes=_current_run_param_hashes(_last_produced))
 
+    # ---- G11：耗时与帧吞吐（每个 stage 一行）----
+    # 数据源是**我们自己写的 job 日志**，不额外探测；所以它描述的是
+    # 这一次真实运行，不是估算。
+    try:
+        from perf_report import (parse_stage_timings as _pst,
+                                 build_perf_report as _bpr,
+                                 render_perf_report as _rpr)
+        _logp = os.path.join(str(params.get("log_dir") or "./logs"),
+                             f"job_{job_id}.log")
+        _timings = _pst(_logp)
+        _arts = {int(k): (v[0] if v else "")
+                 for k, v in (_last_produced or {}).items()}
+        _perf = _bpr(_timings, _arts)
+        for _line in _rpr(_perf).splitlines():
+            job_logger.info("PERF_REPORT", _line, job_id=job_id)
+    except Exception as _pre:            # 记账失败不阻断任务，但必须可见
+        job_logger.warning("PERF_REPORT_FAIL",
+                           "Could not build the per-stage timing report",
+                           job_id=job_id, error=str(_pre))
+
     # ---- G11：磁盘写入按类型记账 ----
     # 一次运行结束时报一张表：**现存**（扫描）与**写入过**（调用方记账）
     # 分开列。合成一个数字会让人把"中间产物被清了"误读成"没写过"。
