@@ -2508,6 +2508,15 @@ def main():
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
+    # ---- B08：结构化阶段事件（同 stage1，供故障注入器定位本次执行）----
+    try:
+        from stage_events import emit as _emit_stage
+        _emit_stage(logger, 3, "start", params,
+                    ai_model=str(params.get("upscale_model") or ""),
+                    ai_scale=params.get("upscale_scale"))
+    except Exception:
+        pass
+
     # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED）。
     if _cancel_guard is not None:
         _cancel_guard.install_cancel_guard(stage=3, logger=logger)

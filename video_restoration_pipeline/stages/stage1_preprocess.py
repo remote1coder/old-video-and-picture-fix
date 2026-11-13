@@ -1169,6 +1169,15 @@ def main():
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
+    # ---- B08：结构化阶段事件 ----
+    # 故障注入器必须等**本次执行**的事件才能动手。原来只靠"temp 里出现
+    # step1 文件"触发，既区分不出本轮与上一轮残留，也认不出 PID 复用。
+    try:
+        from stage_events import emit as _emit_stage
+        _emit_stage(logger, 1, "start", params)
+    except Exception:
+        pass
+
     # NEW-V-06: 注册取消守卫（video main.py 认 rc=88 = EXIT_INTERRUPTED）。
     if _cancel_guard is not None:
         _cancel_guard.install_cancel_guard(stage=1, logger=logger)

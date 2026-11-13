@@ -11,6 +11,7 @@ v7.3 §3.3, §4.3 Compliance:
 - Log rotation by line count
 """
 
+import os
 import time
 import json
 import threading
@@ -236,6 +237,11 @@ class StructuredLogger:
             "message": message,
             "job_id": self.job_id,
             "thread": threading.current_thread().name,
+            # ---- B08：进程身份必须进每一条日志 ----
+            # 故障注入器要证明"杀的是**本次**创建的那个进程"，而不是
+            # PID 复用后的别人、或上一轮的残留。没有 pid 就只能靠文件残留
+            # 猜 —— 那正是审核指出的"旧残留可以伪造注入成功"。
+            "pid": os.getpid(),
         }
         entry.update(kwargs)
 
