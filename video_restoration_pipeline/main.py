@@ -496,6 +496,35 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     if not script_path.exists():
         return 80, f"Script not found: {script_path}"  # Dependency missing
 
+    # ---- P2：可选的**资源准入闸门** ----
+    # 只有当调用方把 `_governor` 注入 params 时才生效（默认完全不介入，
+    # 现有行为零改变）。语义是"**开工前确认余量**"：借→立刻还，
+    # 只当闸门用，不长期占预算（单进程里 stage 是串行的，不需要长占）。
+    #
+    # 为什么不在 main 里自动建 governor：预算比例是**政策**（整机 80%
+    # 只是目标，不是硬保证），写死在 main 里就等于把"能调"变成"不能调"。
+    # 由新执行组（编排层）创建并注入，符合"新执行组经同一 governor 准入"。
+    _gov = (params or {}).get("_governor")
+    if _gov is not None:
+        import os as _os_p2
+        _sn = str(script_name or "")
+        try:
+            _stage_no = int(_sn.split("_", 1)[0].replace("stage", "") or 0)
+        except (TypeError, ValueError):
+            _stage_no = 0
+        _ram = int((params or {}).get("_governor_stage_ram") or 0)
+        _vram = int((params or {}).get("_governor_stage_vram") or 0)
+        _wait = float((params or {}).get("_governor_wait_s") or 30.0)
+        try:
+            _admit = _gov.reserve(
+                "admit:stage%d:%d" % (_stage_no, _os_p2.getpid()),
+                _ram, _vram, wait=_wait, meta={"script": _sn})
+            _gov.release(_admit)
+        except Exception as _ge:
+            # 余量不足 → **明确失败**，不降质、不硬跑
+            return (85, "resource admission refused for %s: %s"
+                    % (_sn, _ge))
+
     # Build command
     cmd = [sys.executable, str(script_path)]
 
