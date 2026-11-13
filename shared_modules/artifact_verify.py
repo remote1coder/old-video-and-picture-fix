@@ -721,6 +721,34 @@ def normalized_correlation(a, b) -> Optional[float]:
     return float((af * bf).sum() / denom)
 
 
+def _frames_or_count(path: str) -> Optional[int]:
+    """帧数：先读容器元数据，读不到就**真数一遍**。
+
+    ## 为什么必须兜底
+
+    mkv 的 `nb_frames` 经常不写。长片实测（2026-11-14，8160 帧 4.4 GB）：
+    `probe_media_facts().frames is None` → `verify_frame_alignment` 直接返回
+    `"帧数未知，无法做对齐校验"` → `frame_order = UNVERIFIED` → 整代被判
+    "published but NOT verified"（exit 89），一次 48 分钟的跑批拿不到 PASS。
+
+    "读不到元数据"和"无法校验"是两件事：前者可以多花一次解码解决。
+    代价只在这条兜底路径上付（且只在发布前一次），不影响常规探测。
+
+    `-count_frames` 走的是完整解码，对长片要几十秒；这是可接受的代价 ——
+    比"整代未验证"轻得多。
+    """
+    facts = probe_media_facts(path)
+    n = facts.get("frames")
+    if n:
+        return int(n)
+    try:
+        from frame_conservation import _count_frames as _cf
+        m = _cf(path)
+        return int(m) if m else None
+    except Exception:                        # pragma: no cover - 部署异常
+        return None
+
+
 def verify_frame_alignment(source_path: str, output_path: str,
                            samples: int = 6,
                            margin: float = 0.02) -> Dict[str, Any]:
@@ -740,8 +768,8 @@ def verify_frame_alignment(source_path: str, output_path: str,
 
     out: Dict[str, Any] = {"ok": None, "points": [], "flipped": 0,
                            "skipped": 0, "note": "", "error": None}
-    src_frames = probe_media_facts(source_path).get("frames")
-    out_frames = probe_media_facts(output_path).get("frames")
+    src_frames = _frames_or_count(source_path)
+    out_frames = _frames_or_count(output_path)
     if not src_frames or not out_frames:
         out["error"] = "帧数未知，无法做对齐校验"
         return out
