@@ -72,6 +72,32 @@ def _materialise_step2(src: str, dst: str) -> str:
         return "copied"
 
 
+def _read_s1_vpy_sha(temp_dir: str, job_id: str, input_name: str,
+                     vpy: str) -> str:
+    """从 stage1 的交接单里取 vpy 摘要；取不到就现算一份。
+
+    两遍绑定必须能回答"两次跑的是不是同一份脚本" —— 这是比像素摘要更前置
+    的一层。交接单缺失时现算，绝不返回空串（空串会让比较变成"两边都空"）。
+    """
+    import json as _json
+    import hashlib as _hl
+    _stem = Path(input_name).stem.replace(" ", "_")
+    side = os.path.join(temp_dir, f"{job_id}_{_stem}_step1_stream.json")
+    try:
+        with open(side, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh) or {}
+        got = str(doc.get("vs_script_sha256") or "")
+        if got and str(doc.get("vs_script") or "") == os.path.abspath(vpy):
+            return got
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(vpy, "rb") as fh:
+            return _hl.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
 class _NoFileInput(Exception):
     """stream_full 的检查遍没有文件可探 —— 不是错误，是这条路径的正常形态。"""
 
@@ -388,6 +414,62 @@ def main():
     # inode 的第二个名字，省掉一次全片写入（16 分钟 1080p = 82 GB）。
     # stream_full：检查遍不产 step2 媒体（设计 §5.2 S2：不创建 step2 媒体）
     if _vpy:
+        # ---- 两遍绑定：把"这一遍看到的像素"变成可比对的摘要 ----
+        # 《设计 v1》§5.1：正式遍要与检查遍比"同边界有序像素摘要"，
+        # 只比帧数/计划/尺寸不算。这里在检查遍算一次，正式遍再算一次。
+        _bind = {"ok": False, "digest": None, "frames": 0, "reason": ""}
+        try:
+            from stream_digest import digest_vpy as _dv
+            # stage2 知道 stage1 写的位深；像素格式由它声明，摘要才有域
+            _bd = int(params.get("vs_bit_depth", 16) or 16)
+            _pf = _stream.get("pix_fmt") or f"yuv420p{_bd}le"
+            _bind = _dv(_vpy, timeout=float(params.get(
+                "stream_digest_timeout", 3600.0)), pix_fmt=_pf)
+        except Exception as _de:            # 摘要失败不能阻断检查结论
+            _bind = {"ok": False, "digest": None, "frames": 0,
+                     "error": str(_de)}
+        _doc = {
+            "schema": "stream_s1_check/1",
+            "stage": 2,
+            "attempt_id": str(params.get("attempt_id") or ""),
+            "vs_script": os.path.abspath(_vpy),
+            "vs_script_sha256": str(
+                _stream.get("vs_script_sha256") or _read_s1_vpy_sha(
+                    temp_dir, job_id, input_name, _vpy)),
+            "pixels": {
+                "ok": bool(_bind.get("ok")),
+                "digest": _bind.get("digest"),
+                "frames": int(_bind.get("frames") or 0),
+                "pix_fmt": _bind.get("pix_fmt") or "",
+                "error": _bind.get("error") or "",
+            },
+            "deterministic": bool(params.get("vs_deterministic")),
+            "idet": {
+                "stats": stats if isinstance(stats, dict) else {},
+                "threshold": threshold,
+            },
+            "written_at": __import__("datetime").datetime.now(
+                ).astimezone().isoformat(),
+        }
+        try:
+            _bp = os.path.join(
+                temp_dir, f"{job_id}_{Path(input_name).stem}"
+                          f"_step1_check.json")
+            import json as _json
+            with open(_bp, "w", encoding="utf-8") as _bf:
+                _json.dump(_doc, _bf, ensure_ascii=False, indent=2)
+        except OSError as _be:
+            logger.error("STAGE2_STREAM_BINDING_FAIL",
+                         "Cannot record the check-pass pixel digest; the "
+                         "formal pass would have nothing to compare against",
+                         error=str(_be))
+            return 84
+        logger.info("STAGE2_STREAM_BINDING",
+                    "Recorded the check-pass pixel digest for the two-pass "
+                    "binding",
+                    sidecar=_bp, digest=_doc["pixels"]["digest"],
+                    frames=_doc["pixels"]["frames"],
+                    deterministic=_doc["deterministic"])
         logger.info("STAGE2_STREAM_NO_ARTIFACT",
                     "stream_full: the check pass produced conclusions only; "
                     "no step2 media was materialised")
