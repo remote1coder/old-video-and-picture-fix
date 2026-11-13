@@ -43,6 +43,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import r22_444_classic_path as s3probe  # noqa: E402
+import strict_compare as sc  # noqa: E402  R24-07 共用严格比较器
 
 PY = s3probe.PY
 MAIN = s3probe.MAIN
@@ -237,7 +238,12 @@ def _run_once(work, cfg, manifest, label, timeout=3600, fresh=True):
                         if sampler.peak_rss else None),
         "peak_vram_mb": sampler.peak_vram,
         "temp_bytes": _dir_bytes(os.path.join(work, "temp")),
-        "output": outs[0] if outs else None,
+        # R24-07：**必须留独立副本**。旧写法记的是
+        # `output/probe_src_restored.mkv` 这个**同一路径**，
+        # 下一轮会覆盖它，最后拿它跟自己比 —— 审核 A08 正是这么
+        # 证明"N22 成品重复性"不成立的。
+        "output": (_snapshot(work, label, outs[0])
+                   if outs else None),
         "output_sha256": _sha(outs[0]) if outs else None,
         "step6": _snapshot(work, label, max(steps, key=os.path.getmtime))
         if steps else None,
@@ -249,16 +255,19 @@ def _run_once(work, cfg, manifest, label, timeout=3600, fresh=True):
     }
 
 
-def _psnr(a, b):
-    rc, rows = s3probe._run(
-        ["ffmpeg", "-hide_banner", "-v", "info", "-i", a, "-i", b,
-         "-lavfi", "[0:v][1:v]psnr=stats_file=-", "-f", "null", "-"],
-        timeout=600).returncode, None
-    r = s3probe._run(["ffmpeg", "-hide_banner", "-v", "info", "-i", a, "-i",
-                      b, "-lavfi", "[0:v][1:v]psnr=stats_file=-",
-                      "-f", "null", "-"], timeout=600)
-    rows = [ln for ln in (r.stdout or "").splitlines() if ln.startswith("n:")]
-    return r.returncode, rows
+def _compare(a, b):
+    """严格比较（R24-07）：统一走 `strict_compare`，不再各写一套。
+
+    旧 `_psnr` 有两个审核点名的漏洞：
+      * 用 `s3probe._run`（`text=True`）拿到的是 str，只能靠文本匹配
+        `psnr_y:inf`，不做真正的数值比较；
+      * **不看 rc、不查完整帧数** —— 审核原话"新 `_psnr`/判定重新漏掉
+        比较器 rc 和完整帧数"，缺产物时甚至能直接跳过必需比较。
+
+    现在自比、短读、帧数不符、解码 rc 非 0 都会进 `problems`，
+    只有 `ok and identical` 才能说"逐像素相同"。
+    """
+    return sc.compare_media(a, b, pix_fmt="yuv420p16le", width=0, height=0)
 
 
 def main():
@@ -387,45 +396,46 @@ def main():
 
     b = by.get("B_single_seed1") or []
     if len(b) == 2 and b[0]["output"] and b[1]["output"]:
-        rc, rows = _psnr(b[0]["output"], b[1]["output"])
-        same = bool(rows) and all(
-            "psnr_y:inf" in x and "psnr_u:inf" in x and "psnr_v:inf" in x
-            for x in rows)
-        print("[n22] B 单线程两次：rc=%s %d 帧，逐像素相同=%s"
-              % (rc, len(rows), same))
-        if not same:
+        r = _compare(b[0]["output"], b[1]["output"])
+        same = bool(r["ok"] and r["identical"])
+        print("[n22] B 单线程两次：ok=%s 帧=%s max|d|=%s 逐像素相同=%s"
+              % (r["ok"], r["frames"].get("a"), r["max_abs_diff"], same))
+        if not r["ok"]:
+            print("[FAIL] 比较本身不成立（自比/短读/帧数不符）: %s"
+                  % (r["problems"][:3],))
+            ok = False
+        elif not same:
             print("[FAIL] 单线程同种子两次仍不相同 —— 还有别的随机源")
             ok = False
 
     c = by.get("C_single_seed2") or []
     if b and c and b[0].get("step6") and c[0].get("step6"):
-        rc, rows = _psnr(b[0]["step6"], c[0]["step6"])
-        diff = bool(rows) and any(
-            "psnr_y:inf" not in x or "psnr_u:inf" not in x
-            or "psnr_v:inf" not in x for x in rows)
-        print("[n22] B(seed=1) vs C(seed=2) 的 **step6**：%d 帧，存在差异=%s"
-              % (len(rows), diff))
-        if not diff:
+        r = _compare(b[0]["step6"], c[0]["step6"])
+        diff = bool(r["ok"] and not r["identical"])
+        print("[n22] B(seed=1) vs C(seed=2) 的 **step6**：ok=%s 帧=%s "
+              "max|d|=%s 存在差异=%s"
+              % (r["ok"], r["frames"].get("a"), r["max_abs_diff"], diff))
+        if not r["ok"]:
+            print("[FAIL] step6 比较不成立: %s" % (r["problems"][:3],))
+            ok = False
+        elif not diff:
             print("[FAIL] 只改 grain_seed，颗粒阶段输出完全相同 —— 种子没生效")
             ok = False
         # 成品是否也不同，单独记（编码器可能把细微颗粒量化掉）
         if b[0]["output"] and c[0]["output"]:
-            rc2, rows2 = _psnr(b[0]["output"], c[0]["output"])
-            same_final = bool(rows2) and all(
-                "psnr_y:inf" in x and "psnr_u:inf" in x
-                and "psnr_v:inf" in x for x in rows2)
-            print("[n22] 同上但在**成品**上：%d 帧，逐像素相同=%s"
+            r2 = _compare(b[0]["output"], c[0]["output"])
+            print("[n22] 同上但在**成品**上：ok=%s 帧=%s 逐像素相同=%s"
                   "（相同不代表种子没生效，只说明这档编码把它量化掉了）"
-                  % (len(rows2), same_final))
+                  % (r2["ok"], r2["frames"].get("a"),
+                     bool(r2["ok"] and r2["identical"])))
 
     a = by.get("A_multi_seed1") or []
     if len(a) == 2 and a[0]["output"] and a[1]["output"]:
-        rc, rows = _psnr(a[0]["output"], a[1]["output"])
-        same = bool(rows) and all(
-            "psnr_y:inf" in x and "psnr_u:inf" in x and "psnr_v:inf" in x
-            for x in rows)
-        print("[n22] A 多线程两次：%d 帧，逐像素相同=%s（相同也照实记，"
-              "不据此断言线程无影响）" % (len(rows), same))
+        r = _compare(a[0]["output"], a[1]["output"])
+        print("[n22] A 多线程两次：ok=%s 帧=%s max|d|=%s 逐像素相同=%s"
+              "（相同也照实记，不据此断言线程无影响）"
+              % (r["ok"], r["frames"].get("a"), r["max_abs_diff"],
+                 bool(r["ok"] and r["identical"])))
 
     if fault.get("rerun", {}).get("rc") != 0:
         print("[FAIL] 故障重跑没有成功: %s"

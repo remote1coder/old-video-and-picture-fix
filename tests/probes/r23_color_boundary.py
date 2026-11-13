@@ -246,6 +246,26 @@ def part_model(work):
     after_path = os.path.join(out_dir, outs[0])
     after = _mean_of_png(after_path)
 
+    # ---- R24-08 / R23-A10：同尺寸的**模型旁路**参考 ----
+    # 审核原话："缺少同尺寸的模型旁路缩放参考"。没有它，"模型让通道均值
+    # 变了 X"就无法排除"光是把这一帧放大到同尺寸、均值就变了 X"。
+    # 这里用 lanczos 把**同一输入帧**放大到模型输出的尺寸，作为不含模型的对照。
+    h2, w2 = after["size"]
+    bypass_png = os.path.join(work, "model_bypass.png")
+    r3 = _ff("-i", os.path.join(frames_in, "f_0001.png"),
+             "-vf", "scale=%d:%d:flags=lanczos" % (w2, h2),
+             "-pix_fmt", "rgb48be", bypass_png)
+    bypass = _mean_of_png(bypass_png) if r3.returncode == 0 else None
+    bypass_vs_model = None
+    if bypass:
+        try:
+            a_arr = _read_rgb48(bypass_png, w2, h2)[0]
+            b_arr = _read_rgb48(after_path, w2, h2)[0]
+            bypass_vs_model = _stats(a_arr.reshape(1, h2, w2, 3),
+                                     b_arr.reshape(1, h2, w2, 3), tiles=4)
+        except Exception as exc:      # pragma: no cover
+            bypass_vs_model = {"error": str(exc)[:160]}
+
     # 转换后 YUV：模型输出 → yuv444p10le → 解回 RGB
     yuv = os.path.join(work, "model_out_yuv.mkv")
     back = os.path.join(work, "model_out_back.mkv")
@@ -271,11 +291,22 @@ def part_model(work):
         "model_before_rgb": before["mean"],
         "model_after_rgb": after["mean"],
         "converted_yuv_rgb": conv,
+        # ---- R24-08：把"模型"与"放大"分开 ----
+        "bypass_scaled_rgb": (bypass or {}).get("mean"),
         "delta_model": _delta(before["mean"], after["mean"]),
+        "delta_bypass_vs_input": _delta(before["mean"],
+                                        (bypass or {}).get("mean")),
+        "delta_model_vs_bypass": _delta((bypass or {}).get("mean"),
+                                        after["mean"]),
+        "bypass_vs_model_stats": bypass_vs_model,
         "delta_conversion": _delta(after["mean"], conv),
         "sizes": {"before": before["size"], "after": after["size"]},
-        "note": ("三者分开记：模型本身引起的色调变化**不是**颜色转换误差；"
-                 "转换后的差异才是矩阵/量化造成的。"),
+        "note": (
+            "四组分开记：① 输入→模型输出（含放大）；② 输入→旁路缩放"
+            "（只有放大，没有模型）；③ 旁路→模型输出（**扣掉放大后的模型净效应**）；"
+            "④ 模型输出→YUV→RGB（转换/量化）。"
+            "审核 A10 要求撤回'偏色已确定全部来自模型'——本样本上"
+            "③ 与 ④ 各是多少，由这里的数据说话，不是由均值差直接推。"),
     }
 
 

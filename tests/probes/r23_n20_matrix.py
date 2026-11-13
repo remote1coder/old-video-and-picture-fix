@@ -187,8 +187,20 @@ def main():
             if row["classic_ok"] and row["fused_ok"]:
                 rc, prows = _psnr_rows(classic, fused)
                 row["psnr_frames"] = len(prows)
-                row["identical"] = _identical(prows)
                 row["rc"] = rc
+                # ---- R24-07 / R23-A09：比较器 rc 必须纳入判定 ----
+                # 旧实现只把 rc 记进结果，`identical` 仍按 rows 文本判断：
+                # 工具非零退出时 rows 可能是空或残缺，却仍可能被判成"相同"。
+                # 审核原话："记录 PSNR rc，却没有把非零 rc 纳入最终失败。"
+                if rc != 0:
+                    row["identical"] = False
+                    row["error"] = f"comparison tool exited {rc}"
+                elif not prows:
+                    row["identical"] = False
+                    row["error"] = ("comparison produced no per-frame rows; "
+                                    "an empty result is not 'identical'")
+                else:
+                    row["identical"] = _identical(prows)
                 if not row["identical"]:
                     row["first_diff"] = next(
                         (x[:160] for x in prows

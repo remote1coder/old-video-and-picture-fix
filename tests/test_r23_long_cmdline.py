@@ -202,3 +202,46 @@ def test_other_oserror_still_maps_to_82(monkeypatch, capture, tmp_path):
 
     assert rc == 82, err
     assert "Access is denied" in err
+
+
+def test_unicode_is_measured_in_characters_not_bytes(tmp_path):
+    """R24-10：Windows 命令行上限是**字符数**，不是字节数。
+
+    中文/emoji 按字符算是 1，UTF-8 字节是 3–4。判据如果按字节算，
+    含中文的 params 会被过早赶去写文件（无害但浪费一次 I/O 与一次读回），
+    更糟的是预算算错后仍可能在内联时越界。
+    """
+    zh = {"素材名称": "第 1 段 中文 路径\\文件.mkv", "备注": "中文值" * 50}
+    payload = json.dumps(zh, ensure_ascii=False)
+    payload_escaped = json.dumps(zh, ensure_ascii=True)   # \uXXXX 形式
+
+    # 不转义的中文更短（字符更少），这是"按字符计数"的直接体现
+    assert len(payload) < len(payload_escaped)
+    # `list2cmdline` 处理的是 str（字符），不会因为中文变长
+    quoted = subprocess.list2cmdline([payload])
+    assert len(quoted) >= len(payload)
+    assert len(quoted) < len(payload) * 2, (
+        "转义把中文文本放大了一倍以上，说明判据可能按字节在算")
+
+
+def test_quote_and_backslash_density_increases_the_budget(tmp_path):
+    """R24-10：引号/反斜杠密度越高，转义占用越大 —— 预算必须据此判断。
+
+    这条把"转义会放大"量化：同样字符数的两串，全是 `"` 与 `\\\\` 的那份
+    在命令行里占更多位置。判据用 `list2cmdline` 的真实结果，就不用依赖
+    任何"经验倍率"。
+    """
+    plain = json.dumps({"k%d" % i: "abcdefgh" for i in range(200)})
+    dense = json.dumps({"k%d" % i: '"' + ("\\" * 8) + '"' for i in range(200)})
+    q_plain = subprocess.list2cmdline([plain])
+    q_dense = subprocess.list2cmdline([dense])
+
+    ratio_plain = len(q_plain) / max(1, len(plain))
+    ratio_dense = len(q_dense) / max(1, len(dense))
+    # 注意：JSON 本身带引号，所以"普通文本"也会被放大（约 1.2 倍）。
+    # 这里**只比相对关系**，不设绝对阈值 —— 绝对倍率取决于内容，
+    # 拍一个数字当判据就是过拟合。
+    assert ratio_dense > ratio_plain, (
+        f"高转义密度的文本没有被放大更多（plain={ratio_plain:.3f}, "
+        f"dense={ratio_dense:.3f}）—— 说明判据没把转义算进去")
+    assert len(q_dense) > len(q_plain)

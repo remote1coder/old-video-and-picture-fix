@@ -255,6 +255,11 @@ def test_hard_exit_leaves_a_provable_generation(tmp_path, point):
     """六个点各自硬退出 → 恢复后必须是完整旧代 / 完整新代 / 明确保留现场。"""
     case = _build_case(tmp_path)
     before = {n: _sha(p) for n, p in case["targets"].items()}
+    # ---- R24-09：新代的期望摘要必须在**事务开始前**取 ----
+    # `publish` 用 `os.replace(staging, final)` 转正，事务跑完 staging 就没了；
+    # 事后去算 `_sha(staging)` 只能得到 `<absent>`，精确 oracle 会退化成
+    # "什么也没比"。审核要求的"预先生成完整旧/新代期望值"正是这个意思。
+    new_expected = {n: _sha(p) for n, p in case["staging"].items()}
 
     proc, hit = _run_child(tmp_path, case, point)
 
@@ -308,10 +313,17 @@ def test_hard_exit_leaves_a_provable_generation(tmp_path, point):
                 f"{point}: 旧代没有 marker，回滚后却出现了 {after['marker']}")
         elif gen in ("all_new",) or rep.get("action") in (
                 "rolled_forward", "recorded_committed"):
-            # 完整新代：所有目标都是新内容
+            # ---- R24-09 / R23-A11：完整新代必须是**精确的新代** ----
+            # 旧断言只要求 `after != before`（"不同于旧"）—— 随机损坏的新内容
+            # 也满足它，于是"六点精确新旧哈希"这句话没有依据。
+            # 这里改成与 `case["staging"]` 里那份**预先生成的新代内容**逐一对齐：
+            # 每个目标的摘要必须**恰好等于**新代那一份。
             for name in ("media", "verify", "fullchain", "marker"):
-                assert after[name] != before.get(name), (
-                    f"{point}: 判成完整新代，但 {name} 仍是旧内容")
+                _want = new_expected[name]
+                assert after[name] == _want, (
+                    f"{point}: 判成完整新代，但 {name} 不是新代内容\n"
+                    f"  期望 {_want}\n  实际 {after[name]}\n"
+                    f"  旧代 {before.get(name)}")
     else:
         # recovery_required：**保留现场**，一个字节都不能动
         assert rep.get("ok") is False

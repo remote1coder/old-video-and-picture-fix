@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import time as _time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from publish_journal import (
@@ -52,6 +54,34 @@ from publish_lock import TargetLockTimeout, acquire_target_locks
 
 #: 事务结束后保留 journal：它是审计记录，也是下次启动识别未完成事务的依据。
 BACKUP_SUFFIX = ".pubbak"
+
+
+@contextmanager
+def _traced_locks(targets, timeout, logger, trace):
+    """`acquire_target_locks` + **锁内时间打点**（R24-09 / R23-A11）。
+
+    为什么需要它：审核指出并发测试记的 `t0/t1` 是**整个 publish 调用区间**
+    （含等锁）——那只能证明"有争用"，**不能**证明互斥。真正互斥要求
+    "锁内区间不重叠"。
+
+    这里在**拿到锁之后**与**释放之前**各打一个点，于是同一份记录里可以
+    区分两个不同事件：
+
+        t0 < lock_acquired_at <= lock_released_at < t1
+
+      * 调用区间 `[t0, t1]` 可以重叠 —— 争用证据；
+      * 锁内区间 `[lock_acquired_at, lock_released_at]` 不能重叠 —— 互斥证据。
+
+    `trace` 是调用方传入的 dict；生产不传时**零影响**（一个分支而已）。
+    """
+    with acquire_target_locks(targets, timeout=timeout, logger=logger):
+        if isinstance(trace, dict):
+            trace["lock_acquired_at"] = _time.monotonic()
+        try:
+            yield
+        finally:
+            if isinstance(trace, dict):
+                trace["lock_released_at"] = _time.monotonic()
 
 
 class Artifact:
@@ -222,7 +252,8 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
             allowed_output_roots: Optional[List[str]] = None,
             run_identity: Optional[str] = None,
             required_objects: Optional[List[str]] = None,
-            marker_digest: str = ""
+            marker_digest: str = "",
+            trace: Optional[Dict[str, Any]] = None
             ) -> PublishResult:
     """把一组候选件作为一个事务提交到各自的最终路径。
 
@@ -287,8 +318,8 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
     targets = sorted(set(finals))
     old_snapshot: Dict[str, Dict[str, Any]] = {}
     try:
-        with acquire_target_locks(targets, timeout=lock_timeout,
-                                  logger=logger):
+        with _traced_locks(targets, timeout=lock_timeout, logger=logger,
+                           trace=trace):
             # ---- 3. 先处理上一次未完成的事务 ----
             # R20-B03：本次只锁了 `targets`。如果旧 journal 记录的是**另一组**
             # 目标，`_recover_locked` 就会在"只锁了本次集合"的临界区里去动

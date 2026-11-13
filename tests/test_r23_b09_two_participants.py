@@ -99,6 +99,10 @@ def _worker(shared_dir, root, idx, barrier, q, timeout):
     except Exception:
         pass
     _t0 = __import__("time").monotonic()
+    # R24-09：让 publisher 记下"进入锁内/离开锁内"两个事件。
+    # 只有这两个点才能证明互斥；`t0/t1` 是**调用区间**（含等锁），
+    # 重叠只能证明"有争用"。
+    _trace = {}
     try:
         res = P.publish(
             arts, out + ".journal.json", os.path.join(root, "backup"),
@@ -106,10 +110,13 @@ def _worker(shared_dir, root, idx, barrier, q, timeout):
             allowed_output_roots=[root],
             required_objects=[a.final for a in arts],
             marker_digest=_mkd,
-            lock_timeout=float(timeout), keep_backups=True)
+            lock_timeout=float(timeout), keep_backups=True,
+            trace=_trace)
         q.put({"idx": idx, "ok": bool(res.ok), "phase": res.phase,
                "failed_at": res.failed_at,
                "t0": _t0, "t1": __import__("time").monotonic(),
+               "lock_acquired_at": _trace.get("lock_acquired_at"),
+               "lock_released_at": _trace.get("lock_released_at"),
                "errors": [str(e)[:200] for e in (res.errors or [])[:2]]})
     except Exception as exc:            # pragma: no cover - 子进程兜底
         q.put({"idx": idx, "ok": False, "phase": "exception",
@@ -150,6 +157,37 @@ def _assert_overlapped(results):
         f"b={b['t0']:.3f}..{b['t1']:.3f}）—— 这不是并发")
 
 
+def _assert_lock_sections_disjoint(results):
+    """**锁内**区间不能重叠（R24-09 / R23-A11）。
+
+    审核原话：旧测试的时间重叠是整个 publish 调用区间、含等锁 ——
+    那是**争用证据**，不是锁内临界区重叠。正确互斥要求锁内区间不重叠。
+
+    这里用 publisher 打的 `lock_acquired_at` / `lock_released_at`：
+    两个参与者的 `[acquired, released]` 必须没有交集。
+    """
+    a, b = results[0], results[1]
+    for r in (a, b):
+        assert r.get("lock_acquired_at") is not None, (
+            "publisher 没有回报进入锁内的时间；互斥无法证明")
+        assert r.get("lock_released_at") is not None, (
+            "publisher 没有回报离开锁内的时间；互斥无法证明")
+    overlap = min(a["lock_released_at"], b["lock_released_at"]) - max(
+        a["lock_acquired_at"], b["lock_acquired_at"])
+    assert overlap <= 0, (
+        "两个参与者的**锁内区间**重叠了 %.4f 秒 —— 互斥失效\n"
+        "a: 锁内 %.4f..%.4f / 调用 %.4f..%.4f\n"
+        "b: 锁内 %.4f..%.4f / 调用 %.4f..%.4f"
+        % (overlap,
+           a["lock_acquired_at"], a["lock_released_at"], a["t0"], a["t1"],
+           b["lock_acquired_at"], b["lock_released_at"], b["t0"], b["t1"]))
+    # 同时确认"锁内区间"确实是调用区间的子集（打点没装错位置）
+    for r in (a, b):
+        assert r["t0"] <= r["lock_acquired_at"] <= r["lock_released_at"] \
+            <= r["t1"] + 1e-6, (
+            "锁内打点不在调用区间内，说明 trace 接错了位置: %s" % (r,))
+
+
 def _assert_one_complete_generation(root):
     """最终必须**只有一整代**：媒体/verify/journal 同源。"""
     out = os.path.join(root, "clip_restored.mkv")
@@ -186,6 +224,7 @@ def test_two_real_participants_first_publish(tmp_path):
     assert len(results) == 2, f"没有两个参与者都返回：{results}"
     assert any(r["ok"] for r in results), f"两方都没成功：{results}"
     _assert_overlapped(results)
+    _assert_lock_sections_disjoint(results)
     winners = [r for r in results if r["ok"]]
     losers = [r for r in results if not r["ok"]]
     for r in losers:
@@ -252,6 +291,7 @@ def test_two_real_participants_replace_an_existing_generation(tmp_path):
     assert len(results) == 2, results
     assert any(r["ok"] for r in results), results
     _assert_overlapped(results)
+    _assert_lock_sections_disjoint(results)
     gen = _assert_one_complete_generation(root)
     assert gen in (1, 2), gen
 
