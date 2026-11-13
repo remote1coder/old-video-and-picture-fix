@@ -1007,6 +1007,16 @@ def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
 #: 允许的执行组模式。未知值**不得静默归零**（审核 R19-B06）。
 _KNOWN_CHAIN_MODES = frozenset({"none", "stage34"})
 
+#: CLI 上**声明了但尚未实现**的执行组模式。
+#:
+#: 审核 P3 要求「先接 S6→S7 及现有 G34」。`--chain` 的 choices 早就写了
+#: ``stage67`` / ``both``，但实现里只认 ``stage34`` —— 于是用户明确要求
+#: 「颗粒+编码融合」时，代码会把它当成**未知模式**并**静默回退到 none**，
+#: 跑完还报成功。那等于"用户要的东西没做，但结果看起来一样"。
+#:
+#: 现在：这两种模式**明确拒绝**（85 + 说明），不静默降级。
+_DECLARED_UNIMPLEMENTED_CHAIN_MODES = frozenset({"stage67", "both"})
+
 
 def _strict_bool(value, default: bool = False) -> bool:
     """把配置值解析成**严格**布尔。
@@ -3135,6 +3145,19 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 (args.get("chain") if isinstance(args, dict)
                  else getattr(args, "chain", None))
                 or _cfg_chain.get("mode") or "none").strip().lower()
+            if _raw_mode in _DECLARED_UNIMPLEMENTED_CHAIN_MODES:
+                # 明确拒绝：不能"回退到 classic 然后报成功"
+                job_logger.error(
+                    "CHAIN_MODE_UNIMPLEMENTED",
+                    "This execution-group mode is accepted by the command "
+                    "line but not implemented yet. Refusing instead of "
+                    "silently running the classic path and reporting "
+                    "success.",
+                    requested=_raw_mode,
+                    implemented=sorted(_KNOWN_CHAIN_MODES))
+                return (85, f"chain mode {_raw_mode!r} is declared but not "
+                            f"implemented; implemented modes are "
+                            f"{sorted(_KNOWN_CHAIN_MODES)}")
             if _raw_mode not in _KNOWN_CHAIN_MODES:
                 job_logger.warning(
                     "CHAIN_MODE_UNKNOWN",
