@@ -4599,9 +4599,34 @@ def main():
                     # `final_publish_result` 取最终代 —— 消费者得猜该读哪一份。
                     # 现在中转代只出现在 `redirected_publish_result`（诊断用）。
                     _final_pres = _wres if original_output_path else _pres
+                    # ---- R24-01 / R23-A01：显式声明执行编号与发布编号 ----
+                    # 顶层 `attempt_id` 是**执行**编号；内层 receipt /
+                    # publish_result / marker 是**最终发布**编号。回拷时两者
+                    # 不同（最终发布 = 执行 + `-wsl`），旧实现要求相同，于是
+                    # 正常回拷被完全验证器拒掉。
+                    # 关系由 `receipts.build_execution_binding()` **算出来**，
+                    # 不在这里手写 —— 生产端与测试夹具共用同一个入口，
+                    # 消费端按 schema + 受控后缀验证，不靠后缀猜对象。
+                    _pub_att = str(getattr(_final_pres, "attempt_id", "")
+                                   or _attempt_id)
+                    try:
+                        from receipts import (
+                            build_execution_binding as _mk_binding)
+                        _exec_block = _mk_binding(_attempt_id, _pub_att)
+                    except Exception as _ebe:
+                        logger.error(
+                            "STAGE7_EXECUTION_BINDING_FAIL",
+                            "Cannot declare which execution produced this "
+                            "publication; refusing to write a result that the "
+                            "consumer would have to guess about",
+                            execution_attempt=_attempt_id,
+                            publication_attempt=_pub_att, error=str(_ebe))
+                        _generation_incomplete = True
+                        _exec_block = None
                     _payload = {
                         "schema": 1,
                         "attempt_id": _attempt_id,
+                        "execution": _exec_block,
                         "ok": bool(_pres.ok) and (
                             bool(_wres.ok) if original_output_path else True),
                         "terminal_pending": bool(

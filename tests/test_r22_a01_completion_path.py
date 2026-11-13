@@ -91,13 +91,22 @@ def _snapshot(*paths):
 
 
 def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
-          attempt="att1", with_result=True, result_over=None,
-          journal_phase=None, params_over=None):
+          attempt="att1", publication_attempt=None, with_result=True,
+          result_over=None, journal_phase=None, params_over=None):
     """用**生产函数**组装一整代并发布；可选把 journal 改成未决态。
+
+    Args:
+        attempt: **执行**编号（私有结果顶层记这个）。
+        publication_attempt: **最终发布**编号。默认等于 `attempt`（无回拷）。
+            传 `attempt + "-wsl"` 就模拟一次 WSL 回拷：marker / receipt /
+            journal / publish_result 全用发布编号，私有结果顶层仍是执行编号，
+            关系由生产函数 `receipts.build_execution_binding()` **算出来**
+            （R24-01：不能由测试手填一个"看起来合规"的关系）。
 
     Returns:
         ctx：路径、job、params（含 attempt 与私有 result）。
     """
+    pub = str(publication_attempt or attempt)
     out = str(tmp_path / "out" / "clip_restored.mkv")
     stage = str(tmp_path / "staging")
     src = str(tmp_path / "src.mp4")
@@ -133,7 +142,7 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
                                                        params=eff),
     }
     _mk, mk_stage, mk_dig, _pm = s7.build_marker_candidate(
-        seed=seed, pub_digests=digests, attempt_id=attempt, job_id="j1",
+        seed=seed, pub_digests=digests, attempt_id=pub, job_id="j1",
         output_path=out, media_digest=digests[0][2],
         media_size=os.path.getsize(arts[0].staging))
     arts.append(P.Artifact("marker", mk_stage, out + ".done.json"))
@@ -143,7 +152,7 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
     # 既掩盖了生产行为，也让"回执证明这一代"变成空话。
     _ri = vmain.build_run_identity({}, job, None, params=eff)
     res = P.publish(arts, out + ".journal.json", str(tmp_path / "backup"),
-                    attempt_id=attempt, decision={"publish": True},
+                    attempt_id=pub, decision={"publish": True},
                     allowed_output_roots=[str(tmp_path / "out")],
                     required_objects=[a.final for a in arts],
                     marker_digest=mk_dig,
@@ -158,9 +167,12 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
     result_path = str(tmp_path / "stage7_result.json")
     eff["_stage7_result_path"] = result_path
     if with_result:
+        from receipts import build_execution_binding as _mk_exec
         payload = {
             "schema": 1,
             "attempt_id": attempt,
+            # R24-01：执行/发布关系由生产函数算出，测试不手填
+            "execution": _mk_exec(attempt, pub),
             "ok": True,
             "terminal_pending": False,
             "journal_phase": "COMMITTED",

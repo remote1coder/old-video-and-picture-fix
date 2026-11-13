@@ -1371,6 +1371,91 @@ def _planned_generation_roles(final_path: str, config=None, params=None):
     return {"required": req, "optional": opt, "full_chain_verify": full}
 
 
+def _resolve_execution_publication(
+        data: Dict[str, Any], expect_attempt: str
+) -> Tuple[bool, str, str]:
+    """从私有结果里解出 **（执行编号 → 最终发布编号）**（R24-01 / R23-A01）。
+
+    为什么需要这个函数
+    ------------------
+    `stage7` 在 WSL 重定向场景会做**两次发布**：
+      1. 中转代 → 重定向路径，attempt = `<执行> -wsl` 的**前身**；
+      2. 最终代 → 用户原路径，attempt = `<执行>` + `-wsl`。
+    私有结果顶层记的是**执行**编号（`_attempt_id`），内层
+    `generation_receipt` / `publish_result` / 完成 marker 记的是**最终发布**
+    编号。旧实现要求两者完全相同，结果是把**正常回拷路径整个拒掉**：
+
+        False: generation receipt belongs to attempt 'att1-wsl', not 'att1'
+
+    审核用生产 publisher 复现了这条（`round23_completion_results.json` 的
+    `parent_execution_child_publication`）。
+
+    为什么不直接用后缀判断
+    ----------------------
+    审核明确要求：不能用 `endswith('-wsl')` 放行任意对象。那种判据对
+    `att9-wsl` 也成立 —— 别的执行的对象搬过来照样过，等于没绑定。
+    所以这里要求结果**显式声明**关系（`execution` 段），并且：
+
+      * `direct`   —— 发布编号必须**等于**执行编号；
+      * `copyback` —— 发布编号必须**恰好**是 `执行编号 + 受控后缀`，
+                      且 `derived_from` 必须等于本次执行编号。
+
+    两者都失败即拒。旧结果（没有 `execution` 段）按 direct 处理：
+    发布编号 = 执行编号，与改动前行为一致（不放松）。
+
+    Returns:
+        ``(ok, reason, publication_attempt)``。
+    """
+    ex = data.get("execution")
+    if not isinstance(ex, dict):
+        # 旧结果没有声明。它只能是"直接发布"，绝不推断成回拷。
+        return True, "legacy result: direct publication", str(expect_attempt)
+    try:
+        from receipts import (COPYBACK_ATTEMPT_SUFFIX as _CB,
+                              EXECUTION_PUBLICATION_SCHEMA as _EP)
+    except Exception:                        # pragma: no cover - 部署异常
+        _CB = "-wsl"
+        _EP = "execution-publication/1"
+
+    if str(ex.get("schema") or "") != _EP:
+        return (False,
+                f"execution/publication schema is {ex.get('schema')!r}, "
+                f"expected {_EP!r}", "")
+    att = str(ex.get("attempt_id") or "")
+    pub = str(ex.get("publication_attempt") or "")
+    rel = str(ex.get("relation") or "")
+    if not att or not pub:
+        return False, ("the result declares an execution/publication "
+                       "relation but carries no attempt ids"), ""
+    if att != str(expect_attempt):
+        return (False,
+                f"result was produced by execution {att!r}, not the current "
+                f"attempt {expect_attempt!r}", "")
+
+    if rel == "direct":
+        if pub != att:
+            return (False,
+                    "a direct publication must carry the execution's own "
+                    f"attempt, got publication={pub!r} for execution {att!r}",
+                    "")
+        return True, "direct publication", pub
+
+    if rel == "copyback":
+        src = str(ex.get("derived_from") or "")
+        if src != att:
+            return (False,
+                    f"the copyback publication claims to derive from {src!r}, "
+                    f"not from this execution {att!r}", "")
+        if pub != att + _CB:
+            return (False,
+                    f"copyback publication {pub!r} is not the controlled "
+                    f"derivation of execution {att!r} "
+                    f"(allowed: execution + {_CB!r})", "")
+        return True, "copyback publication", pub
+
+    return False, f"unknown execution/publication relation {rel!r}", ""
+
+
 def load_private_result(final_path: str, expect_attempt: str,
                         params: Optional[Dict[str, Any]], logger=None,
                         current_identity: Optional[Dict[str, Any]] = None,
@@ -1432,6 +1517,15 @@ def load_private_result(final_path: str, expect_attempt: str,
         return (False,
                 f"result belongs to attempt {got_att!r}, not {expect_attempt!r}",
                 {})
+
+    # ---- 1b) 执行编号 → 最终发布编号（R24-01 / R23-A01）----
+    # 回拷时两者不同：顶层是执行，内层 receipt/publish_result/marker 是
+    # 最终发布。下面所有"内层对象属于哪次尝试"的判据都用 publication。
+    _rel_ok, _rel_why, _pub_att = _resolve_execution_publication(
+        data, str(expect_attempt))
+    if not _rel_ok:
+        return False, _rel_why, {}
+
     fin = str(data.get("final_output_path") or "")
     if os.path.abspath(fin) != os.path.abspath(str(final_path)):
         return (False,
@@ -1493,10 +1587,11 @@ def load_private_result(final_path: str, expect_attempt: str,
     _gr_ok, _gr_why = _gr.is_complete()
     if not _gr_ok:
         return False, f"generation receipt is incomplete: {_gr_why}", {}
-    if str(_gr.attempt_id) != str(expect_attempt):
+    if str(_gr.attempt_id) != str(_pub_att):
         return (False,
                 f"generation receipt belongs to attempt {_gr.attempt_id!r}, "
-                f"not {expect_attempt!r}", {})
+                f"not the final publication {_pub_att!r} "
+                f"(execution {expect_attempt!r}, relation: {_rel_why})", {})
     if str(_gr.run_identity) != _cur_digest:
         return (False,
                 "generation receipt was produced for a different run identity "
@@ -1513,10 +1608,11 @@ def load_private_result(final_path: str, expect_attempt: str,
     _ph = str(_pr.get("phase") or "")
     if _ph != "COMMITTED":
         return False, f"publish result phase is {_ph!r}, not COMMITTED", {}
-    if str(_pr.get("attempt_id") or "") != str(expect_attempt):
+    if str(_pr.get("attempt_id") or "") != str(_pub_att):
         return (False,
                 f"publish result belongs to attempt "
-                f"{_pr.get('attempt_id')!r}, not {expect_attempt!r}", {})
+                f"{_pr.get('attempt_id')!r}, not the final publication "
+                f"{_pub_att!r}", {})
     _jp = str(_pr.get("journal_path") or "")
     _want_jp = _journal_path_for(str(final_path))
     if os.path.abspath(_jp) != os.path.abspath(_want_jp):
@@ -1654,6 +1750,20 @@ def _verify_generation_locked(p: str, job: Dict[str, Any],
                         "a private result exists but cannot be read; resume "
                         "cannot prove which generation it describes")
 
+    # ---- 1b) 执行编号 → 最终发布编号（R24-01 / R23-A01）----
+    # marker / journal / receipt 记的都是**最终发布**编号；回拷时它等于
+    # 执行编号 + `-wsl`。下面所有"这一代属于哪次尝试"的判据都用 publication，
+    # 否则正常的 WSL 回拷会被自己拒掉（审核实测 A01）。
+    # resume 没有当前执行编号时，以私有结果里的执行编号为基准。
+    _pub_att = str(expect_attempt or "")
+    if _res:
+        _base_att = str(expect_attempt or _res.get("attempt_id") or "")
+        if _base_att:
+            _rel_ok, _rel_why, _pub_att = _resolve_execution_publication(
+                _res, _base_att)
+            if not _rel_ok:
+                return False, _rel_why
+
     # ---- 2) marker 存在且身份字段对得上 ----
     mp = completion_marker_path(p)
     if not os.path.exists(mp):
@@ -1719,10 +1829,11 @@ def _verify_generation_locked(p: str, job: Dict[str, Any],
     if not _mk_att:
         return False, ("marker carries no attempt id; it cannot be bound to "
                        "an execution")
-    if expect_attempt is not None and _mk_att != str(expect_attempt):
+    if expect_attempt is not None and _mk_att != _pub_att:
         return (False,
-                f"marker belongs to attempt {_mk_att!r}, not the current "
-                f"attempt {expect_attempt!r}")
+                f"marker belongs to attempt {_mk_att!r}, not the final "
+                f"publication {_pub_att!r} of the current attempt "
+                f"{expect_attempt!r}")
 
     # ---- 4) journal：终态 + 覆盖 + 同一 attempt ----
     jp = _journal_path_for(p)
@@ -1768,13 +1879,15 @@ def _verify_generation_locked(p: str, job: Dict[str, Any],
                 "publish journal does not cover planned object(s): "
                 f"{[os.path.basename(x) for x in _miss[:3]]}")
 
-    # ---- 5) resume：result 若存在，必须描述**同一个** attempt ----
+    # ---- 5) resume：result 若存在，必须描述**同一次发布** ----
+    # 比的是**发布编号**：回拷结果里 `_res["attempt_id"]` 是执行编号，
+    # 而 marker 记的是最终发布编号（执行 + `-wsl`）；直接比会把正常的
+    # 回拷代判成"两份不同代"。用 `_pub_att` 比才是同一件事。
     if expect_attempt is None and _res:
-        _r_att = str(_res.get("attempt_id") or "")
-        if _r_att and _r_att != _mk_att:
+        if _pub_att and _pub_att != _mk_att:
             return (False,
-                    f"the private result describes attempt {_r_att!r} but the "
-                    f"published marker is attempt {_mk_att!r}")
+                    f"the private result points at publication {_pub_att!r} "
+                    f"but the published marker is attempt {_mk_att!r}")
 
     # ---- 6) 回执：marker 摘要 + 每个必需对象的摘要 ----
     _gr_raw = _res.get("generation_receipt") if _res else None

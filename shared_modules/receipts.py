@@ -33,6 +33,77 @@ from typing import Any, Dict, List, Optional, Tuple
 #: 旧 schema 缺必要字段按 `legacy/unproven` 处理（不复用、不冒充已验证）。
 RECEIPT_SCHEMA = 2
 
+#: 「执行编号 / 发布编号」关系的 schema（R24-01 / R23-A01）。
+#:
+#: 一次执行可能产生**两次发布**：先发布到重定向路径（中转代），再整代回拷到
+#: 用户原路径（最终代）。私有结果顶层记**执行编号**，内层
+#: receipt / publish_result / marker 记**最终发布编号**。旧实现要求两者
+#: 完全相同，于是正常回拷被自己拒掉（审核实测："generation receipt belongs
+#: to attempt 'att1-wsl', not 'att1'"）。
+#:
+#: 关系必须显式声明并成组验证，**不允许**用 `endswith("-wsl")` 这类放行规则
+#: —— 那条对 "att9-wsl" 也成立，等于没绑定到这次执行。
+EXECUTION_PUBLICATION_SCHEMA = "execution-publication/1"
+
+#: 回拷派生的**受控后缀**。只有 `执行编号 + 该后缀` 能构成 copyback 发布编号。
+#: 生产端（stage7）与消费端（main）必须使用同一个常量。
+COPYBACK_ATTEMPT_SUFFIX = "-wsl"
+
+
+def build_execution_binding(execution_attempt: str,
+                            publication_attempt: str) -> Dict[str, Any]:
+    """生产端**唯一入口**：由两个编号推出它们的关系（R24-01）。
+
+    为什么要有这个函数，而不是让调用方直接拼 `execution` 字典
+    --------------------------------------------------------
+    审核 R23-A01 的要求是"生产者和消费者都使用该关系；不能仅让测试手工
+    拼成相同字符串"。如果只给一个字典模板，测试夹具可以手写一份"看起来
+    合规"的关系，生产端也可以写得不一样 —— 两边漂移就回到原点。
+
+    这里把关系**算出来**：给两个编号，能得到的关系只有三种，
+    第三种直接抛错。生产端（stage7）与测试夹具（`build`）都调它，
+    因此不存在"手填一个合规关系"的路径。
+
+    Args:
+        execution_attempt: 本次执行的编号（私有结果顶层那个）。
+        publication_attempt: 最终发布落地的编号（marker/receipt/journal 那个）。
+
+    Returns:
+        `execution` 段（可直接塞进私有结果）。
+
+    Raises:
+        ValueError: 两个编号既不相等、也不是受控回拷派生 —— 说明调用方
+            在试图声明一个不受支持的关系。**宁可让生产当场失败，也不要
+            写一份消费端将来会拒的结果**。
+    """
+    ex = str(execution_attempt or "").strip()
+    pub = str(publication_attempt or "").strip()
+    if not ex or not pub:
+        raise ValueError(
+            "execution/publication attempt ids must both be non-empty "
+            f"(got {execution_attempt!r} / {publication_attempt!r})")
+
+    if pub == ex:
+        relation, derived, rule = "direct", None, None
+    elif pub == ex + COPYBACK_ATTEMPT_SUFFIX:
+        relation = "copyback"
+        derived = ex
+        rule = "copyback:" + COPYBACK_ATTEMPT_SUFFIX
+    else:
+        raise ValueError(
+            "publication attempt %r is neither the execution id %r nor its "
+            "controlled copyback derivation (execution + %r)"
+            % (pub, ex, COPYBACK_ATTEMPT_SUFFIX))
+
+    return {
+        "schema": EXECUTION_PUBLICATION_SCHEMA,
+        "attempt_id": ex,
+        "publication_attempt": pub,
+        "relation": relation,
+        "derived_from": derived,
+        "derive_rule": rule,
+    }
+
 
 def _canonical(obj: Any) -> bytes:
     """稳定序列化：键排序、无多余空格、UTF-8。"""
