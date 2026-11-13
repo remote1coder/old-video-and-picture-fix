@@ -344,7 +344,21 @@ def run_realesrgan(input_path: str, output_dir: str, model: str,
     FIX-R6-02: DAT 家族分流到 _run_dat_batch（RealESRGANer 加载不了 DAT
     架构；ncnn-vulkan 的 DAT 需要 .bin/.param，本项目只有 .pth）。
     """
-    model_dir = SCRIPT_DIR.parent.resolve() / "models"
+    # ---- B04/I02 的另一半：worker 必须能找到**真实权重** ----
+    # 仓库布局把权重放在项目根的 `models/`，而这里原来只查
+    # `video_restoration_pipeline/models/` —— 结果永远找不到 .pth，
+    # 静默返回 False（表现成"模型失败"，很难查）。
+    # 按"子目录优先、项目根兜底"搜索。
+    model_dir = None
+    for _c in (SCRIPT_DIR / "models", SCRIPT_DIR.parent / "models"):
+        try:
+            if (_c / f"{model}.pth").exists():
+                model_dir = _c.resolve()
+                break
+        except OSError:
+            continue
+    if model_dir is None:
+        model_dir = (SCRIPT_DIR.parent / "models").resolve()
 
     # FIX-R6-02: DAT 家族（单窗口 = 单窗口批处理）
     try:
@@ -1747,7 +1761,21 @@ def run_realesrgan_batch(window_dirs: List[Tuple[str, str]], model: str,
     .pth）。DAT 分支与 RealESRGAN 分支返回同一套三态契约
     （True/False/"OOM"），调用方的 OOM 降级链原样适用。
     """
-    model_dir = SCRIPT_DIR.parent.resolve() / "models"
+    # ---- B04/I02 的另一半：worker 必须能找到**真实权重** ----
+    # 仓库布局把权重放在项目根的 `models/`，而这里原来只查
+    # `video_restoration_pipeline/models/` —— 结果永远找不到 .pth，
+    # 静默返回 False（表现成"模型失败"，很难查）。
+    # 按"子目录优先、项目根兜底"搜索。
+    model_dir = None
+    for _c in (SCRIPT_DIR / "models", SCRIPT_DIR.parent / "models"):
+        try:
+            if (_c / f"{model}.pth").exists():
+                model_dir = _c.resolve()
+                break
+        except OSError:
+            continue
+    if model_dir is None:
+        model_dir = (SCRIPT_DIR.parent / "models").resolve()
 
     # 3a：只探测并记录传输方式决策，暂不改变行为
     _plan_frame_transport(window_dirs, params or {}, logger,

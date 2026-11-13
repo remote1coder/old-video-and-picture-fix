@@ -108,6 +108,10 @@ def _run_stage3(tmp_path, monkeypatch, first_result, model="RealESRGAN_x4plus"):
         "ai_enabled": True, "ai_upscale_model": model,
         "ai_upscale_scale": 4, "ai_face_restore": False,
         "force_allow_banned_upscale": True,
+        # B05：4x->2x / GPU->CPU 属于**降质**，现在必须事前授权。
+        # 本文件测的正是"降级路径还在不在"，所以显式打开；
+        # "未授权不降"由 audit Q01 等用例覆盖。
+        "gpu_memory_fallback": True,
     })
     argv = ["stage3_ai_upscale.py", "--input", clip, "--job-id", "jobB9",
             "--params", params]
@@ -221,6 +225,10 @@ def test_gpu_oom_then_cpu_endpoint(tmp_path, monkeypatch):
         "ai_enabled": True, "ai_upscale_model": "RealESRGAN_x4plus",
         "ai_upscale_scale": 4, "ai_face_restore": False,
         "force_allow_banned_upscale": True,
+        # B05：4x->2x / GPU->CPU 属于**降质**，现在必须事前授权。
+        # 本文件测的正是"降级路径还在不在"，所以显式打开；
+        # "未授权不降"由 audit Q01 等用例覆盖。
+        "gpu_memory_fallback": True,
     })
     old = sys.argv
     sys.argv = ["stage3_ai_upscale.py", "--input", clip, "--job-id", "jobB9c",

@@ -114,6 +114,12 @@ def _sidecar(art, **fields):
         "artifact_size": art.stat().st_size,
         "artifact_digest": M._artifact_digest(str(art)),
     }
+    # B04/I05：侧车现在也记实现/模型指纹。本文件的用例测的是 stage 归属
+    # 与 upstream 变化，所以由调用方传 `_params`，这里算一个与匹配端
+    # 一致的指纹 —— 否则会先被"缺实现指纹"那条判据拦下。
+    _p = fields.pop("_params", None)
+    if _p is not None:
+        base["impl_fingerprint"] = M._impl_fingerprint(_p)
     base.update(fields)
     with open(str(art) + ".identity.json", "w", encoding="utf-8") as f:
         json.dump(base, f)
@@ -135,7 +141,8 @@ def test_id08_stage_mismatch_is_rejected(tmp_path):
     art.write_bytes(b"ART")
     _sidecar(art, stage=3,
              source_identity=M.build_input_identity(job["input_path"]),
-             params_identity=M.build_params_identity(cfg, job, None))
+             params_identity=M.build_params_identity(cfg, job, None),
+             _params=M.merge_params(job, cfg, {}, None))
     ok, why = M.intermediate_identity_matches(art, job, cfg, None,
                                               expected_stage=5)
     assert ok is False
@@ -148,7 +155,8 @@ def test_id08_matching_stage_passes(tmp_path):
     art.write_bytes(b"ART")
     _sidecar(art, stage=5,
              source_identity=M.build_input_identity(job["input_path"]),
-             params_identity=M.build_params_identity(cfg, job, None))
+             params_identity=M.build_params_identity(cfg, job, None),
+             _params=M.merge_params(job, cfg, {}, None))
     ok, why = M.intermediate_identity_matches(art, job, cfg, None,
                                               expected_stage=5)
     assert ok is True, why
@@ -160,7 +168,8 @@ def test_id08_sidecar_without_stage_is_rejected(tmp_path):
     art.write_bytes(b"ART")
     _sidecar(art,  # 不写 stage
              source_identity=M.build_input_identity(job["input_path"]),
-             params_identity=M.build_params_identity(cfg, job, None))
+             params_identity=M.build_params_identity(cfg, job, None),
+             _params=M.merge_params(job, cfg, {}, None))
     ok, why = M.intermediate_identity_matches(art, job, cfg, None,
                                               expected_stage=5)
     assert ok is False
@@ -177,6 +186,7 @@ def test_id08_upstream_change_invalidates(tmp_path):
     _sidecar(art, stage=5,
              source_identity=M.build_input_identity(job["input_path"]),
              params_identity=M.build_params_identity(cfg, job, None),
+             _params=M.merge_params(job, cfg, {}, None),
              upstream_artifact=str(up),
              upstream_digest=M._artifact_digest(str(up)))
 
