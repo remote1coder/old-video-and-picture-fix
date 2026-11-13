@@ -72,6 +72,74 @@ def _materialise_step2(src: str, dst: str) -> str:
         return "copied"
 
 
+class _NoFileInput(Exception):
+    """stream_full 的检查遍没有文件可探 —— 不是错误，是这条路径的正常形态。"""
+
+
+class _IdetResult:
+    __slots__ = ("returncode", "stderr")
+
+    def __init__(self, returncode, stderr=""):
+        self.returncode = int(returncode)
+        self.stderr = str(stderr or "")
+
+
+def _run_idet_on_vpy(vpy: str, timeout: float, vs_log_path: str = ""):
+    """`vspipe(vpy) | ffmpeg -vf idet -f null -`，返回与 subprocess 同形的结果。
+
+    ## 为什么必须并发排空 vspipe 的 stderr
+
+    stage1 踩过这个坑（见其注释）：给 vspipe 开 PIPE 却不读，缓冲区
+    （约 64KB）一满 vspipe 就阻塞、不再出帧，ffmpeg 于是读到无效数据并
+    报 "Invalid data found"。所以这里把 stderr 落文件，绝不留在管道里。
+    """
+    import subprocess
+    _err = subprocess.DEVNULL
+    _fh = None
+    if vs_log_path:
+        try:
+            _fh = open(vs_log_path, "wb")
+            _err = _fh
+        except OSError:
+            _err = subprocess.DEVNULL
+    vp = None
+    try:
+        vp = subprocess.Popen(["vspipe", "-c", "y4m", vpy, "-"],
+                              stdout=subprocess.PIPE, stderr=_err,
+                              shell=False)
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-v", "info", "-i", "-",
+             "-vf", "idet", "-f", "null", "-"],
+            stdin=vp.stdout, capture_output=True, text=True,
+            errors="replace", timeout=timeout, shell=False)
+        return _IdetResult(r.returncode, r.stderr)
+    except subprocess.TimeoutExpired:
+        return _IdetResult(124, f"idet on the stage1 script timed out after "
+                                f"{timeout:.0f}s")
+    except OSError as exc:
+        return _IdetResult(127, f"cannot run vspipe/ffmpeg: {exc}")
+    finally:
+        try:
+            if vp is not None and vp.stdout is not None:
+                vp.stdout.close()
+        except Exception:
+            pass
+        try:
+            if vp is not None:
+                vp.wait(timeout=30)
+        except Exception:
+            try:
+                if vp is not None:
+                    vp.kill()
+            except Exception:
+                pass
+        try:
+            if _fh is not None:
+                _fh.close()
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -104,23 +172,45 @@ def main():
     # R3-01：这里原本的黑名单元信息不全（挡不住未来的新侧车类型），统一
     # 收编到 checkpoint 的媒体后缀白名单 + mtime 新→旧 排序
     # （select_media_candidates），与 stage6/stage7 同一套规则。
-    from checkpoint import select_media_candidates
-    candidates = select_media_candidates(
-        glob.glob(os.path.join(temp_dir, pattern)))
-    if not candidates:
-        logger.error("STAGE2_NO_INPUT", "Stage 1 output not found")
-        return 82
+    # ---- stream_full：检查遍直接吃 stage1 的 vpy（不读 step1 媒体）----
+    # 设计 §5.1：检查遍 = 原源 → 同一 stage1 图 → 本阶段检查 → null sink。
+    # "同一张图"由**同一个 vpy** 保证；不是"再算一遍碰巧一样"。
+    _vpy = ""
+    _stream = params.get("_stream_s1") or {}
+    if isinstance(_stream, dict) and _stream.get("vs_script"):
+        _vpy = str(_stream["vs_script"])
+        if not os.path.exists(_vpy):
+            logger.error("STAGE2_STREAM_VPY_MISSING",
+                         "stream_full asked for a check pass, but the stage1 "
+                         "VapourSynth script is gone", vs_script=_vpy)
+            return 82
+        stage1_output = ""
+        logger.info("STAGE2_STREAM_START",
+                    "Checking the deinterlace output straight from the stage1 "
+                    "script (no step1 media is read or written)",
+                    vs_script=_vpy)
+    else:
+        from checkpoint import select_media_candidates
+        candidates = select_media_candidates(
+            glob.glob(os.path.join(temp_dir, pattern)))
+        if not candidates:
+            logger.error("STAGE2_NO_INPUT", "Stage 1 output not found")
+            return 82
 
-    stage1_output = str(candidates[0])
-    logger.info("STAGE2_START", "Verifying deinterlace output", path=stage1_output)
+        stage1_output = str(candidates[0])
+    logger.info("STAGE2_START", "Verifying deinterlace output",
+                path=stage1_output or _vpy)
 
-    # Check file integrity
-    if not os.path.exists(stage1_output) or os.path.getsize(stage1_output) == 0:
+    # Check file integrity（stream 模式没有文件可查，改由 vspipe 自己报错）
+    if stage1_output and (not os.path.exists(stage1_output)
+                          or os.path.getsize(stage1_output) == 0):
         logger.error("STAGE2_EMPTY", "Stage 1 output missing or empty")
         return 86
 
     # Verify with ffprobe
     try:
+        if not stage1_output:
+            raise _NoFileInput()
         import subprocess
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -131,6 +221,8 @@ def main():
         if r.returncode != 0 or "video" not in r.stdout:
             logger.error("STAGE2_CORRUPT", "Stage 1 output not valid video")
             return 86
+    except _NoFileInput:
+        pass                     # stream 模式已在上面日志说明
     except Exception as e:
         logger.error("STAGE2_VERIFY_FAIL", f"Verification failed: {e}")
         return 86
@@ -170,18 +262,26 @@ def main():
             # 场序检查保持同一条原则。
             _gb = 0.0
             try:
-                _gb = _os.path.getsize(stage1_output) / float(1 << 30)
+                if stage1_output:
+                    _gb = _os.path.getsize(stage1_output) / float(1 << 30)
             except OSError:
                 pass
-            _idet_timeout = min(3600.0, 300.0 + 25.0 * _gb)
-            cmd = [
-                "ffmpeg", "-hide_banner", "-v", "info",
-                "-i", stage1_output,
-                "-vf", "idet",
-                "-f", "null", "-"
-            ]
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                              timeout=_idet_timeout, shell=False)
+            # stream 模式没有文件大小可依；按"整片解码"给足时间
+            _idet_timeout = (min(3600.0, 300.0 + 25.0 * _gb)
+                             if stage1_output else 3600.0)
+            if _vpy:
+                r = _run_idet_on_vpy(
+                    _vpy, _idet_timeout,
+                    vs_log_path=os.path.splitext(_vpy)[0] + ".vspipe.log")
+            else:
+                cmd = [
+                    "ffmpeg", "-hide_banner", "-v", "info",
+                    "-i", stage1_output,
+                    "-vf", "idet",
+                    "-f", "null", "-"
+                ]
+                r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                  timeout=_idet_timeout, shell=False)
             if r.returncode != 0:
                 logger.warning("STAGE2_IDET_INCONCLUSIVE",
                                "idet returned non-zero; the deinterlace gate does "
@@ -286,6 +386,12 @@ def main():
     # R23-LONG-02：**这里不该 copyfile**。见 `_materialise_step2()` ——
     # stage2 一个像素都不改，产物只是换个名字给下游；同卷硬链接是同一
     # inode 的第二个名字，省掉一次全片写入（16 分钟 1080p = 82 GB）。
+    # stream_full：检查遍不产 step2 媒体（设计 §5.2 S2：不创建 step2 媒体）
+    if _vpy:
+        logger.info("STAGE2_STREAM_NO_ARTIFACT",
+                    "stream_full: the check pass produced conclusions only; "
+                    "no step2 media was materialised")
+        return 0
     try:
         from checkpoint import compute_param_hash
         param_hash = compute_param_hash(stage1_output, params)

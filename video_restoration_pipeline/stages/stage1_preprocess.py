@@ -1327,6 +1327,46 @@ def main():
                           "VFM _Combed pre-check failed, requesting sRestore fallback")
             return 86
 
+    # ---- stream_full：只出 vpy，不写 step1 媒体 ----
+    # 检查遍与正式遍都用同一份 vpy（见设计 §5.1）；"同一 stage1 图"由
+    # 同一个脚本保证，不是靠再算一遍碰巧一致。
+    _stream_cfg = params.get("_stream_s1") or {}
+    if bool(_stream_cfg.get("emit_only")):
+        import hashlib as _hl
+        import json as _json
+        try:
+            with open(vs_path, "rb") as _vf:
+                _sha = _hl.sha256(_vf.read()).hexdigest()
+        except OSError as _ve:
+            logger.error("STAGE1_STREAM_VPY_UNREADABLE", str(_ve))
+            return 84
+        _stem = Path(input_name).stem.replace(" ", "_")
+        _side = os.path.join(temp_dir,
+                             f"{args.job_id}_{_stem}_step1_stream.json")
+        _doc = {
+            "schema": "stream_s1/1",
+            "stage": 1,
+            "attempt_id": str(params.get("attempt_id") or ""),
+            "vs_script": os.path.abspath(vs_path),
+            "vs_script_sha256": _sha,
+            "source": os.path.abspath(input_path),
+            "intermediate_written": False,
+            "target_fps": str(params.get("target_fps") or "auto"),
+            "vs_bit_depth": int(params.get("vs_bit_depth", 16) or 16),
+        }
+        try:
+            with open(_side, "w", encoding="utf-8") as _sf:
+                _json.dump(_doc, _sf, ensure_ascii=False, indent=2)
+        except OSError as _se:
+            logger.error("STAGE1_STREAM_SIDECAR_FAIL", str(_se))
+            return 84
+        logger.info("STAGE1_STREAM_VPY_ONLY",
+                    "stream_full: stage1 emitted the VapourSynth script only; "
+                    "no full-length step1 media was written",
+                    vs_script=vs_path, sidecar=_side,
+                    vs_script_sha256=_sha)
+        return 0
+
     # Render with vspipe -> ffmpeg
     try:
         # R4（关键修复）：**`--y4m` 这个参数根本不存在** —— 实测
