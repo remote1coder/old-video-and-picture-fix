@@ -2552,6 +2552,87 @@ def _frames_from_check_sidecar(temp_dir: str, job_id: str,
         return 0
 
 
+def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
+                    vpy: str, params, logger):
+    """正式遍的像素摘要 → 与检查遍比对（设计 §5.1 的后半截）。
+
+    ## 为什么正式遍要**再算一次**
+
+    检查遍的摘要只证明"检查时那条流长这样"。正式遍如果换了参数、换了
+    脚本、或者渲染本身不可复现，检查结论就不该被复用 —— 而**只比帧数和
+    计划看不出来**。所以正式遍必须自己出一份摘要再比。
+
+    代价：多一次整片解码（不落盘）。对长片是实打实的时间，但这个项目
+    的原则是"先证明，再省"；想省可以显式关 `stream_two_pass_check`，
+    关掉时日志会写明"这一代**未**做两遍比对"。
+
+    Returns:
+        ``(ok, reason)``。``ok=False`` 时调用方必须停止（严格模式）。
+    """
+    import json as _json
+    if not _bool_param(params.get("stream_two_pass_check", True), True):
+        logger.warning(
+            "STAGE3_TWO_PASS_SKIPPED",
+            "stream_two_pass_check is off: this generation has NO formal-pass "
+            "pixel digest, so the check verdict is reused on script identity "
+            "alone (documented, not silent)")
+        return True, "skipped by configuration"
+    _stem = Path(input_name).stem.replace(" ", "_")
+    side = os.path.join(temp_dir, f"{job_id}_{_stem}_step1_check.json")
+    try:
+        with open(side, "r", encoding="utf-8") as fh:
+            _chk_doc = _json.load(fh) or {}
+    except (OSError, ValueError) as _ce:
+        logger.error("STAGE3_TWO_PASS_NO_CHECK",
+                     "the check pass left no digest to compare against; "
+                     "refusing to claim the two passes agree",
+                     sidecar=side, error=str(_ce))
+        return False, f"no check-pass sidecar: {_ce}"
+    if str(_chk_doc.get("vs_script") or "") != os.path.abspath(vpy):
+        logger.error("STAGE3_TWO_PASS_OTHER_SCRIPT",
+                     "the check pass ran a different VapourSynth script; the "
+                     "verdict cannot be carried over",
+                     check_script=_chk_doc.get("vs_script"), current=vpy)
+        return False, "the check pass ran a different script"
+    try:
+        from stream_digest import digest_vpy as _dv, compare as _cmp
+    except Exception as _ie:                      # pragma: no cover
+        logger.error("STAGE3_TWO_PASS_NO_MODULE", str(_ie))
+        return False, f"stream_digest unavailable: {_ie}"
+    _pf = ""
+    try:
+        _pf = str((params.get("_stream_s1") or {}).get("pix_fmt") or "")
+    except Exception:
+        _pf = ""
+    if not _pf:
+        _bd = int(params.get("vs_bit_depth", 16) or 16)
+        _pf = f"yuv420p{_bd}le"
+    _formal = _dv(vpy, timeout=float(params.get(
+        "stream_digest_timeout", 3600.0)), pix_fmt=_pf)
+    _verdict = _cmp(_chk_doc.get("pixels") or {}, _formal,
+                    deterministic=bool(params.get("vs_deterministic")))
+    if not _verdict.get("comparable"):
+        logger.error("STAGE3_TWO_PASS_INCOMPARABLE",
+                     "the formal pass produced no usable digest; the check "
+                     "verdict cannot be reused", reason=_verdict.get("reason"))
+        return False, str(_verdict.get("reason") or "no formal digest")
+    if _verdict.get("match") is not True:
+        logger.error("STAGE3_TWO_PASS_MISMATCH",
+                     "the formal pass produced different pixels than the "
+                     "check pass; refusing to reuse the check verdict",
+                     reason=_verdict.get("reason"),
+                     check_digest=str((_chk_doc.get("pixels") or {}
+                                       ).get("digest"))[:16],
+                     formal_digest=str(_formal.get("digest"))[:16])
+        return False, str(_verdict.get("reason") or "pixel digest mismatch")
+    logger.info("STAGE3_TWO_PASS_OK",
+                "the formal pass reproduced the check pass's pixels",
+                reason=_verdict.get("reason"),
+                digest=str(_formal.get("digest"))[:16],
+                frames=_formal.get("frames"), pix_fmt=_formal.get("pix_fmt"))
+    return True, str(_verdict.get("reason") or "match")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -3398,6 +3479,19 @@ def main():
                                     "Zero-disk raw-pipe upscale succeeded; "
                                     "skipping PNG extract/encode entirely",
                                     frames=_s_n, output=_s_out)
+                        # ---- 两遍绑定：正式遍自己出一份摘要再与检查遍比 ----
+                        # 只比帧数/计划/尺寸不够（G8 原文），必须比像素摘要。
+                        if _svpy:
+                            _tp_ok, _tp_why = _two_pass_check(
+                                temp_dir, job_id, input_name, _svpy,
+                                params, logger)
+                            if not _tp_ok:
+                                logger.error(
+                                    "STAGE3_TWO_PASS_BLOCKED",
+                                    "strict mode: the two passes could not be "
+                                    "bound, so this generation must not be "
+                                    "published", reason=_tp_why)
+                                return 86
                         if _s_fuse34:
                             # ---- 融合回执：告诉 main"stage4 已经在这里做完了" ----
                             # 没有它 main 会照常去跑 stage4，而 stage4 找不到
