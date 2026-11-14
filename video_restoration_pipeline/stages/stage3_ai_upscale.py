@@ -2529,6 +2529,29 @@ def write_job_timeline_plan(params, source_timeline=None, fps_value=None,
         return None
 
 
+def _frames_from_check_sidecar(temp_dir: str, job_id: str,
+                              input_name: str, vpy: str) -> int:
+    """从检查遍侧车取帧数，并核**脚本身份**一致。
+
+    两遍绑定要求"同一个 vpy"：侧车里的 `vs_script` 必须与当前要跑的那份
+    完全一致，否则帧数就是另一条流的事实，拿它切窗口会切错。
+    """
+    import json as _json
+    _stem = Path(input_name).stem.replace(" ", "_")
+    side = os.path.join(temp_dir, f"{job_id}_{_stem}_step1_check.json")
+    try:
+        with open(side, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh) or {}
+    except (OSError, ValueError):
+        return 0
+    if str(doc.get("vs_script") or "") != os.path.abspath(vpy):
+        return 0
+    try:
+        return int(((doc.get("pixels") or {}).get("frames")) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -2619,46 +2642,73 @@ def main():
     # 选中 .json → ffprobe 解析失败 → STAGE3_STAGE2_UNDECODABLE (82)，
     # 而真正的 mkv 就在旁边（2026-10-18 矩阵首跑实测复现）。
     # 按 checkpoint 的媒体后缀白名单过滤后再按 mtime 选最新。
-    from checkpoint import select_media_candidates
-    candidates = select_media_candidates(Path(temp_dir).glob(pattern))
-    if not candidates:
-        logger.error("STAGE3_NO_INPUT",
-                     "Stage 2 traditional output not found")
-        return 82
-
-    stage2_output = str(candidates[0])
-
-    # Validate stage2 output (v6.32 §7.1 mandatory)
-    if Path(stage2_output).stat().st_size == 0:
-        logger.error("STAGE3_STAGE2_EMPTY", "Stage 2 output is empty")
-        return 82
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-hide_banner", "-v", "error", stage2_output],
-            capture_output=True, timeout=30, shell=False
-        )
-        if r.returncode != 0:
-            logger.error("STAGE3_STAGE2_UNDECODABLE",
-                         "Stage 2 output undecodable")
+    # ---- stream_full：输入不是 step2 媒体，而是 stage1 的 vpy ----
+    # 设计与 G8 都要求"不出现 stage1 全片临时视频"，所以这条路上
+    # step2 根本没有文件。尺寸只能从 y4m 头取（`probe_vpy_header`），
+    # **取不到就拒绝**，绝不用 720×480 / 1920×1080 这类默认值猜（P-D02）。
+    _svpy = str((params.get("_stream_s1") or {}).get("vs_script") or "")
+    _hdr = {}
+    stage2_output = ""
+    width = height = 0
+    if _svpy:
+        try:
+            from stream_digest import probe_vpy_header as _pvh
+            _hdr = _pvh(_svpy)
+        except Exception as _he:                      # pragma: no cover
+            _hdr = {"ok": False, "error": str(_he)}
+        if not _hdr.get("ok"):
+            logger.error("STAGE3_STREAM_HEADER_FAIL",
+                         "stream_full: cannot read the stage1 y4m header; "
+                         "refusing to guess the frame size",
+                         vs_script=_svpy, error=_hdr.get("error"))
+            return 86
+        width, height = int(_hdr["width"]), int(_hdr["height"])
+        logger.info("STAGE3_STREAM_SOURCE",
+                    "stream_full: upscaling straight from the stage1 script; "
+                    "no step2 media is read",
+                    vs_script=_svpy, width=width, height=height,
+                    fps=_hdr.get("fps"), chroma=_hdr.get("chroma"))
+    else:
+        from checkpoint import select_media_candidates
+        candidates = select_media_candidates(Path(temp_dir).glob(pattern))
+        if not candidates:
+            logger.error("STAGE3_NO_INPUT",
+                         "Stage 2 traditional output not found")
             return 82
-    except Exception as e:
-        logger.error("STAGE3_STAGE2_CHECK_FAIL", str(e))
-        return 82
 
-    # Get intermediate dimensions for supplementary ban check
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height",
-             "-of", "json", stage2_output],
-            capture_output=True, text=True, errors="replace", timeout=30, shell=False
-        )
-        info = json.loads(r.stdout)
-        stream = info["streams"][0]
-        width = stream["width"]
-        height = stream["height"]
-    except Exception:
-        width, height = 720, 480
+        stage2_output = str(candidates[0])
+
+        # Validate stage2 output (v6.32 §7.1 mandatory)
+        if Path(stage2_output).stat().st_size == 0:
+            logger.error("STAGE3_STAGE2_EMPTY", "Stage 2 output is empty")
+            return 82
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-hide_banner", "-v", "error", stage2_output],
+                capture_output=True, timeout=30, shell=False
+            )
+            if r.returncode != 0:
+                logger.error("STAGE3_STAGE2_UNDECODABLE",
+                             "Stage 2 output undecodable")
+                return 82
+        except Exception as e:
+            logger.error("STAGE3_STAGE2_CHECK_FAIL", str(e))
+            return 82
+
+        # Get intermediate dimensions for supplementary ban check
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height",
+                 "-of", "json", stage2_output],
+                capture_output=True, text=True, errors="replace", timeout=30, shell=False
+            )
+            info = json.loads(r.stdout)
+            stream = info["streams"][0]
+            width = stream["width"]
+            height = stream["height"]
+        except Exception:
+            width, height = 720, 480
 
     target_w = width * scale
     target_h = height * scale
@@ -2880,9 +2930,42 @@ def main():
                 model=model, scale=scale, backend=backend,
                 input_width=width, input_height=height)
 
+    # ---- stream_full：没有 step2 文件时，**不能**掉进 PNG 抽帧路径 ----
+    # PNG 路径要 `ffmpeg -i <step2 文件>`；流式被跳过时那个文件不存在，
+    # 硬走只会得到 `Error opening input file .`（实测），把"能力不足"
+    # 伪装成"素材坏了"。这里提前拦下并说明原因。
+    if _svpy and not stage2_output:
+        # 走到这里说明流式分支没有成功返回（被跳过或提前退出），而
+        # step2 文件在这条路上**本来就不存在** —— PNG 路径必然打不开。
+        logger.error(
+            "STAGE3_STREAM_UNAVAILABLE",
+            "stream_full was requested but the streaming path did not run; "
+            "there is no step2 media to fall back to. Fix the stated reason "
+            "or run with execution.mode=file.",
+            vs_script=_svpy)
+        return 86
+
     # 256-frame sliding window processing
     win_size = params.get("ai_window_size", 256)
-    total_frames = _count_video_frames(stage2_output)
+    if _svpy:
+        # stream_full：没有 step2 文件可数。检查遍已经对**同一个 vpy**数过帧
+        # （`stream_s1_check/1` 的 `pixels.frames`），用它；拿不到就失败，
+        # 不猜窗口数（旧实现猜 30000 会切出上百个空窗口，白烧时间）。
+        total_frames = _frames_from_check_sidecar(
+            temp_dir, job_id, input_name, _svpy)
+        if total_frames <= 0:
+            logger.error(
+                "STAGE3_STREAM_NO_FRAME_COUNT",
+                "stream_full: cannot read the check pass's frame count for "
+                "this script; refusing to guess a window count",
+                vs_script=_svpy,
+                sidecar=f"{job_id}_{Path(input_name).stem}_step1_check.json")
+            return 86
+        logger.info("STAGE3_STREAM_FRAME_COUNT",
+                    "Using the frame count recorded by the check pass on the "
+                    "same VapourSynth script", frames=total_frames)
+    else:
+        total_frames = _count_video_frames(stage2_output)
     if total_frames <= 0:
         # FIX-2026-10-22：原来这里静默 `total_frames = 30000`。
         #
@@ -2937,7 +3020,21 @@ def main():
     actual_fps = None
     _fps_ok = False
     _fps_raw_str = None      # 首次探测到的**原始有理数**（如 "30000/1001"）
-    _fps_source = None       # probe | pts-derived | user-assumed
+    _fps_source = None       # probe | pts-derived | user-assumed | y4m-header
+    if _svpy:
+        # stream_full：没有文件可 probe，帧率直接来自 y4m 头（`F25:1`）。
+        # **不能**退回"猜 25"——R13-02 已经钉过：帧数对、时长错的错法
+        # 任何帧数核对都发现不了。
+        _hf = str((_hdr or {}).get("fps") or "")
+        if _hf and ":" in _hf:
+            _n, _d = _hf.split(":", 1)
+            try:
+                actual_fps = float(_n) / float(_d)
+                _fps_ok = bool(actual_fps and actual_fps > 0)
+                _fps_raw_str = f"{_n}/{_d}"
+                _fps_source = "y4m-header"
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
     try:
         r = subprocess.run(fps_cmd, capture_output=True, text=True, errors="replace",
                           timeout=10, shell=False)
@@ -3094,6 +3191,19 @@ def main():
             source_timeline=_src_tl,
             src_pts_usable=len(_src_pts_map or {}),
             intermediate_timeline=_classify_timeline(all_pts_map, total_frames))
+    elif _svpy:
+        # ---- stream_full：时间证据来自 **y4m 头**，不是"读不出 PTS 就当 CFR" ----
+        # y4m 容器头显式声明定帧率（`F25:1` / `F30000:1001`），这是可核对的
+        # 证据；而 stage1 的 vpy 输出正是按这个帧率逐帧产出。
+        # 与 `_classify_timeline` 的关系：那个函数靠**中间产物的 PTS** 判，
+        # 流式路径根本没有中间产物，用它必然得出 UNKNOWN —— 那不是"VFR"，
+        # 是"这条路上没有这个观测"。所以这里显式记录依据，不冒充。
+        logger.info(
+            "STAGE3_STREAM_TIMELINE_Y4M",
+            "stream_full: the y4m header declares a constant frame rate; "
+            "using it as the timing evidence (no intermediate PTS exists on "
+            "this path)", fps=_fps_raw_str, fps_source=_fps_source,
+            source_timeline=_src_tl)
     elif _classify_timeline(all_pts_map, total_frames) != "cfr":
         # STR-04 / R12-10：只有**确认是 CFR** 才允许走不携带 PTS 的流式路径。
         # VFR 会被压成 CFR；UNKNOWN（PTS 读不出/非单调/不足）同样不能
@@ -3211,20 +3321,24 @@ def main():
                         "refusing to guess one (timing would silently change)")
                     return 86
 
-                _s_dims = (0, 0)
-                try:
-                    _rd = subprocess.run(
-                        ["ffprobe", "-hide_banner", "-v", "error",
-                         "-select_streams", "v:0",
-                         "-show_entries", "stream=width,height",
-                         "-of", "csv=p=0", stage2_output],
-                        capture_output=True, text=True, errors="replace",
-                        timeout=10, shell=False)
-                    if _rd.returncode == 0:
-                        _parts = _rd.stdout.strip().split(",")
-                        _s_dims = (int(_parts[0]), int(_parts[1]))
-                except Exception:
-                    pass
+                if _svpy:
+                    # stream_full：宽高来自 y4m 头（上游已核过 ok=True 且 >0）
+                    _s_dims = (int(width), int(height))
+                else:
+                    _s_dims = (0, 0)
+                    try:
+                        _rd = subprocess.run(
+                            ["ffprobe", "-hide_banner", "-v", "error",
+                             "-select_streams", "v:0",
+                             "-show_entries", "stream=width,height",
+                             "-of", "csv=p=0", stage2_output],
+                            capture_output=True, text=True, errors="replace",
+                            timeout=10, shell=False)
+                        if _rd.returncode == 0:
+                            _parts = _rd.stdout.strip().split(",")
+                            _s_dims = (int(_parts[0]), int(_parts[1]))
+                    except Exception:
+                        pass
 
                 _s_copts = []
                 try:
@@ -3258,6 +3372,9 @@ def main():
                     _s_meta = {}
                     _s_ok, _s_why, _s_n = _stream_raw_upscale(
                         input_video=stage2_output, output_mkv=_s_out,
+                        # stream_full：解码端不读文件，读 vspipe 的 y4m
+                        stream_src_cmd=(["vspipe", "-c", "y4m", _svpy, "-"]
+                                        if _svpy else None),
                         post_filter_chain=_s_chain, out_pix_fmt=_s_pix_fmt,
                         # 融合进链前的统一格式 = 经典 step3 的落盘格式
                         chain_input_fmt=(_bpf(params, "stage3_step3",
