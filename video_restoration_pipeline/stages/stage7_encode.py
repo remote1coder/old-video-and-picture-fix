@@ -2687,6 +2687,50 @@ def _group_bounds(pre_check: Dict[str, Any],
     }
 
 
+def _run_with_progress(fn, logger, label: str, every: float = 30.0):
+    """跑一个**可能整片解码**的函数，期间每 `every` 秒打一行进度。
+
+    ## 为什么必须有它
+
+    卡死看门狗（`run_stage` 的 `progress_watch`）按"temp 字节 + 日志大小"
+    判有没有进展。`verify_output()` 这类函数会整片解码源与成品比像素，
+    几分钟内**既不写文件也不打日志** → 明明在干活却被判 stall。
+    长片实测踩了两次：
+      * `STAGE7_FULLCHAIN_VERIFY` 那次（已用同样的办法修过）；
+      * **发布前**那次 `_vo_pre(...)`（第 4202 行）—— 紧跟在 fullchain 之后，
+        又是一次同规模整片解码，5 分 28 秒后被杀。
+
+    所以抽成助手，凡是"整片级"的校验都必须走它；不要再各自内联一份。
+
+    注意：这不是假心跳 —— 它描述的是"这个校验确实还在跑"，
+    函数返回就不再打。真卡住的函数仍然会被 watchdog 杀掉
+    （只是从"300 秒没字节"变成"300 秒没日志"，判据同样成立）。
+    """
+    import threading as _th
+    box = {"v": None, "err": None}
+
+    def _worker():
+        try:
+            box["v"] = fn()
+        except Exception as exc:          # pragma: no cover
+            box["err"] = exc
+
+    t = _th.Thread(target=_worker, daemon=True)
+    t.start()
+    waited = 0.0
+    while t.is_alive():
+        t.join(timeout=every)
+        if t.is_alive():
+            waited += every
+            logger.info(
+                "STAGE7_LONG_OP_PROGRESS",
+                f"{label} is still running (whole-file decode + compare)",
+                label=label, waited_s=int(waited))
+    if box["err"] is not None:
+        raise box["err"]
+    return box["v"]
+
+
 def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
                          params: Dict[str, Any], logger,
                          frames: Optional[int],
@@ -3922,32 +3966,9 @@ def main():
                     # "仍在跑 + 已等多久"，让 marker 看到真实进展。
                     # 注意：这不是假心跳 —— 它描述的是"这个校验确实还在进行"，
                     # 校验本身结束就停。
-                    import threading as _th
-                    import time as _tm
-                    _fc_done = {"v": None, "err": None}
-
-                    def _fc_worker():
-                        try:
-                            _fc_done["v"] = _fc_verify(
-                                args.input, _publish_tmp, params)
-                        except Exception as _e:      # pragma: no cover
-                            _fc_done["err"] = _e
-
-                    _t = _th.Thread(target=_fc_worker, daemon=True)
-                    _t.start()
-                    _waited = 0.0
-                    while _t.is_alive():
-                        _t.join(timeout=30.0)
-                        if _t.is_alive():
-                            _waited += 30.0
-                            logger.info(
-                                "STAGE7_FULLCHAIN_PROGRESS",
-                                "Full-chain verification is still running "
-                                "(whole-file decode + compare)",
-                                waited_s=int(_waited))
-                    if _fc_done["err"] is not None:
-                        raise _fc_done["err"]
-                    _fc = _fc_done["v"]
+                    _fc = _run_with_progress(
+                        lambda: _fc_verify(args.input, _publish_tmp, params),
+                        logger, "fullchain verification")
                     # R23-08：把"这一代消费了降级中间产物"写进全链报告，
                     # 让报告读者（而不是只有翻日志的人）能看到。
                     if isinstance(_fc, dict):
@@ -4114,8 +4135,11 @@ def main():
                     _retime_info = {"action": "unavailable", "reason": "no mkvmerge"}
                     # ---- R20-A06：mkvmerge 缺失**不能**跳过时间检查 ----
                     # 工具只决定"能不能执行该重封装方案"，不决定"要不要校验"。
-                    _map_state, _map_info = check_declared_timeline_mapping(
-                        params, _orig_src, _publish_tmp, logger)
+                    # 整片级：会读源与候选的时间轴，长片要几分钟 → 走进度助手
+                    _map_state, _map_info = _run_with_progress(
+                        lambda: check_declared_timeline_mapping(
+                            params, _orig_src, _publish_tmp, logger),
+                        logger, "declared-timeline mapping")
                     _retime_info.update(_map_info)
                     # R21-C04：结论进**统一发布门**，不再只打日志
                     _checks["timeline_mapping"] = mapping_check_entry(
@@ -4157,8 +4181,10 @@ def main():
                     # ---- P0-C / R20-A06：按声明的变换核对候选 ----
                     # 已抽成 `check_declared_timeline_mapping()`：
                     # **mkvmerge 缺失时也照样校验**（见上面 `elif not _mkv`）。
-                    _map_state, _map_info = check_declared_timeline_mapping(
-                        params, _orig_src, _publish_tmp, logger)
+                    _map_state, _map_info = _run_with_progress(
+                        lambda: check_declared_timeline_mapping(
+                            params, _orig_src, _publish_tmp, logger),
+                        logger, "declared-timeline mapping (transform)")
                     _retime_info.update(_map_info)
                     # R21-C04：结论进**统一发布门**，不再只打日志
                     _checks["timeline_mapping"] = mapping_check_entry(
@@ -4173,7 +4199,10 @@ def main():
                             "but timeline_mapping_strict=false; the publish gate "
                             "now requires an explicit force.",
                             problems=(_map_info.get("mapping_problems") or [])[:4])
-                elif _plan_tl == "vfr" or _is_var(_probe_pts(_orig_src)):
+                elif (_plan_tl == "vfr"
+                      or _is_var(_run_with_progress(
+                          lambda: _probe_pts(_orig_src), logger,
+                          "source PTS probe"))):
                     _ok_r, _retime_info = _retime(_orig_src, _publish_tmp, _mkv,
                                                   work_dir=str(temp_dir), logger=logger)
                     if not _ok_r:
@@ -4201,7 +4230,11 @@ def main():
                     verify_output as _vo_pre,
                     render_verdict as _rv_pre,
                 )
-                _pre = _vo_pre(_probe_source, _publish_tmp, {})
+                # 这是**第二次**同规模整片解码（fullchain 之后紧跟着又来一次）。
+                # 长片实测：不包进度就会被 300s 判 stall（5 分 28 秒后被杀）。
+                _pre = _run_with_progress(
+                    lambda: _vo_pre(_probe_source, _publish_tmp, {}),
+                    logger, "pre-publish verification")
             except Exception as _pe:
                 logger.error("STAGE7_PREPUBLISH_VERIFY_ERROR",
                              f"pre-publish check raised: {_pe}")
