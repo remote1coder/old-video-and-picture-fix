@@ -840,8 +840,21 @@ def find_stage_artifacts(temp_dir: str, job_id: str, input_path: str,
     """
     import glob
     from checkpoint import select_media_candidates
-    pattern = str(Path(temp_dir) / f"{job_id}_{_safe_input_stem(input_path)}_step{stage_num}*")
-    candidates = glob.glob(pattern)
+    _stem = _safe_input_stem(input_path)
+    patterns = [str(Path(temp_dir) / f"{job_id}_{_stem}_step{stage_num}*")]
+    if stage_num == 3:
+        # ---- S3+S4 融合：这一级真正的产物叫 step4（step3 根本不存在）----
+        # 只在**确认融合发生过**时才认它（回执在才算），否则会把 stage4 的
+        # 正常产物误记到 stage3 名下、并让 stage4 重复登记。
+        _fused = glob.glob(str(Path(temp_dir) /
+                                f"{job_id}_{_stem}_step4_postprocess*"
+                                 f".fused_stage34.json"))
+        if _fused:
+            patterns.append(str(Path(temp_dir) /
+                                f"{job_id}_{_stem}_step4_postprocess*"))
+    candidates = []
+    for _pat in patterns:
+        candidates.extend(glob.glob(_pat))
     return [str(p) for p in select_media_candidates(candidates)]
 
 
@@ -2986,10 +2999,16 @@ def _chain_mode_on(params) -> bool:
 
 
 def _chain67_on(params) -> bool:
-    """当前是否启用了 S6→S7 融合执行组（`chain.mode: stage67` / `both`）。"""
+    """当前是否启用了 S6→S7 融合执行组。
+
+    `stream_full` 也算：它的目标就是"stage 之间不写大媒体"，而 step6 正是
+    这条链上除了 step4 之外剩下的唯一整片中间媒体。既然 S3→S4 已经在
+    stream_full 下自动融合（见 stage3 的说明），S6→S7 没有理由反而落盘。
+    想保留 step6 做核对，用 `--chain none` / `stage34`。
+    """
     try:
         return str((params or {}).get("chain_mode") or "none").lower() in (
-            "stage67", "both")
+            "stage67", "both", "stream_full")
     except Exception:
         return False
 
