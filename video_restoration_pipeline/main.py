@@ -87,7 +87,8 @@ def parse_args():
     parser.add_argument("--keep-intermediates", action="store_true",
                         help="Keep intermediate files")
     parser.add_argument("--chain", default=None,
-                        choices=["none", "stage34", "stage67", "both"],
+                        choices=["none", "stage34", "stage67", "both",
+                                 "stream_full"],
                         help="execution-group mode; only changes HOW stages run, "
                              "never which features are available")
     parser.add_argument("--no-wsl-redirect", action="store_true",
@@ -1016,7 +1017,10 @@ def _identity_semantics(params: Dict[str, Any]) -> Dict[str, Any]:
 #: 只在 argparse 的 choices 里存在、实现里被当成"未知模式"静默回退到
 #: none —— 用户明确要求"颗粒+编码融合"时，跑完还报成功。现在四种都真有
 #: 实现，选择什么就执行什么。
-_KNOWN_CHAIN_MODES = frozenset({"none", "stage34", "stage67", "both"})
+#: `stream_full` = 设计与 G8 的主路线：stage 之间不写大型中间媒体。
+#: 其余三个是执行组（局部融合）。四者共用同一份计划与算法内核。
+_KNOWN_CHAIN_MODES = frozenset({"none", "stage34", "stage67", "both",
+                                "stream_full"})
 
 
 def _strict_bool(value, default: bool = False) -> bool:
@@ -2886,6 +2890,92 @@ def _resolve_plan_for_job(job: Dict[str, Any], config: Dict[str, Any],
     return params, plan, True
 
 
+def _verify_stream_check_sidecar(params, job_id: str, input_path: str,
+                                 vpy: str, logger):
+    """stream_full 的"传统门"：核检查遍侧车，而不是找 step2 文件。
+
+    三件事必须同时成立，少一条都拦：
+      1. 侧车存在且 `schema == stream_s1_check/1`；
+      2. 侧车里的 `vs_script` 与本次计划要跑的**完全一致**（同一张图）；
+      3. `pixels` 里有可用摘要（`ok=True` 且 digest 非空）——
+         没有摘要就没法做两遍绑定，后面 stage3 会拒绝。
+    """
+    import json as _json
+    temp_dir = str((params or {}).get("temp_dir") or "./temp")
+    stem = Path(input_path).stem.replace(" ", "_")
+    side = os.path.join(temp_dir, f"{job_id}_{stem}_step1_check.json")
+    if not os.path.exists(side):
+        return False, (f"stream_full: the check pass left no sidecar at {side};"
+                       " without it there is no evidence the traditional "
+                       "check ever ran")
+    try:
+        with open(side, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh) or {}
+    except (OSError, ValueError) as exc:
+        return False, f"stream_full: check sidecar unreadable: {exc}"
+    if str(doc.get("schema") or "") != "stream_s1_check/1":
+        return False, (f"stream_full: unknown check sidecar schema "
+                       f"{doc.get('schema')!r}")
+    if str(doc.get("vs_script") or "") != os.path.abspath(vpy):
+        return False, ("stream_full: the check pass ran a different script "
+                       "than the one this job will run")
+    px = doc.get("pixels") or {}
+    if not px.get("ok") or not px.get("digest"):
+        return False, ("stream_full: the check pass recorded no usable pixel "
+                       f"digest ({px.get('error') or 'empty'})")
+    return True, (f"stream_full: check pass verified on the same script "
+                  f"({px.get('frames')} frames, {px.get('pix_fmt')})")
+
+
+def _stream_full_on(params) -> bool:
+    """本次是否走 `execution.mode: stream_full`（stage 之间不写大媒体）。"""
+    return str((params or {}).get("chain_mode") or "none").lower() in (
+        "stream_full", "stream")
+
+
+def _stream_s1_sha(vpy: str) -> str:
+    """vpy 的 sha256。两遍绑定靠它回答"两次跑的是不是同一份脚本"。"""
+    import hashlib as _hl
+    try:
+        with open(vpy, "rb") as fh:
+            return _hl.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _read_stream_s1_script(params, job_id: str, input_path: str,
+                           logger) -> str:
+    """读 stage1 的交接单，返回 vpy 绝对路径；不可用时返回空串。
+
+    为什么不让 main 自己拼路径：交接单是 stage1 写的，它才知道脚本落在哪；
+    而且单子里带 `vs_script_sha256`，是"同一张图"的唯一凭据。
+    """
+    import json as _json
+    temp_dir = str((params or {}).get("temp_dir") or "./temp")
+    stem = Path(input_path).stem.replace(" ", "_")
+    side = os.path.join(temp_dir, f"{job_id}_{stem}_step1_stream.json")
+    try:
+        with open(side, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh) or {}
+    except (OSError, ValueError) as exc:
+        logger.error("STREAM_S1_SIDECAR_UNREADABLE",
+                     "cannot read the stage1 hand-off", sidecar=side,
+                     error=str(exc))
+        return ""
+    vpy = str(doc.get("vs_script") or "")
+    if not vpy or not os.path.exists(vpy):
+        logger.error("STREAM_S1_SCRIPT_MISSING",
+                     "the stage1 hand-off points at a missing script",
+                     sidecar=side, vs_script=vpy)
+        return ""
+    if str(doc.get("schema") or "") != "stream_s1/1":
+        logger.error("STREAM_S1_SCHEMA_UNKNOWN",
+                     "the stage1 hand-off has an unknown schema; refusing to "
+                     "guess its meaning", schema=doc.get("schema"))
+        return ""
+    return vpy
+
+
 def _chain_mode_on(params) -> bool:
     """当前是否启用了含 stage34 的融合执行组。"""
     try:
@@ -3858,11 +3948,52 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         # glob 结果并逐条写入当前身份 —— temp 里任何**陈旧**的同 step
         # 文件（上次运行留下、或别的参数生成的）都会被"洗白"成当前
         # 身份，下次 resume 就把它当成合法产物复用。
+        # ---- stream_full：stage1 只出 vpy，之后两遍都用同一个脚本 ----
+        _sf = _stream_full_on(params)
+        if _sf and stage_num == 1:
+            # ---- stream_full 的**能力前提**必须在开跑前说清 ----
+            # 两遍绑定要求"检查遍与正式遍的像素摘要可比"。VapourSynth 多线程
+            # 渲染本来就不可复现（实测同一 vpy 连跑两次，60 帧里 30~35 帧不同，
+            # 本底 PSNR min≈42 dB）。所以严格模式下 **必须** vs.deterministic。
+            # 不在计划阶段拒绝的话，会在 stage3 深处炸成"像素摘要不一致"，
+            # 看起来像缺陷，实际是"这条组合的能力前提没满足"——
+            # 设计 §5.1 要求"标能力不满足"，不是让它伪装成 bug。
+            if not _strict_bool(params.get("vs_deterministic"), False):
+                job_logger.error(
+                    "STREAM_FULL_REQUIRES_DETERMINISM",
+                    "stream_full binds a check pass to a formal pass by pixel "
+                    "digest, so it requires vs.deterministic: true. Without it "
+                    "VapourSynth's multi-threaded rendering is not "
+                    "reproducible and the two passes cannot be bound. This is "
+                    "a capability gap of this combination, not a defect: set "
+                    "vs.deterministic: true (slower, reproducible) or use "
+                    "--chain none/stage67 for this job.",
+                    chain_mode=params.get("chain_mode"))
+                return 82, ("stream_full requires vs.deterministic: true; "
+                            "refusing to start a generation whose two passes "
+                            "cannot be bound")
+            params["_stream_s1"] = {"emit_only": True}
         _pre_stage_files: Dict[str, Tuple[int, int]] = (
             _snapshot_stage_files(params.get("temp_dir", "./temp"),
                                   job_id, input_path, stage_num)
             if stage_num != 7 else {})
         exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
+        if _sf and stage_num == 1 and exit_code == 0:
+            _vpy = _read_stream_s1_script(params, job_id, input_path, job_logger)
+            if not _vpy:
+                job_logger.error(
+                    "STREAM_S1_NO_SCRIPT",
+                    "stream_full: stage1 reported success but left no usable "
+                    "VapourSynth hand-off; refusing to continue (the check "
+                    "pass and the AI pass must run the same script)")
+                return 82, "stream_full: no stage1 script hand-off"
+            params["_stream_s1"] = {"vs_script": _vpy,
+                                    "vs_script_sha256": _stream_s1_sha(_vpy)}
+            job_logger.info(
+                "STREAM_S1_SCRIPT_READY",
+                "stream_full: stage1 emitted the script only; the check pass "
+                "and the AI pass will both run it",
+                vs_script=_vpy, sha256=params["_stream_s1"]["vs_script_sha256"][:16])
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
             # ---- S6→S7：stage6 交出了脚本，把接力棒交给 stage7 ----
@@ -3967,10 +4098,23 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                         "PREVIEW_FORCED_UPSCALE_FAIL",
                         f"Comparison frame generation failed: {e}")
             if stage_num == 2:
-                # FIX-W2: validate stage2 output via shared helper (exists +
-                # non-empty + ffprobe-decodeable per v7.32 §3.10.8).
+                # ---- stream_full：这道门的证据是**检查结论**，不是 step2 文件 ----
+                # 设计 §5.2 S2 明确"不创建 step2 媒体"。拿文件是否存在来放行
+                # 会把一条正确的流式跑批判死（实测：TRADITIONAL_GATE_BLOCK
+                # "Stage 2 output file missing"，而检查遍已经跑完并落了摘要）。
+                # 所以这里换成校验**检查遍侧车**：schema 对、脚本身份与本次
+                # 计划一致、像素摘要可比较。少任何一条都仍然拦。
                 temp_dir = params.get("temp_dir", "./temp")
-                ok, msg = _verify_stage2_output(job_id, input_path, temp_dir, job_logger)
+                if _sf:
+                    ok, msg = _verify_stream_check_sidecar(
+                        params, job_id, input_path,
+                        str((params.get("_stream_s1") or {}).get("vs_script")
+                            or ""), job_logger)
+                else:
+                    # FIX-W2: validate stage2 output via shared helper (exists +
+                    # non-empty + ffprobe-decodeable per v7.32 §3.10.8).
+                    ok, msg = _verify_stage2_output(
+                        job_id, input_path, temp_dir, job_logger)
                 if not ok:
                     job_logger.error("TRADITIONAL_GATE_BLOCK", msg)
                     return 86, msg
