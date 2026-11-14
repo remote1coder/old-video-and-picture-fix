@@ -699,19 +699,9 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
             # 日志的大小**也算进 marker：有真实进展就一定有新日志。
             # 边界：一个只会空转打日志的死循环仍会被当成"活着" —— 那是
             # "结构化进度事件"要解决的事（下一轮），不是这条能覆盖的。
-            try:
-                _lp = params.get("log_path") or params.get("_log_path")
-                if not _lp:
-                    # 日志文件名是 `job_{job_id}.log`（见 logger.get_logger）
-                    _ld = str(params.get("log_dir") or "./logs")
-                    _jid = str((job or {}).get("job_id")
-                               or params.get("job_id") or "")
-                    if _jid:
-                        _lp = os.path.join(_ld, f"job_{_jid}.log")
-                if _lp and os.path.exists(str(_lp)):
-                    total += os.path.getsize(str(_lp)) * 1000
-            except (OSError, TypeError):
-                pass
+            # 日志增长也算进展（纯计算段落唯一的信号）。
+            # ×1000 是为了让"日志涨几百字节"在 16 GB 的基数下也一定改变整数。
+            total += _job_log_bytes(params, job) * 1000
             if out_dir and out_stem:
                 try:
                     for _fn in os.listdir(out_dir):
@@ -2959,6 +2949,34 @@ def _verify_stream_check_sidecar(params, job_id: str, input_path: str,
                        f"digest ({px.get('error') or 'empty'})")
     return True, (f"stream_full: check pass verified on the same script "
                   f"({px.get('frames')} frames, {px.get('pix_fmt')})")
+
+
+def _job_log_bytes(params, job) -> int:
+    """本 job 日志文件的字节数；找不到返回 0。
+
+    为什么单独抽出来：这段逻辑第一版只信 `params["log_path"]`，而
+    manifest 里写的是 `logs/job_001.log`、logger 实际落
+    `logs/job_job_001.log`（它自己又加了一次 `job_` 前缀）→
+    文件不存在 → 日志分量被**静默跳过** → 长片在发布段仍被 300s 判 stall
+    （`last marker=16443759457`，而日志每 30 秒在涨）。
+    抽成函数是为了能被单元测试钉住，不再靠"跑一次看看"。
+    """
+    _cands = []
+    _lp = (params or {}).get("log_path") or (params or {}).get("_log_path")
+    if _lp:
+        _cands.append(str(_lp))
+    _ld = str((params or {}).get("log_dir") or "./logs")
+    _jid = str((job or {}).get("job_id") or (params or {}).get("job_id") or "")
+    if _jid:
+        _cands.append(os.path.join(_ld, f"job_{_jid}.log"))
+        _cands.append(os.path.join(_ld, f"{_jid}.log"))
+    for _c in _cands:
+        try:
+            if os.path.exists(_c):
+                return os.path.getsize(_c)
+        except OSError:
+            continue
+    return 0
 
 
 def _stream_full_on(params) -> bool:

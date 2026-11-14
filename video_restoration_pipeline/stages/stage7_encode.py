@@ -2687,7 +2687,7 @@ def _group_bounds(pre_check: Dict[str, Any],
     }
 
 
-def _run_with_progress(fn, logger, label: str, every: float = 30.0):
+def _run_with_progress(fn, logger, label: str, every: float = 15.0):
     """跑一个**可能整片解码**的函数，期间每 `every` 秒打一行进度。
 
     ## 为什么必须有它
@@ -2705,6 +2705,10 @@ def _run_with_progress(fn, logger, label: str, every: float = 30.0):
     注意：这不是假心跳 —— 它描述的是"这个校验确实还在跑"，
     函数返回就不再打。真卡住的函数仍然会被 watchdog 杀掉
     （只是从"300 秒没字节"变成"300 秒没日志"，判据同样成立）。
+
+    **`every=15` 的理由**：看门狗的采样间隔是 `inactivity_timeout / 8`
+    （默认 300/8 = 37.5 秒）。若这里 30 秒一条，最坏情况会连续两次采样
+    落在同一条日志之后 → 看不到变化。15 秒给了一倍余量。
     """
     import threading as _th
     box = {"v": None, "err": None}
