@@ -2930,21 +2930,6 @@ def main():
                 model=model, scale=scale, backend=backend,
                 input_width=width, input_height=height)
 
-    # ---- stream_full：没有 step2 文件时，**不能**掉进 PNG 抽帧路径 ----
-    # PNG 路径要 `ffmpeg -i <step2 文件>`；流式被跳过时那个文件不存在，
-    # 硬走只会得到 `Error opening input file .`（实测），把"能力不足"
-    # 伪装成"素材坏了"。这里提前拦下并说明原因。
-    if _svpy and not stage2_output:
-        # 走到这里说明流式分支没有成功返回（被跳过或提前退出），而
-        # step2 文件在这条路上**本来就不存在** —— PNG 路径必然打不开。
-        logger.error(
-            "STAGE3_STREAM_UNAVAILABLE",
-            "stream_full was requested but the streaming path did not run; "
-            "there is no step2 media to fall back to. Fix the stated reason "
-            "or run with execution.mode=file.",
-            vs_script=_svpy)
-        return 86
-
     # 256-frame sliding window processing
     win_size = params.get("ai_window_size", 256)
     if _svpy:
@@ -3191,20 +3176,7 @@ def main():
             source_timeline=_src_tl,
             src_pts_usable=len(_src_pts_map or {}),
             intermediate_timeline=_classify_timeline(all_pts_map, total_frames))
-    elif _svpy:
-        # ---- stream_full：时间证据来自 **y4m 头**，不是"读不出 PTS 就当 CFR" ----
-        # y4m 容器头显式声明定帧率（`F25:1` / `F30000:1001`），这是可核对的
-        # 证据；而 stage1 的 vpy 输出正是按这个帧率逐帧产出。
-        # 与 `_classify_timeline` 的关系：那个函数靠**中间产物的 PTS** 判，
-        # 流式路径根本没有中间产物，用它必然得出 UNKNOWN —— 那不是"VFR"，
-        # 是"这条路上没有这个观测"。所以这里显式记录依据，不冒充。
-        logger.info(
-            "STAGE3_STREAM_TIMELINE_Y4M",
-            "stream_full: the y4m header declares a constant frame rate; "
-            "using it as the timing evidence (no intermediate PTS exists on "
-            "this path)", fps=_fps_raw_str, fps_source=_fps_source,
-            source_timeline=_src_tl)
-    elif _classify_timeline(all_pts_map, total_frames) != "cfr":
+    elif not _svpy and _classify_timeline(all_pts_map, total_frames) != "cfr":
         # STR-04 / R12-10：只有**确认是 CFR** 才允许走不携带 PTS 的流式路径。
         # VFR 会被压成 CFR；UNKNOWN（PTS 读不出/非单调/不足）同样不能
         # 冒充 CFR —— 否则"量不出来"又变成了"按固定帧率处理"。
@@ -3219,6 +3191,19 @@ def main():
                     "Frame rate could not be determined; rawvideo would need a "
                     "guessed -framerate, so use the PNG path instead")
     elif params.get("ai_stream_raw"):
+        # ---- stream_full：时间证据来自 **y4m 头**，不是"读不出 PTS 就当 CFR" ----
+        # y4m 容器头显式声明定帧率（`F25:1` / `F30000:1001`），这是可核对的
+        # 证据；stage1 的 vpy 输出正是按这个帧率逐帧产出。
+        # `_classify_timeline` 靠中间产物的 PTS 判，而流式路径**根本没有
+        # 中间产物** —— 它必然给 UNKNOWN。那不是 VFR，是"这条路上没有这个
+        # 观测"，所以上面那个 cfr 门对 `_svpy` **不适用**（不是放宽，是换证据源）。
+        if _svpy:
+            logger.info(
+                "STAGE3_STREAM_TIMELINE_Y4M",
+                "stream_full: the y4m header declares a constant frame rate; "
+                "using it as the timing evidence (no intermediate PTS exists "
+                "on this path)", fps=_fps_raw_str, fps_source=_fps_source,
+                source_timeline=_src_tl)
         _s_ai_py = _resolve_ai_python(logger)
         if not _s_ai_py:
             logger.warning("STAGE3_STREAM_NO_AI_PY",
@@ -3634,6 +3619,21 @@ def main():
             except Exception as _se:
                 logger.warning("STAGE3_STREAM_FALLBACK",
                                f"raw-pipe path raised: {_se}")
+
+    # ---- stream_full：没有 step2 文件时，**不能**掉进 PNG 抽帧路径 ----
+    # PNG 路径要 `ffmpeg -i <step2 文件>`；流式被跳过时那个文件不存在，
+    # 硬走只会得到 `Error opening input file .`（实测），把"能力不足"
+    # 伪装成"素材坏了"。这里提前拦下并说明原因。
+    if _svpy and not stage2_output:
+        # 走到这里说明流式分支没有成功返回（被跳过或提前退出），而
+        # step2 文件在这条路上**本来就不存在** —— PNG 路径必然打不开。
+        logger.error(
+            "STAGE3_STREAM_UNAVAILABLE",
+            "stream_full was requested but the streaming path did not run; "
+            "there is no step2 media to fall back to. Fix the stated reason "
+            "or run with execution.mode=file.",
+            vs_script=_svpy)
+        return 86
 
     for win_start in range(0, total_frames, win_size):
         win_end = min(win_start + win_size, total_frames)
