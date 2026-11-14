@@ -287,7 +287,11 @@ def test_stage3_fused_path_runs_the_boundary_check():
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage3_ai_upscale.py"),
                encoding="utf-8", errors="replace").read()
-    i_check = src.find("from generation_evidence import collect")
+    i_check = src.find("_ev = _ev_collect(")
+    if i_check < 0:
+        i_check = src.find("_ev_collect(stage2_output")
+    if i_check < 0:
+        i_check = src.find('\"bounds\": {')
     i_rcpt = src.find('".fused_stage34.json"')
     assert 0 < i_check < i_rcpt, (i_check, i_rcpt)
     assert "STAGE3_FUSE34_BOUNDS_BROKEN" in src
