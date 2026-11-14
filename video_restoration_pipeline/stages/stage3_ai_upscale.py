@@ -3303,7 +3303,19 @@ def main():
                 # 只有"默认关闭 + 显式开启"才走融合，且只限本路径（raw+CFR）。
                 # PNG / VFR 仍然走经典两阶段 —— 那是本轮未验证的范围，
                 # 不是"技术上不可能"。
-                _s_fuse34 = _chain_mode(params) in ("stage34", "both")
+                # ---- stream_full 下**默认融合 S3+S4** ----
+                # 理由：stream_full 的目标是"stage 之间不写大媒体"。S1/S2 已经
+                # 不落盘了，如果 S3 仍写一份 step3，那这份就是整条链上剩下的
+                # 唯一整片中间媒体 —— 等于白做。
+                # 安全性：S3+S4 融合的等价性已有实测（b14_g34_equiv.json：
+                # 8/8 帧、3840×2160、PSNR 全 inf），且 stream_full 强制
+                # `vs.deterministic`，对照条件比当时更严。
+                # 想保留 step3 做核对，可显式 `chain.mode: stream_full_nofuse`
+                # （那不是默认，也不是"更安全"——只是多写一份文件）。
+                _cm = _chain_mode(params)
+                _sf_here = _cm in ("stream_full", "stream")
+                _s_fuse34 = (_cm in ("stage34", "both")
+                             or (_sf_here and _cm != "stream_full_nofuse"))
                 # ---- 等价性：已在确定性模式下验证为**逐像素相同** ----
                 # 2026-11-06 实测（tools_r4/g34_equiv_det.py，60 帧 1080p→4K，
                 # 完整 stage1→7，vs.deterministic=true）：
@@ -3507,9 +3519,65 @@ def main():
                             # 现在两条路线共用 `generation_evidence`，回执里也带上
                             # 颜色成组描述（matrix/range/primaries/transfer）。
                             try:
-                                from generation_evidence import collect as _ev_collect
-                                _ev = _ev_collect(stage2_output, _s_out,
-                                                  "stage34", params, logger)
+                                if _svpy:
+                                    # stream_full：源不是文件，`collect` 无从
+                                    # 探测。守恒判据换成"检查遍数过的帧数 vs
+                                    # 融合产物实测帧数"——两个都是实测值，
+                                    # 不是估算；颜色证据留空并标明来源。
+                                    # 帧数要**真数**：`_probe_output_video`
+                                    # 只探流参数，不含帧数（实测给了 0，
+                                    # 于是下面 performed=False，回执被判
+                                    # "bounds check was not performed"）。
+                                    try:
+                                        _on = int(_count_video_frames(_s_out))
+                                    except Exception:      # pragma: no cover
+                                        _on = 0
+                                    # 颜色要**真探**：回执消费方（stage5）
+                                    # 明确拒绝"从未探测过"的证据。流式没有
+                                    # 中间产物可探，就探**原始输入**（源）与
+                                    # **融合产物**（输出），并在 basis 里写明
+                                    # 源侧探的是原始输入而不是 step2。
+                                    _cg = {}
+                                    _cg_src = {}
+                                    try:
+                                        from generation_evidence import (
+                                            color_group as _cgf,
+                                            _lost_tags as _lt,
+                                            _changed_tags as _ct)
+                                        _cg = _cgf(_s_out)
+                                        _cg_src = _cgf(str(args.input))
+                                        _lost = _lt(_cg_src, _cg)
+                                        _chg = _ct(_cg_src, _cg)
+                                    except Exception as _ce:   # pragma: no cover
+                                        _cg = {"probed": False,
+                                               "complete": False,
+                                               "error": str(_ce)}
+                                        _cg_src = {"probed": False,
+                                                   "error": str(_ce)}
+                                        _lost, _chg = [], []
+                                    _ev = {
+                                        "color": _cg,
+                                        "color_source": _cg_src,
+                                        "color_lost_tags": _lost,
+                                        "color_changed_tags": _chg,
+                                        "bounds": {
+                                            "ok": bool(
+                                                total_frames and _on
+                                                and _on == total_frames),
+                                            "performed": bool(_on),
+                                            "basis": ("check-pass frame count "
+                                                      "vs fused output"),
+                                            "src_frames": int(total_frames or 0),
+                                            "out_frames": _on,
+                                            "reason": "",
+                                        },
+                                    }
+                                else:
+                                    from generation_evidence import (
+                                        collect as _ev_collect)
+                                    _ev = _ev_collect(stage2_output, _s_out,
+                                                      "stage34", params,
+                                                      logger)
                             except Exception as _ee:   # pragma: no cover
                                 _ev = {
                                     "color": {"probed": False, "complete": False,
