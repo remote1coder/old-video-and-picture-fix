@@ -4341,8 +4341,12 @@ def main():
                     verify_frame_alignment as _vfa_pre,
                     render_alignment as _ra_pre,
                 )
-                _align_pre = _vfa_pre(
-                    _probe_source, _publish_tmp, samples=4)
+                # 帧对齐校验要**在 2.7 GB 源里定位 4 个采样帧**（要先扫出
+                # 关键帧位置再解码），长片实测 5 分钟且全程静默 —— 不包进度
+                # 就会被 300s 判 stall（第九跑实测：复用 fullchain 之后卡在这）。
+                _align_pre = _run_with_progress(
+                    lambda: _vfa_pre(_probe_source, _publish_tmp, samples=4),
+                    logger, "pre-publish frame alignment")
             except Exception as _ae:
                 logger.error("STAGE7_PREPUBLISH_ALIGN_ERROR",
                              f"pre-publish alignment raised: {_ae}")

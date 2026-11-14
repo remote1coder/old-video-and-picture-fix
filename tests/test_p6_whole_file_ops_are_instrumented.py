@@ -30,7 +30,8 @@ _S7 = os.path.join(ROOT, "video_restoration_pipeline", "stages",
                    "stage7_encode.py")
 
 #: 这些函数会整片解码/扫描，必须走进度助手
-_HEAVY = ("verify_output(", "check_declared_timeline_mapping(", "_probe_pts(")
+_HEAVY = ("verify_output(", "verify_frame_alignment(",
+          "check_declared_timeline_mapping(", "_probe_pts(")
 #: 出现这些字样的行不算调用（定义、import、注释、文档）
 _SKIP_HINTS = ("def ", "import ", "from ", "#", '"""', "`")
 
