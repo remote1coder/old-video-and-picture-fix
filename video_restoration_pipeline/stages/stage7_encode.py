@@ -3455,6 +3455,20 @@ def main():
         audio_path_fallback = Path(temp_dir) / f"{job_id}_{input_name}_audio_raw.wav"
         if audio_path_fallback.exists() and audio_path_fallback.stat().st_size > 0:
             audio_path_obj = audio_path_fallback
+    # ---- stream_full：直接引用**原源音轨**，不读 stage0 的 .mka 副本 ----
+    # 设计 §5.2 S0 / §5.5：全链用原源音轨引用，不预先复制 .mka。
+    # 判据是显式开关（main 在 stream_full 下置位），不是"找不到就猜"。
+    _sa_flag = str(params.get("stream_audio_from_source")).lower() in (
+        "1", "true", "yes", "on")
+    if (not audio_path_obj.exists()
+            or audio_path_obj.stat().st_size == 0) and _sa_flag:
+        _orig = str(params.get("input_path") or "")
+        if _orig and os.path.exists(_orig):
+            audio_path_obj = Path(_orig)
+            logger.info(
+                "STAGE7_AUDIO_FROM_SOURCE",
+                "stream_full: reading the audio straight from the original "
+                "source instead of a pre-extracted .mka copy", source=_orig)
     audio_path = str(audio_path_obj)
     has_audio = audio_path_obj.exists() and audio_path_obj.stat().st_size > 0
     if has_audio:

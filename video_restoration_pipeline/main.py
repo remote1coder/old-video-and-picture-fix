@@ -3706,6 +3706,13 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
         (1, "stage1_preprocess.py"),
         (2, "stage2_traditional_check.py"),
     ]
+    # ---- stream_full：不抽 .mka，stage7 直接引用原源音轨 ----
+    # G8 的通过条件明确列了"不出现……默认.mka源音轨副本"。抽一份 .mka
+    # 既多占盘、又让"这条链读了哪个音轨"变成两个来源。改成引用原文件后，
+    # 音轨身份就是源本身。
+    if _stream_full_on(params):
+        stages = [s for s in stages if s[0] != 0]
+        params["stream_audio_from_source"] = True
 
     ai_enabled = params.get("ai_enabled", False)
     ai_banned = job.get("ai_upscale_banned", False)
