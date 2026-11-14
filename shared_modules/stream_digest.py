@@ -154,6 +154,61 @@ def digest_vpy(vpy: str, *, timeout: float = 3600.0,
         return out
 
 
+def probe_vpy_header(vpy: str, *, timeout: float = 120.0) -> Dict[str, Any]:
+    """读 y4m 头，拿到 **宽/高/帧率**（不解码整片）。
+
+    ## 为什么需要它
+
+    stage3 的编码端吃的是 rawvideo（没有头），必须显式给 `-s WxH -framerate`。
+    接上流式上游后第一步就没有文件可 probe 了，所以尺寸只能从 **y4m 头**取：
+    `YUV4MPEG2 W320 H240 F25:1 Ip A1:1 C420p16`。
+
+    只读第一行就杀掉 vspipe —— 代价约等于一次滤镜初始化。
+
+    Returns:
+        ``{"ok": bool, "width": int, "height": int, "fps": "25",
+        "chroma": "420p16", "error": str}``。解析不出来时 ``width=0``，
+        调用方必须拒绝，**不能**用 1920×1080 之类的默认值猜（P-D02 的教训）。
+    """
+    import re as _re
+    import subprocess
+    out: Dict[str, Any] = {"ok": False, "width": 0, "height": 0,
+                           "fps": "", "chroma": "", "error": ""}
+    if not vpy or not os.path.exists(vpy):
+        out["error"] = f"vs script is gone: {vpy!r}"
+        return out
+    vp = None
+    try:
+        vp = subprocess.Popen(["vspipe", "-c", "y4m", vpy, "-"],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, shell=False)
+        line = vp.stdout.readline(4096).decode("ascii", "replace")
+    except OSError as exc:
+        out["error"] = f"cannot start vspipe: {exc}"
+        return out
+    finally:
+        try:
+            if vp is not None:
+                vp.kill()
+                vp.wait(timeout=30)
+        except Exception:
+            pass
+    if not line.startswith("YUV4MPEG2"):
+        out["error"] = f"unexpected y4m header: {line[:120]!r}"
+        return out
+    m_w = _re.search(r"\bW(\d+)", line)
+    m_h = _re.search(r"\bH(\d+)", line)
+    m_f = _re.search(r"\bF(\d+:\d+)", line)
+    m_c = _re.search(r"\bC(\S+)", line)
+    if not (m_w and m_h):
+        out["error"] = f"y4m header has no dimensions: {line[:120]!r}"
+        return out
+    out.update(ok=True, width=int(m_w.group(1)), height=int(m_h.group(1)),
+               fps=(m_f.group(1) if m_f else ""),
+               chroma=(m_c.group(1) if m_c else ""))
+    return out
+
+
 def compare(check: Dict[str, Any], formal: Dict[str, Any],
             *, deterministic: bool) -> Dict[str, Any]:
     """比较两遍的摘要，给出**可引用的结论**。

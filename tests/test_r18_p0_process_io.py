@@ -242,7 +242,13 @@ def test_T09_stream_pipeline_has_single_cleanup_path():
     src = open(os.path.join(_ROOT, "video_restoration_pipeline", "stages",
                             "stage3_ai_upscale.py"),
                encoding="utf-8", errors="replace").read()
-    assert "_reap_stream_pipeline([dec, ai, enc]" in src, "必须有统一收尾"
+    # R25：流式链加了可选的第四进程（vspipe），统一收尾的**语义**不变 ——
+    # 仍然只有一个调用点，且必须覆盖全部进程。这里按语义断言，
+    # 而不是钉死某一种字面写法（钉字面量会让"多接一个进程"变成假失败）。
+    assert src.count("_reap_stream_pipeline(") >= 2, "必须有统一收尾"
+    assert ("_reap_stream_pipeline(\n            [p for p in "
+            "(src, dec, ai, enc) if p is not None]") in src, \
+        "统一收尾必须覆盖 src/dec/ai/enc 四个进程"
     # 旧的"raise 后再也到不了下一个 except"写法必须消失
     assert "except Exception as _stall_exc:" not in src
 
