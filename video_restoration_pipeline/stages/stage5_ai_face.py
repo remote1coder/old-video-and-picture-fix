@@ -1790,19 +1790,24 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
         return 83
 
     # 5. Build mapping of frame_idx -> restored image (BGR from cv2)
-    restored_frames: Dict[int, np.ndarray] = {}
+    # ---- G8：**不累计整片**。这里只建"帧号 → PNG 路径"的索引 ----
+    # 原实现把所有修复帧 `cv2.imread` 进一个 dict —— 有脸的长片等于把
+    # 整片 RGB 常驻内存（1080p 一帧 ~6 MB，3000 帧就是 18 GB）。
+    # 设计 §5.2 S5 明确要求"不累计整片 PNG、restored_frames 字典、颈部 ROI"。
+    # 现在改成索引 + 按需读；颜色匹配的结果**写回该 PNG**（原来只改内存），
+    # 于是下一段按需读时拿到的就是匹配后的像素。
+    restored_frames: Dict[int, str] = {}
     try:
-        import cv2
         for rf in sorted(Path(face_output_dir).rglob("*.png")):
             m = re.match(r"frame_(\d+)\.png", rf.name)
             if m:
-                fidx = int(m.group(1))
-                img = cv2.imread(str(rf))
-                if img is not None:
-                    restored_frames[fidx] = img
+                restored_frames[int(m.group(1))] = str(rf)
     except Exception as e:
         logger.warning("STAGE5_RESTORED_LOAD",
-                      f"Error loading restored frames: {e}")
+                      f"Error indexing restored frames: {e}")
+    logger.info("STAGE5_RESTORED_INDEXED",
+                "restored frames are indexed by path, not held in memory",
+                frames=len(restored_frames))
 
     # 6. Apply color matching to restored frames (in memory)
     # FIX-W9-05: Per v7.32 §3.10.7, the streaming color-match path must have a
@@ -1823,11 +1828,17 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                        "landmark-based hand ROI not detected per v7.32 §3.10.7 "
                        "(needs face keypoint model)")
         import cv2
-        for fidx, rimg in list(restored_frames.items()):
+        for fidx, rpath in list(restored_frames.items()):
             frame_name = f"frame_{fidx:08d}.png"
             boxes = face_boxes_for_color.get(frame_name, [])
             if not boxes:
                 continue
+            # 按需读：一次只驻留一帧
+            import cv2 as _cv2_lazy
+            rimg = _cv2_lazy.imread(str(rpath))
+            if rimg is None:
+                continue
+            _dirty = False
             try:
                 boxes_sorted = sorted(boxes,
                                       key=lambda b: b[2] * b[3],
@@ -1892,7 +1903,7 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                         matched_bgr = cv2.cvtColor(
                             matched_lab, cv2.COLOR_LAB2BGR)
                         rimg[fy1:fy2, fx1:fx2] = matched_bgr
-                        restored_frames[fidx] = rimg
+                        _dirty = True
             except Exception as e:
                 # FIX-W9-05: Plan A failed for this frame - leave it uncolor-
                 # matched (frame still has the restored face, just not color-
@@ -1910,6 +1921,16 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
                             seg_png, seg_png + "_face_restored.tif")
                 except Exception:
                     pass
+
+            if _dirty:
+                # 必须写回：下一段是**按需读**，不落盘等于匹配白做
+                try:
+                    _cv2_lazy.imwrite(str(rpath), rimg)
+                except Exception as _we:
+                    logger.warning("STAGE5_COLOR_WRITEBACK_FAIL",
+                                   f"cannot write the color-matched frame "
+                                   f"back: {_we}")
+            del rimg
 
     # 7. Stream-encode: passthrough non-segment frames,
     #    feather-blend restored segment frames
@@ -1961,11 +1982,19 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
             with StreamingDecoder(input_source,
                                    pix_fmt=stream_pix_fmt_in) as decoder:
                 for frame_idx, frame, pts in decoder.frames():
+                    _rimg = None
                     if frame_idx in restored_frames:
+                        # 按需读：一次一帧（G8：不累计整片）
+                        _rimg = cv2.imread(str(restored_frames[frame_idx]))
+                        if _rimg is None:
+                            logger.warning(
+                                "STAGE5_RESTORED_UNREADABLE",
+                                f"restored frame {frame_idx} cannot be read; "
+                                f"passing the original frame through")
+                    if _rimg is not None:
                         # Convert BGR restored → RGB for encoder
                         restored_rgb = cv2.cvtColor(
-                            restored_frames[frame_idx],
-                            cv2.COLOR_BGR2RGB)
+                            _rimg, cv2.COLOR_BGR2RGB)
                         # FIX-W9-07: if decoding 16bit, upsample the 8bit model
                         # output (GFPGAN/CodeFormer produce uint8) to uint16
                         # (x257) so the feather-blend math operates in the same
