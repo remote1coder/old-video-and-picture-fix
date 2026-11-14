@@ -458,8 +458,20 @@ def main():
                         "digest domain resolved", pix_fmt=_pf,
                         from_stream_field=str(_stream.get("pix_fmt") or ""),
                         y4m_chroma=str(locals().get("_c") or ""))
+            # 摘要写到 temp 里**本 job 前缀**的文件：看门狗按这个前缀的
+            # 总字节数判进展。只走管道的话，一段纯计算阶段在它眼里完全静止
+            # （长片实测被 300s 判 stall）。文件跑完即删，不留垃圾。
+            _prog = os.path.join(
+                temp_dir, f"{job_id}_{Path(input_name).stem}"
+                          f"_step1_digest.progress")
             _bind = _dv(_vpy, timeout=float(params.get(
-                "stream_digest_timeout", 3600.0)), pix_fmt=_pf)
+                "stream_digest_timeout", 3600.0)), pix_fmt=_pf,
+                out_path=_prog)
+            try:
+                if os.path.exists(_prog):
+                    os.remove(_prog)
+            except OSError:
+                pass
         except Exception as _de:            # 摘要失败不能阻断检查结论
             _bind = {"ok": False, "digest": None, "frames": 0,
                      "error": str(_de)}

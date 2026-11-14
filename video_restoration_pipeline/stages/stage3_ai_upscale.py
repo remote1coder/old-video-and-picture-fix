@@ -2624,8 +2624,15 @@ def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
             logger.warning("STAGE3_TWO_PASS_PIXFMT_DEFAULTED",
                            "cannot read the y4m header; assuming 4:2:0 for "
                            "the formal-pass digest domain", pix_fmt=_pf)
+    _prog = os.path.join(
+        temp_dir, f"{job_id}_{Path(input_name).stem}_step3_digest.progress")
     _formal = _dv(vpy, timeout=float(params.get(
-        "stream_digest_timeout", 3600.0)), pix_fmt=_pf)
+        "stream_digest_timeout", 3600.0)), pix_fmt=_pf, out_path=_prog)
+    try:
+        if os.path.exists(_prog):
+            os.remove(_prog)
+    except OSError:
+        pass
     _verdict = _cmp(_chk_doc.get("pixels") or {}, _formal,
                     deterministic=bool(params.get("vs_deterministic")))
     if not _verdict.get("comparable"):

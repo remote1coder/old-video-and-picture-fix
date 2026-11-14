@@ -43,13 +43,22 @@ from typing import Any, Dict, Optional
 
 
 def digest_vpy(vpy: str, *, timeout: float = 3600.0,
-               pix_fmt: str = "") -> Dict[str, Any]:
+               pix_fmt: str = "", out_path: str = "") -> Dict[str, Any]:
     """跑一遍 vpy，返回**有序逐帧像素摘要**。
 
     Args:
         vpy: stage1 生成的 VapourSynth 脚本（绝对路径）。
         timeout: 整片解码的时间上限（默认 1 小时，长片按需调）。
         pix_fmt: 期望的解码像素格式；给定时会校验，不一致直接判失败。
+        out_path: 若给定，framemd5 **写到这个文件**而不是内存里的临时管道。
+
+    ## 为什么要 `out_path`
+
+    主流程的卡死看门狗按"temp 里本 job 前缀文件的总字节数"判断有没有进展。
+    摘要只走管道、不落盘 —— 于是**一段只算摘要的阶段在它眼里完全静止**，
+    长片实测被当成 stall 杀掉（`Stage stalled: no progress for 300s
+    (last marker=1957)`，8160 帧）。写到一个会增长的文件里，看门狗看到的是
+    真实进展（帧数在涨），不是假心跳。
 
     Returns:
         ``{"ok": bool, "digest": str|None, "frames": int, "pix_fmt": str,
@@ -73,9 +82,10 @@ def digest_vpy(vpy: str, *, timeout: float = 3600.0,
                 vp = subprocess.Popen(
                     ["vspipe", "-c", "y4m", vpy, "-"],
                     stdout=subprocess.PIPE, stderr=_fh, shell=False)
+                _dst = str(out_path) if out_path else "-"
                 r = subprocess.run(
                     ["ffmpeg", "-hide_banner", "-v", "error", "-i", "-",
-                     "-f", "framemd5", "-"],
+                     "-f", "framemd5", _dst],
                     stdin=vp.stdout, capture_output=True, text=True,
                     errors="replace", timeout=timeout, shell=False)
                 try:
@@ -93,7 +103,16 @@ def digest_vpy(vpy: str, *, timeout: float = 3600.0,
                 out["error"] = ("framemd5 pass failed: "
                                 f"{(r.stderr or '')[-500:]}")
                 return out
-            text = r.stdout or ""
+            if out_path:
+                try:
+                    with open(out_path, "r", encoding="utf-8",
+                              errors="replace") as _fh:
+                        text = _fh.read()
+                except OSError as _re:
+                    out["error"] = f"cannot read the framemd5 file: {_re}"
+                    return out
+            else:
+                text = r.stdout or ""
             # framemd5 每帧一行；以 '#' 开头的是版本/流信息
             rows = [ln for ln in text.splitlines()
                     if ln and not ln.lstrip().startswith("#")]
