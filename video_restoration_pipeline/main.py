@@ -691,6 +691,27 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
                             pass
             except OSError:
                 pass
+            # ---- 纯计算段落：字节数不涨，但**日志在涨** ----
+            # 设计 §4.2："增加真实状态/租约/进度观测…不能单靠定时心跳掩盖停滞"。
+            # 实测踩过三次（stage2 检查遍摘要、stage3 正式遍摘要、stage5 人脸
+            # 推理）：这些段落不写大文件，字节数恒定 → 被 300s 判 stall。
+            # stage 在长循环里会 emit `STAGE_EVENT`/进度日志，所以把**本 job
+            # 日志的大小**也算进 marker：有真实进展就一定有新日志。
+            # 边界：一个只会空转打日志的死循环仍会被当成"活着" —— 那是
+            # "结构化进度事件"要解决的事（下一轮），不是这条能覆盖的。
+            try:
+                _lp = params.get("log_path") or params.get("_log_path")
+                if not _lp:
+                    # 日志文件名是 `job_{job_id}.log`（见 logger.get_logger）
+                    _ld = str(params.get("log_dir") or "./logs")
+                    _jid = str((job or {}).get("job_id")
+                               or params.get("job_id") or "")
+                    if _jid:
+                        _lp = os.path.join(_ld, f"job_{_jid}.log")
+                if _lp and os.path.exists(str(_lp)):
+                    total += os.path.getsize(str(_lp)) * 1000
+            except (OSError, TypeError):
+                pass
             if out_dir and out_stem:
                 try:
                     for _fn in os.listdir(out_dir):
