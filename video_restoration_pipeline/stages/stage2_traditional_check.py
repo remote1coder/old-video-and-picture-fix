@@ -436,21 +436,28 @@ def main():
                     _c = str((_pvh2(_vpy) or {}).get("chroma") or "")
                 except Exception:                      # pragma: no cover
                     _c = ""
-                _map = {"420": "yuv420p", "422": "yuv422p", "444": "yuv444p"}
-                _sampling = ""
-                _bits = ""
-                for _k, _v in _map.items():
-                    if _c.startswith(_k):
-                        _sampling, _bits = _v, _c[len(_k):]
-                        break
-                if _sampling and _bits.isdigit():
-                    _pf = f"{_sampling}{_bits}le"
+                # y4m 的写法是 `<采样>p<位深>`，例如 `444p16` / `420p16` /
+                # `420jpeg`。我第一版按 `<采样><位深>` 解析，于是 `444p16`
+                # 的"位深"取到 `p16`、`isdigit()` 为假 → 悄悄退回 420，
+                # 444 素材每帧 460800 字节对不上 230400，摘要被拒。
+                # 实测日志：y4m_chroma='444p16' 而 pix_fmt='yuv420p16le'。
+                import re as _re2
+                _m2 = _re2.match(r"^(420|422|444)p(\d+)", _c)
+                if _m2:
+                    _pf = f"yuv{_m2.group(1)}p{_m2.group(2)}le"
+                elif _c.startswith(("420", "422", "444")):
+                    # 无位深后缀（如 `420jpeg`）：位深取参数声明值
+                    _pf = f"yuv{_c[:3]}p{_bd}le"
             if not _pf:
                 _pf = f"yuv420p{_bd}le"
                 logger.warning(
                     "STAGE2_STREAM_PIXFMT_DEFAULTED",
                     "cannot read the stage1 y4m header; assuming 4:2:0 "
                     "16-bit for the digest domain", pix_fmt=_pf)
+            logger.info("STAGE2_STREAM_PIXFMT",
+                        "digest domain resolved", pix_fmt=_pf,
+                        from_stream_field=str(_stream.get("pix_fmt") or ""),
+                        y4m_chroma=str(locals().get("_c") or ""))
             _bind = _dv(_vpy, timeout=float(params.get(
                 "stream_digest_timeout", 3600.0)), pix_fmt=_pf)
         except Exception as _de:            # 摘要失败不能阻断检查结论

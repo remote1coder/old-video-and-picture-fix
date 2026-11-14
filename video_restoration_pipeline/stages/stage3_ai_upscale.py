@@ -2605,8 +2605,25 @@ def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
     except Exception:
         _pf = ""
     if not _pf:
+        # 与 stage2 同一条教训：**从 y4m 头实测**，不要按 4:2:0 猜。
+        # 444 工作表示下写死 420 会让正式遍的摘要算不出来 →
+        # `STAGE3_TWO_PASS_INCOMPARABLE` → 严格模式拒绝发布（实测踩过）。
         _bd = int(params.get("vs_bit_depth", 16) or 16)
-        _pf = f"yuv420p{_bd}le"
+        _pf = ""
+        try:
+            import re as _re3
+            from stream_digest import probe_vpy_header as _pvh3
+            _c3 = str((_pvh3(vpy) or {}).get("chroma") or "")
+            _m3 = _re3.match(r"^(420|422|444)p(\d+)", _c3)
+            if _m3:
+                _pf = f"yuv{_m3.group(1)}p{_m3.group(2)}le"
+        except Exception:                          # pragma: no cover
+            _pf = ""
+        if not _pf:
+            _pf = f"yuv420p{_bd}le"
+            logger.warning("STAGE3_TWO_PASS_PIXFMT_DEFAULTED",
+                           "cannot read the y4m header; assuming 4:2:0 for "
+                           "the formal-pass digest domain", pix_fmt=_pf)
     _formal = _dv(vpy, timeout=float(params.get(
         "stream_digest_timeout", 3600.0)), pix_fmt=_pf)
     _verdict = _cmp(_chk_doc.get("pixels") or {}, _formal,
