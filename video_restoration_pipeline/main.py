@@ -2990,10 +2990,17 @@ def _read_stream_s1_script(params, job_id: str, input_path: str,
 
 
 def _chain_mode_on(params) -> bool:
-    """当前是否启用了含 stage34 的融合执行组。"""
+    """当前是否启用了含 stage34 的融合执行组。
+
+    `stream_full` 也算 —— stage3 在它下面**默认**把 S4 一起做完（否则 step3
+    就是整条链上唯一剩下的整片中间媒体）。不把这里算进去的后果是实测过的：
+    main 不会跳过独立的 stage4，反而把我刚登记成 stage3 产物的那份 step4
+    钉成 stage4 的输入，于是**对已经后处理过的画面再后处理一遍**
+    （8160 帧实测：temp 里多出一个 16 GB 的 step4，成品也是错的）。
+    """
     try:
         return str((params or {}).get("chain_mode") or "none").lower() in (
-            "stage34", "both")
+            "stage34", "both", "stream_full")
     except Exception:
         return False
 
