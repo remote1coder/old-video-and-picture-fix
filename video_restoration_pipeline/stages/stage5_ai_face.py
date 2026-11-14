@@ -2603,6 +2603,12 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
             else:
                 _durs.append(_durs[-1] if _durs else 1.0 / max(float(fps_val or 25), 1e-6))
         _vfr_concat = os.path.join(all_frames_dir, "concat_vfr.txt")
+        # `NL` 从来没定义过 —— 这一段（VFR concat 清单）**一执行就 NameError**，
+        # 也就是说"legacy 路径 + 有逐帧 PTS"这个组合此前根本没跑通过。
+        # 实测（真实人脸素材 75 帧）：`NameError: name 'NL' is not defined`
+        # 出现在 stage5 的 legacy 分支，整条任务 exit 1。
+        # concat 清单要求每行以换行结尾。
+        NL = "\n"
         with open(_vfr_concat, "w", encoding="utf-8") as _cf:
             for _i in range(_n):
                 _cf.write("file 'frame_%08d.png'" % (_i + 1) + NL)
