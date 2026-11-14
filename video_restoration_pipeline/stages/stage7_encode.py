@@ -3914,7 +3914,40 @@ def main():
                 # （把"校验异常"变成整个 stage 崩溃）。故此处再确保一次。
                 try:
                     from artifact_verify import verify_output as _fc_verify
-                    _fc = _fc_verify(args.input, _publish_tmp, params)
+                    # ---- 校验期的**真实进度**（看门狗要它）----
+                    # `verify_output` 会整片解码源与成品比像素，长片要几分钟，
+                    # 期间**不写文件也不打日志** → 看门狗的 marker 静止
+                    # （实测：8160 帧 `Stage 7 failed: 87 | Stage stalled:
+                    # no progress for 300s`）。这里在等待期间每 30 秒打一行
+                    # "仍在跑 + 已等多久"，让 marker 看到真实进展。
+                    # 注意：这不是假心跳 —— 它描述的是"这个校验确实还在进行"，
+                    # 校验本身结束就停。
+                    import threading as _th
+                    import time as _tm
+                    _fc_done = {"v": None, "err": None}
+
+                    def _fc_worker():
+                        try:
+                            _fc_done["v"] = _fc_verify(
+                                args.input, _publish_tmp, params)
+                        except Exception as _e:      # pragma: no cover
+                            _fc_done["err"] = _e
+
+                    _t = _th.Thread(target=_fc_worker, daemon=True)
+                    _t.start()
+                    _waited = 0.0
+                    while _t.is_alive():
+                        _t.join(timeout=30.0)
+                        if _t.is_alive():
+                            _waited += 30.0
+                            logger.info(
+                                "STAGE7_FULLCHAIN_PROGRESS",
+                                "Full-chain verification is still running "
+                                "(whole-file decode + compare)",
+                                waited_s=int(_waited))
+                    if _fc_done["err"] is not None:
+                        raise _fc_done["err"]
+                    _fc = _fc_done["v"]
                     # R23-08：把"这一代消费了降级中间产物"写进全链报告，
                     # 让报告读者（而不是只有翻日志的人）能看到。
                     if isinstance(_fc, dict):
