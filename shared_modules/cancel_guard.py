@@ -748,6 +748,12 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
 
     started = _time.monotonic()
     try:
+        # 曾试过把"子进程 CPU 秒"并入 marker（想覆盖纯计算段落）。
+        # **本机实测不可用**：`GetProcessTimes` 与 `psutil` 对一个 3 秒
+        # 死循环子进程都报 0.0 —— 这个沙箱环境的进程 CPU 计数器不工作。
+        # 留着就是永远不变的分量（等于没加），所以不引入。
+        # 纯计算段落改由"stage 自己往会增长的文件里写进度"覆盖（见
+        # stage2/stage3 的 *_digest.progress 与 stage7 的 _run_with_progress）。
         last_mark = progress_watch()
     except BaseException:
         last_mark = None

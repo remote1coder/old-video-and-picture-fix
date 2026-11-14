@@ -4234,11 +4234,35 @@ def main():
                     verify_output as _vo_pre,
                     render_verdict as _rv_pre,
                 )
-                # 这是**第二次**同规模整片解码（fullchain 之后紧跟着又来一次）。
-                # 长片实测：不包进度就会被 300s 判 stall（5 分 28 秒后被杀）。
-                _pre = _run_with_progress(
-                    lambda: _vo_pre(_probe_source, _publish_tmp, {}),
-                    logger, "pre-publish verification")
+                # ---- 复用 fullchain 的结论，别重数一遍源帧 ----
+                # 两处的输入是**同一对文件**（源 = args.input / _probe_source，
+                # 成品 = 同一个 _publish_tmp）；区别只在 params：
+                #   fullchain 传 `params`（含预期帧数/时长）→ 约 2 分钟；
+                #   pre-publish 传 `{}` → 要**重新整片统计 2.7 GB 源的帧数**
+                #   → 长片实测 7.5 分钟，且期间连日志都打不出来被 300s 判 stall。
+                # 所以 `{}` 这版只多花时间，判据并不更严 —— params 给的预期值
+                # 反而是更强的约束。fullchain 已启用且通过时直接复用；
+                # 未启用 / 未通过时照旧跑（那时它是唯一的门）。
+                _fc_v = locals().get("_fc")       # 未启用时它可能根本没赋值
+                _reuse = bool(_fc_enabled) and bool(_fc_v) \
+                    and bool(_fc_v.get("ok")) and not (_fc_blocked or [])
+                if _reuse:
+                    _pre = _fc_v
+                    logger.info(
+                        "STAGE7_PREPUBLISH_REUSE_FULLCHAIN",
+                        "Reusing the full-chain verdict for the pre-publish "
+                        "gate: same source, same staged candidate, and the "
+                        "full-chain pass carried stricter expected values "
+                        "(frame count / duration) than the param-less check. "
+                        "Re-running it would only re-count the source.",
+                        frames=(_fc_v.get("checks") or {}).get(
+                            "frame_count", {}).get("actual")
+                        if isinstance(_fc_v.get("checks"), dict) else None)
+                else:
+                    # 未复用时才真跑；仍包进度（fallback 路径也可能很慢）。
+                    _pre = _run_with_progress(
+                        lambda: _vo_pre(_probe_source, _publish_tmp, {}),
+                        logger, "pre-publish verification")
             except Exception as _pe:
                 logger.error("STAGE7_PREPUBLISH_VERIFY_ERROR",
                              f"pre-publish check raised: {_pe}")
