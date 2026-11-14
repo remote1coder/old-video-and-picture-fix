@@ -26,7 +26,7 @@ import conftest  # noqa: F401
 
 import main as vmain  # noqa: E402
 
-MODES = ("none", "stage34", "stage67", "both")
+MODES = ("none", "stage34", "stage67", "both", "stream_full")
 
 
 def _job(tmp_path):
@@ -108,7 +108,10 @@ def test_known_modes_equal_cli_choices():
         os.path.abspath(__file__))), "video_restoration_pipeline", "main.py"),
         encoding="utf-8").read()
     # 从源码里抽 --chain 的 choices，避免依赖 parser 的私有结构
-    assert 'choices=["none", "stage34", "stage67", "both"]' in src, \
+    # R25：stream_full 是按《设计 v1》加进来的第四种执行模式，
+    # 它与 stage34/stage67/both 同属"改怎么执行"，所以两个集合都要有它。
+    assert ('choices=["none", "stage34", "stage67", "both",\n'
+            '                                 "stream_full"]') in src, \
         "CLI choices 变了，本测试需要同步更新"
     assert vmain._KNOWN_CHAIN_MODES == frozenset(MODES), \
         vmain._KNOWN_CHAIN_MODES
