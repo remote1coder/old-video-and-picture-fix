@@ -420,9 +420,37 @@ def main():
         _bind = {"ok": False, "digest": None, "frames": 0, "reason": ""}
         try:
             from stream_digest import digest_vpy as _dv
-            # stage2 知道 stage1 写的位深；像素格式由它声明，摘要才有域
+            # 像素格式**不能写死 420**：工作表示可能是 444（G7 三边界之一）。
+            # 写死会让 444 素材的每帧字节数对不上（实测 460800 vs 230400），
+            # 摘要被拒 → 传统门判死。这里问 work_format 要真实边界，
+            # 问不到才退到 420 并**在日志里说明**（不静默）。
             _bd = int(params.get("vs_bit_depth", 16) or 16)
-            _pf = _stream.get("pix_fmt") or f"yuv420p{_bd}le"
+            _pf = _stream.get("pix_fmt") or ""
+            if not _pf:
+                # **实测优先**：y4m 头里的 `C420p16` / `C444p16` 就是这条流
+                # 真实的采样与位深。用配置推断会在 444 工作表示下判错
+                # （实测：写死 420 时每帧 460800 字节对不上 230400，
+                # 摘要被拒 → 传统门把正确跑批判死）。
+                try:
+                    from stream_digest import probe_vpy_header as _pvh2
+                    _c = str((_pvh2(_vpy) or {}).get("chroma") or "")
+                except Exception:                      # pragma: no cover
+                    _c = ""
+                _map = {"420": "yuv420p", "422": "yuv422p", "444": "yuv444p"}
+                _sampling = ""
+                _bits = ""
+                for _k, _v in _map.items():
+                    if _c.startswith(_k):
+                        _sampling, _bits = _v, _c[len(_k):]
+                        break
+                if _sampling and _bits.isdigit():
+                    _pf = f"{_sampling}{_bits}le"
+            if not _pf:
+                _pf = f"yuv420p{_bd}le"
+                logger.warning(
+                    "STAGE2_STREAM_PIXFMT_DEFAULTED",
+                    "cannot read the stage1 y4m header; assuming 4:2:0 "
+                    "16-bit for the digest domain", pix_fmt=_pf)
             _bind = _dv(_vpy, timeout=float(params.get(
                 "stream_digest_timeout", 3600.0)), pix_fmt=_pf)
         except Exception as _de:            # 摘要失败不能阻断检查结论
