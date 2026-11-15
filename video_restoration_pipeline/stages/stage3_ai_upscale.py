@@ -2499,7 +2499,15 @@ def write_job_timeline_plan(params, source_timeline=None, fps_value=None,
     try:
         from timeline_plan import (build_plan as _bp, write_plan as _wp,
                                    build_identity as _bid)
-        _tl = (source_timeline or "unknown").strip().lower()
+        # ---- 流式路径下回退到"计划阶段探测的源时间轴" ----
+        # `_tl_probe` 只在 fps 探测失败时才赋值；stream_full 走 y4m 头那条路，
+        # 它压根没被赋值 → 这里收到 None → 计划里写成 unknown →
+        # stage7 报 `STAGE7_SOURCE_TIMELINE_NOT_VERIFIED` → 整代 UNVERIFIED。
+        # 而 main 在 stage1 之后**已经扫过源的全片 PTS**（`source_timeline`）。
+        # 所以：调用方给不出结论时，采用那个已测得的源时间轴。
+        _tl = (source_timeline or "").strip().lower()
+        if _tl not in ("cfr", "vfr"):
+            _tl = str(params.get("source_timeline") or "").strip().lower()
         if _tl not in ("cfr", "vfr", "unknown"):
             _tl = "unknown"
         _doc = _bp(
