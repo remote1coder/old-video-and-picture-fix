@@ -4066,6 +4066,43 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
                 "stream_full: stage1 emitted the script only; the check pass "
                 "and the AI pass will both run it",
                 vs_script=_vpy, sha256=params["_stream_s1"]["vs_script_sha256"][:16])
+
+            # ---- 源时间轴：stream_full 下**没人探测过源** ----
+            # stage1 只出 vpy 不落盘，stage3 用 y4m 头确定的是**输出**的帧率。
+            # stage7 因此报 `STAGE7_SOURCE_TIMELINE_NOT_VERIFIED`，整代被判
+            # UNVERIFIED（长片实测：成品五项校验全过，只缺这一项）。
+            #
+            # 放在 main 这里而不是某个 stage 里，有两个理由：
+            #   ① 时间轴属**计划阶段的事实**，必须在任何 stage 消费它之前定下来；
+            #   ② main 自己的代码不受 stage 的 inactivity 看门狗约束，而这次
+            #      全片 PTS 扫描在长片上要 20+ 分钟（2.7 GB）。
+            try:
+                job_logger.info(
+                    "STREAM_S1_SOURCE_TIMELINE_PROBE",
+                    "Probing the source timeline (full PTS scan); this can take "
+                    "tens of minutes on long sources and is not idle - do not "
+                    "interrupt")
+                from vfr_timecodes import probe_pts as _vprobe, \
+                    is_variable as _isvar
+                _spts = _vprobe(str(input_path), timeout=5400)
+                if len(_spts) < 3:
+                    _tl = "unknown"
+                else:
+                    _tl = "vfr" if _isvar(_spts) else "cfr"
+                params["source_timeline"] = _tl
+                job_logger.info(
+                    "STREAM_S1_SOURCE_TIMELINE",
+                    "Source timeline established for stream_full",
+                    timeline=_tl, frames=len(_spts))
+            except Exception as _te:
+                # 探测失败就**不宣称**已验证 —— 宁可 UNVERIFIED，
+                # 也不能把"没探到"写成"探到了是 CFR"。
+                params["source_timeline"] = "unknown"
+                job_logger.warning(
+                    "STREAM_S1_SOURCE_TIMELINE_FAIL",
+                    "Could not probe the source timeline; this generation will "
+                    "be reported as UNVERIFIED (capability gap, not a pass)",
+                    error=str(_te))
         if exit_code == 0:
             job_logger.info("STAGE_DONE", f"Stage {stage_num} complete")
             # ---- S6→S7：stage6 交出了脚本，把接力棒交给 stage7 ----
