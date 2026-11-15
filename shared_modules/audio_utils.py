@@ -805,14 +805,38 @@ def process_audio(audio_path: str, output_path: str,
 
         cmd.append(output_path)
 
-        r = subprocess.run(cmd, capture_output=True, timeout=300, shell=False)
-        if r.returncode == 0:
+        # ---- 整条音轨的转码：**不能**用固定总时长判超时 ----
+        # 原来写 `timeout=300`。这是"处理整段音频"的调用，耗时随片长线性增长：
+        # 4 小时素材的 aac/flac 转码远超 5 分钟，写死 300 秒就是在长片上必然
+        # 失败（而且失败方式很难看：被 kill 后只报一句 AUDIO_FAIL）。
+        # 真实进展是**输出文件在长**；不长才是卡住。
+        _proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, shell=False)
+        try:
+            import cancel_guard as _cg
+            _outs, _rcs = _cg.collect_outputs_while_waiting(
+                [_proc], heartbeat=_cg.file_growth_watch(output_path),
+                inactivity_timeout=getattr(_cg, "INACTIVITY_TIMEOUT_S", 300),
+                logger=logger, label="audio-process")
+            _rc = _rcs[0] if _rcs else -1
+            _err = (_outs[0].get("stderr") or b"") if _outs else b""
+        except Exception as _ae:
+            try:
+                _proc.kill(); _proc.wait()
+            except Exception:
+                pass
+            logger.error("AUDIO_FAIL",
+                         "Audio processing could not be supervised",
+                         error=str(_ae))
+            return False
+        if _rc == 0:
             logger.info("AUDIO_DONE", "Audio processing complete",
                        output=output_path, codec=codec, channels=num_channels)
             return True
         else:
-            logger.error("AUDIO_FAIL", "Audio processing failed", 
-                        stderr=r.stderr.decode("utf-8", errors="replace"))
+            logger.error("AUDIO_FAIL", "Audio processing failed",
+                        stderr=_err.decode("utf-8", errors="replace")
+                        if isinstance(_err, (bytes, bytearray)) else str(_err))
             return False
 
     except Exception as e:
