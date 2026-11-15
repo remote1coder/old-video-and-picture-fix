@@ -680,6 +680,47 @@ def _extract_frame(path: str, index: int, out_png: str,
     return _run(cmd, timeout=timeout) is not None and os.path.exists(out_png)
 
 
+def _extract_frames_batch(path: str, idxs, out_dir: str, prefix: str,
+                          width: int = 320, timeout: int = 1800) -> dict:
+    """一次解码抽出**多帧**，返回 ``{帧号: png 路径}``。
+
+    ## 为什么不复用 `_extract_frame`
+
+    它每次都 `-i path` 从头解码到目标帧（**没有 `-ss` 定位**）。长片实测：
+    `verify_frame_alignment(samples=4)` 要 4 个点 × 3 帧 = **12 次启动**，
+    平均每次解 4000 帧 ≈ 把 2.7 GB 源**解码了 6 遍** → 26 分钟，
+    占整条链 1h54m 的 23%。
+
+    一次 `select` 只解一遍，同样素材降到 2~3 分钟。判据一个字没改。
+
+    ## 一个必须防的错位
+
+    `-vsync 0` 下输出文件数 = **实际选中的帧数**。如果请求里混进了超出范围的
+    帧号，输出会少一个，于是"第 j 个文件对应第 j 个帧号"的映射**整体错位**
+    —— 那会拿错误的帧去比，得出看似合理但完全错误的结论。
+    所以：数量对不上就返回空 dict，让调用方按"抽帧失败"处理，**绝不猜**。
+    """
+    import glob as _glob
+    want = sorted({int(i) for i in idxs if int(i) >= 0})
+    if not want:
+        return {}
+    sel = "+".join(f"eq(n\\,{i})" for i in want)
+    pattern = os.path.join(out_dir, f"{prefix}_%05d.png")
+    for _old in _glob.glob(os.path.join(out_dir, f"{prefix}_*.png")):
+        try:
+            os.remove(_old)
+        except OSError:
+            pass
+    cmd = ["ffmpeg", "-v", "error", "-i", path,
+           "-vf", f"select='{sel}',scale={width}:-2",
+           "-vsync", "0", "-y", pattern]
+    _run(cmd, timeout=timeout)
+    files = sorted(_glob.glob(os.path.join(out_dir, f"{prefix}_*.png")))
+    if len(files) != len(want):
+        return {}
+    return {k: files[j] for j, k in enumerate(want)}
+
+
 def _gray_float(img_path: str):
     try:
         import cv2
@@ -784,25 +825,40 @@ def verify_frame_alignment(source_path: str, output_path: str,
 
     try:
         with tempfile.TemporaryDirectory() as td:
+            # ---- 一次解码抽完所有需要的帧 ----
+            # 旧实现逐帧调 `_extract_frame`，每次都从头解到目标帧：4 个采样点
+            # × 3 帧 = 12 次启动 ≈ 把源解码 6 遍，长片 26 分钟。
+            # 这里每个文件只解一遍。**判据一个字没改**，只是取帧方式变了。
+            need_src = sorted({k for k in idxs}
+                              | {k + 1 for k in idxs if k + 1 < n})
+            need_out = sorted({k for k in idxs}
+                              | {k + 1 for k in idxs if k + 1 < n}
+                              | {k - 1 for k in idxs if k - 1 >= 0})
+            src_frames = _extract_frames_batch(source_path, need_src, td, "s")
+            if not src_frames:
+                out["error"] = ("源批量抽帧失败（数量与请求不符或解码失败），"
+                                "拒绝在缺帧的情况下下结论")
+                return out
+            out_frames = _extract_frames_batch(output_path, need_out, td, "c")
+            if not out_frames:
+                out["error"] = "成品批量抽帧失败（数量与请求不符或解码失败）"
+                return out
             for k in idxs:
-                s_png = os.path.join(td, f"s{k}.png")
-                c_png = os.path.join(td, f"c{k}.png")
-                p_png = os.path.join(td, f"p{k}.png")
-                m_png = os.path.join(td, f"m{k}.png")
-                if not _extract_frame(source_path, k, s_png):
-                    out["error"] = f"源第 {k} 帧抽取失败"
-                    return out
-                if not _extract_frame(output_path, k, c_png):
-                    out["error"] = f"成品第 {k} 帧抽取失败"
+                s_png = src_frames.get(k)
+                c_png = out_frames.get(k)
+                if not s_png or not c_png:
+                    out["error"] = f"第 {k} 帧缺失（批量抽帧未覆盖）"
                     return out
                 self_sim = normalized_correlation(_gray_float(s_png),
                                                   _gray_float(c_png))
                 # 邻居：往后一帧（错位最常表现为整体前移/后移一位）
                 nbr = []
-                if k + 1 < n and _extract_frame(output_path, k + 1, p_png):
+                p_png = out_frames.get(k + 1)
+                if k + 1 < n and p_png:
                     nbr.append(("k+1", normalized_correlation(
                         _gray_float(s_png), _gray_float(p_png))))
-                if k - 1 >= 0 and _extract_frame(output_path, k - 1, m_png):
+                m_png = out_frames.get(k - 1)
+                if k - 1 >= 0 and m_png:
                     nbr.append(("k-1", normalized_correlation(
                         _gray_float(s_png), _gray_float(m_png))))
                 nbr = [(t, v) for t, v in nbr if v is not None]
@@ -827,9 +883,9 @@ def verify_frame_alignment(source_path: str, output_path: str,
                 # 判据：源的第 k 帧与第 k+1 帧本身是否足够不同。
                 # 太像就跳过（记 skipped），并让最终结论把"可判定点数"
                 # 一起报出来 —— 不假装查过判不了的点。
-                _s_next = os.path.join(td, f"sn{k}.png")
+                _s_next = src_frames.get(k + 1)
                 src_self_diff = None
-                if _extract_frame(source_path, k + 1, _s_next):
+                if _s_next:
                     _a = _gray_float(s_png)
                     _b = _gray_float(_s_next)
                     _nc = normalized_correlation(_a, _b)
