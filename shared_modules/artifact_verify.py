@@ -744,6 +744,14 @@ def _extract_frames_batch(path: str, idxs, out_dir: str, prefix: str,
     return {k: files[j] for j, k in enumerate(want)}
 
 
+# 抽帧是否优先用 seek。默认 **False**：实测对 16.9 GB 的 ffv1 上游件，
+# `-ss` 组合 seek 跑 600 秒仍未返回（mkv cue 不足以快速定位 ffv1），
+# 而全片批量解码是 20.9 分钟 —— 已经更快。小文件/有索引的文件上 seek
+# 精确且快（tests/test_p6_seek_extract_precision.py 钉住了精度），
+# 需要时可显式打开。
+_SEEK_EXTRACT_ENABLED = False
+
+
 def _extract_frames_seek(path: str, idxs, out_dir: str, prefix: str,
                          width: int = 320, logger=None) -> dict:
     """用**快 seek + 精 seek** 抽指定帧，只解 1 个 GOP；精度不可靠时返回空。
@@ -779,13 +787,41 @@ def _extract_frames_seek(path: str, idxs, out_dir: str, prefix: str,
     want = sorted({int(i) for i in idxs if int(i) >= 0})
     if not want:
         return {}
+    # ---- 先判 CFR：CFR 下时间戳就是 k/fps，**不需要**全片读 PTS ----
+    # 这一步至关重要：`probe_pts` 对 16.9 GB 的 **ffv1** 上游件实测
+    # **120 秒超时、读到 0 帧**（ffv1 没有帧索引，只能全片扫）。
+    # 而 ffprobe 的 `r_frame_rate` / `avg_frame_rate` 只要几百毫秒。
+    # 两者相等即 CFR —— 此时 t = k / fps 就是精确时间戳。
+    _times = {}
     try:
-        from vfr_timecodes import probe_pts as _probe
+        import json as _json
+        _r = _sp.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+             "-of", "json", path],
+            capture_output=True, text=True, errors="replace",
+            timeout=30, shell=False)
+        _st = ((_json.loads(_r.stdout or "{}").get("streams") or [{}])[0] or {})
+        _rf = str(_st.get("r_frame_rate") or "")
+        _af = str(_st.get("avg_frame_rate") or "")
+        if _rf and _rf == _af and "/" in _rf:
+            _n, _, _d = _rf.partition("/")
+            _fps = float(_n) / float(_d or 1)
+            if _fps > 0:
+                _times = {k: k / _fps for k in want}
     except Exception:
-        return {}
-    pts = _probe(path)
-    if len(pts) <= max(want):
-        return {}          # 帧数对不上，交给批量实现
+        _times = {}
+    if not _times:
+        # 非 CFR（或探测失败）才去读逐帧 PTS —— 它可能很慢，读不全就放弃，
+        # 让调用方回退到"全片解码"的批量实现（正确性优先）。
+        try:
+            from vfr_timecodes import probe_pts as _probe
+        except Exception:
+            return {}
+        pts = _probe(path)
+        if len(pts) <= max(want):
+            return {}
+        _times = {k: float(pts[k]) for k in want}
     for _old in _glob.glob(os.path.join(out_dir, f"{prefix}_*.png")):
         try:
             os.remove(_old)
@@ -793,7 +829,7 @@ def _extract_frames_seek(path: str, idxs, out_dir: str, prefix: str,
             pass
     got = {}
     for j, k in enumerate(want):
-        t = float(pts[k])
+        t = float(_times[k])
         lead = 2.0 if t > 2.0 else t
         dest = os.path.join(out_dir, f"{prefix}_{j:05d}.png")
         cmd = ["ffmpeg", "-v", "error",
@@ -930,22 +966,31 @@ def verify_frame_alignment(source_path: str, output_path: str,
             # seek 抽帧与顺序解码抽到的**是同一帧**（最大像素差 0，
             # 含首帧与末帧）。见 tests/test_p6_seek_extract_precision.py。
             _t0 = time.time()
-            src_frames = _extract_frames_seek(source_path, need_src, td, "s",
-                                              logger=logger)
-            _src_mode = "seek"
+            # ---- 默认走批量；seek 只对**小/有索引**的文件有意义 ----
+            # 实测（2026-11-16）：对 16.9 GB 的 ffv1 上游件，
+            #   * `probe_pts` 120 秒超时、读到 0 帧（ffv1 无帧索引）；
+            #   * `-ss` 组合 seek 跑 600 秒仍未返回。
+            # 也就是说 seek **救不了**"上游件过大"这个硬成本。
+            # 而 h264 / 小 ffv1 上 seek 是精确且快的（见
+            # tests/test_p6_seek_extract_precision.py），所以保留它，
+            # 但**只在显式要求时**用（默认 False，避免长片掉进慢路径）。
+            _use_seek = bool((globals().get("_SEEK_EXTRACT_ENABLED") or False))
+            src_frames = (_extract_frames_seek(source_path, need_src, td, "s",
+                                               logger=logger)
+                          if _use_seek else {})
+            _src_mode = "seek" if src_frames else "batch"
             if not src_frames:
-                _src_mode = "batch"
                 src_frames = _extract_frames_batch(source_path, need_src,
                                                    td, "s", logger=logger)
             if not src_frames:
                 out["error"] = ("源抽帧失败（seek 与批量都取不到完整帧集），"
                                 "拒绝在缺帧的情况下下结论")
                 return out
-            out_frames = _extract_frames_seek(output_path, need_out, td, "c",
-                                              logger=logger)
-            _out_mode = "seek"
+            out_frames = (_extract_frames_seek(output_path, need_out, td, "c",
+                                                logger=logger)
+                          if _use_seek else {})
+            _out_mode = "seek" if out_frames else "batch"
             if not out_frames:
-                _out_mode = "batch"
                 out_frames = _extract_frames_batch(output_path, need_out,
                                                    td, "c", logger=logger)
             if not out_frames:
