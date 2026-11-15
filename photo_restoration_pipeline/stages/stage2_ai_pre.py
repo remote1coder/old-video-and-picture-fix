@@ -227,10 +227,17 @@ def run_stage2_ai_pre(input_path: str, output_path: str,
             degradation = None
     if degradation is None:
         degradation = detect_channel_degradation(input_path, params)
+    # 注意：这两个出口返回 3（= 本 stage 跳过），但**必须也打 DONE**。
+    # 原来只打 CHANNEL_SKIP 就 return，于是任何"按事件判 stage 完整性"的检查
+    # 都会漏掉这一支 —— 实测：7 张照片里只有 2 张有 STAGE2_DONE，
+    # 另外 5 张走了这里，看起来像"stage 2 没跑完"。
     if not degradation.get("degraded"):
         if logger:
             logger.info("STAGE2_CHANNEL_SKIP",
                         "No channel degradation detected, skipping correction")
+            logger.info("STAGE2_DONE",
+                        "Stage 2 finished without correction (nothing to fix)",
+                        status="skipped", reason="no_channel_degradation")
         return 3
 
     degraded_channels = degradation.get("channels", [])
@@ -238,6 +245,9 @@ def run_stage2_ai_pre(input_path: str, output_path: str,
         if logger:
             logger.info("STAGE2_CHANNEL_SKIP",
                         "No degraded channels identified")
+            logger.info("STAGE2_DONE",
+                        "Stage 2 finished without correction (nothing to fix)",
+                        status="skipped", reason="no_degraded_channels")
         return 3
 
     if logger:
