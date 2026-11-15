@@ -663,10 +663,23 @@ def process_audio(audio_path: str, output_path: str,
                     if filter_complex is not None:
                         # Append denoise to existing filter_complex
                         # (from Step 1 FFmpeg<4.4 per-channel arnndn hum)
+                        #
+                        # ---- 必须 asplit：一个标签只能被消费一次 ----
+                        # 原来每个声道都写 `[{final_label}]pan=mono|c0=c{i}`，
+                        # 于是 `[aout]` 被消费了 N 次。ffmpeg 明确不允许：
+                        #   Stream specifier 'aout' in filtergraph description
+                        #   ... matches no streams.  → Invalid argument
+                        # 实测确认：同样的图加 `asplit=2` 后立刻成功
+                        # （输出 38478 字节 wav），不加则报上面那句。
+                        # 这也是 `process_audio` 一直跑不通的直接原因。
                         fc_parts = [filter_complex]
+                        _src = final_label[1:-1]
+                        _n = len(ch_names)
+                        _outs = "".join(f"[{_src}_s{j}]" for j in range(_n))
+                        fc_parts.append(f"[{_src}]asplit={_n}{_outs}")
                         for i, ch in enumerate(ch_names):
                             fc_parts.append(
-                                f"[{final_label[1:-1]}]pan=mono|c0=c{i}"
+                                f"[{_src}_s{i}]pan=mono|c0=c{i}"
                                 f"[dch{i}]"
                             )
                             fc_parts.append(
