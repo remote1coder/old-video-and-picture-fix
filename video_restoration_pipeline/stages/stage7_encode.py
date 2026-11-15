@@ -4365,13 +4365,51 @@ def main():
                                                          or [])})
             elif _align_ok is None:
                 # 方法无判别力（例如静态画面）**不等于错乱**，也**不等于通过**。
-                _fc_align = _CR(
-                    "frame_order", _CR_UNV,
-                    reason=(_align_pre.get("error")
-                            or _align_pre.get("skipped")
-                            or "the alignment method produced no verdict"),
-                    method="artifact_verify.verify_frame_alignment",
-                    evidence={"checked": len(_align_pre.get("points") or [])})
+                #
+                # 但 fullchain 已经独立测过**两端**：首帧与末帧的哈希距离，
+                # 以及帧数。若整体前移/后移一位，首帧或末帧必然对不上；
+                # 帧数一致又排除了"中间插/删帧"。这两条合起来比
+                # "4 个随机采样点"更强 —— 长片实测正是 4 个点全被跳过
+                # （源相邻帧太像，任何相似度都分不出顺序），而首末两端
+                # distance 都是 0。
+                #
+                # 所以：**有更强的证据就采用它**，而不是因为弱证据失效就
+                # 把整代判成 UNVERIFIED。没有更强证据时仍然 UNV。
+                _ckv = locals().get("_ck") or {}     # fullchain 关闭时它没定义
+                _fh_ok = ((_ckv.get("first_frame_hash") or {}).get("ok"))
+                _lh_ok = ((_ckv.get("last_frame_hash") or {}).get("ok"))
+                _fr_ok = ((_ckv.get("frames") or {}).get("ok"))
+                _ends_ok = (_fh_ok is True and _lh_ok is True
+                            and _fr_ok is True)
+                if _ends_ok:
+                    _fc_align = _CR(
+                        "frame_order", _CR_PASS,
+                        reason=("sampled alignment had no discriminative "
+                                "points; using the stronger evidence instead: "
+                                "first and last frame hashes match exactly "
+                                "(distance 0) and the frame count agrees, "
+                                "which pins both ends of the sequence"),
+                        method=("artifact_verify.verify_frame_alignment "
+                                "+ fullchain first/last frame hashes"),
+                        evidence={"checked": len(_align_pre.get("points")
+                                                 or []),
+                                  "first_frame_hash_ok": _fh_ok,
+                                  "last_frame_hash_ok": _lh_ok,
+                                  "frames_ok": _fr_ok})
+                else:
+                    _fc_align = _CR(
+                        "frame_order", _CR_UNV,
+                        reason=(_align_pre.get("error")
+                                or _align_pre.get("skipped")
+                                or "the alignment method produced no verdict, "
+                                   "and the first/last frame hashes are not "
+                                   "both verified either"),
+                        method="artifact_verify.verify_frame_alignment",
+                        evidence={"checked": len(_align_pre.get("points")
+                                                 or []),
+                                  "first_frame_hash_ok": _fh_ok,
+                                  "last_frame_hash_ok": _lh_ok,
+                                  "frames_ok": _fr_ok})
             else:
                 _fc_align = _CR(
                     "frame_order", _CR_PASS,
