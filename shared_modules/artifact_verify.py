@@ -671,15 +671,6 @@ if __name__ == "__main__":
 # 不要拿它去比"原始源 vs 全链成品"。
 
 
-def _extract_frame(path: str, index: int, out_png: str,
-                   width: int = 320, timeout: int = 120) -> bool:
-    """抽第 index 帧，缩到 width 宽（统一尺寸后可比）。"""
-    cmd = ["ffmpeg", "-v", "error", "-i", path,
-           "-vf", f"select=eq(n\\,{index}),scale={width}:-2",
-           "-frames:v", "1", "-y", out_png]
-    return _run(cmd, timeout=timeout) is not None and os.path.exists(out_png)
-
-
 def _extract_frames_batch(path: str, idxs, out_dir: str, prefix: str,
                           width: int = 320, logger=None) -> dict:
     """一次解码抽出**多帧**，返回 ``{帧号: png 路径}``。
