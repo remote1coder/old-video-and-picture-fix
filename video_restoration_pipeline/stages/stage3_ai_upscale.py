@@ -3111,6 +3111,26 @@ def main():
     # 合法性必须由**源**决定；这里探不到就按 unknown 处理（不放行）。
     _src_pts_map = _query_all_pts(str(args.input), logger)
     _src_tl = _classify_timeline(_src_pts_map, None)
+    if _src_tl == "unknown":
+        # ---- 两条判据不一致时，采用更合适的那个 ----
+        # `_classify_timeline` 要求"帧号从 0 连续"（它本来是为**中间产物**
+        # 设计的，中间产物总是从 0 开始）。但**源**的 PTS 可以从任意值开始
+        # ——裁剪/拼接/concat 都会带偏移。实测：一段 concat 出来的 VFR 素材
+        # 首帧 PTS=0.021016，这里判 unknown，于是 stage3 放行了不带 PTS 的
+        # 流式路径，把 VFR 压成固定帧率；stage7 只好在发布前拒绝
+        # （`STAGE7_VFR_RETIME_FAIL`，rc=86）。
+        #
+        # main 已经在 stage1 之后用 `vfr_timecodes.is_variable` 探过源
+        # （那条判据用"间隔相对中位数是否有明显偏离"，不要求首帧为 0），
+        # 结论更贴合"源"这个对象。所以这里 unknown 时采用它。
+        _p = str(params.get("source_timeline") or "").strip().lower()
+        if _p in ("cfr", "vfr"):
+            _src_tl = _p
+            logger.info(
+                "STAGE3_SOURCE_TIMELINE_FROM_PLAN",
+                "Per-frame index-based classification was inconclusive for "
+                "this source; adopting the plan-stage verdict instead",
+                source_timeline=_src_tl, pts_read=len(_src_pts_map or {}))
 
     # R12-10：帧率探测失败**不能静默用默认值**。
     # 真实 30fps 的素材若按 25fps 编码，帧数完全正确但时长变了 20%，
@@ -3288,7 +3308,23 @@ def main():
             "original timing. Use the PNG path, which carries per-frame PTS.",
             source_timeline=_src_tl,
             src_pts_usable=len(_src_pts_map or {}),
+            # stream_full 下**没有 PNG 路径可退**：它不写 step1 媒体。
+            # 不讲清楚的话，用户看到的是
+            # `compute_param_hash: input identity degraded for ''`
+            # 这种完全不知所云的错误（实测）。
+            stream_full=bool(_svpy),
             intermediate_timeline=_classify_timeline(all_pts_map, total_frames))
+        if _svpy:
+            logger.error(
+                "STAGE3_STREAM_VFR_UNSUPPORTED",
+                "stream_full cannot process this job: the source is VFR, so "
+                "the fixed-frame-rate raw pipe would destroy the original "
+                "timing, while the PNG fallback needs the stage1 media that "
+                "stream_full deliberately does not write. Run this job with "
+                "--chain none (classic chain, carries per-frame PTS) — that is "
+                "a capability boundary of stream_full, not a defect.",
+                source_timeline=_src_tl)
+            return 86
     elif not _svpy and _classify_timeline(all_pts_map, total_frames) != "cfr":
         # STR-04 / R12-10：只有**确认是 CFR** 才允许走不携带 PTS 的流式路径。
         # VFR 会被压成 CFR；UNKNOWN（PTS 读不出/非单调/不足）同样不能
