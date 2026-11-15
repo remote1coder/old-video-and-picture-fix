@@ -707,6 +707,59 @@ def _join_chunks(chunks):
         for c in chunks).encode("utf-8", "replace")
 
 
+def _tree_cpu_seconds(pid) -> float:
+    """读**整个进程树**累计 CPU 秒数（自身 + 所有后代）；失败返回 0.0。
+
+    ## 为什么必须是"进程树"
+
+    `GetProcessTimes` / `psutil.Process.cpu_times()` 只算**该进程本身**的
+    线程。而 stage 脚本大部分时间在**等子进程**（ffmpeg / vspipe / mkvmerge）：
+    实测一个正在编码的 main.py，自身 CPU 11.48s，而进程树合计 52.08s ——
+    只读自身会被误判成"没在干活"。
+
+    加上"所有后代"之后就准了：同一跑批 5 秒墙钟涨 **4.95 秒** CPU。
+
+    ## 它解决什么问题
+
+    `progress_watch` 给的是"写了多少字节 / 日志涨了多少"。凡是**纯计算、
+    不写文件、也不打日志**的段落，这两个信号都是静止的 —— 长片实测被误杀
+    5 次（stage2 摘要、stage3 正式遍摘要、stage5 人脸推理、stage7 fullchain、
+    stage7 pre-publish）。之前只能一处一处补进度文件/进度日志。
+
+    进程树的 CPU 时间是**操作系统计数器**，不受 GIL、日志锁、缓冲影响：
+    只要它在算，这个数就在涨；真死锁时 CPU 不涨，照样会被抓。
+    这是设计 §4.2 要的"真实状态观测"，而不是假心跳。
+
+    Args:
+        pid: 进程号。
+
+    Returns:
+        用户 + 内核 CPU 秒数之和（含所有后代）；psutil 不可用或进程已退出
+        时返回 0.0（此时靠另一个分量判活）。
+    """
+    try:
+        import psutil
+    except Exception:
+        return 0.0
+    total = 0.0
+    try:
+        p = psutil.Process(int(pid))
+        t = p.cpu_times()
+        total += float(t.user) + float(t.system)
+    except Exception:
+        return 0.0
+    try:
+        for c in p.children(recursive=True):
+            try:
+                t = c.cpu_times()
+                total += float(t.user) + float(t.system)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return total
+
+
 def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
                              inactivity_timeout, poll_interval):
     """轮询子进程进度，无进展超阈值则杀掉并抛 :class:`StageStalled`。
@@ -754,7 +807,21 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
         # 留着就是永远不变的分量（等于没加），所以不引入。
         # 纯计算段落改由"stage 自己往会增长的文件里写进度"覆盖（见
         # stage2/stage3 的 *_digest.progress 与 stage7 的 _run_with_progress）。
-        last_mark = progress_watch()
+        def _mark():
+            """(= 既有进度标记, 进程树累计 CPU 秒)。
+
+            两个分量互补：
+              * 第一项覆盖"有副作用"的进度（字节增长 / 日志增长）；
+              * 第二项覆盖"纯计算、无副作用"的段落（摘要在算、校验在解码）。
+            两项都不动才是真停滞。
+            """
+            try:
+                _b = progress_watch()
+            except BaseException:
+                _b = None
+            return (_b, round(_tree_cpu_seconds(proc.pid), 1))
+
+        last_mark = _mark()
     except BaseException:
         last_mark = None
     last_change = started
@@ -773,7 +840,7 @@ def _supervise_with_watchdog(proc, cmd, timeout, logger, progress_watch,
             if inactivity_timeout is not None and now >= next_poll:
                 next_poll = now + poll_interval
                 try:
-                    mark = progress_watch()
+                    mark = _mark()
                 except BaseException:
                     mark = last_mark
                 if mark != last_mark:
