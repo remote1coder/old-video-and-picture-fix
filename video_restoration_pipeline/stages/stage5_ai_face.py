@@ -2330,7 +2330,13 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
 
     # P9-ARCH: disk pre-check and path selection
     # Per P9-ARCH spec: when video > 5 min or > 10000 frames, use streaming
-    use_streaming = (video_duration > 300 or video_frames_total > 10000)
+    # 门限**可配置**：默认值保持不变（行为零改变），但允许用小素材验证
+    # streaming 分支 —— 否则 `restored_frames` 的索引化改造永远走不到
+    # （>300s 或 >10000 帧的**带人脸**素材极难造，实测两条腿都跑不到）。
+    _s5_min_s = float(params.get("stage5_streaming_min_seconds", 300) or 300)
+    _s5_min_f = int(params.get("stage5_streaming_min_frames", 10000) or 10000)
+    use_streaming = (video_duration > _s5_min_s
+                     or video_frames_total > _s5_min_f)
 
     # Disk space pre-check for legacy path
     if not use_streaming and video_frames_total > 0 and video_width > 0:
