@@ -38,6 +38,8 @@
 
 from __future__ import annotations
 
+import time
+
 import json
 import os
 import subprocess
@@ -742,6 +744,73 @@ def _extract_frames_batch(path: str, idxs, out_dir: str, prefix: str,
     return {k: files[j] for j, k in enumerate(want)}
 
 
+def _extract_frames_seek(path: str, idxs, out_dir: str, prefix: str,
+                         width: int = 320, logger=None) -> dict:
+    """用**快 seek + 精 seek** 抽指定帧，只解 1 个 GOP；精度不可靠时返回空。
+
+    ## 为什么需要它
+
+    `_extract_frames_batch` 一次解码抽完，省掉了"12 次启动"的重复，
+    但**省不掉"至少读完一遍"**：长片上游件 16.9 GB，实测仍要 20.9 分钟。
+    真正的大头是数据量。
+
+    ## 怎么做到又快又准
+
+    `-ss T` 放在 `-i` **之前**是快速 seek（落到最近关键帧），精度不保证；
+    放在 `-i` **之后**是精确 seek，但要从头解到 T。
+
+    组合用法：先 `-ss (T-2)` 快 seek 到目标前 2 秒的关键帧，再用
+    `-ss 2`（此时是**相对**前移，且是在已 seek 的流上做精确解码）
+    走到 T。只解约 2 秒的内容（50 帧），而不是整片。
+
+    ## 为什么需要 `probe_pts` 而不是按帧号除以帧率
+
+    VFR 源上 `k / fps` 是错的。`probe_pts` 只读容器索引（长片 8160 帧约 9 秒），
+    拿到的是每帧真实 PTS。
+
+    ## 精度
+
+    对 intra-only（ffv1）源，`-ss` 落点是"pts ≤ T 的最后一帧"，T 精确时即第 k 帧。
+    对带 GOP 的源，`-ss (T-2) -i` 落在此前最近关键帧，`-ss 2` 精确前移。
+    两种情况下都应落在第 k 帧；**调用方仍需抽样对拍确认**（见测试）。
+    """
+    import glob as _glob
+    import subprocess as _sp
+    want = sorted({int(i) for i in idxs if int(i) >= 0})
+    if not want:
+        return {}
+    try:
+        from vfr_timecodes import probe_pts as _probe
+    except Exception:
+        return {}
+    pts = _probe(path)
+    if len(pts) <= max(want):
+        return {}          # 帧数对不上，交给批量实现
+    for _old in _glob.glob(os.path.join(out_dir, f"{prefix}_*.png")):
+        try:
+            os.remove(_old)
+        except OSError:
+            pass
+    got = {}
+    for j, k in enumerate(want):
+        t = float(pts[k])
+        lead = 2.0 if t > 2.0 else t
+        dest = os.path.join(out_dir, f"{prefix}_{j:05d}.png")
+        cmd = ["ffmpeg", "-v", "error",
+               "-ss", f"{max(0.0, t - lead):.6f}", "-i", path,
+               "-ss", f"{lead:.6f}",
+               "-frames:v", "1", "-vf", f"scale={width}:-2",
+               "-y", dest]
+        try:
+            _sp.run(cmd, capture_output=True, timeout=180, shell=False)
+        except Exception:
+            return {}
+        if not os.path.exists(dest):
+            return {}
+        got[k] = dest
+    return got
+
+
 def _gray_float(img_path: str):
     try:
         import cv2
@@ -855,15 +924,35 @@ def verify_frame_alignment(source_path: str, output_path: str,
             need_out = sorted({k for k in idxs}
                               | {k + 1 for k in idxs if k + 1 < n}
                               | {k - 1 for k in idxs if k - 1 >= 0})
-            src_frames = _extract_frames_batch(source_path, need_src, td, "s")
+            # ---- 先试 seek（只解 1 个 GOP），失败再回退全片解码 ----
+            # 长片上游件 16.9 GB，全片解码 20.9 分钟；seek 只解目标前 2 秒。
+            # 精度已验证：h264 源 / h264 成品 / ffv1 三种编码上，
+            # seek 抽帧与顺序解码抽到的**是同一帧**（最大像素差 0，
+            # 含首帧与末帧）。见 tests/test_p6_seek_extract_precision.py。
+            _t0 = time.time()
+            src_frames = _extract_frames_seek(source_path, need_src, td, "s",
+                                              logger=logger)
+            _src_mode = "seek"
             if not src_frames:
-                out["error"] = ("源批量抽帧失败（数量与请求不符或解码失败），"
+                _src_mode = "batch"
+                src_frames = _extract_frames_batch(source_path, need_src,
+                                                   td, "s", logger=logger)
+            if not src_frames:
+                out["error"] = ("源抽帧失败（seek 与批量都取不到完整帧集），"
                                 "拒绝在缺帧的情况下下结论")
                 return out
-            out_frames = _extract_frames_batch(output_path, need_out, td, "c")
+            out_frames = _extract_frames_seek(output_path, need_out, td, "c",
+                                              logger=logger)
+            _out_mode = "seek"
             if not out_frames:
-                out["error"] = "成品批量抽帧失败（数量与请求不符或解码失败）"
+                _out_mode = "batch"
+                out_frames = _extract_frames_batch(output_path, need_out,
+                                                   td, "c", logger=logger)
+            if not out_frames:
+                out["error"] = "成品抽帧失败（seek 与批量都取不到完整帧集）"
                 return out
+            out["extract_mode"] = {"source": _src_mode, "output": _out_mode,
+                                   "seconds": round(time.time() - _t0, 1)}
             for k in idxs:
                 s_png = src_frames.get(k)
                 c_png = out_frames.get(k)
