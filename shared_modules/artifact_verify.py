@@ -681,7 +681,7 @@ def _extract_frame(path: str, index: int, out_png: str,
 
 
 def _extract_frames_batch(path: str, idxs, out_dir: str, prefix: str,
-                          width: int = 320, timeout: int = 1800) -> dict:
+                          width: int = 320, logger=None) -> dict:
     """一次解码抽出**多帧**，返回 ``{帧号: png 路径}``。
 
     ## 为什么不复用 `_extract_frame`
@@ -714,7 +714,37 @@ def _extract_frames_batch(path: str, idxs, out_dir: str, prefix: str,
     cmd = ["ffmpeg", "-v", "error", "-i", path,
            "-vf", f"select='{sel}',scale={width}:-2",
            "-vsync", "0", "-y", pattern]
-    _run(cmd, timeout=timeout)
+
+    # ---- 不用固定总时长，用"输出还在长"判活 ----
+    # 我第一版写的是 `_run(cmd, timeout=1800)` —— 同一个文件里的
+    # `retime_to_source_pts` 已经明确记过这个教训（"4K 16 位中间件单件
+    # 250 GB，30 分钟根本不够；换个更长的素材又得再调一次"），我还是照抄了。
+    # 硬编码总时长的本质错误：**把"跑多久"当成了可以预先知道的量**，
+    # 而它取决于素材大小/码率/磁盘速度。
+    # 抽帧的**真实进展**是输出 PNG 的总字节在长；不长才是卡住。
+    import subprocess as _sp
+    def _bytes_watch():
+        try:
+            return sum(os.path.getsize(f) for f in
+                       _glob.glob(os.path.join(out_dir, f"{prefix}_*.png")))
+        except Exception:
+            return 0
+    try:
+        _p = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.PIPE, shell=False)
+    except Exception:
+        return {}
+    try:
+        import cancel_guard as _cg
+        _cg.collect_outputs_while_waiting(
+            [_p], heartbeat=_bytes_watch,
+            inactivity_timeout=getattr(_cg, "INACTIVITY_TIMEOUT_S", 300),
+            logger=logger, label="extract-frames")
+    except Exception:
+        try:
+            _p.kill(); _p.wait()
+        except Exception:
+            pass
+        return {}
     files = sorted(_glob.glob(os.path.join(out_dir, f"{prefix}_*.png")))
     if len(files) != len(want):
         return {}
