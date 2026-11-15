@@ -218,25 +218,39 @@ def get_audio_info(audio_path: str) -> Dict[str, Any]:
         "codec": None,
     }
     try:
+        # ---- 按 **key** 取，不按行序取 ----
+        # 原来用 `-of default=noprint_wrappers=1:nokey=1` 然后
+        # `lines[0]`→sample_rate、`lines[1]`→channels、`lines[2]`→codec。
+        # 这假设了 ffprobe 按**请求顺序**输出 —— 它实际按**内部字段序**：
+        # 对 audio stream 是 codec_name 在前。
+        # 实测 `-of csv=p=0` 输出 `aac,48000,2`，于是：
+        #   lines[0]="aac"    → isdigit False → sample_rate 丢失
+        #   lines[1]="48000"  → **channels = 48000**  ← 就是这个 bug
+        #   lines[2]="2"      → codec = "2"
+        # 后果：`num_channels(48000) > 2` 成立 → 走进多声道分支（加 `-ac 48000`）
+        # → ffmpeg 失败 → `AUDIO_FAIL`、输出 0 字节。
+        # 日志里那句 `Detected 48000ch (stereo)` 就是它。
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=sample_rate,channels,codec_name",
-             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+             "-of", "json", audio_path],
             capture_output=True, text=True, errors="replace", timeout=30, shell=False
         )
         if r.returncode == 0:
-            lines = [line.strip() for line in r.stdout.strip().splitlines() if line.strip()]
-            if len(lines) >= 3:
-                # sample_rate
-                sr = lines[0]
-                if sr.isdigit():
-                    info["sample_rate"] = int(sr)
-                # channels
-                ch = lines[1]
-                if ch.isdigit():
-                    info["channels"] = int(ch)
-                # codec
-                info["codec"] = lines[2] if lines[2] else None
+            import json as _json
+            try:
+                _streams = (_json.loads(r.stdout or "{}").get("streams") or [])
+            except ValueError:
+                _streams = []
+            if _streams:
+                _st = _streams[0] or {}
+                _sr = str(_st.get("sample_rate") or "").strip()
+                if _sr.isdigit():
+                    info["sample_rate"] = int(_sr)
+                _ch = str(_st.get("channels") or "").strip()
+                if _ch.isdigit():
+                    info["channels"] = int(_ch)
+                info["codec"] = _st.get("codec_name") or None
         # channel_layout from separate probe (more reliable)
         info["channel_layout"] = get_audio_channel_layout(audio_path)
     except Exception:
