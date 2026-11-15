@@ -38,10 +38,15 @@ CLAUDE.md
 # 文档：默认忽略所有 md；README.md 与下面两本长期文档保留入库（用户指定）
 *.md
 *.md.bak*
-!README.md
-!readme.md
-!PROJECT_MANUAL.md
-!architecture.md
+# 只放行**仓库根**的那几本长期文档。
+# 原来写的是 `!README.md`（不带斜杠）—— gitignore 的规则是"不带斜杠的模式
+# 匹配任意层级"，于是 `tests/probes/README.md` 这种子目录里的 README
+# 也被放行了，被误推到远程（2026-11-16 已撤回）。
+# 带上前导斜杠 `!/` 就只匹配根目录。
+!/README.md
+!/readme.md
+!/PROJECT_MANUAL.md
+!/architecture.md
 # 第四轮：真实环境依赖（工具与venv，体积大，不入库）
 tools_r4/
 .venv_r4/
