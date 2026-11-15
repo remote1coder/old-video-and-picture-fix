@@ -75,3 +75,33 @@ def test_process_audio_returns_true_and_writes_output(tmp_path, ch):
         "② filtergraph 标签被重复消费（缺 asplit）")
     assert os.path.exists(out) and os.path.getsize(out) > 1000, \
         "process_audio 声称成功但输出为空"
+
+
+def test_process_audio_preserves_5_1_layout(tmp_path):
+    """5.1 素材必须保持 6 声道、不被混缩成立体声。
+
+    这条覆盖 asplit 修复的**多声道**场景：6 声道 → `[aout]` 要被消费 6 次，
+    标签重复消费的 bug 在这里比 stereo 更容易暴露。
+    设计明确要求"严禁混缩为立体声"（v7.32 §3.10.9）。
+    """
+    src = str(tmp_path / "s51.mka")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-v", "error", "-y",
+             "-f", "lavfi", "-i", "anoisesrc=d=1.0:c=pink:r=48000:a=0.05",
+             "-af", "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0",
+             "-c:a", "flac", src],
+            check=True, capture_output=True, timeout=120)
+    except Exception:
+        pytest.skip("cannot synthesize 5.1 audio")
+    out = str(tmp_path / "o51.flac")
+    cfg = {"audio": {"enabled": True, "denoise": "afftdn", "hum_freq": None,
+                     "codec": "flac", "sample_rate": "auto",
+                     "multichannel_preserve": True}}
+    ok = audio_utils.process_audio(src, out, cfg, None)
+    assert ok is True, "5.1 处理失败（asplit 标签数或声道映射有问题）"
+    info = audio_utils.get_audio_info(out)
+    assert info["channels"] == 6, (
+        f"5.1 输出变成 {info['channels']} 声道 —— 被混缩了，违反'严禁混缩为立体声'")
+    assert "5.1" in str(info.get("channel_layout") or ""), \
+        f"声道布局丢了：{info.get('channel_layout')!r}"
