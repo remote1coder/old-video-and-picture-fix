@@ -744,11 +744,23 @@ def _extract_frames_batch(path: str, idxs, out_dir: str, prefix: str,
     return {k: files[j] for j, k in enumerate(want)}
 
 
-# 抽帧是否优先用 seek。默认 **False**：实测对 16.9 GB 的 ffv1 上游件，
-# `-ss` 组合 seek 跑 600 秒仍未返回（mkv cue 不足以快速定位 ffv1），
-# 而全片批量解码是 20.9 分钟 —— 已经更快。小文件/有索引的文件上 seek
-# 精确且快（tests/test_p6_seek_extract_precision.py 钉住了精度），
-# 需要时可显式打开。
+# 抽帧是否优先用 seek。**默认 False —— 实测 `-ss` 抽帧不可靠**。
+#
+# 完整体测矩阵（240 帧素材，与"顺序解码"逐像素对拍）：
+#
+# | seek 方式                    | ffv1        | h264        | 1fps 素材 |
+# |------------------------------|-------------|-------------|-----------|
+# | 单段 `-ss t -i f`            | 差 32764 ✗  | 差 201 ✗    | —         |
+# | 两段 `-ss t-2 -i f -ss 2`    | 差 0 ✓      | 差 0 ✓      | **抽到 k+1 ✗** |
+# | `-ss` 放在 `-i` 之后（精确） | 对，但等于全片解码 | 同左 | 同左 |
+#
+# 两段式看似能用，但它第二段是**相对位移**，落点取决于第一段落在哪个
+# 关键帧 —— 于是结果随素材帧率/GOP 结构漂移。而这条判据判的正是
+# "是否错位 1 帧"，**任何不稳定都等于把要检测的误差引入测量**。
+#
+# 所以：宁可慢（批量 20.9 分钟），不用不可靠的快。
+# 函数 `_extract_frames_seek` 保留，供**人工诊断**用（速度确实快：
+# 长片上游件 4 帧 6.5 秒），但**不进判据链路**。
 _SEEK_EXTRACT_ENABLED = False
 
 
@@ -787,6 +799,14 @@ def _extract_frames_seek(path: str, idxs, out_dir: str, prefix: str,
     want = sorted({int(i) for i in idxs if int(i) >= 0})
     if not want:
         return {}
+    # 输出目录必须自己建：调用方可能传一个还不存在的路径（我就是这么用的），
+    # 而 ffmpeg 不会替你建目录 —— 它会静默失败，于是本函数返回空，
+    # 看上去就像"这个文件不支持 seek"。我第一次测长片时正是栽在这里，
+    # 差点把一条**可用**的优化当成"无效"永久关掉。
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        return {}
     # ---- 先判 CFR：CFR 下时间戳就是 k/fps，**不需要**全片读 PTS ----
     # 这一步至关重要：`probe_pts` 对 16.9 GB 的 **ffv1** 上游件实测
     # **120 秒超时、读到 0 帧**（ffv1 没有帧索引，只能全片扫）。
@@ -808,7 +828,14 @@ def _extract_frames_seek(path: str, idxs, out_dir: str, prefix: str,
             _n, _, _d = _rf.partition("/")
             _fps = float(_n) / float(_d or 1)
             if _fps > 0:
-                _times = {k: k / _fps for k in want}
+                # **帧中点**，不是帧起始。
+                # 用 `k / fps` 会让 seek 时间正好落在第 k 帧的边界上，
+                # ffmpeg 取哪一帧取决于内部舍入 —— 实测在 1fps 素材上
+                # 抽到的是 **k+1 帧**（`test_r7_artifact_verify.py::
+                # test_alignment_passes_on_reencode` 抓到的：
+                # 对应=0.9972 而邻居 k+1=1.0，正好反了）。
+                # 加半个帧长，落在帧内部，边界歧义消失。
+                _times = {k: (k + 0.5) / _fps for k in want}
     except Exception:
         _times = {}
     if not _times:
@@ -918,7 +945,8 @@ def _frames_or_count(path: str) -> Optional[int]:
 
 def verify_frame_alignment(source_path: str, output_path: str,
                            samples: int = 6,
-                           margin: float = 0.02) -> Dict[str, Any]:
+                           margin: float = 0.02,
+                           logger=None) -> Dict[str, Any]:
     """抽查若干位置，确认 src[k] 比 src[k±1] 更像 out[k]。
 
     Args:
