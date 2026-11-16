@@ -361,8 +361,17 @@ def read_png(path: str) -> Any:
     Supports the subset our writer emits: 8/16-bit, color type 0/2/4/6,
     filter type 0 or adaptive filters (all 5 filter types), no interlace.
     """
+    return read_png_bytes(Path(path).read_bytes())
+
+
+def read_png_bytes(data: bytes) -> Any:
+    """`read_png` 的**字节版**（R26-A11：G'MIC adapter 走 stdin/stdout，
+    中间不落盘，需要能直接解内存里的 PNG）。
+
+    位深由 PNG 头（IHDR）决定，**不经过 PIL** —— PIL 会把 16bit 降成 8bit
+    （项目里踩过：avifdec 输出的 16bit PNG 用 PIL 读会丢失低 8 位）。
+    """
     import numpy as np
-    data = Path(path).read_bytes()
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise ValueError("not a PNG file")
     pos = 8
