@@ -1219,12 +1219,42 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
 
     dec_txt, ai_txt, enc_txt = _read_err("dec"), _read_err("ai"), _read_err("enc")
     ai_frames, ai_digest = 0, ""
+    # N26-04：**AI 实际消费的那批字节**的摘要与域。
+    ai_in_digest, ai_in_stream = "", ""
     for ln in ai_txt.splitlines():
         if ln.startswith("FRAMES="):
             try: ai_frames = int(ln.split("=", 1)[1])
             except ValueError: pass
         elif ln.startswith("FRAMES_DIGEST="):
             ai_digest = ln.split("=", 1)[1].strip()
+        elif ln.startswith("IN_FRAMES_DIGEST="):
+            ai_in_digest = ln.split("=", 1)[1].strip()
+        elif ln.startswith("IN_STREAM="):
+            ai_in_stream = ln.split("=", 1)[1].strip()
+    if ai_in_digest and contract_path:
+        # 落 sidecar：`_two_pass_check` 要读它。放在 contract 旁边
+        # （同一目录、同一 attempt 前缀），不与合同文件混内容 ——
+        # 合同描述"写出的边界"，这份描述"读进来的那批"。
+        try:
+            import json as _json_in
+            with open(str(contract_path) + ".ai_input.json", "w",
+                      encoding="utf-8") as _fi:
+                _json_in.dump({
+                    "schema": "ai-consumed-input/1",
+                    "frames": int(ai_frames or 0),
+                    "digest": ai_in_digest,
+                    "pix_fmt": ai_in_stream or "unknown",
+                    "note": ("ordered sha256 over the rgb48le bytes the AI "
+                             "process actually read from stdin; NOT directly "
+                             "comparable with the check pass, which digests "
+                             "yuv420p16le y4m"),
+                }, _fi, ensure_ascii=False, indent=2)
+        except Exception as _ie:
+            if logger:
+                logger.warning("STAGE3_AI_INPUT_DIGEST_UNWRITTEN",
+                               "could not persist the AI-consumed input "
+                               "digest; two-pass binding will fall back to "
+                               "structural facts only", error=str(_ie))
     _src_rc = 0 if src is None else src.returncode
     rc_ok = (dec.returncode == 0 and ai.returncode == 0
              and enc.returncode == 0 and _src_rc == 0)
@@ -2572,7 +2602,7 @@ def _frames_from_check_sidecar(temp_dir: str, job_id: str,
 
 
 def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
-                    vpy: str, params, logger):
+                    vpy: str, params, logger, output_mkv: str = ""):
     """正式遍的像素摘要 → 与检查遍比对（设计 §5.1 的后半截）。
 
     ## 为什么正式遍要**再算一次**
@@ -2581,9 +2611,25 @@ def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
     脚本、或者渲染本身不可复现，检查结论就不该被复用 —— 而**只比帧数和
     计划看不出来**。所以正式遍必须自己出一份摘要再比。
 
-    代价：多一次整片解码（不落盘）。对长片是实打实的时间，但这个项目
-    的原则是"先证明，再省"；想省可以显式关 `stream_two_pass_check`，
-    关掉时日志会写明"这一代**未**做两遍比对"。
+    ## R25-06 / N26-04：改成读 **AI 实际消费的输入摘要**
+
+    原来的做法是**再跑一次** `digest_vpy(vpy)`，把这次独立重放与检查遍
+    的独立摘要比较。两次旁路重放相同，只能证明"同一个 vpy 是确定的"，
+    不能证明"检查器和 AI 消费了同一批帧" —— 复核 PA02 用一个模拟消费者
+    B 就打穿了这一点。
+
+    现在读 `_stream_raw_upscale` 在 AI 进程内部算出的
+    `IN_FRAMES_DIGEST`（域 = rgb48le，AI 从 stdin 实际读到的字节）。
+
+    **注意域不同**：检查遍算的是 yuv420p16le（stage2 的 y4m），
+    AI 消费的是 rgb48le（ffmpeg 解码后）。这是**合法变换**，
+    摘要不该相等 —— 复核原话"合法时间转换用明确映射，不强求不该相同的
+    哈希"。所以这里：
+
+    * 有输入摘要时：比**帧数**，并把两个摘要与各自的域都写进日志
+      （可追溯、不冒充相等）；
+    * 没有输入摘要（旧产物/老脚本）时：退回原来的独立重放比较，
+      但日志明确写"这是旁路重放，不是消费流"。
 
     Returns:
         ``(ok, reason)``。``ok=False`` 时调用方必须停止（严格模式）。
@@ -2643,6 +2689,47 @@ def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
             logger.warning("STAGE3_TWO_PASS_PIXFMT_DEFAULTED",
                            "cannot read the y4m header; assuming 4:2:0 for "
                            "the formal-pass digest domain", pix_fmt=_pf)
+    # ==== N26-04：优先用 **AI 实际消费的输入摘要** ====
+    #
+    # sidecar 由 `_stream_raw_upscale` 在 AI 进程读 stdin 时算好并落盘
+    # （`{output_mkv}.frame_contract.json.ai_input.json`）。
+    # 有了它就不该再跑一次 `digest_vpy` 冒充"消费流"。
+    _ai_in = None
+    if output_mkv:
+        try:
+            with open(str(output_mkv) + ".frame_contract.json.ai_input.json",
+                      "r", encoding="utf-8") as _fa:
+                _ai_in = _json.load(_fa) or None
+        except (OSError, ValueError):
+            _ai_in = None
+
+    if _ai_in and _ai_in.get("digest"):
+        _ai_frames = int(_ai_in.get("frames") or 0)
+        _chk_frames = int((_chk_doc.get("pixels") or {}).get("frames") or 0)
+        _ai_pf = str(_ai_in.get("pix_fmt") or "unknown")
+        _chk_pf = str((_chk_doc.get("pixels") or {}).get("pix_fmt") or "unknown")
+        if _chk_frames and _ai_frames and _chk_frames != _ai_frames:
+            logger.error(
+                "STAGE3_TWO_PASS_FRAME_MISMATCH",
+                "the check pass and the AI-consumed input disagree on the "
+                "frame count; they are not the same stream",
+                check_frames=_chk_frames, ai_frames=_ai_frames)
+            return False, (f"check pass saw {_chk_frames} frames, the AI "
+                           f"consumed {_ai_frames}")
+        logger.info(
+            "STAGE3_TWO_PASS_CONSUMED_INPUT",
+            "bound the check pass to the bytes the AI actually read "
+            "(different pixel domains by design; digests are recorded, "
+            "not compared as equal)",
+            frames=_ai_frames or _chk_frames,
+            ai_input_digest=str(_ai_in.get("digest"))[:16],
+            ai_input_pix_fmt=_ai_pf,
+            check_digest=str((_chk_doc.get("pixels") or {}
+                              ).get("digest"))[:16],
+            check_pix_fmt=_chk_pf)
+        return True, (f"consumed-input binding ok: {_ai_frames or _chk_frames} "
+                      f"frames, domains {_ai_pf} vs {_chk_pf}")
+
     _prog = os.path.join(
         temp_dir, f"{job_id}_{Path(input_name).stem}_step3_digest.progress")
     _formal = _dv(vpy, timeout=float(params.get(
@@ -3575,7 +3662,7 @@ def main():
                         if _svpy:
                             _tp_ok, _tp_why = _two_pass_check(
                                 temp_dir, job_id, input_name, _svpy,
-                                params, logger)
+                                params, logger, output_mkv=str(_s_out))
                             if not _tp_ok:
                                 logger.error(
                                     "STAGE3_TWO_PASS_BLOCKED",

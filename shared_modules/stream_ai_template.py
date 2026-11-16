@@ -136,8 +136,13 @@ def build_fixed_frame_script(frame_dir, in_w, in_h, out_w, out_h):
 
 
 def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
-                           gpu_id=0):
+                           gpu_id=0, in_pix_fmt="rgb48le"):
     """生成 AI 子进程脚本：stdin 读 raw 帧 -> 超分 -> stdout 写 raw 帧。
+
+    Args:
+        in_pix_fmt: **输入流的像素格式名**（默认 rgb48le，即解码后的
+            RGB16）。只用于在日志里标明"这份输入摘要属于哪个域" ——
+            它与检查遍的 yuv420p16le 不同域，摘要不可直接比较。
 
     Returns:
         str: 可直接交给 python 执行的脚本文本。
@@ -269,8 +274,23 @@ def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
         # 算法与 frame_contract.digest_ordered_frames 一致 —— 这样
         # "经典物化"与"融合串流"两条后半链的边界身份可以直接比。
         "_h = hashlib.sha256()",
+        # R25-06 / N26-04：**AI 实际消费的那批字节**的摘要。
+        #
+        # 原来只算 `_h`（写出后的 rgb48le），那只证明"AI 产出了什么"，
+        # 证明不了"AI 收到的是被检查过的那批帧"。复核 PA02 正是这样
+        # 打穿的：检查摘要 A、模拟消费者 B、再重放 A，guard 仍返回 True。
+        #
+        # **域**：这里算 rgb48le（解码后的 RGB16），而检查遍算的是
+        # yuv420p16le（stage2 的 y4m）。两者**不该相同** ——
+        # ffmpeg 的解码/颜色转换是合法变换。所以消费方只比
+        # 帧数/首末时间等**结构事实**；摘要各自记账，域各自写明。
+        "_h_in = hashlib.sha256()",
+        "IN_STREAM_NAME = " + repr(in_pix_fmt),
         "while True:",
         "    buf = _in.read(IN_BYTES)",
+        # N26-04：**消费前先记账** —— 这一批字节就是模型实际读到的。
+        # 放在读之后、解码之前，所以它含完整帧（短帧在上面就被拒了）。
+        "    _h_in.update(buf)",
         # R12 边界：空读 = 上游正常结束；**非空但不足一帧 = 协议错误**。
         # 原实现把两者都当 EOF，残尾会被静默丢弃（帧数变少却 rc=0）。
         "    if not buf:",
@@ -319,6 +339,12 @@ def build_stream_ai_script(in_w, in_h, scale, model_path, model_name,
         "_h.update(b'|frames=' + str(_n).encode('ascii'))",
         "sys.stderr.write(('FRAMES=%d' % _n) + chr(10))",
         "sys.stderr.write('FRAMES_DIGEST=' + _h.hexdigest() + chr(10))",
+        # N26-04：把**输入侧**的摘要与域一起报出来。
+        # 消费方（stage3）拿它与检查遍的结构事实比对；
+        # 摘要本身不可跨域直接比，所以域名必须显式写出。
+        "_h_in.update(b'|frames=' + str(_n).encode('ascii'))",
+        "sys.stderr.write('IN_FRAMES_DIGEST=' + _h_in.hexdigest() + chr(10))",
+        "sys.stderr.write('IN_STREAM=' + IN_STREAM_NAME + chr(10))",
         "sys.stderr.flush()",
     ]
     return NL.join(lines) + NL

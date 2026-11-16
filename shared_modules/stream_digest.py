@@ -99,6 +99,17 @@ def digest_vpy(vpy: str, *, timeout: float = 3600.0,
                         vp.kill()
                     except Exception:
                         pass
+            # R25-06 / PA03：**所有生产者的退出码都要合取**。
+            #
+            # 原来只查 ffmpeg 的 `r.returncode`。复核反例：vspipe 退出 17、
+            # 下游 ffmpeg 退出 0 并产出一帧 → `ok=True`，摘要被当成"整片"。
+            # 一帧的摘要与整片的摘要长度差几个数量级，但判据只看"有没有行"。
+            _vp_rc = vp.returncode
+            if _vp_rc not in (0, None):
+                out["error"] = (
+                    f"vspipe exited {_vp_rc}; the digest would only cover a "
+                    f"truncated stream, so it is not a whole-clip digest")
+                return out
             if r.returncode != 0:
                 out["error"] = ("framemd5 pass failed: "
                                 f"{(r.stderr or '')[-500:]}")
