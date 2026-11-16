@@ -631,6 +631,96 @@ def _verify_stage_output(job_id: str, input_path: str,
     return True
 
 
+def _run_inproc_photo_job(*, job: Dict[str, Any], params: Dict[str, Any],
+                          logger, job_id: str, input_path: str,
+                          config_path: str, temp_dir: str) -> int:
+    """照片链**内存模式**：S1→S5 同一进程，S6 写最终候选。
+
+    与逐 stage 子进程模式的区别：S1–S5 之间**不落 TIFF**，图像以 PNG 字节
+    在进程内传递；模型阶段（S3/S4）走常驻 worker（`.venv_r4` + torch）。
+
+    **唯一物化的端点**是给 S6 的那份 PNG：`stage6_encode.py` 按 glob 找
+    `step5_postprocess*`，它需要一个文件。这是"编码器必须文件输入"的能力
+    登记，用完立即删除 —— 不是"照片链又回到 TIFF 交接"。
+
+    能力边界（由 `photo_chain.capabilities()` 决定）：
+    S1/S2/S3/S4/S5 都有内存入口；S6 只写最终候选。
+    """
+    import numpy as _np
+    from media_io import read_image_array as _ria, encode_png as _enc
+    import photo_chain as _pc
+
+    # ---- 1) 读输入，保留真实位深 ----
+    try:
+        arr, _meta = _ria(input_path, allow_precision_downgrade=False)
+    except Exception as _e:
+        logger.error("PHOTO_INPROC_READ_FAIL",
+                     "Cannot read the input at its real bit depth; refusing "
+                     "to downgrade silently", input=input_path, error=str(_e))
+        return 82
+    if arr.ndim == 2:
+        arr = _np.stack([arr] * 3, axis=2)
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    if arr.dtype != _np.uint16:
+        arr = (arr.astype(_np.uint16) * 257)
+    _png = _enc(arr)
+    logger.info("PHOTO_INPROC_START",
+                "In-memory chain start (S1-S5, no intermediate TIFF)",
+                input=input_path, size="%dx%d" % (arr.shape[1], arr.shape[0]))
+
+    # ---- 2) 内存链（模型阶段走常驻 worker）----
+    from photo_model_client import ModelWorkerClient
+    try:
+        with ModelWorkerClient(gpu_id=int(params.get("gpu_id", 0) or 0),
+                               model_dir=str(params.get("model_dir") or "")) as _c:
+            r = _pc.run_inproc_chain(_png, params, client=_c)
+    except Exception as _e:
+        logger.error("PHOTO_INPROC_CHAIN_FAIL",
+                     "In-memory chain raised; nothing was published",
+                     error="%s: %s" % (type(_e).__name__, _e))
+        return 86
+    if not r.get("ok"):
+        logger.error("PHOTO_INPROC_CHAIN_REFUSED",
+                     "In-memory chain did not complete; see the error for "
+                     "which stage/why", error=r.get("error"),
+                     unsupported=r.get("unsupported"),
+                     stages_run=r.get("stages_run"))
+        return 86
+    logger.info("PHOTO_INPROC_CHAIN_DONE", "S1-S5 finished in memory",
+                stages=r.get("stages_run"),
+                warnings=(r.get("warnings") or [])[:3] or None)
+
+    # ---- 3) 给编码器物化一份 step5（能力登记 + 用完删）----
+    from pathlib import Path as _P
+    _stem = _P(input_path).stem
+    _sp = _P(temp_dir) / ("%s_%s_step5_postprocess_inproc.png"
+                          % (job_id, _stem))
+    try:
+        _sp.write_bytes(r["png"])
+    except OSError as _e:
+        logger.error("PHOTO_INPROC_ENCODE_INPUT_FAIL",
+                     "Cannot materialise the encoder's input", error=str(_e))
+        return 82
+
+    # ---- 4) S6：写最终候选 ----
+    try:
+        rc, err = _run_stage("stage6_encode.py", job_id, input_path,
+                             config_path, params, 6, is_ai_stage=False)
+    finally:
+        try:
+            _sp.unlink()
+        except OSError:
+            pass
+    if rc != 0:
+        logger.error("PHOTO_INPROC_ENCODE_FAIL",
+                     "Final encode failed", rc=rc, error=(err or "")[:300])
+        return rc
+    logger.info("PHOTO_INPROC_DONE",
+                "In-memory chain finished and the final candidate was encoded")
+    return 0
+
+
 def _run_single_job(job: Dict[str, Any],
                     config_path: str,
                     config: Dict[str, Any],
@@ -749,6 +839,18 @@ def _run_single_job(job: Dict[str, Any],
     # check_wsl_space() handles redirect + space estimation + /mnt/ fallback
     # chain internally per v7.32 §3.10.10. No separate WSL redirect block needed.
     temp_dir = params.get("temp_dir", "./temp")
+
+    # ==== N27-05：内存链模式（S1–S5 同进程，无中间 TIFF）====
+    #
+    # 与逐 stage 子进程模式并存：默认仍是 file 模式，显式
+    # `photo_chain_mode: inproc` 才走内存链。不自动切换 ——
+    # 换执行模式等于换资源/失败形态，必须由计划决定。
+    if str(params.get("photo_chain_mode") or "").lower() in ("inproc",
+                                                             "memory"):
+        return _run_inproc_photo_job(
+            job=job, params=params, logger=logger, job_id=job_id,
+            input_path=input_path, config_path=config_path,
+            temp_dir=temp_dir)
 
     # ---- P5：中间存储策略（与视频链同一个决策点）----
     # 必须**早于**任何写/删：策略不成立就该一个字节都不动。
