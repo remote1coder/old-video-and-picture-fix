@@ -27,13 +27,13 @@ def outdir(tmp_path):
             "output": {"frames": 458, "duration": 15.21},
             "checks": {"frames": {"src": 458, "out": 458, "ok": True},
                        "duration": {"src": 15.19, "out": 15.21,
-                                    "ok": True}}}
+                                    "ok": True}, "not_black": {"ok": True}}}
     bad = {"ok": False,
            "source": {"frames": 556, "duration": 28.44},
            "output": {"frames": 500, "duration": 28.46},
            "checks": {"frames": {"src": 556, "out": 500, "ok": False},
                       "duration": {"src": 28.44, "out": 28.46,
-                                   "ok": True}}}
+                                   "ok": True}, "not_black": {"ok": True}}}
     for name, payload in (("clip_good_restored.mkv", good),
                           ("clip_bad_restored.mkv", bad)):
         with io.open(str(tmp_path / (name + ".fullchain.json")), "w",

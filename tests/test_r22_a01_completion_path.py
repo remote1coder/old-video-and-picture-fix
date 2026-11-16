@@ -163,7 +163,7 @@ def build(tmp_path, *, with_fullchain=True, media=b"GEN-BYTES",
         _w(os.path.join(stage, "fullchain.json"),
            json.dumps({"schema": "fullchain/1", "ok": True,
                        "attempt_id": pub, "checks": {
-                           "frames": {"ok": True}, "duration": {"ok": True}}}))
+                           "frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
         arts.append(P.Artifact("fullchain", os.path.join(stage, "fullchain.json"),
                                out + ".fullchain.json"))
 

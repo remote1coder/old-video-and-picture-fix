@@ -2601,20 +2601,49 @@ def _fullchain_report_problems(doc: Dict[str, Any], *,
         probs.append("fullchain report's checks is empty; an empty set of "
                      "check results does not show that anything was compared")
     else:
+        # R26-A02：**不能只要求"非空 + 每行布尔真"**。
+        #
+        # 复核反例：把 fullchain 的 checks 换成 `{"dummy": {"ok": true}}`，
+        # 完成入口照样通过 —— 它核的是"有没有行"，不是"计划要的行在不在"。
+        #
+        # `artifact_verify.verify_output()` 生产的是 duration / frames /
+        # not_black（以及可选的首末帧哈希）。前两项是**时间与帧数的底线**，
+        # 缺了就没有"这一代是同一段素材"的证据，必须拒。
+        #
+        # `not_black` 只要求**存在**：亮度未知时它的 `ok` 是 None，
+        # 那是合法局限（例如源没有亮度信息），不能因此拒整代 ——
+        # 否则就是复核说的"既误杀也漏放"里的误杀那一半。
+        _FC_REQUIRED = ("duration", "frames")
+        for _need in _FC_REQUIRED:
+            if _need not in checks:
+                probs.append(
+                    f"fullchain report is missing the required {_need!r} "
+                    f"check; a report without it does not prove the "
+                    f"candidate has the same timeline/length as the source")
+        if "not_black" not in checks:
+            probs.append(
+                "fullchain report is missing the 'not_black' check; a blank "
+                "frame screen is part of what the chain must report")
         for name, row in checks.items():
             if not isinstance(row, dict):
                 probs.append(f"fullchain check {name!r} is not an object")
                 continue
-            # R25-01/C06：`ok` 必须是**真布尔**。`frames: {}` 这种空检查行
-            # 原来因为 `row.get("ok") is False` 为假而被放过 ——
-            # "没写结论"和"结论是通过"不是一回事。
             _okv = row.get("ok")
-            if not isinstance(_okv, bool):
-                probs.append(
-                    f"fullchain check {name!r} has no boolean ok field "
-                    f"(got {_okv!r}); an absent verdict is not a pass")
-            elif _okv is False:
-                probs.append(f"fullchain check {name!r} failed")
+            if name in _FC_REQUIRED:
+                # R25-01/C06：这两项必须是**真布尔**
+                if not isinstance(_okv, bool):
+                    probs.append(
+                        f"fullchain check {name!r} has no boolean ok field "
+                        f"(got {_okv!r}); an absent verdict is not a pass")
+                elif _okv is False:
+                    probs.append(f"fullchain check {name!r} failed")
+            else:
+                # 其余（not_black / 首末帧哈希 / 未来新增）：只有**明确的
+                # false** 才拒。`ok=None` 是合法局限（例如源没有亮度信息），
+                # 它已经写在报告里，由读报告的人看到，不在这里升级成错误 ——
+                # 否则就是复核说的"既误杀也漏放"里的误杀那一半。
+                if _okv is False:
+                    probs.append(f"fullchain check {name!r} failed")
     return probs
 
 

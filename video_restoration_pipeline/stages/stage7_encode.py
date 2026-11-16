@@ -4388,6 +4388,14 @@ def main():
                 _fr_ok = ((_ckv.get("frames") or {}).get("ok"))
                 _fc_align = _CR(
                         "frame_order", _CR_UNV,
+                        # R26-A02：**明确声明这不是硬门**。
+                        #
+                        # `frame_order` 在计划里是可选（`derive()` 里
+                        # `required=False`）：方法无判别力时保留 UNVERIFIED
+                        # 是合法局限，不该阻断发布。而 `severity` 的默认值
+                        # 是 `"info"`，不标就会被判成硬门 ——
+                        # 复核的 `test_r211` 就是因此从 rc=0 变成 86。
+                        severity="warning",
                         reason=(_align_pre.get("error")
                                 or _align_pre.get("skipped")
                                 or "no discriminative sample points: the "
