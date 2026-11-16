@@ -4822,6 +4822,65 @@ def main():
                 "measured on the attempt's private candidate before publish; "
                 "the published file is the same bytes")
 
+            # ==== R25-01 / D01：未验证的一代**不许覆盖正式代** ====
+            #
+            # 原来 `verified=False` 只影响返回码，产物照样通过 publisher
+            # 覆盖正式路径 —— 于是"一次诊断导出"会把上一代已验证的成品
+            # 换成未验证的。而"未验证"恰恰意味着**不知道它好不好**，
+            # 拿它替换已知良好的旧代是本末倒置。
+            #
+            # 做法：在 publisher 之前分叉。未验证 → 整代写到
+            # `<输出目录>/.diagnostic-<attempt>/`，正式路径一个字节不动；
+            # 判断依据是 `publish_decision.verified`，**不是事后的返回码**。
+            if _dec.get("verified") is not True:
+                _diag_parent = os.path.dirname(os.path.abspath(output_path))
+                _diag_root = os.path.join(_diag_parent,
+                                          f".diagnostic-{_attempt_id}")
+                try:
+                    os.makedirs(_diag_root, exist_ok=True)
+                    _diag_media = os.path.join(
+                        _diag_root, os.path.basename(output_path))
+                    os.replace(_publish_tmp, _diag_media)
+                    _ver_doc["diagnostic"] = True
+                    _ver_doc["diagnostic_reason"] = (
+                        "the aggregated decision did not declare "
+                        "verified=true; exported beside the official "
+                        "generation instead of replacing it")
+                    _ver_doc["official_output"] = os.path.abspath(output_path)
+                    import json as _json_diag
+                    with open(os.path.join(
+                            _diag_root,
+                            os.path.basename(output_path) + ".verify.json"),
+                            "w", encoding="utf-8") as _fd:
+                        _json_diag.dump(_ver_doc, _fd, ensure_ascii=False,
+                                        indent=2)
+                    if _fc_pending:
+                        try:
+                            os.replace(
+                                _fc_pending[0],
+                                os.path.join(_diag_root,
+                                             os.path.basename(_fc_pending[1])))
+                        except OSError:
+                            pass
+                    logger.error(
+                        "STAGE7_DIAGNOSTIC_EXPORT",
+                        "This generation was NOT verified; it was exported "
+                        "to a diagnostic directory and the official output "
+                        "was left untouched.",
+                        attempt_id=_attempt_id, diagnostic_root=_diag_root,
+                        blocked_by=_dec.get("blocked_by"),
+                        reasons=_dec.get("reasons"))
+                    return 89
+                except OSError as _de2:
+                    logger.error(
+                        "STAGE7_DIAGNOSTIC_EXPORT_FAIL",
+                        "Could not export the unverified generation to the "
+                        "diagnostic directory; the attempt candidate is "
+                        "discarded and the official output is untouched.",
+                        attempt_id=_attempt_id, error=str(_de2))
+                    _discard_attempt_tmp(_publish_tmp, logger)
+                    return 82
+
             _side_tmp = f"{output_path}.verify.{_attempt_id}.json"
             try:
                 import json as _jsonw
