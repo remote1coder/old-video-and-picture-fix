@@ -488,6 +488,12 @@ def write_png(path: str, arr: Any, icc: Optional[bytes] = None) -> str:
 def _write_png16_internal(path: str, arr: Any,
                           icc: Optional[bytes] = None) -> str:
     """Write a 16-bit PNG (filter 0, no interlace) with stdlib zlib only."""
+    Path(path).write_bytes(_encode_png16(arr, icc=icc))
+    return "internal-png16"
+
+
+def _encode_png16(arr: Any, icc: Optional[bytes] = None) -> bytes:
+    """16bit PNG 的**字节版**（R26-A11：内存链路要能直接拿到 PNG 字节）。"""
     import numpy as np
     arr = np.ascontiguousarray(arr.astype(">u2"))
     h, w, c = arr.shape
@@ -508,8 +514,41 @@ def _write_png16_internal(path: str, arr: Any,
                             zlib.compress(bytes(icc), 6)))
     chunks.append(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
     chunks.append(chunk(b"IEND", b""))
-    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + b"".join(chunks))
-    return "internal-png16"
+    return b"\x89PNG\r\n\x1a\n" + b"".join(chunks)
+
+
+def encode_png(arr: Any, icc: Optional[bytes] = None) -> bytes:
+    """把数组编码成 PNG **字节**（8/16bit，多通道）。
+
+    与 `write_png()` 同一实现，只是不落盘 —— 内存链路（S1–S6 管道、
+    G'MIC stdin/stdout）需要它。`_ensure_uint` 仍然生效：float 会被
+    clamp 到整数域，调用方要自己确认这是不是想要的精度。
+    """
+    import numpy as np
+    a = _ensure_uint(arr)
+    if a.ndim == 2:
+        a = a[:, :, None]
+    if a.shape[2] not in PNG_COLOR_TYPE:
+        raise MediaWriteError("unsupported channel count %s" % (a.shape[2],))
+    if a.dtype == np.uint16:
+        return _encode_png16(a, icc=icc)
+    try:
+        import io as _io
+        from PIL import Image
+        if a.shape[2] == 1:
+            img = Image.fromarray(a[:, :, 0], mode="L")
+        elif a.shape[2] == 3:
+            img = Image.fromarray(a, mode="RGB")
+        else:
+            img = Image.fromarray(a, mode="RGBA")
+        kwargs = {"format": "PNG"}
+        if icc:
+            kwargs["icc_profile"] = icc
+        buf = _io.BytesIO()
+        img.save(buf, **kwargs)
+        return buf.getvalue()
+    except Exception:
+        return _encode_png16(a.astype(np.uint16), icc=icc)
 
 
 # --- TIFF master ------------------------------------------------------------

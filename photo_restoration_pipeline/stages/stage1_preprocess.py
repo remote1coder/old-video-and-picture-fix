@@ -1487,3 +1487,126 @@ if __name__ == "__main__":
     if rc is None:
         rc = 86  # validation failure — main() must always return explicit exit code
     sys.exit(rc)
+
+
+# ---------------------------------------------------------------- 内存快路径
+def preprocess_png_bytes(data: bytes, params: dict, *, logger=None,
+                         gmic: str = "") -> dict:
+    """S1 的**内存入口**：PNG 字节 → 规范化 RGB16 PNG 字节。
+
+    与 `main()` 的区别（这是**能力边界，不是偷工减料**）：
+
+    | 项 | `main()`（file 模式）| 本函数（内存模式）|
+    |---|---|---|
+    | 输入 | 任意图片文件 | **已规范化的 PNG 字节** |
+    | 色彩空间 / ICC / EXIF 方向 | 在这里处理 | **由入口统一处理**（`plan` 负责）|
+    | sidecar（color_meta 等） | 写盘 | 由调用方在计划层记录 |
+    | G'MIC 三条链 | 文件进文件出 | **内存进内存出**（`gmic_stdio`）|
+    | 位深/通道 | 由 G'MIC 输出决定 | 显式规范化到 **RGB 16bit** |
+
+    Returns:
+        ``{"ok", "png", "width", "height", "channels", "bit_depth",
+        "steps": [...], "warnings": [...], "error"}``。
+    """
+    import numpy as _np
+    out = {"ok": False, "png": b"", "width": 0, "height": 0,
+           "channels": 0, "bit_depth": 0, "steps": [],
+           "warnings": [], "error": ""}
+    if not data:
+        out["error"] = "empty input"
+        return out
+    try:
+        from media_io import read_png_bytes as _rp
+        import gmic_stdio as _gs
+    except Exception as exc:
+        out["error"] = "cannot import helpers: %s" % exc
+        return out
+
+    # ---- 1) 读 + 规范到 RGB16 ----
+    try:
+        arr = _rp(data)
+    except Exception as exc:
+        out["error"] = "input is not a decodable PNG: %s" % exc
+        return out
+    if arr.ndim == 2:
+        arr = _np.stack([arr] * 3, axis=2)          # 灰度 → RGB
+        out["steps"].append("gray->rgb")
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]                          # 丢 alpha（合同里记明）
+        out["steps"].append("rgba->rgb")
+        out["warnings"].append(
+            "alpha channel dropped; the plan must record that the working "
+            "domain is RGB (alpha is not silently composited)")
+    elif arr.ndim != 3 or arr.shape[2] != 3:
+        out["error"] = "unsupported channel count: %r" % (arr.shape,)
+        return out
+    if arr.dtype != _np.uint16:
+        arr = (arr.astype(_np.uint16) * 257)         # 8bit → 16bit
+        out["steps"].append("8bit->16bit")
+
+    def _to_png(a):
+        # R26-A11：**PIL 不能写多通道 16bit PNG**（`(h,w,3), '<u2'` 会
+        # 抛 KeyError）。项目里已有 `media_io.encode_png()` 用 zlib 自己拼，
+        # 8/16bit 与单/多通道都支持。
+        from media_io import encode_png as _enc
+        return _enc(a)
+
+    cur = _to_png(arr)
+    w, h = int(arr.shape[1]), int(arr.shape[0])
+
+    # ---- 2) G'MIC 三条链（与 main() 同参数，只是不落盘）----
+    _deblock_strength = int(params.get("deblock_strength", 25) or 0)
+    _scratch_strength = int(params.get("scratch_remove_strength", 0) or 0)
+    _deband = float(params.get("deband_threshold", 1.2) or 0)
+
+    if _scratch_strength > 0:
+        _t = 0.5 + (max(0, min(100, _scratch_strength)) / 100.0) * 2.0
+        r = _gs.gmic_filter_png(cur, ["-denoise_haar", "%.3f" % _t],
+                                gmic=gmic, expect_width=w, expect_height=h,
+                                expect_channels=3, expect_bit_depth=16)
+        if r["ok"]:
+            cur = r["png"]
+            out["steps"].append("gmic:denoise_haar(scratch)")
+        else:
+            # **可选增强失败不阻断整张照片**（与 main() 的既有取舍一致）
+            out["warnings"].append("scratch removal skipped: %s" % r["error"])
+
+    if _deblock_strength > 0:
+        _t = 0.5 + (max(0, min(100, _deblock_strength)) / 100.0) * 2.5
+        r = _gs.gmic_filter_png(cur, ["-denoise_patchpca", "%.3f" % _t],
+                                gmic=gmic, expect_width=w, expect_height=h,
+                                expect_channels=3, expect_bit_depth=16)
+        if r["ok"]:
+            cur = r["png"]
+            out["steps"].append("gmic:denoise_patchpca")
+        else:
+            # main() 的注释记了：4.0.6 的 patchpca 在测过的所有输入上都会崩，
+            # 所以那里也选择"降级跳过，不阻断"。
+            out["warnings"].append("deblock skipped: %s" % r["error"])
+
+    if _deband > 0:
+        r = _gs.gmic_filter_png(cur, ["-denoise_haar", str(_deband)],
+                                gmic=gmic, expect_width=w, expect_height=h,
+                                expect_channels=3, expect_bit_depth=16)
+        if r["ok"]:
+            cur = r["png"]
+            out["steps"].append("gmic:denoise_haar(deband)")
+        else:
+            # deband 在 main() 里是**必需**的（失败 → PHOTO_ERR_GMIC_FAIL），
+            # 这里保持一致：失败即整张失败，不静默跳过。
+            out["error"] = "deband is required but failed: %s" % r["error"]
+            return out
+
+    # ---- 3) 最终校验（读得回来 + 几何/位深不变）----
+    try:
+        back = _rp(cur)
+    except Exception as exc:
+        out["error"] = "produced PNG cannot be decoded: %s" % exc
+        return out
+    if back.shape[:2] != (h, w) or back.dtype.name != "uint16":
+        out["error"] = ("representation drifted: %r %s (expected %dx%d uint16)"
+                        % (back.shape, back.dtype, w, h))
+        return out
+    out.update({"ok": True, "png": cur, "width": w, "height": h,
+                "channels": 3, "bit_depth": 16})
+    return out
