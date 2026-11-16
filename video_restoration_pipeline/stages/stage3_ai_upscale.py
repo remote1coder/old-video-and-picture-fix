@@ -2933,9 +2933,16 @@ def main():
     parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
+    # N27-04：`--output -` 表示**写 stdout**（管道模式，不落 step3/step4）
+    parser.add_argument("--output", "-o", default=None,
+                        help="'-' writes the stream to stdout")
     args = parser.parse_args()
 
     params = _load_params(args)
+    # N27-04：显式输出目标（`-` = stdout）。放在 params 里是因为真正的
+    # 编码发生在上游函数内部，它拿不到 argparse 的 args。
+    if getattr(args, "output", None):
+        params["_stream_output"] = str(args.output)
     log_dir = params.get("log_dir", "./logs")
     logger = get_logger(log_dir=log_dir, job_id=args.job_id)
 
@@ -3690,9 +3697,12 @@ def main():
                             if _bpf else "yuv420p16le")
                         # 产物直接叫 step4：下游（stage5/6）是**按 glob**
                         # `*_step4_postprocess*` 找输入的，不依赖 hash。
-                        _s_out = str(Path(temp_dir) / (
-                            f"{job_id}_{Path(input_name).stem}"
-                            f"_step4_postprocess_p{param_hash}.mkv"))
+                        # N27-04：`--output -` 时融合产物直接写 stdout，
+                        # **不落 step4**（下游 stage5 从 stdin 读）。
+                        _s_out = str(params.get("_stream_output") or (
+                            Path(temp_dir) / (
+                                f"{job_id}_{Path(input_name).stem}"
+                                f"_step4_postprocess_p{param_hash}.mkv")))
                         logger.info(
                             "STAGE3_FUSE34_ENABLED",
                             "stage3+stage4 will run as one execution group; "
@@ -4447,7 +4457,9 @@ def main():
         inter_name = (f"{job_id}_{Path(input_name).stem}"
                       f"_step3_forced_upscale_p{param_hash}")
 
-    output_path = str(Path(temp_dir) / f"{inter_name}.mkv")
+    # N27-04：`--output -` → 经典 step3 也写 stdout
+    output_path = str(params.get("_stream_output") or
+                      (Path(temp_dir) / f"{inter_name}.mkv"))
 
     # NEW-V-06: 编码开始前登记产物——取消时删掉半截 mkv，否则下游 stage
     # 的 exists()>0 缓存检查会把它当成功产物复用。

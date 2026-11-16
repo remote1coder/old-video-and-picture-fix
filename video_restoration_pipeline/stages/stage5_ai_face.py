@@ -2155,6 +2155,9 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     parser.add_argument("--params-file")
     parser.add_argument("--config")
     parser.add_argument("--cleanup-intermediates", action="store_true")
+    # N27-04：`--output -` 表示**写 stdout**（管道模式，不落 step5）
+    parser.add_argument("--output", "-o", default=None,
+                        help="'-' writes the stream to stdout")
     args = parser.parse_args()
 
     params = _load_params(args)
@@ -2401,7 +2404,9 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     # 改为就地计算（与 stage1/3/4 同一模式），以本 stage 的实际输入为身份基准。
     from checkpoint import compute_param_hash as _cph
     param_hash = _cph(args.input, params)
-    output_path = os.path.join(
+    # N27-04：`--output -` → 写 stdout（下游 stage6 从 stdin 读）
+    _cli_out = getattr(args, "output", None)
+    output_path = str(_cli_out) if _cli_out else os.path.join(
         temp_dir,
         f"{job_id}_{Path(args.input).stem}_step5_face_p{param_hash}.mkv"
     )
@@ -2409,7 +2414,8 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     # NEW-V-06: 写任何字节之前登记产物（legacy 帧目录编码与 streaming
     # 两条路径共用）——取消时删掉半截 mkv，否则下游 stage 的
     # exists()>0 缓存检查会把它当成功产物复用。
-    if _cancel_guard is not None:
+    if _cancel_guard is not None and str(output_path) != "-":
+        # stdout 不是文件，没有"半截 mkv"要删
         _cancel_guard.watch_outputs(output_path, logger=logger, stage=5)
 
     # P9-ARCH: disk pre-check and path selection
