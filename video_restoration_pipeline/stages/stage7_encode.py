@@ -2818,6 +2818,100 @@ def _write_group_receipt(*, output_path: str, spec: Dict[str, Any],
         return False
 
 
+def export_diagnostic_generation(*, output_path: str, attempt_id: str,
+                                 ver_doc: Dict[str, Any],
+                                 publish_tmp: str,
+                                 fc_pending,
+                                 decision: Dict[str, Any],
+                                 logger) -> Tuple[int, str]:
+    """把**未验证**的一代导出到 `<输出目录>/.diagnostic-<attempt>/`。
+
+    R26-A01：这是"不满足计划的一代不许覆盖正式代"的落点。
+    抽成模块级函数是为了能被测试**直接调用真实实现** ——
+    复核明确指出"只校验字典"不算修好。
+
+    不变量（测试会逐条核）：
+      1. 正式路径上的任何文件**一个字节都不动**；
+      2. 诊断目录里有 media + verify + `_diagnostic.json`；
+      3. fullchain 搬不过去 → `complete=false` 且返回 82（不是 89）。
+
+    Returns:
+        ``(rc, detail)``：89 = 完整诊断代；82 = 不完整或搬运失败。
+    """
+    diag_parent = os.path.dirname(os.path.abspath(output_path))
+    diag_root = os.path.join(diag_parent, ".diagnostic-%s" % attempt_id)
+    missing: List[str] = []
+    try:
+        os.makedirs(diag_root, exist_ok=True)
+        diag_media = os.path.join(diag_root, os.path.basename(output_path))
+        os.replace(publish_tmp, diag_media)
+        ver_doc["diagnostic"] = True
+        ver_doc["diagnostic_reason"] = (
+            "the aggregated decision did not declare verified=true; "
+            "exported beside the official generation instead of replacing it")
+        ver_doc["official_output"] = os.path.abspath(output_path)
+        import json as _jd
+        with open(os.path.join(diag_root,
+                               os.path.basename(output_path) + ".verify.json"),
+                  "w", encoding="utf-8") as _f:
+            _jd.dump(ver_doc, _f, ensure_ascii=False, indent=2)
+        if fc_pending:
+            try:
+                os.replace(fc_pending[0],
+                           os.path.join(diag_root,
+                                        os.path.basename(fc_pending[1])))
+            except OSError as _fe:
+                # 不能吞：必要条件搬不过去，这一代就是**不完整**的
+                missing.append("fullchain: %s" % _fe)
+        state = {
+            "schema": "diagnostic-generation/1",
+            "attempt_id": attempt_id,
+            "complete": not missing,
+            "missing": list(missing),
+            "media": os.path.basename(output_path),
+            "objects": (["media", "verify"]
+                        + ([] if missing else ["fullchain"])),
+            "reason": ver_doc["diagnostic_reason"],
+        }
+        try:
+            with open(os.path.join(diag_root, "_diagnostic.json"),
+                      "w", encoding="utf-8") as _f2:
+                _jd.dump(state, _f2, ensure_ascii=False, indent=2)
+        except OSError as _se:
+            missing.append("state: %s" % _se)
+            state["complete"] = False
+            state["missing"] = list(missing)
+        if missing:
+            if logger is not None:
+                logger.error(
+                    "STAGE7_DIAGNOSTIC_INCOMPLETE",
+                    "The diagnostic export is INCOMPLETE: a required sidecar "
+                    "could not be placed. Do not treat this directory as a "
+                    "full generation.",
+                    attempt_id=attempt_id, diagnostic_root=diag_root,
+                    missing=missing, blocked_by=decision.get("blocked_by"))
+            return 82, "incomplete diagnostic export: %s" % missing
+        if logger is not None:
+            logger.error(
+                "STAGE7_DIAGNOSTIC_EXPORT",
+                "This generation was NOT verified; it was exported to a "
+                "diagnostic directory and the official output was left "
+                "untouched.",
+                attempt_id=attempt_id, diagnostic_root=diag_root,
+                blocked_by=decision.get("blocked_by"),
+                reasons=decision.get("reasons"), complete=True)
+        return 89, "diagnostic export complete"
+    except OSError as _e:
+        if logger is not None:
+            logger.error(
+                "STAGE7_DIAGNOSTIC_EXPORT_FAIL",
+                "Could not export the unverified generation to the diagnostic "
+                "directory; the attempt candidate is discarded and the "
+                "official output is untouched.",
+                attempt_id=attempt_id, error=str(_e))
+        return 82, "diagnostic export failed: %s" % _e
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -4837,89 +4931,15 @@ def main():
             # 不再让 verified=False，所以合法的"未验证但可发布"仍能正常发布，
             # 不会因为这条无条件分叉而被误赶到诊断目录。
             if _dec.get("verified") is not True:
-                _diag_parent = os.path.dirname(os.path.abspath(output_path))
-                _diag_root = os.path.join(_diag_parent,
-                                          f".diagnostic-{_attempt_id}")
-                _diag_missing: List[str] = []
-                try:
-                    os.makedirs(_diag_root, exist_ok=True)
-                    _diag_media = os.path.join(
-                        _diag_root, os.path.basename(output_path))
-                    os.replace(_publish_tmp, _diag_media)
-                    _ver_doc["diagnostic"] = True
-                    _ver_doc["diagnostic_reason"] = (
-                        "the aggregated decision did not declare "
-                        "verified=true; exported beside the official "
-                        "generation instead of replacing it")
-                    _ver_doc["official_output"] = os.path.abspath(output_path)
-                    import json as _json_diag
-                    with open(os.path.join(
-                            _diag_root,
-                            os.path.basename(output_path) + ".verify.json"),
-                            "w", encoding="utf-8") as _fd:
-                        _json_diag.dump(_ver_doc, _fd, ensure_ascii=False,
-                                        indent=2)
-                    if _fc_pending:
-                        try:
-                            os.replace(
-                                _fc_pending[0],
-                                os.path.join(_diag_root,
-                                             os.path.basename(_fc_pending[1])))
-                        except OSError as _fe:
-                            # R26-A01：**不能吞**。必要条件搬不过去，
-                            # 这一代就是"不完整的诊断代"，不能报 89 让人
-                            # 以为拿到了一份完整产物。
-                            _diag_missing.append(
-                                "fullchain: %s" % _fe)
-                    # 诊断代自己的状态清单（审核要求：完整/不完整分开）
-                    _diag_state = {
-                        "schema": "diagnostic-generation/1",
-                        "attempt_id": _attempt_id,
-                        "complete": not _diag_missing,
-                        "missing": _diag_missing,
-                        "media": os.path.basename(output_path),
-                        "objects": (["media", "verify"]
-                                    + ([] if _diag_missing else ["fullchain"])),
-                        "reason": _ver_doc["diagnostic_reason"],
-                    }
-                    try:
-                        with open(os.path.join(_diag_root, "_diagnostic.json"),
-                                  "w", encoding="utf-8") as _fd2:
-                            _json_diag.dump(_diag_state, _fd2,
-                                            ensure_ascii=False, indent=2)
-                    except OSError as _se:
-                        _diag_missing.append("state: %s" % _se)
-                        _diag_state["complete"] = False
-                        _diag_state["missing"] = list(_diag_missing)
-                    if _diag_missing:
-                        logger.error(
-                            "STAGE7_DIAGNOSTIC_INCOMPLETE",
-                            "The diagnostic export is INCOMPLETE: a required "
-                            "sidecar could not be placed. Do not treat this "
-                            "directory as a full generation.",
-                            attempt_id=_attempt_id, diagnostic_root=_diag_root,
-                            missing=_diag_missing,
-                            blocked_by=_dec.get("blocked_by"))
-                        return 82
-                    logger.error(
-                        "STAGE7_DIAGNOSTIC_EXPORT",
-                        "This generation was NOT verified; it was exported "
-                        "to a diagnostic directory and the official output "
-                        "was left untouched.",
-                        attempt_id=_attempt_id, diagnostic_root=_diag_root,
-                        blocked_by=_dec.get("blocked_by"),
-                        reasons=_dec.get("reasons"),
-                        complete=True)
-                    return 89
-                except OSError as _de2:
-                    logger.error(
-                        "STAGE7_DIAGNOSTIC_EXPORT_FAIL",
-                        "Could not export the unverified generation to the "
-                        "diagnostic directory; the attempt candidate is "
-                        "discarded and the official output is untouched.",
-                        attempt_id=_attempt_id, error=str(_de2))
+                # R26-A01：抽成模块级函数，测试可以直接调真实实现
+                # （复核明确要求"不能只校验字典"）。
+                _drc, _dwhy = export_diagnostic_generation(
+                    output_path=output_path, attempt_id=_attempt_id,
+                    ver_doc=_ver_doc, publish_tmp=_publish_tmp,
+                    fc_pending=_fc_pending, decision=_dec, logger=logger)
+                if _drc != 89:
                     _discard_attempt_tmp(_publish_tmp, logger)
-                    return 82
+                return _drc
 
             _side_tmp = f"{output_path}.verify.{_attempt_id}.json"
             try:
