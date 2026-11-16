@@ -554,9 +554,46 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     _out_for_cat = str((params or {}).get("output_path") or "")
     _pre = _dir_snapshot(_tmp_root) if _tmp_root else {}
 
+    # ==== R26-A05：资源预约**覆盖整个 stage 执行** ====
+    #
+    # 原来在 `_run_stage_inner` 里 `reserve()` 之后**立刻** `release()`，
+    # 只当"开工前看一眼余量"的闸门。结果是：受控执行到启动子进程之前
+    # `live` 与 `ram_used` 已经归 0 —— 它从来没有约束过真正的工作，
+    # 多 job 并发时也不构成任何合计上限。
+    #
+    # 现在预约持有到 stage 结束（`finally` 里释放）。语义变了：
+    # **这个 stage 在跑的时候，它的额度是占着的**。这才叫预算。
+    #
+    # 仍未做到的：跨进程共享预算（现在每个 job 一个 per-job governor）、
+    # Windows Job Object 配额、GPU 异步事件结束确认 —— 见 N27-03 剩余项。
+    _gov = (params or {}).get("_governor")
+    _admit = None
+    if _gov is not None:
+        _sn = str(script_name or "")
+        try:
+            _stage_no = int(_sn.split("_", 1)[0].replace("stage", "") or 0)
+        except (TypeError, ValueError):
+            _stage_no = 0
+        _ram = int((params or {}).get("_governor_stage_ram") or 0)
+        _vram = int((params or {}).get("_governor_stage_vram") or 0)
+        _wait = float((params or {}).get("_governor_wait_s") or 30.0)
+        try:
+            _admit = _gov.reserve(
+                "stage%d:%d" % (_stage_no, os.getpid()),
+                _ram, _vram, wait=_wait, meta={"script": _sn})
+        except Exception as _ge:
+            # 余量不足 → **明确失败**，不降质、不硬跑
+            return (85, "resource admission refused for %s: %s"
+                    % (_sn, _ge))
+
     try:
         return _run_stage_inner(script_name, job, params, config_path)
     finally:
+        if _admit is not None and _gov is not None:
+            try:
+                _gov.release(_admit)
+            except Exception:
+                pass
         if _l is not None and _tmp_root:
             try:
                 # ==== R26-A07：目录差**只作为存量信号** ====
@@ -625,34 +662,10 @@ def _run_stage_inner(script_name: str, job: Dict[str, Any],
     if not script_path.exists():
         return 80, f"Script not found: {script_path}"  # Dependency missing
 
-    # ---- P2：可选的**资源准入闸门** ----
-    # 只有当调用方把 `_governor` 注入 params 时才生效（默认完全不介入，
-    # 现有行为零改变）。语义是"**开工前确认余量**"：借→立刻还，
-    # 只当闸门用，不长期占预算（单进程里 stage 是串行的，不需要长占）。
-    #
-    # 为什么不在 main 里自动建 governor：预算比例是**政策**（整机 80%
-    # 只是目标，不是硬保证），写死在 main 里就等于把"能调"变成"不能调"。
-    # 由新执行组（编排层）创建并注入，符合"新执行组经同一 governor 准入"。
-    _gov = (params or {}).get("_governor")
-    if _gov is not None:
-        import os as _os_p2
-        _sn = str(script_name or "")
-        try:
-            _stage_no = int(_sn.split("_", 1)[0].replace("stage", "") or 0)
-        except (TypeError, ValueError):
-            _stage_no = 0
-        _ram = int((params or {}).get("_governor_stage_ram") or 0)
-        _vram = int((params or {}).get("_governor_stage_vram") or 0)
-        _wait = float((params or {}).get("_governor_wait_s") or 30.0)
-        try:
-            _admit = _gov.reserve(
-                "admit:stage%d:%d" % (_stage_no, _os_p2.getpid()),
-                _ram, _vram, wait=_wait, meta={"script": _sn})
-            _gov.release(_admit)
-        except Exception as _ge:
-            # 余量不足 → **明确失败**，不降质、不硬跑
-            return (85, "resource admission refused for %s: %s"
-                    % (_sn, _ge))
+    # R26-A05：资源准入整段搬到包装器 —— 这样预约可以**持续到这个
+    # stage 结束**，而不是"借完立刻还"。原来在这里 reserve 之后马上
+    # release，受控执行到启动子进程之前 `live` 与 `ram_used` 已经归 0，
+    # 等于**从来没有约束过执行**。详见 `run_stage()`。
 
     # Build command
     cmd = [sys.executable, str(script_path)]
