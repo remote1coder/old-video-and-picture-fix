@@ -346,3 +346,108 @@ class StreamTap:
                      and not out["header_problem"]
                      and out["frames"] > 0)
         return out
+
+
+# --------------------------------------------------------------------- filter
+def run_as_filter(digest_out: str = "", chunk: int = 1 << 20) -> int:
+    """Unix-filter 模式：``stdin(y4m) -> stdout(y4m)``，同时算摘要。
+
+    进程级用法（供 `stage3` 把它插在 `vspipe` 与 `ffmpeg` 之间）::
+
+        vspipe -c y4m x.vpy - | python -m stream_tap --digest-out d.json | ffmpeg ...
+
+    为什么用"进程"而不是"父进程里中转"：`stage3` 的三进程管道靠 OS 背压，
+    父进程一旦接管数据流就会变成同步瓶颈，而且拿不到"边中转边让下游并行"。
+
+    Returns:
+        进程退出码：0 成功；85 短帧/协议错；86 头无法解析。
+    """
+    import sys
+    sin = sys.stdin.buffer
+    sout = sys.stdout.buffer
+    res: Dict[str, Any] = {"ok": False, "frames": 0, "digest": "",
+                           "bytes": 0, "width": 0, "height": 0,
+                           "chroma": "", "fps": "", "short_frame": False,
+                           "problem": ""}
+    h = hashlib.blake2b()
+    rc = 0
+    try:
+        hdr = b""
+        while not hdr.endswith(b"\n"):
+            c = sin.read(1)
+            if not c:
+                break
+            hdr += c
+        if not hdr:
+            res["problem"] = "no header on stdin"
+            rc = 86
+        else:
+            meta = parse_y4m_header(hdr)
+            res.update({k: meta[k] for k in ("width", "height", "chroma", "fps")})
+            if not meta["ok"]:
+                res["problem"] = meta["problem"]
+                rc = 86
+            else:
+                sout.write(hdr)
+                fb = meta["frame_bytes"]
+                while True:
+                    line = b""
+                    while not line.endswith(b"\n"):
+                        c = sin.read(1)
+                        if not c:
+                            break
+                        line += c
+                    if not line:
+                        break
+                    if not line.startswith(b"FRAME"):
+                        res["problem"] = "unexpected frame marker: %r" % line[:20]
+                        rc = 85
+                        break
+                    data = StreamTap._read_exact(sin, fb)
+                    short = len(data) < fb
+                    h.update(data)
+                    res["bytes"] += len(data)
+                    res["frames"] += 1
+                    sout.write(line)
+                    sout.write(data)
+                    if short:
+                        res["short_frame"] = True
+                        res["problem"] = ("short frame: got %d of %d bytes"
+                                          % (len(data), fb))
+                        rc = 85
+                        break
+    except BrokenPipeError:
+        res["problem"] = "downstream closed the pipe"
+        rc = 85
+    except Exception as exc:
+        res["problem"] = "tap filter failed: %s" % str(exc)[:160]
+        rc = 85
+    finally:
+        try:
+            sout.flush()
+        except Exception:
+            pass
+
+    h.update(b"|frames=" + str(res["frames"]).encode("ascii"))
+    res["digest"] = h.hexdigest()
+    res["ok"] = (rc == 0 and res["frames"] > 0 and not res["short_frame"])
+    if digest_out:
+        try:
+            import json as _j
+            with open(digest_out, "w", encoding="utf-8") as f:
+                _j.dump(res, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            res["problem"] += "; cannot write digest: %s" % exc
+            rc = rc or 85
+    return rc
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys as _sys
+    ap = argparse.ArgumentParser(
+        description="y4m pass-through that records an ordered digest")
+    ap.add_argument("--digest-out", default="",
+                    help="where to write the JSON digest (default: none)")
+    _a = ap.parse_args()
+    _sys.exit(run_as_filter(_a.digest_out))

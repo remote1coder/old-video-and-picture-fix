@@ -1100,16 +1100,31 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 会有缓冲区打满导致子进程阻塞的风险。落文件最稳。
     err_paths = {}
     # `src` 只在 stream_full 下存在（vspipe 那把 stage1 的 vpy 变成 y4m）
-    for _tag in ("src", "dec", "ai", "enc"):
+    for _tag in ("src", "tap", "dec", "ai", "enc"):
         err_paths[_tag] = os.path.join(tmpd, f"{_tag}.err")
 
     # 失败原因在这里累积，**收尾统一交给下面的 finally**。
     # 不在 except 里直接 return：那样会绕过公共清理路径（见下方注释）。
     _failed = None
+    # R26-A04：tap 进程与它的摘要路径要在 try 之外可见 —— 收尾要核它的 rc。
+    tap = None
+    # 放在 `output_mkv` 旁边而不是 tmpd 里：`_two_pass_check` 在
+    # `_stream_raw_upscale` 之外调用，它只知道 output_mkv。
+    _tap_digest_path = str(output_mkv) + ".formal_tap.json"
     try:
         src = None
+        # ==== R26-A04：正式遍在 y4m 上装 tap ====
+        #
+        # 原来 `vspipe → ffmpeg(dec) → AI` 里**没有任何代码看过那股字节**，
+        # 所以"检查遍和正式遍消费了同一批帧"只能靠"再跑一次 digest"来猜。
+        #
+        # 现在插一个 filter 进程：它读 y4m、原样写 y4m、同时算有序摘要。
+        # 摘要在**与检查遍相同的域**（y4m）上算 —— 两边可以直接比。
+        # 用进程而不是父进程中转，是为了保住三进程的 OS 背压；
+        # 父进程一旦接管数据流就会变成同步瓶颈（实测 tap 进程本身
+        # 吞吐 417 MB/s，远高于 1080p24 的 74 MB/s 需求）。
         if stream_src_cmd:
-            # 生产者先起：它的 stdout 接给解码器的 stdin。
+            # 生产者先起：它的 stdout 接给 tap 的 stdin。
             # 顺序不能反 —— 先起 dec 再起 src 时，dec 会因为 stdin 尚未
             # 连上而立刻读到 EOF（"Invalid data found"）。
             with open(err_paths["src"], "wb") as _fs:
@@ -1118,13 +1133,25 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                                        stderr=_fs,
                                        stdin=subprocess.DEVNULL,
                                        bufsize=10 ** 8)
+            _tap_script = str(Path(__file__).resolve().parents[2]
+                              / "shared_modules" / "stream_tap.py")
+            with open(err_paths["tap"], "wb") as _ft:
+                tap = subprocess.Popen(
+                    [sys.executable, _tap_script,
+                     "--digest-out", _tap_digest_path],
+                    stdin=src.stdout, stdout=subprocess.PIPE, stderr=_ft,
+                    bufsize=10 ** 8)
+            src.stdout.close()      # 让 src→tap 直接连通
         with open(err_paths["dec"], "wb") as _fe:
             dec = subprocess.Popen(
                 dec_cmd, stdout=subprocess.PIPE, stderr=_fe,
-                stdin=(src.stdout if src is not None
-                       else subprocess.DEVNULL),
+                stdin=((tap.stdout if tap is not None
+                        else (src.stdout if src is not None
+                              else subprocess.DEVNULL))),
                 bufsize=10 ** 8)
-        if src is not None:
+        if tap is not None:
+            tap.stdout.close()      # 让 tap→dec 直接连通
+        elif src is not None:
             src.stdout.close()      # 让 src→dec 直接连通
         env = os.environ.copy()
         for k in list(env):
@@ -1256,13 +1283,18 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                                "digest; two-pass binding will fall back to "
                                "structural facts only", error=str(_ie))
     _src_rc = 0 if src is None else src.returncode
+    _tap_rc = 0 if tap is None else tap.returncode
+    # R26-A04 / PA03：**所有** producer 的 rc 都要合取 —— 包括 tap。
+    # tap 退出非 0 意味着"有一股数据没被完整中转/摘要"，那这一代的
+    # 两遍绑定就没有可信证据，不能因为下游碰巧出了片就算成功。
     rc_ok = (dec.returncode == 0 and ai.returncode == 0
-             and enc.returncode == 0 and _src_rc == 0)
+             and enc.returncode == 0 and _src_rc == 0 and _tap_rc == 0)
     if ai.returncode == 83:
         return False, "OOM in AI process (exit 83)", ai_frames
     if not rc_ok:
         # 把三方的 stderr 尾巴都带上——否则"启动失败"会被误当成 OOM
-        return False, (f"rc src={_src_rc} dec={dec.returncode} "
+        return False, (f"rc src={_src_rc} tap={_tap_rc} "
+                       f"dec={dec.returncode} "
                        f"ai={ai.returncode} enc={enc.returncode} "
                        f"| ai_err={ai_txt[-500:]} "
                        f"| dec_err={dec_txt[-200:]} "
@@ -2689,7 +2721,92 @@ def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
             logger.warning("STAGE3_TWO_PASS_PIXFMT_DEFAULTED",
                            "cannot read the y4m header; assuming 4:2:0 for "
                            "the formal-pass digest domain", pix_fmt=_pf)
-    # ==== N26-04：优先用 **AI 实际消费的输入摘要** ====
+    # ==== R26-A04：**同域摘要**优先（检查遍 vs 正式遍，都在 y4m 上）====
+    #
+    # 这是"两遍消费了同一批帧"的**直接**证据：
+    #   检查遍：stage2 把 `vspipe | tap | ffmpeg -vf idet` 的 y4m 摘要
+    #           写进 `{temp}/{job}_{stem}_step2_check_tap.json`；
+    #   正式遍：stage3 把 `vspipe | tap | ffmpeg(rgb48le) | AI` 的 y4m
+    #           摘要写进 `{output_mkv}.formal_tap.json`。
+    # 两边都在**格式转换之前**的同一域上算，所以可以直接比。
+    _chk_tap = None
+    _fml_tap = None
+    if output_mkv:
+        try:
+            with open(str(output_mkv) + ".formal_tap.json", "r",
+                      encoding="utf-8") as _ff:
+                _fml_tap = _json.load(_ff) or None
+        except (OSError, ValueError):
+            _fml_tap = None
+    _stem_tap = Path(input_name).stem.replace(" ", "_")
+    try:
+        with open(os.path.join(
+                temp_dir, "%s_%s_step2_check_tap.json"
+                % (job_id, _stem_tap)), "r", encoding="utf-8") as _fc:
+            _chk_tap = _json.load(_fc) or None
+    except (OSError, ValueError):
+        _chk_tap = None
+
+    if _chk_tap and _fml_tap:
+        _c_ok = bool(_chk_tap.get("digest")) and _chk_tap.get("frames")
+        _f_ok = bool(_fml_tap.get("digest")) and _fml_tap.get("frames")
+        # 短帧 / 明确失败：**半截的"相同"比"不同"更危险** ——
+        # 两侧都在同一位置截断时摘要会一致，但那证明不了整片。
+        _c_bad = bool(_chk_tap.get("short_frame")) or (
+            _chk_tap.get("ok") is False)
+        _f_bad = bool(_fml_tap.get("short_frame")) or (
+            _fml_tap.get("ok") is False)
+        if _c_bad or _f_bad:
+            logger.error(
+                "STAGE3_TWO_PASS_TAP_TRUNCATED",
+                "a tap reports a short frame or an explicit failure; a "
+                "truncated 'match' does not prove the whole clip",
+                check_short=bool(_chk_tap.get("short_frame")),
+                formal_short=bool(_fml_tap.get("short_frame")),
+                check_ok=_chk_tap.get("ok"),
+                formal_ok=_fml_tap.get("ok"))
+            return False, ("tap truncated/failed (check short=%r ok=%r, "
+                           "formal short=%r ok=%r)"
+                           % (_chk_tap.get("short_frame"), _chk_tap.get("ok"),
+                              _fml_tap.get("short_frame"),
+                              _fml_tap.get("ok")))
+        if not _c_ok or not _f_ok:
+            logger.error(
+                "STAGE3_TWO_PASS_TAP_INCOMPLETE",
+                "a tap digest is present but empty/0-frame; that is not a "
+                "usable binding",
+                check=_chk_tap, formal=_fml_tap)
+            return False, ("tap digest incomplete (check frames=%r, "
+                           "formal frames=%r)"
+                           % (_chk_tap.get("frames"),
+                              _fml_tap.get("frames")))
+        if (_chk_tap.get("frames") != _fml_tap.get("frames")
+                or _chk_tap.get("digest") != _fml_tap.get("digest")):
+            logger.error(
+                "STAGE3_TWO_PASS_TAP_MISMATCH",
+                "the check pass and the formal pass did NOT consume the same "
+                "y4m frames; the check verdict cannot be reused",
+                check_digest=str(_chk_tap.get("digest"))[:16],
+                formal_digest=str(_fml_tap.get("digest"))[:16],
+                check_frames=_chk_tap.get("frames"),
+                formal_frames=_fml_tap.get("frames"))
+            return False, ("the two passes consumed different y4m frames "
+                           "(check %s f=%s, formal %s f=%s)"
+                           % (str(_chk_tap.get("digest"))[:12],
+                              _chk_tap.get("frames"),
+                              str(_fml_tap.get("digest"))[:12],
+                              _fml_tap.get("frames")))
+        logger.info(
+            "STAGE3_TWO_PASS_TAP_OK",
+            "check pass and formal pass consumed byte-identical y4m streams",
+            frames=_fml_tap.get("frames"),
+            digest=str(_fml_tap.get("digest"))[:16],
+            bytes=_fml_tap.get("bytes"))
+        return True, ("same-domain y4m binding ok: %s frames, digest %s"
+                      % (_fml_tap.get("frames"),
+                         str(_fml_tap.get("digest"))[:12]))
+
+    # ==== 退路：AI 实际消费的输入摘要（rgb48le，与 y4m 不同域）====
     #
     # sidecar 由 `_stream_raw_upscale` 在 AI 进程读 stdin 时算好并落盘
     # （`{output_mkv}.frame_contract.json.ai_input.json`）。
