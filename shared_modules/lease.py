@@ -92,6 +92,15 @@ class FrameLease:
     buffer: bytearray
     state: str = "live"
     meta: Dict[str, Any] = field(default_factory=dict)
+    #: R26-A06：**槽位代际**。同一槽被复用后这个值会变，旧 lease 因此
+    #: 能被识别为 stale。
+    #:
+    #: **局限（必须写清）**：Python 的裸 `bytearray` 引用**无法被撤销**。
+    #: 旧 lease 手里的 `buffer` 仍指向同一块内存，写它就能污染新帧 ——
+    #: 代际号只能让**遵守 API 的调用方**发现"我已经过期了"，
+    #: 不能阻止故意/疏忽的裸写。真正的隔离要靠"离开作用域不保留引用"
+    #: 或跨进程共享槽位描述符（见指令 §1.4）。
+    generation: int = 0
 
     @property
     def expired(self) -> bool:
@@ -132,6 +141,10 @@ class LeasePool:
             bytearray(self.slot_bytes) for _ in range(self.capacity)]
         #: 每个 slot 见过的最大 seq（防旧帧覆盖）
         self._last_seq: List[int] = [-1] * self.capacity
+        #: R26-A06：每个 slot 的代际（复用一次 +1）
+        self._gen: List[int] = [0] * self.capacity
+        #: 被隔离的 slot（超时/撤销后不立即复用）
+        self._quarantined: set = set()
         self._live: Dict[str, FrameLease] = {}
         # 账目
         self.issued = 0
@@ -176,9 +189,57 @@ class LeasePool:
 
     def _find_free_slot(self) -> Optional[int]:
         for i, cur in enumerate(self._slots):
-            if cur is None:
+            # R26-A06：隔离中的槽**不再分配** —— 那是"无法确认旧 owner
+            # 已停止写"的槽，交给新帧等于把污染合法化。
+            if cur is None and i not in self._quarantined:
                 return i
         return None
+
+    def is_current(self, lease: "FrameLease") -> bool:
+        """这个 lease 还是不是它那个槽的**当前**持有者（R26-A06）。
+
+        判据：`state == "live"` 且 `generation` 与该槽的当前代际相同。
+        槽被复用一次，代际就 +1，旧 lease 立即变成 stale。
+
+        **局限**：它只保护"遵守 API 的调用方"。Python 的裸 `bytearray`
+        引用无法被撤销 —— 旧 lease 手里的 `buffer` 仍指向同一块内存。
+        真正的隔离要靠跨进程共享槽位描述符或"离开作用域不保留引用"。
+        """
+        if lease is None:
+            return False
+        if str(getattr(lease, "state", "")) != "live":
+            return False
+        _slot = int(getattr(lease, "slot", -1))
+        if _slot < 0 or _slot >= self.capacity:
+            return False
+        return int(getattr(lease, "generation", -1)) == int(self._gen[_slot])
+
+    def quarantine(self, lease_id: str, reason: str = "") -> bool:
+        """把该 lease 的槽**隔离**：撤销并**不再分配**（R26-A06）。
+
+        用于"超时/所有者进程可能还在写"的场景 —— 指令 §1.3 的原话是
+        "先 fence 旧 owner，不能直接复用；无法确认则 quarantine 并中止
+        该执行组"。`release()` 是正常归还（槽可立即复用），
+        `quarantine()` 是异常路径（槽退役）。
+
+        Returns:
+            是否找到并隔离了该 lease。
+        """
+        with self._cond:
+            lease = self._live.get(str(lease_id))
+            if lease is None:
+                return False
+            lease.state = "revoked"
+            self._quarantined.add(lease.slot)
+            self._slots[lease.slot] = None
+            del self._live[lease.lease_id]
+            self.revoked += 1
+            self._cond.notify_all()
+            return True
+
+    def quarantined_slots(self) -> List[int]:
+        """当前被隔离的槽（审计用）。"""
+        return sorted(self._quarantined)
 
     def _issue(self, slot: int, owner: str, seq: int, ttl: float,
                meta: Optional[Dict[str, Any]]) -> FrameLease:
@@ -191,7 +252,12 @@ class LeasePool:
         lease = FrameLease(
             lease_id=uuid.uuid4().hex[:16], slot=slot, seq=seq, owner=str(owner),
             bytes=self.slot_bytes, acquired_at=time.monotonic(), ttl=ttl,
-            buffer=self._buffers[slot], meta=dict(meta or {}))
+            buffer=self._buffers[slot], meta=dict(meta or {}),
+            generation=self._gen[slot])
+        # R26-A06：**先推进代际，再登记新 lease** —— 这样从这一刻起
+        # 任何更早的 lease 都能被 `is_current()` 判成过期。
+        self._gen[slot] += 1
+        lease.generation = self._gen[slot]
         self._slots[slot] = lease
         self._last_seq[slot] = seq
         self._live[lease.lease_id] = lease
