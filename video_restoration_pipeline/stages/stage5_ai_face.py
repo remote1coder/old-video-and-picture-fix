@@ -1748,7 +1748,17 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
     Module-level function for multiprocessing spawn compliance (CLAUDE.md §5).
     """
     # 1. Get video info
-    decoder_info = StreamingDecoder(input_source)
+    # R26-A04：stdin 模式**没有容器可探测**，几何必须由计划给
+    # （`StreamingDecoder("-")` 在缺宽高时会 ValueError —— 那是刻意的，
+    #  猜尺寸等于把错误埋进像素里）。
+    if str(input_source) == "-":
+        decoder_info = StreamingDecoder(
+            "-",
+            width=int(params.get("stream_width") or 0),
+            height=int(params.get("stream_height") or 0),
+            fps=float(params.get("stream_fps") or 0))
+    else:
+        decoder_info = StreamingDecoder(input_source)
     width, height = decoder_info.width, decoder_info.height
 
     # 2. Compute absolute frame ranges for each segment
@@ -2180,7 +2190,9 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
         output_path="", temp_dir=temp_dir_raw,
         no_wsl_redirect=no_wsl_redirect, logger=logger)
     job_id = args.job_id
-    input_name = Path(args.input).name
+    # `-` 不是路径：给它一个稳定占位名（后续用它拼临时文件名）
+    input_name = (Path(args.input).name if str(args.input) != "-"
+                  else "<stream>")
 
     # FIX-P9-1: stage5必须在stage4之后执行，严禁直接接收stage3或stage1输出
     # Per v6.3 §3.10.5: 执行顺序为 传统修复 → AI超分(stage3) → AI人脸修复(stage5)
@@ -2202,7 +2214,17 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
     # 约定：main 通过 `params["upstream_artifact"]` 传**已验证过的精确
     # 路径**；stage 有就用它，没有（独立 CLI 运行）才回落到 glob。
     _pinned = str(params.get("upstream_artifact") or "")
-    if _pinned:
+    if _pinned == "-":
+        # ==== R26-A04 / N27-04：**管道模式** ====
+        #
+        # 上游（stage3 的融合输出）写 stdout，本 stage 从 stdin 读。
+        # 这条路径下**没有文件可 glob**，也不该 glob —— 输入就是"现在
+        # 这一股流"。`StreamingDecoder("-")` 已经支持从 stdin 读 y4m。
+        input_source = "-"
+        logger.info(
+            "STAGE5_INPUT_STREAM",
+            "Consuming the upstream stage's stdout (no intermediate file)")
+    elif _pinned:
         if os.path.exists(_pinned):
             input_source = _pinned
             logger.info("STAGE5_INPUT_PINNED",
