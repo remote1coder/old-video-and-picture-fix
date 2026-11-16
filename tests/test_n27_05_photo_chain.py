@@ -53,7 +53,7 @@ def test_s3_is_reported_as_unsupported_not_skipped():
                             stages=["s1", "s2", "s3", "s5"])
     assert r["ok"] is False
     assert r["unsupported"] == ["s3"], r
-    assert "resident model worker" in r["error"], r["error"]
+    assert "model worker client" in r["error"], r["error"]
     # 拒绝发生**在动手之前**：一 stage 都没跑
     assert r["stages_run"] == []
 

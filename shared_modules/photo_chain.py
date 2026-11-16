@@ -32,7 +32,12 @@ __all__ = ["MEMORY_STAGES", "STAGE_SCRIPTS", "capabilities",
            "run_inproc_chain"]
 
 #: 具备内存入口的 stage（键是计划里的名字）。
-MEMORY_STAGES = frozenset({"s1", "s2", "s5"})
+#:
+#: `s3` / `s4` 在**给了 `client=`** 时也可用 —— 它们是模型阶段，
+#: 必须跑在带 torch 的常驻 worker 里（`photo_model_client`）。
+MEMORY_STAGES = frozenset({"s1", "s2", "s3", "s4", "s5"})
+#: 必须依赖模型 worker 的 stage。
+MODEL_STAGES = frozenset({"s3", "s4"})
 
 #: 全部 6 个 stage 的脚本名（用于"请求了但没有内存入口"的判断）。
 STAGE_SCRIPTS = {
@@ -70,20 +75,31 @@ def _load(stage: str):
     return mod
 
 
-def capabilities() -> Dict[str, Any]:
-    """这张表就是"能不能跑内存链"的唯一依据。"""
+def capabilities(*, with_model_client: bool = False) -> Dict[str, Any]:
+    """这张表就是"能不能跑内存链"的唯一依据。
+
+    `s3`/`s4` 只有在**给了模型 worker client** 时才算可用 ——
+    没给时它们仍需回退到 file 模式。
+    """
+    avail = set(MEMORY_STAGES)
+    if not with_model_client:
+        avail -= MODEL_STAGES
     return {
         "schema": "photo-inproc-capabilities/1",
-        "memory_stages": sorted(MEMORY_STAGES),
-        "file_only_stages": sorted(set(STAGE_SCRIPTS) - MEMORY_STAGES
-                                  - {"s6"}),
-        "note": ("S3/S4 need a resident model worker; S6 always writes the "
-                 "final candidate by design"),
+        "memory_stages": sorted(avail),
+        "model_stages": sorted(MODEL_STAGES),
+        "needs_model_client": sorted(MODEL_STAGES) if not with_model_client
+                              else [],
+        "file_only_stages": sorted(set(STAGE_SCRIPTS) - avail - {"s6"}),
+        "note": ("S3/S4 run through a resident model worker "
+                 "(photo_model_worker); S6 always writes the final "
+                 "candidate by design"),
     }
 
 
 def run_inproc_chain(data: bytes, params: Dict[str, Any], *,
                      stages: Optional[Sequence[str]] = None,
+                     client=None,
                      logger=None) -> Dict[str, Any]:
     """按 `stages` 顺序在内存里跑照片链。
 
@@ -103,13 +119,23 @@ def run_inproc_chain(data: bytes, params: Dict[str, Any], *,
     _stages = tuple(stages) if stages else _DEFAULT_ORDER
 
     # ---- 先判能力，再动手 ----
-    _need = [s for s in _stages if s not in MEMORY_STAGES and s != "s6"]
+    #
+    # `s3`/`s4` 是模型阶段：**没有 client 就不能跑**。
+    # 拒绝必须发生在动手之前 —— 静默跳过等于交付一张没超分/没修脸的
+    # 照片还说过全链。
+    _need = []
+    for s in _stages:
+        if s == "s6":
+            continue
+        if s not in MEMORY_STAGES:
+            _need.append("%s (no in-memory entry)" % s)
+        elif s in MODEL_STAGES and client is None:
+            _need.append("%s (needs a model worker client)" % s)
     if _need:
-        out["unsupported"] = _need
+        out["unsupported"] = [s.split(" ")[0] for s in _need]
         out["error"] = (
-            "this chain requests %s, which have no in-memory entry yet "
-            "(they need a resident model worker). Refusing to silently skip "
-            "them and call the result a full chain." % (", ".join(_need),))
+            "this chain needs %s. Refusing to silently skip them and call "
+            "the result a full chain." % ("; ".join(_need),))
         return out
 
     cur = data
@@ -117,11 +143,14 @@ def run_inproc_chain(data: bytes, params: Dict[str, Any], *,
         if st == "s6":
             # 编码不在内存链里（最终候选本来就要落盘）
             continue
-        try:
-            mod = _load(st)
-        except Exception as exc:
-            out["error"] = "cannot load %s: %s" % (st, exc)
-            return out
+        # s3/s4 走 worker，不需要在本进程加载它们的脚本
+        mod = None
+        if st not in MODEL_STAGES:
+            try:
+                mod = _load(st)
+            except Exception as exc:
+                out["error"] = "cannot load %s: %s" % (st, exc)
+                return out
         try:
             if st == "s1":
                 r = mod.preprocess_png_bytes(cur, params, logger=logger)
@@ -131,6 +160,46 @@ def run_inproc_chain(data: bytes, params: Dict[str, Any], *,
                     cur, params,
                     degraded_channels=params.get("degraded_channels"),
                     logger=logger)
+            elif st == "s3":
+                # 模型阶段：**不在本进程里加载模型**，走常驻 worker
+                r = client.upscale(
+                    cur,
+                    model=str(params.get("upscale_model")
+                              or "realesr-general-x4v3"),
+                    scale=int(params.get("upscale_scale") or 2),
+                    half=bool(params.get("ai_half", True)))
+            elif st == "s4":
+                # 记录输入几何：GFPGAN 的 `upscale=` 是**为了让模型拿到
+                # 足够分辨率**而做的放大，不是"我们要把照片放大"。
+                # 不把它缩回去，S3 的 2× 会再叠一层变成 4×（实测 64×48
+                # 走完 S3+S4 变成 256×192）。S4 的语义是**只修脸、不改几何**。
+                import numpy as _np2
+                from media_io import read_png_bytes as _rp2, encode_png as _enc2
+                _before = _rp2(cur)
+                _h0, _w0 = int(_before.shape[0]), int(_before.shape[1])
+                r = client.face(cur,
+                                upscale=int(params.get("face_upscale") or 2),
+                                only_center_face=bool(
+                                    params.get("only_center_face", False)))
+                if not r.get("ok") and r.get("no_face"):
+                    # **无脸是合法不适用**（与 S4 的 `face_boxes == []`
+                    # 分支同一语义）：交付当前图并继续，不判整链失败。
+                    # 但要留痕 —— 让人知道这一张没做人脸修复。
+                    r = {"ok": True, "png": cur, "no_face": True,
+                         "warnings": ["no face detected; S4 delivered the "
+                                      "image unchanged"]}
+                elif r.get("ok") and (int(r.get("height") or 0) != _h0
+                                      or int(r.get("width") or 0) != _w0):
+                    import cv2 as _cv2
+                    _a = _rp2(r["png"])
+                    _a = _cv2.resize(_a, (_w0, _h0),
+                                     interpolation=_cv2.INTER_AREA)
+                    r = dict(r, png=_enc2(_a), width=_w0, height=_h0,
+                             resized_from="%dx%d" % (int(r.get("width") or 0),
+                                                     int(r.get("height") or 0)),
+                             warnings=list(r.get("warnings") or []) + [
+                                 "GFPGAN upscale is a side effect; resized "
+                                 "back to the S4 input geometry"])
             elif st == "s5":
                 r = mod.postprocess_bytes(cur, params, logger=logger)
             else:                                    # pragma: no cover
