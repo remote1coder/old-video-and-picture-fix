@@ -4346,6 +4346,8 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
 
     # Run stages
     traditional_stage_completed = False
+    # N27-04：S3→S5 管道是否已经跑过（避免 stage5 再跑一次）
+    _s3s5_piped = False
     # ID-04：本 job 内"每个 stage 本次真正产出的路径"，供下游精确消费
     _last_produced: Dict[int, List[str]] = {}
 
@@ -4493,7 +4495,25 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             _snapshot_stage_files(params.get("temp_dir", "./temp"),
                                   job_id, input_path, stage_num)
             if stage_num != 7 else {})
-        exit_code, stderr = run_stage(script_name, job, params, args.get("config"))
+        # ==== N27-04：S3→S5 管道（消除 step4 整片媒体）====
+        if (stage_num == 3 and _sf and params.get("face_restore")
+                and not _s3s5_piped):
+            job_logger.info(
+                "S3S5_PIPE_START",
+                "stage3 and stage5 will run as one pipe (no step4 media)")
+            _prc, _perr = run_s3_s5_pipe(job, params, args.get("config"),
+                                         job_logger)
+            _s3s5_piped = True
+            exit_code, stderr = _prc, _perr
+        elif stage_num == 5 and _s3s5_piped:
+            exit_code, stderr = 3, "merged into the S3->S5 pipe"
+            job_logger.info(
+                "S5_MERGED_SKIP",
+                "stage5 already ran inside the S3->S5 pipe; not running it "
+                "again as a separate process")
+        else:
+            exit_code, stderr = run_stage(script_name, job, params,
+                                          args.get("config"))
         if _sf and stage_num == 1 and exit_code == 0:
             _vpy = _read_stream_s1_script(params, job_id, input_path, job_logger)
             if not _vpy:
@@ -5396,6 +5416,99 @@ def _persist_job_result(manifest_path: str, job_id: str, status: str,
     if not saved:
         return False, "save_manifest_job_result returned False"
     return True, ""
+
+
+def run_s3_s5_pipe(job: Dict[str, Any], params: Dict[str, Any],
+                   config_path: str, logger) -> Tuple[int, str]:
+    """`stage3(--output -) | stage5(--input -)` —— 消除 step4 整片媒体。
+
+    ## 这一步消掉的是什么
+
+    经典链：stage3/4 融合写 `step4_postprocess_*.mkv`（整片 FFV1），
+    stage5 再读它。现在 stage3 把同一份数据写 stdout，stage5 从 stdin 读
+    —— **step4 这个文件根本不存在**。
+
+    ## 还没消掉的
+
+    stage5 的输出仍然落 `step5_face_*.mkv`（stage6 的 vpy 需要文件源）。
+    要消 step5 得把 stage6 改成流式 vpy 源 —— 那是另一件事，
+    **不在本函数里假装做到了**。
+
+    Returns:
+        ``(rc, detail)``。两个进程都 rc=0 才算成功。
+    """
+    from stream_chain import run_chain
+
+    stages_dir = SCRIPT_DIR / "stages"
+    s3 = str(stages_dir / "stage3_ai_upscale.py")
+    s5 = str(stages_dir / "stage5_ai_face.py")
+
+    # ---- stage3 的 params：输出到 stdout ----
+    p3 = dict(params)
+    p3["_stream_output"] = "-"
+
+    # ---- stage5 的 params：从 stdin 读 ----
+    #
+    # stdin 模式**没有容器可探测**，几何必须由计划给。这里从 stage2 的
+    # 产物探一次（那是 stage3 的输入，分辨率与 stage3 输出只差 scale）。
+    p5 = dict(params)
+    p5["upstream_artifact"] = "-"
+    _src = str(params.get("upstream_artifact") or "")
+    _scale = int(params.get("upscale_scale") or 2)
+    _w = _h = 0
+    _fps = 0.0
+    try:
+        import subprocess as _sp
+        _probe_src = _src or ""
+        if _probe_src and os.path.isfile(_probe_src):
+            _r = _sp.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                          "-show_entries",
+                          "stream=width,height,r_frame_rate",
+                          "-of", "csv=p=0", _probe_src],
+                         capture_output=True, text=True, errors="replace",
+                         timeout=30, shell=False)
+            if _r.returncode == 0 and _r.stdout.strip():
+                _parts = _r.stdout.strip().split(",")
+                _w = int(_parts[0]) * _scale
+                _h = int(_parts[1]) * _scale
+                if len(_parts) > 2 and "/" in _parts[2]:
+                    _num, _den = _parts[2].split("/")
+                    _fps = float(_num) / float(_den) if float(_den) else 0.0
+    except Exception as _e:
+        logger.warning("S3S5_PIPE_PROBE_FAIL",
+                       "cannot probe the upstream geometry for the stdin "
+                       "consumer; the pipe will fail with a clear error "
+                       "instead of guessing", error=str(_e))
+    if not (_w and _h and _fps):
+        logger.error(
+            "S3S5_PIPE_NO_GEOMETRY",
+            "the stdin consumer needs width/height/fps from the plan, and "
+            "they could not be established. Refusing to guess them.",
+            upstream=_src, width=_w, height=_h, fps=_fps)
+        return (86, "no geometry for the stdin consumer")
+    p5["stream_width"] = _w
+    p5["stream_height"] = _h
+    p5["stream_fps"] = _fps
+
+    def _argv(script: str, p: Dict[str, Any], extra: List[str]) -> List[str]:
+        import json as _j
+        return ([sys.executable, script,
+                 "--job-id", str(job.get("job_id") or ""),
+                 "--input", str(job.get("input_path") or ""),
+                 "--config", config_path,
+                 "--params", _j.dumps(p, default=str)] + extra)
+
+    cmds = [
+        _argv(s3, p3, ["--output", "-"]),
+        _argv(s5, p5, ["--input", "-"]),
+    ]
+    _tmpd = str(params.get("temp_dir") or "./temp")
+    _res = run_chain(cmds, tmpd=_tmpd, logger=logger,
+                     label="s3-s5")
+    if not _res.get("ok"):
+        return (86, "S3->S5 pipe failed: %s"
+                % ("; ".join(_res.get("errors") or []) or _res.get("rcs")))
+    return (0, "")
 
 
 def _run_single_job(job: Dict[str, Any], config: Dict[str, Any],
