@@ -393,7 +393,18 @@ ai:
   grain_strength: 0.3
   force_traditional_first: true
   force_allow_banned_upscale: false
-  gpu_memory_fallback: true
+  # R26-A09：**默认不授权降质**（第 26 轮独立审核）。
+  #
+  # 这个开关的含义是"显存不足时**允许改变质量**"—— 换更差的模型、
+  # 降倍率、换后端。开着它等于把"画质"交给运行时的资源状况决定，
+  # 而用户要求是"开跑前明确画质"。
+  #
+  # 需要这种能力时，**显式**改成 true，或用下面的 plan 写具体替代方案。
+  # 关掉后显存不足的行为是"等待 / 明确失败（rc=85）"，不是偷偷降级。
+  gpu_memory_fallback: false
+  # 具体替代方案（仅当上面为 true 时生效）。留空表示沿用既定的
+  # "同模型家族、倍率减半"规则；写成列表则只按列表里的方案降级。
+  gpu_fallback_plan: []
   face_detect_fallback: ["RetinaFace", "YOLOv8-face", "MTCNN"]
   face_detect_threshold: 0.8
   face_detect_threshold_lowres: 0.6
