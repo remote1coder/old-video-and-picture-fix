@@ -217,8 +217,16 @@ class StreamingEncoder:
 
     def __init__(self, output_path: str, width: int, height: int,
                  fps: float, pix_fmt_in: str = "rgb24",
-                 codec: str = "ffv1", pix_fmt_out: str = "yuv420p16le"):
+                 codec: str = "ffv1", pix_fmt_out: str = "yuv420p16le",
+                 stderr_path: str = ""):
         self.output_path = output_path
+        # R26-A04 / N27-04：`output_path == "-"` 表示**写 stdout**（管道模式）。
+        # 那时不落盘，下游（stage6/stage7）直接读这股 Matroska。
+        self.to_stdout = (str(output_path) == "-")
+        # stderr **不能挂 PIPE 不读**：编码器 warning 一多就阻塞在写上，
+        # 整条链跟着卡死（photo worker 那边踩过同一坑）。
+        self.stderr_path = stderr_path
+        self._err_fh = None
         self.width = width
         self.height = height
         self.fps = fps
@@ -243,10 +251,21 @@ class StreamingEncoder:
             "-color_primaries", "bt709",
             "-color_trc", "bt709",
             "-colorspace", "bt709",
-            self.output_path
         ]
+        if self.to_stdout:
+            # Matroska 到 stdout（`-f` 必须在 `-` 之前）
+            cmd += ["-f", "matroska", "-"]
+        else:
+            cmd += [self.output_path]
+        _err = subprocess.DEVNULL
+        if self.stderr_path:
+            try:
+                self._err_fh = open(self.stderr_path, "wb")
+                _err = self._err_fh
+            except OSError:
+                _err = subprocess.DEVNULL
         self._proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+            cmd, stdin=subprocess.PIPE, stderr=_err, shell=False)
         # NEW-V-06/RV-12: 流式编码器是独立子进程，必须登记——取消时只杀
         # Python stage 的话，ffmpeg 会继续把半截数据写回 output_path
         # （守卫刚删掉的文件被孤儿进程重新创建，取消就白做了）。
@@ -258,9 +277,21 @@ class StreamingEncoder:
         if self._proc:
             if _cancel_guard is not None:
                 _cancel_guard.unwatch_process(self._proc)
-            self._proc.stdin.close()
-            self._proc.stderr.close()
+            try:
+                self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                if self._proc.stderr is not None:
+                    self._proc.stderr.close()
+            except Exception:
+                pass
             self._proc.wait()
+        try:
+            if self._err_fh is not None:
+                self._err_fh.close()
+        except Exception:
+            pass
 
     def write_frame(self, frame: np.ndarray) -> None:
         """Write one RGB numpy array to the encoder pipe."""
