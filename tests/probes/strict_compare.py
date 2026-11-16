@@ -788,15 +788,20 @@ def compare_media(a_path: str, b_path: str, *,
                            "start_a": _finite_or_none(fa["start_time"]),
                            "start_b": _finite_or_none(fb["start_time"])}
 
-    # ---- 6) 音频（可选必需项：比**规格**，不是"有没有"）----
+    # ---- 6) 音频：**三级**（R26-A08）----
+    #
+    # 原来只比音轨数与布局 —— 复核原话："没有比较内容、样本、起止与同步"。
+    # 现在按 `require_audio` 的取值分三级（`True` 等价于 `"spec"`）：
+    #   spec    —— 数量/codec/采样率/声道/布局
+    #   range   —— 再加每轨 start_time / duration
+    #   content —— 再加 PCM（无损）或包级（有损/有意处理）摘要
+    # 详见 `check_audio_three_levels()` 的 docstring。
     if require_audio:
-        if fa["audio_streams"] != fb["audio_streams"]:
-            p.append("audio stream count differs "
-                     f"(a={fa['audio_streams']}, b={fb['audio_streams']})")
-        elif fa["audio_layouts"] != fb["audio_layouts"]:
-            p.append("audio stream specs differ "
-                     f"(a={fa['audio_layouts']}, b={fb['audio_layouts']})")
-        res["audio"] = {"a": fa["audio_layouts"], "b": fb["audio_layouts"]}
+        _ar = check_audio_three_levels(
+            a_path, b_path, require_audio=require_audio,
+            stream_index=stream_index)
+        res["audio"] = _ar
+        p.extend(_ar.get("problems") or [])
 
     if p:
         return res
@@ -1107,3 +1112,190 @@ def json_safe(obj: Any) -> Any:
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     return obj
+
+
+# --------------------------------------------------------------- 音频三级
+#: 音频检查的三个级别（R26-A08 / 指令 §"音频三级"）。
+#:
+#: * ``spec``：**规格与选流** —— 音轨数、codec、采样率、声道数、布局。
+#:   这一级只能回答"两边装的是不是同一类音轨"。
+#: * ``range``：再加**真实样本范围与起止** —— 每轨的 `start_time` 与
+#:   `duration`。它能抓"音轨整体后移""尾部被截断"。
+#: * ``content``：再加**内容** —— 无损旁路比 PCM（解码后逐样本），
+#:   有意处理/有损编码比**包级** framemd5（比的是压缩后的字节流，
+#:   不能强求与无损参考相同）。
+#:
+#: 为什么必须分级：只比 spec 时，"同样 48k/2ch 但内容完全错"会通过；
+#: 直接比 content 又会在"有意处理"（降噪/变速）上误杀。
+AUDIO_LEVELS = ("spec", "range", "content")
+
+
+def _audio_level_of(require_audio: Any) -> str:
+    """把 `require_audio` 的多种写法归一成三级名。"""
+    if require_audio is True:
+        return "spec"
+    if not require_audio:
+        return ""
+    s = str(require_audio).strip().lower()
+    return s if s in AUDIO_LEVELS else "spec"
+
+
+def _audio_streams_detail(path: str) -> List[Dict[str, Any]]:
+    """每条音轨的规格 + 起止（失败返回空表，由调用方判"读不到"）。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries",
+             "stream=index,codec_name,channels,channel_layout,sample_rate,"
+             "start_time,duration,sample_fmt",
+             "-of", "json", str(path)],
+            capture_output=True, timeout=600)
+        if r.returncode != 0:
+            return []
+        doc = json.loads((r.stdout or b"").decode("utf-8", "replace") or "{}")
+        out = []
+        for s in (doc.get("streams") or []):
+            out.append({
+                "index": s.get("index"),
+                "codec": s.get("codec_name"),
+                "channels": s.get("channels"),
+                "layout": s.get("channel_layout"),
+                "sample_rate": s.get("sample_rate"),
+                "sample_fmt": s.get("sample_fmt"),
+                "start": _finite_or_none(s.get("start_time")),
+                "duration": _finite_or_none(s.get("duration")),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _audio_frame_md5(path: str, stream_index: int = 0,
+                     *, decode: bool) -> str:
+    """音轨的有序 md5 摘要。
+
+    Args:
+        decode: True → 先解码成 PCM 再算（无损旁路用，能抓"容器相同但
+            样本不同"）；False → 直接对**包**算（有损/有意处理用，
+            比的是压缩流，解码后的 PCM 本来就不该与参考相同）。
+
+    Returns:
+        32 位十六进制；读不到返回空串。
+    """
+    cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin",
+           "-i", str(path), "-map", f"0:a:{stream_index}", "-vn"]
+    if decode:
+        cmd += ["-c:a", "pcm_s16le"]
+    else:
+        cmd += ["-c", "copy"]
+    cmd += ["-f", "md5", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=1800)
+        if r.returncode != 0:
+            return ""
+        txt = (r.stdout or b"").decode("utf-8", "replace").strip()
+        return txt.split("=")[-1].strip() if "=" in txt else txt
+    except Exception:
+        return ""
+
+
+def check_audio_three_levels(a_path: str, b_path: str, *,
+                             require_audio: Any = "content",
+                             stream_index: int = 0,
+                             tolerance: float = 0.0
+                             ) -> Dict[str, Any]:
+    """按三级做音频核对，返回结构化结果（供 `compare_media` 与独立探针共用）。
+
+    Args:
+        require_audio: ``"spec"`` / ``"range"`` / ``"content"``（或 True=spec）。
+        stream_index: 只对第几条音轨做内容比较（规格/范围比全部）。
+        tolerance: 起止时间容差（秒）；0 表示用 1e-3。
+
+    Returns:
+        ``{"level", "ok", "problems", "a", "b", "content", "digest_a",
+        "digest_b"}``。
+
+        **读不到音轨时**：`level` 非空但两边都为空 → `ok=False` 且
+        problems 写明"读不到"，不把"读不到"当成"一致"。
+    """
+    lvl = _audio_level_of(require_audio)
+    out: Dict[str, Any] = {"level": lvl, "ok": True, "problems": [],
+                           "a": [], "b": [], "content": "", "digest_a": "",
+                           "digest_b": ""}
+    if not lvl:
+        return out
+    probs: List[str] = out["problems"]
+    ta = _audio_streams_detail(a_path)
+    tb = _audio_streams_detail(b_path)
+    out["a"], out["b"] = ta, tb
+    if not ta or not tb:
+        out["ok"] = False
+        probs.append("audio streams could not be read on at least one side "
+                     f"(a={len(ta)}, b={len(tb)}); 'unreadable' is not "
+                     f"'identical'")
+        return out
+
+    _tol = float(tolerance) if tolerance else 1e-3
+
+    # ---- 级 1：规格与选流 ----
+    if len(ta) != len(tb):
+        probs.append(f"audio stream count differs (a={len(ta)}, b={len(tb)})")
+    else:
+        for i, (sa, sb) in enumerate(zip(ta, tb)):
+            for key in ("codec", "channels", "layout", "sample_rate"):
+                if sa.get(key) != sb.get(key):
+                    probs.append(
+                        f"audio[{i}].{key} differs ({sa.get(key)!r} vs "
+                        f"{sb.get(key)!r})")
+
+    # ---- 级 2：真实样本范围与起止 ----
+    if lvl in ("range", "content") and len(ta) == len(tb):
+        for i, (sa, sb) in enumerate(zip(ta, tb)):
+            for key, label in (("start", "start"), ("duration", "duration")):
+                va, vb = sa.get(key), sb.get(key)
+                if va is None or vb is None:
+                    probs.append(
+                        f"audio[{i}].{label} could not be read on both sides "
+                        f"(a={va!r}, b={vb!r})")
+                elif abs(float(va) - float(vb)) > _tol:
+                    probs.append(
+                        f"audio[{i}].{label} differs ({va} vs {vb}, "
+                        f"tolerance {_tol})")
+
+    # ---- 级 3：内容 ----
+    if lvl == "content":
+        if stream_index >= min(len(ta), len(tb)):
+            probs.append(
+                f"audio stream index {stream_index} does not exist on both "
+                f"sides (a={len(ta)}, b={len(tb)})")
+        else:
+            # 先试**解码后**比较：如果两边都是无损/同一编码，这是最强的判据。
+            da = _audio_frame_md5(a_path, stream_index, decode=True)
+            db = _audio_frame_md5(b_path, stream_index, decode=True)
+            if da and db and da == db:
+                out["content"] = "pcm-identical"
+                out["digest_a"] = out["digest_b"] = da
+            else:
+                # PCM 不同：可能是"有意处理"（降噪/变速/有损编码）。
+                # 这时改比**包级**摘要 —— 它能证明"压缩流一致"，
+                # 但**不能**证明"解码后一致"，所以理由里要写明。
+                pa = _audio_frame_md5(a_path, stream_index, decode=False)
+                pb = _audio_frame_md5(b_path, stream_index, decode=False)
+                out["digest_a"], out["digest_b"] = pa, pb
+                if pa and pb and pa == pb:
+                    out["content"] = "packets-identical"
+                elif not da or not db:
+                    out["content"] = "unreadable"
+                    probs.append(
+                        "audio content could not be read on at least one "
+                        "side; refusing to claim equality")
+                else:
+                    out["content"] = "differs"
+                    probs.append(
+                        "audio content differs in both the decoded PCM and "
+                        f"the packet stream (pcm {da[:8]} vs {db[:8]}, "
+                        f"packets {pa[:8] if pa else '-'} vs "
+                        f"{pb[:8] if pb else '-'})")
+
+    out["ok"] = not probs
+    return out
