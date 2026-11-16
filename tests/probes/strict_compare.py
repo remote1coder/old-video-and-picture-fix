@@ -516,25 +516,44 @@ def compare_media(a_path: str, b_path: str, *,
                   require_time: bool = False,
                   require_audio: bool = False,
                   stream_index: int = 0,
-                  timeout_hint: str = "") -> Dict[str, Any]:
+                  timeout_hint: str = "",
+                  mode: str = "native_exact") -> Dict[str, Any]:
     """严格比较两份媒体在**解码像素**上是否相同。
 
     Args:
-        pix_fmt: 两边共用的**原生**解码格式。不同格式不可比 —— 先转再比
-            必须在调用方显式做，并把转换损失另记（审核明确：不能先把 444
-            转成 420 再声称 444 等价）。
+        pix_fmt: 两边共用的解码格式。
+        mode: **R25-03/R05** —— 比较的**语义层级**：
+
+            * ``"native_exact"``（默认）：`pix_fmt` 必须是两边的**原始**
+              格式。只要有一边源格式不同，就**拒绝比较** ——
+              因为 ffmpeg 的 `-pix_fmt` 会静默转换，"转完再比"得到的
+              "相同"不是"这两份源表示相同"。444 转 420 后比出的相同，
+              不能拿来宣称 444 等价。
+            * ``"converted"``：允许把两边都转成 `pix_fmt` 再比。
+              这时结果里会带 `mode="converted"` 与每边的源格式，
+              报告必须按"转换后相同"表述，不能升级成原生等价。
         width/height: 期望尺寸；给 0 表示从 ffprobe 取，并**要求两边一致**。
         expect_frames: 期望帧数；给定时两边**解码出的**帧数都必须等于它。
         require_time: 是否把"时间覆盖"作为必需项。
+            **R25-03/R06**：不只是容器时长 —— 还会逐帧比 PTS。
+            只有起点不同（0 vs 0.5s）也必须被抓到。
         require_audio: 是否把"音频流规格一致"作为必需项。
         stream_index: 选哪条视频流（两边用同一个序号）。
 
     Returns:
         dict：``ok`` / ``problems`` / ``identical`` / ``frames`` /
-        ``max_abs_diff`` / ``psnr`` / ``alias`` / ``planes`` / ``spec``。
-        只有 ``ok and identical`` 才能说"逐像素相同"。
+        ``max_abs_diff`` / ``psnr`` / ``alias`` / ``planes`` / ``spec`` /
+        ``mode`` / ``source_pix_fmt``。
+        只有 ``ok and identical`` 才能说"逐像素相同"，且要连同 ``mode``
+        一起表述。
     """
     import numpy as np
+
+    _mode = str(mode or "native_exact").strip().lower()
+    if _mode not in ("native_exact", "converted"):
+        raise ValueError(
+            f"unknown comparison mode {mode!r}; use 'native_exact' or "
+            f"'converted'")
 
     res: Dict[str, Any] = {
         "ok": False, "problems": [], "identical": False,
@@ -543,6 +562,7 @@ def compare_media(a_path: str, b_path: str, *,
         "expect_frames": expect_frames, "hint": timeout_hint,
         "planes": [], "spec": {}, "require_time": bool(require_time),
         "require_audio": bool(require_audio), "stream_index": int(stream_index),
+        "mode": _mode,
     }
     p: List[str] = res["problems"]
 
@@ -594,6 +614,20 @@ def compare_media(a_path: str, b_path: str, *,
                      f"geometry is not comparable even with equal byte counts")
         if f["pix_fmt"]:
             res.setdefault("source_pix_fmt", {})[tag] = f["pix_fmt"]
+            # R25-03/R05：native_exact 要求**源格式就是比较格式**。
+            #
+            # 原来这里只把源格式记进 `source_pix_fmt` 当参考，
+            # 解码命令却无条件带 `-pix_fmt` —— 于是 rgb48le 与 rgb24
+            # 被转成同一个格式后比出"相同"，报告却写着原生等价。
+            # 转换后的相同只能支持"转换后表示相同"这个更弱的结论。
+            if _mode == "native_exact" and f["pix_fmt"] != str(pix_fmt):
+                p.append(
+                    f"input {tag} is {f['pix_fmt']!r} on disk, but a "
+                    f"native_exact comparison was requested at "
+                    f"{str(pix_fmt)!r}; decoding would convert it first, and "
+                    f"'equal after conversion' is not 'equal natively' "
+                    f"(use mode='converted' if a converted comparison is "
+                    f"what you actually want)")
     if p:
         return res
 
@@ -620,6 +654,52 @@ def compare_media(a_path: str, b_path: str, *,
             if abs(fa["duration"] - fb["duration"]) > _tol:
                 p.append("durations differ beyond one frame "
                          f"({fa['duration']:.6f} vs {fb['duration']:.6f})")
+
+            # R25-03/R06：**起点也必须比**。
+            #
+            # 原来只比容器时长：同样 10 秒、起点分别 0 和 0.5 秒的两份
+            # 媒体会判"时间一致"，而它们的内容整体后移了半秒。
+            _sa, _sb = fa.get("start_time"), fb.get("start_time")
+            if _sa is not None and _sb is not None:
+                if abs(float(_sa) - float(_sb)) > _tol:
+                    p.append(
+                        f"start times differ beyond one frame "
+                        f"({float(_sa):.6f}s vs {float(_sb):.6f}s); the same "
+                        f"duration does not mean the same timeline")
+
+            # R25-03/R06：**逐帧 PTS**。时长与起点相同、中间时刻被拉伸
+            # 或重排的组合，只有逐帧比才能抓到。
+            try:
+                from vfr_timecodes import probe_pts as _pp
+                _pa, _pb = _pp(a_path), _pp(b_path)
+                if not _pa or not _pb:
+                    p.append(
+                        "require_time was requested but per-frame PTS could "
+                        "not be read on at least one side")
+                elif len(_pa) != len(_pb):
+                    p.append(
+                        f"per-frame PTS lists have different lengths "
+                        f"(a={len(_pa)}, b={len(_pb)})")
+                else:
+                    _dev = max(abs(float(x) - float(y))
+                               for x, y in zip(_pa, _pb))
+                    res["pts"] = {"frames": len(_pa),
+                                  "max_deviation": round(_dev, 6)}
+                    if _dev > _tol:
+                        p.append(
+                            f"per-frame PTS differ by up to {_dev:.6f}s "
+                            f"(tolerance {_tol:.6f}s)")
+                    # 尾帧 duration 也要有——"最后一帧显示多久"同样属于
+                    # 时间轴的事实，缺它就只剩首帧与间隔。
+                    if len(_pa) >= 2:
+                        _last_a = float(_pa[-1]) - float(_pa[-2])
+                        _last_b = float(_pb[-1]) - float(_pb[-2])
+                        if abs(_last_a - _last_b) > _tol:
+                            p.append(
+                                f"last interval differs ({_last_a:.6f}s vs "
+                                f"{_last_b:.6f}s)")
+            except Exception as _pe:
+                p.append(f"require_time: per-frame PTS probe failed: {_pe}")
         res["duration"] = {"a": _finite_or_none(fa["duration"]),
                            "b": _finite_or_none(fb["duration"]),
                            "start_a": _finite_or_none(fa["start_time"]),
