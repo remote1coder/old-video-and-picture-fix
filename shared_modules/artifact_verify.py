@@ -395,8 +395,10 @@ def verify_output(source_path: str, output_path: str,
     # 否则，若一边有音轨、另一边没有，容器时长本来就不可比 → 不判失败。
     _sv, _ov = src.get("video_duration"), out.get("video_duration")
     _cmp_src = _cmp_out = None
+    _basis = ""
     if _sv and _ov:
         _cmp_src, _cmp_out = _sv, _ov
+        _basis = "video_stream"
     elif (src.get("has_audio") is not None
           and out.get("has_audio") is not None
           and src.get("has_audio") != out.get("has_audio")):
@@ -417,37 +419,52 @@ def verify_output(source_path: str, output_path: str,
                                    f"{out.get('duration')}s）——未按时长判定")})
     else:
         _cmp_src, _cmp_out = src.get("duration"), out.get("duration")
+        _basis = "container"
 
     if _cmp_src and _cmp_out:
+        # R25-02/R02-R03：**选定口径后必须一直用它**。
+        #
+        # 原实现先算出 `_cmp_src/_cmp_out`（优先视频流时长），
+        # 紧接着又用 `src["duration"]`（容器时长）把 `rel` 覆盖掉，
+        # 后面的 frame_dur 与 checks 里的 src/out 也全是容器时长 ——
+        # 等于"先选了视频轨，又悄悄换成容器"。
+        #
+        # 审核用两个反例说明这有多严重：
+        #   * 源视频 10s / 候选视频 6s / 两边容器都 10s  → 通过（漏掉 4s 损失）
+        #   * 视频都 10s / 候选音轨把容器拉到 14s        → 失败（假报警）
         rel = abs(_cmp_out - _cmp_src) / _cmp_src
-        rel = abs(out["duration"] - src["duration"]) / src["duration"]
         diff_frames = None
         allowed_frames = None
-        if src.get("frames"):
-            frame_dur = src["duration"] / src["frames"]
+        if src.get("frames") and _cmp_src > 0:
+            frame_dur = _cmp_src / src["frames"]
             if frame_dur > 0:
-                diff_frames = abs(out["duration"] - src["duration"]) / frame_dur
+                diff_frames = abs(_cmp_out - _cmp_src) / frame_dur
                 allowed_frames = max(2.0, src["frames"] * DURATION_TOLERANCE)
         if diff_frames is not None:
             ok = diff_frames <= allowed_frames
             checks["duration"] = {
-                "src": src["duration"], "out": out["duration"],
+                "src": _cmp_src, "out": _cmp_out,
                 "rel_error": round(rel, 4),
                 "diff_frames": round(diff_frames, 2),
                 "allowed_frames": round(allowed_frames, 2),
                 "ok": ok,
+                # 口径写清楚：这一条比的是**视频流**时长（不是容器），
+                # 音频覆盖由 audio 项单独判。
+                "basis": _basis,
             }
         else:
             ok = rel <= DURATION_TOLERANCE
-            checks["duration"] = {"src": src["duration"],
-                                  "out": out["duration"],
+            checks["duration"] = {"src": _cmp_src,
+                                  "out": _cmp_out,
                                   "rel_error": round(rel, 4), "ok": ok,
+                                  "basis": _basis,
                                   "note": "源帧数未知，退回百分比判据"}
         if not ok:
             issues.append({"level": "error", "code": "DURATION_MISMATCH",
                            "message": f"时长差 {rel:.1%}"
-                                      f"（源 {src['duration']:.3f}s → "
-                                      f"成品 {out['duration']:.3f}s）"})
+                                      f"（源 {_cmp_src:.3f}s → "
+                                      f"成品 {_cmp_out:.3f}s，"
+                                      f"口径={_basis}）"})
     else:
         checks["duration"] = {"ok": None, "note": "时长未知，未校验"}
 

@@ -4364,46 +4364,36 @@ def main():
                                           "checked": len(_align_pre.get("points")
                                                          or [])})
             elif _align_ok is None:
-                # 方法无判别力（例如静态画面）**不等于错乱**，也**不等于通过**。
+                # 方法无判别力（例如静态画面）**不等于错乱**，
+                # 但**也不等于通过** —— 这一条曾被写反过。
                 #
-                # 但 fullchain 已经独立测过**两端**：首帧与末帧的哈希距离，
-                # 以及帧数。若整体前移/后移一位，首帧或末帧必然对不上；
-                # 帧数一致又排除了"中间插/删帧"。这两条合起来比
-                # "4 个随机采样点"更强 —— 长片实测正是 4 个点全被跳过
-                # （源相邻帧太像，任何相似度都分不出顺序），而首末两端
-                # distance 都是 0。
+                # 原先在这里用"fullchain 的首帧/末帧 pHash + 帧数"把
+                # frame_order 提升成 PASS，理由写"first and last frame
+                # hashes match exactly (distance 0)"。R25-02 证明它站不住：
                 #
-                # 所以：**有更强的证据就采用它**，而不是因为弱证据失效就
-                # 把整代判成 UNVERIFIED。没有更强证据时仍然 UNV。
-                _ckv = locals().get("_ck") or {}     # fullchain 关闭时它没定义
+                # 1. `first_frame_hash.ok` 是**感知哈希**，阈值允许汉明距离
+                #    ≤ 12 —— 它从没承诺过 distance 0，理由里的"exactly"
+                #    是错的。实测把首末距离都设成 12、有效采样点 0 个，
+                #    照样得到 PASS。
+                # 2. 即使首末真的完全相同，`[0,1,2,3,4,5]` 与
+                #    `[0,1,4,3,2,5]` 也有相同的首末和长度 ——
+                #    内部交换、等量删补都不能由端点证明。
+                #
+                # 所以：**保留 UNVERIFIED**。首末哈希仍是很有用的粗内容
+                # 检查（能抓"整段错位/换了素材"），但它证明不了帧序，
+                # 不能拿它给 frame_order 盖章。
+                _ckv = locals().get("_ck") or {}
                 _fh_ok = ((_ckv.get("first_frame_hash") or {}).get("ok"))
                 _lh_ok = ((_ckv.get("last_frame_hash") or {}).get("ok"))
                 _fr_ok = ((_ckv.get("frames") or {}).get("ok"))
-                _ends_ok = (_fh_ok is True and _lh_ok is True
-                            and _fr_ok is True)
-                if _ends_ok:
-                    _fc_align = _CR(
-                        "frame_order", _CR_PASS,
-                        reason=("sampled alignment had no discriminative "
-                                "points; using the stronger evidence instead: "
-                                "first and last frame hashes match exactly "
-                                "(distance 0) and the frame count agrees, "
-                                "which pins both ends of the sequence"),
-                        method=("artifact_verify.verify_frame_alignment "
-                                "+ fullchain first/last frame hashes"),
-                        evidence={"checked": len(_align_pre.get("points")
-                                                 or []),
-                                  "first_frame_hash_ok": _fh_ok,
-                                  "last_frame_hash_ok": _lh_ok,
-                                  "frames_ok": _fr_ok})
-                else:
-                    _fc_align = _CR(
+                _fc_align = _CR(
                         "frame_order", _CR_UNV,
                         reason=(_align_pre.get("error")
                                 or _align_pre.get("skipped")
-                                or "the alignment method produced no verdict, "
-                                   "and the first/last frame hashes are not "
-                                   "both verified either"),
+                                or "no discriminative sample points: the "
+                                   "frame-order method could not prove the "
+                                   "sequence, and first/last content hashes "
+                                   "cannot substitute for it"),
                         method="artifact_verify.verify_frame_alignment",
                         evidence={"checked": len(_align_pre.get("points")
                                                  or []),
