@@ -62,8 +62,12 @@ def test_gate_refuses_when_budget_short(tmp_path):
     assert st["live"] == 0, st
 
 
-def test_gate_passes_and_releases_immediately(tmp_path, monkeypatch):
-    """余量充足：放行，且闸门的预约用完立刻归还（不留长期占用）。"""
+def test_gate_passes_and_holds_the_reservation(tmp_path, monkeypatch):
+    """余量充足：放行，且预约**覆盖整个 stage 执行**（R26-A05）。
+
+    旧语义是"借了立刻还"：受控执行到启动子进程之前 `live` 就已经归 0，
+    等于从未约束过真正的工作。现在预约持有到 stage 结束。
+    """
     import cancel_guard
 
     gov = ResourceGovernor(ram_budget=128 * MB, vram_budget=8 * MB,
@@ -76,8 +80,9 @@ def test_gate_passes_and_releases_immediately(tmp_path, monkeypatch):
             stdout = "ok"
             stderr = ""
         seen["called"] = True
-        # 闸门是"借了立刻还"，所以在子进程执行的这一刻，live 应为 0
+        # R26-A05：执行期间预约**必须还在占着**（旧断言是 == 0）
         seen["live_during_run"] = gov.stats()["live"]
+        seen["ram_during_run"] = gov.stats()["ram_used"]
         return _R()
 
     monkeypatch.setattr(cancel_guard, "run_managed", fake_run)
@@ -90,8 +95,9 @@ def test_gate_passes_and_releases_immediately(tmp_path, monkeypatch):
     rc, err = vmain.run_stage("stage1_preprocess.py", _job(tmp_path),
                               params, str(tmp_path / "cfg.yaml"))
     assert seen.get("called") is True, "闸门放行后应当真的去起子进程"
-    assert seen.get("live_during_run") == 0, (
-        "闸门只做开工前确认，不应长期占用预算")
+    assert seen.get("live_during_run") == 1, (
+        "执行期间预约必须还在；live=0 说明又是'借完立刻还'")
+    assert seen.get("ram_during_run") == 32 * MB, seen
     assert rc == 0, (rc, err)
     st = gov.stats()
     assert st["live"] == 0 and st["balanced"], st
