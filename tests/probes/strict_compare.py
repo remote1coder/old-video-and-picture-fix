@@ -681,7 +681,31 @@ def compare_media(a_path: str, b_path: str, *,
             p.append("require_time was requested but a container duration "
                      "could not be read on at least one side")
         else:
-            _tol = max(1e-3, 1.0 / 30.0)
+            # R26-A08：容差**不能固定 1/30 秒**。
+            #
+            # 它要覆盖的是"两侧表示的时间量化误差 + 合法的一帧级抖动"：
+            #   * 量化步长：由 `time_base` 决定（B 帧容器常是 1/10240 这类
+            #     精细刻度，真正粗的是**帧间隔**）；
+            #   * 一帧级抖动：取两侧中位帧间隔的一半。
+            #
+            # 60fps 得到 ~8ms、24fps 得到 ~21ms —— 固定 1/30 (33ms) 在
+            # 前者会放过真实错位、在后者会误杀。
+            # 真正的逐项判定在下面用 `probe_frame_timeline()` 做，
+            # 这里的 `_tol` 只用于容器时长这一项。
+            _tol = 1.0 / 30.0
+            try:
+                _ia = float(fa.get("duration") or 0)
+                _ib = float(fb.get("duration") or 0)
+                _med = 0.0
+                for _t in (probe_frame_timeline(a_path, stream_index),
+                           probe_frame_timeline(b_path, stream_index)):
+                    _m = _t.get("median_interval") or 0
+                    if _m and _m > _med:
+                        _med = float(_m)
+                if _med > 0:
+                    _tol = max(1e-4, 0.5 * _med)
+            except Exception:
+                pass
             if abs(fa["duration"] - fb["duration"]) > _tol:
                 p.append("durations differ beyond one frame "
                          f"({fa['duration']:.6f} vs {fb['duration']:.6f})")
@@ -701,36 +725,64 @@ def compare_media(a_path: str, b_path: str, *,
             # R25-03/R06：**逐帧 PTS**。时长与起点相同、中间时刻被拉伸
             # 或重排的组合，只有逐帧比才能抓到。
             try:
-                from vfr_timecodes import probe_pts as _pp
-                _pa, _pb = _pp(a_path), _pp(b_path)
-                if not _pa or not _pb:
+                # R26-A08：改用 `probe_frame_timeline` —— 它有三件
+                # 旧调用没有的东西：
+                #   ① **`stream_index`**：原来 `probe_pts(path)` 永远取
+                #      第 0 条流，多视频流素材比错了对象；
+                #   ② **真实的末帧 duration**（`frame.duration`）：
+                #      原来拿"末两帧 PTS 差"冒充，那是**间隔**不是时长；
+                #   ③ **乱序检测**：它保留原始顺序，不倒序修饰事实。
+                #
+                # 长片不能把全部 PTS 留在内存里，所以逐项相同由**有序摘要**
+                # 判定；汇总值（帧数/起点/终点/末帧时长/跨度）另比一次，
+                # 这样"哪里不同"仍然可读。
+                _ta = probe_frame_timeline(a_path, stream_index)
+                _tb = probe_frame_timeline(b_path, stream_index)
+                res["timeline"] = {
+                    "a": {k: _ta.get(k) for k in
+                          ("state", "frames", "first_pts", "last_pts",
+                           "last_duration", "span", "out_of_order",
+                           "pts_digest", "problems")},
+                    "b": {k: _tb.get(k) for k in
+                          ("state", "frames", "first_pts", "last_pts",
+                           "last_duration", "span", "out_of_order",
+                           "pts_digest", "problems")},
+                }
+                if not _ta.get("ok") or not _tb.get("ok"):
                     p.append(
-                        "require_time was requested but per-frame PTS could "
-                        "not be read on at least one side")
-                elif len(_pa) != len(_pb):
-                    p.append(
-                        f"per-frame PTS lists have different lengths "
-                        f"(a={len(_pa)}, b={len(_pb)})")
+                        "require_time: the frame timeline is not usable "
+                        f"(a={_ta.get('state')}: {_ta.get('problem')!r}; "
+                        f"b={_tb.get('state')}: {_tb.get('problem')!r})")
                 else:
-                    _dev = max(abs(float(x) - float(y))
-                               for x, y in zip(_pa, _pb))
-                    res["pts"] = {"frames": len(_pa),
-                                  "max_deviation": round(_dev, 6)}
-                    if _dev > _tol:
-                        p.append(
-                            f"per-frame PTS differ by up to {_dev:.6f}s "
-                            f"(tolerance {_tol:.6f}s)")
-                    # 尾帧 duration 也要有——"最后一帧显示多久"同样属于
-                    # 时间轴的事实，缺它就只剩首帧与间隔。
-                    if len(_pa) >= 2:
-                        _last_a = float(_pa[-1]) - float(_pa[-2])
-                        _last_b = float(_pb[-1]) - float(_pb[-2])
-                        if abs(_last_a - _last_b) > _tol:
+                    for _side, _t in (("a", _ta), ("b", _tb)):
+                        if _t.get("out_of_order"):
                             p.append(
-                                f"last interval differs ({_last_a:.6f}s vs "
-                                f"{_last_b:.6f}s)")
+                                f"input {_side} has "
+                                f"{_t['out_of_order']} out-of-order display "
+                                f"timestamps; its timeline is contradictory")
+                    if _ta["frames"] != _tb["frames"]:
+                        p.append(
+                            f"decoded frame counts differ (a={_ta['frames']}, "
+                            f"b={_tb['frames']})")
+                    for _key, _label in (("first_pts", "first PTS"),
+                                         ("last_pts", "last PTS"),
+                                         ("last_duration", "last frame duration"),
+                                         ("span", "presentation span")):
+                        _va, _vb = _ta.get(_key), _tb.get(_key)
+                        if _va is None or _vb is None:
+                            p.append(
+                                f"{_label} could not be established on "
+                                f"both sides (a={_va!r}, b={_vb!r})")
+                        elif abs(float(_va) - float(_vb)) > _tol:
+                            p.append(
+                                f"{_label} differs ({_va} vs {_vb}, "
+                                f"tolerance {_tol:.6f}s)")
+                    if _ta.get("pts_digest") != _tb.get("pts_digest"):
+                        p.append(
+                            "the ordered per-frame PTS sequences differ "
+                            "(same summary values can still hide a reorder)")
             except Exception as _pe:
-                p.append(f"require_time: per-frame PTS probe failed: {_pe}")
+                p.append(f"require_time: frame timeline probe failed: {_pe}")
         res["duration"] = {"a": _finite_or_none(fa["duration"]),
                            "b": _finite_or_none(fb["duration"]),
                            "start_a": _finite_or_none(fa["start_time"]),
@@ -897,6 +949,22 @@ def probe_frame_timeline(path: str, stream_index: int = 0,
         "dropped_rows": [], "problem": "", "varies": None,
         "duplicate_timestamps": 0, "non_finite": 0,
     }
+    # R26-A08：**time_base 要一起取**。
+    # 容差必须由两侧的时间量化步长决定（`1/time_base`），不能固定 1/30 秒 ——
+    # 60fps 素材的量化步长是 1/60，拿 1/30 当容差会放过真实的一帧错位；
+    # 而 24000/1001 的步长是 ~0.0417 秒，1/30 又会误杀。
+    out["time_base"] = ""
+    try:
+        _tb = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", f"v:{stream_index}",
+             "-show_entries", "stream=time_base", "-of", "csv=p=0", str(path)],
+            capture_output=True, timeout=30)
+        if _tb.returncode == 0:
+            out["time_base"] = (
+                (_tb.stdout or b"").decode("utf-8", "replace").strip()
+                .splitlines() or [""])[0].strip()
+    except Exception:
+        pass
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", f"v:{stream_index}",
@@ -951,17 +1019,40 @@ def probe_frame_timeline(path: str, stream_index: int = 0,
                           else "every frame row was unusable")
         return out
 
-    order = sorted(range(len(pts)), key=lambda i: pts[i])
-    pts = [pts[i] for i in order]
-    durs = [durs[i] for i in order]
+    # R26-A08：**不排序**。
+    #
+    # 原来这里 `order = sorted(...)` 把 PTS 重排后再算首尾 ——
+    # 于是"第 50 帧的 PTS 比第 49 帧小"这种**真实的观测倒退**被悄悄抹平，
+    # 报告的 first/last 看起来完全正常。排序是在修饰事实，不是测量。
+    #
+    # 现在保留原始顺序，并显式记录 `out_of_order`：倒退了几处。
+    # 首尾/跨度用 `min`/`max`（乱序时首项未必是极小值），
+    # 但**末帧 duration 必须跟着"显示顺序最后一帧"**，也就是 max PTS
+    # 那一项 —— 而不是列表最后一个。
     out["frames"] = len(pts)
-    out["first_pts"] = round(pts[0], 6)
-    out["last_pts"] = round(pts[-1], 6)
-    out["last_duration"] = round(durs[-1], 6)
+    out["out_of_order"] = sum(
+        1 for a, b in zip(pts, pts[1:]) if b < a)
+    _last_idx = max(range(len(pts)), key=lambda i: pts[i])
+    out["first_pts"] = round(min(pts), 6)
+    out["last_pts"] = round(pts[_last_idx], 6)
+    out["last_duration"] = round(durs[_last_idx], 6)
     out["duplicate_timestamps"] = sum(
         1 for x, y in zip(pts, pts[1:]) if y == x)
+    # R26-A08：**有序**时间轴摘要。
+    #
+    # 长片不能把全部 PTS 留在内存里（指令明确），但"两边 PTS 序列是否
+    # 逐项相同"必须能判。用一个增量 sha256 覆盖**原始顺序**的
+    # `round(pts,6)` 串 —— 内存恒定，且顺序敏感（不排序）。
+    _h = hashlib.sha256()
+    for _v in pts:
+        _h.update(("%.6f," % _v).encode("ascii"))
+    out["pts_digest"] = _h.hexdigest()[:32]
 
     problems: List[str] = []
+    if out["out_of_order"]:
+        problems.append(
+            f"{out['out_of_order']} out-of-order display timestamp(s); "
+            f"the observation is kept in its original order, not sorted")
     if out["non_finite"]:
         problems.append(f"{out['non_finite']} non-finite timestamp/duration")
     if out["dropped_rows"]:
@@ -971,11 +1062,12 @@ def probe_frame_timeline(path: str, stream_index: int = 0,
         problems.append(f"{out['duplicate_timestamps']} duplicate display "
                         f"timestamp(s); one of each pair is never shown")
 
-    if durs[-1] > 0:
-        out["span"] = round(pts[-1] + durs[-1] - pts[0], 6)
+    if durs[_last_idx] > 0:
+        out["span"] = round(pts[_last_idx] + durs[_last_idx]
+                            - min(pts), 6)
         out["coverage"] = "observed"
     else:
-        out["span"] = round(pts[-1] - pts[0], 6)
+        out["span"] = round(pts[_last_idx] - min(pts), 6)
         out["coverage"] = "unknown" if len(pts) == 1 else "derived"
         problems.append("the last frame has no duration; the span excludes "
                         "the final frame")
@@ -989,7 +1081,10 @@ def probe_frame_timeline(path: str, stream_index: int = 0,
             out["median_interval"] = round(med, 6)
 
     out["problems"] = problems
-    if out["non_finite"] or out["duplicate_timestamps"] > 0:
+    # R26-A08：**倒退的观测是矛盾，不是"需要修的噪声"**。
+    # 排序会把它们变成"正常"，从而让一份时间轴错乱的成品通过比较。
+    if (out["non_finite"] or out["duplicate_timestamps"] > 0
+            or out["out_of_order"] > 0):
         out["state"] = "contradictory"
     elif problems:
         # 解析留痕/缺尾帧时长 → "不完整"而不是"矛盾"
