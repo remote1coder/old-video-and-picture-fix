@@ -103,11 +103,15 @@ class _NoFileInput(Exception):
 
 
 class _IdetResult:
-    __slots__ = ("returncode", "stderr")
+    #: R26-A04：`tap` 保存**这一次检查遍实际流过的字节**的摘要。
+    #: 下游（stage3 的正式遍）拿它比 —— 那是"同一域、同一批帧"的
+    #: 直接证据，而不是"两次旁路重放恰好一致"。
+    __slots__ = ("returncode", "stderr", "tap")
 
-    def __init__(self, returncode, stderr=""):
+    def __init__(self, returncode, stderr="", tap=None):
         self.returncode = int(returncode)
         self.stderr = str(stderr or "")
+        self.tap = tap or {}
 
 
 def _run_idet_on_vpy(vpy: str, timeout: float, vs_log_path: str = ""):
@@ -119,51 +123,50 @@ def _run_idet_on_vpy(vpy: str, timeout: float, vs_log_path: str = ""):
     （约 64KB）一满 vspipe 就阻塞、不再出帧，ffmpeg 于是读到无效数据并
     报 "Invalid data found"。所以这里把 stderr 落文件，绝不留在管道里。
     """
+    # ==== R26-A04：走 StreamTap，而不是裸管道 ====
+    #
+    # 原来 `vspipe | ffmpeg -vf idet` 是两条独立进程，**没有任何地方
+    # 看到过"这份字节"**。stage3 的正式遍另跑一次 digest，两者相同
+    # 只能说明"同一个 vpy 是确定的"，说明不了"检查器和 AI 消费了同一批帧"。
+    #
+    # 现在检查遍的 y4m 从 tap 里过一遍：`StreamTap` 同时算**有序摘要**
+    # 和帧数。这份摘要与正式遍在同一域（y4m）算出来的可比。
+    #
+    # consumer 的 stderr 要**完整保留**（idet 每帧一行，长片约 500 KB），
+    # 所以把上限放宽到 8 MiB —— 那是解析 idet 统计的输入，不是日志尾巴。
     import subprocess
-    _err = subprocess.DEVNULL
-    _fh = None
-    if vs_log_path:
-        try:
-            _fh = open(vs_log_path, "wb")
-            _err = _fh
-        except OSError:
-            _err = subprocess.DEVNULL
-    vp = None
+    from stream_tap import StreamTap
+    tap = StreamTap(consumer_err_bytes=8 << 20)
     try:
-        vp = subprocess.Popen(["vspipe", "-c", "y4m", vpy, "-"],
-                              stdout=subprocess.PIPE, stderr=_err,
-                              shell=False)
-        r = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-v", "info", "-i", "-",
+        res = tap.run(
+            ["vspipe", "-c", "y4m", vpy, "-"],
+            ["ffmpeg", "-hide_banner", "-v", "info",
+             "-f", "yuv4mpegpipe", "-i", "-",
              "-vf", "idet", "-f", "null", "-"],
-            stdin=vp.stdout, capture_output=True, text=True,
-            errors="replace", timeout=timeout, shell=False)
-        return _IdetResult(r.returncode, r.stderr)
-    except subprocess.TimeoutExpired:
-        return _IdetResult(124, f"idet on the stage1 script timed out after "
-                                f"{timeout:.0f}s")
-    except OSError as exc:
+            timeout=timeout,
+        )
+    except Exception as exc:
         return _IdetResult(127, f"cannot run vspipe/ffmpeg: {exc}")
-    finally:
+    # 保持原行为：把 vspipe 的 stderr 落到 vs_log_path
+    if vs_log_path and res.get("producer_err"):
         try:
-            if vp is not None and vp.stdout is not None:
-                vp.stdout.close()
-        except Exception:
+            with open(vs_log_path, "w", encoding="utf-8") as fh:
+                fh.write(res["producer_err"])
+        except OSError:
             pass
-        try:
-            if vp is not None:
-                vp.wait(timeout=30)
-        except Exception:
-            try:
-                if vp is not None:
-                    vp.kill()
-            except Exception:
-                pass
-        try:
-            if _fh is not None:
-                _fh.close()
-        except Exception:
-            pass
+    if res.get("header_problem", "").startswith("tap timed out"):
+        return _IdetResult(124, f"idet on the stage1 script timed out after "
+                                f"{timeout:.0f}s", res)
+    # **两个 rc 都要 0** 才算"检查遍正常完成"（PA03 的同一原则）
+    _rc = 0 if (res.get("producer_rc") == 0
+                and res.get("consumer_rc") == 0
+                and not res.get("short_frame")
+                and not res.get("header_problem")) else (
+        res.get("consumer_rc") or res.get("producer_rc") or 1)
+    _err = res.get("consumer_err", "")
+    if res.get("header_problem"):
+        _err = (res["header_problem"] + "\n" + _err)
+    return _IdetResult(_rc, _err, res)
 
 
 def main():
@@ -299,6 +302,45 @@ def main():
                 r = _run_idet_on_vpy(
                     _vpy, _idet_timeout,
                     vs_log_path=os.path.splitext(_vpy)[0] + ".vspipe.log")
+                # ==== R26-A04：检查遍的 tap 摘要落盘 ====
+                #
+                # 这是"检查器实际消费的那批帧"的证据。stage3 的正式遍
+                # 在同一域（y4m）算一份，两边比**摘要**而不是比"帧数"。
+                #
+                # 只有检查遍**完整完成**（两个 rc 都 0、无短帧）才写 ——
+                # 半截的摘要比没有更危险：它会与同样半截的另一侧"相同"。
+                _tap = (getattr(r, "tap", None) or {})
+                if _tap.get("digest") and r.returncode == 0:
+                    try:
+                        import json as _jt2
+                        _stem2 = Path(input_name).stem.replace(" ", "_")
+                        _sp2 = os.path.join(
+                            temp_dir, "%s_%s_step2_check_tap.json"
+                            % (job_id, _stem2))
+                        with open(_sp2, "w", encoding="utf-8") as _f2:
+                            _jt2.dump({
+                                "schema": "check-pass-tap/1",
+                                "digest": _tap["digest"],
+                                "frames": _tap.get("frames"),
+                                "bytes": _tap.get("bytes"),
+                                "width": _tap.get("width"),
+                                "height": _tap.get("height"),
+                                "chroma": _tap.get("chroma"),
+                                "fps": _tap.get("fps"),
+                                "producer_rc": _tap.get("producer_rc"),
+                                "consumer_rc": _tap.get("consumer_rc"),
+                                "short_frame": bool(_tap.get("short_frame")),
+                                "vs_script": os.path.abspath(_vpy),
+                                "note": ("ordered blake2b over the y4m frames "
+                                         "the check pass actually consumed; "
+                                         "same domain as the formal pass"),
+                            }, _f2, ensure_ascii=False, indent=2)
+                    except OSError as _tse:
+                        logger.warning(
+                            "STAGE2_TAP_SIDECAR_FAIL",
+                            "could not persist the check-pass tap digest; the "
+                            "formal pass will fall back to structural facts",
+                            error=str(_tse))
             else:
                 cmd = [
                     "ffmpeg", "-hide_banner", "-v", "info",

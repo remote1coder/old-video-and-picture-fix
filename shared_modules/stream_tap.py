@@ -147,9 +147,22 @@ class StreamTap:
     """
 
     def __init__(self, chunk: int = 1 << 20,
-                 stderr_limit: int = 64) -> None:
+                 stderr_limit: int = 64,
+                 consumer_err_bytes: int = 600,
+                 producer_err_bytes: int = 600) -> None:
+        """
+        Args:
+            consumer_err_bytes: consumer 的 stderr 保留多少字节。
+                **idet 这类消费者每帧输出一行**（8160 帧约 500 KB），
+                留 600 字节会把统计截断，解析出来是错的。
+                需要完整输出时传大值（默认值只够"看错误信息"）。
+            producer_err_bytes: producer 的 stderr 保留字节数。vspipe
+                的报错通常在尾部，600 够诊断。
+        """
         self.chunk = int(chunk)
         self.stderr_limit = int(stderr_limit)
+        self.consumer_err_bytes = int(consumer_err_bytes)
+        self.producer_err_bytes = int(producer_err_bytes)
 
     # ------------------------------------------------------------------ 内部
     def _drain(self, pipe, sink: List[bytes]) -> None:
@@ -239,6 +252,21 @@ class StreamTap:
                         pass                  # 下游提前关管，如实记录
                     fb = meta["frame_bytes"]
                     while True:
+                        # R26-A08：**整体可取消**。长片的中转可能跑很久，
+                        # 调用方给的 timeout 必须能在循环里生效 ——
+                        # 不能只在最后 `wait(timeout=)` 才有机会。
+                        if timeout and (time.monotonic() - t0) > timeout:
+                            out["header_problem"] = (
+                                "tap timed out after %.0fs" % timeout)
+                            try:
+                                prod.kill()
+                            except Exception:
+                                pass
+                            try:
+                                cons.kill()
+                            except Exception:
+                                pass
+                            break
                         # `FRAME` + 可选标签 + 换行
                         line = b""
                         while not line.endswith(b"\n"):
@@ -304,10 +332,10 @@ class StreamTap:
             tc.join(timeout=10)
             out["producer_rc"] = prod.returncode
             out["consumer_rc"] = cons.returncode
-            out["producer_err"] = b"".join(p_err)[-600:].decode(
-                "utf-8", "replace")
-            out["consumer_err"] = b"".join(c_err)[-600:].decode(
-                "utf-8", "replace")
+            out["producer_err"] = b"".join(p_err)[-self.producer_err_bytes:
+                                                  ].decode("utf-8", "replace")
+            out["consumer_err"] = b"".join(c_err)[-self.consumer_err_bytes:
+                                                  ].decode("utf-8", "replace")
             out["elapsed"] = round(time.monotonic() - t0, 3)
 
         h.update(b"|frames=" + str(out["frames"]).encode("ascii"))

@@ -66,15 +66,22 @@ def test_stage2_stream_branch_skips_the_artifact_copy():
 
 
 def test_stage2_idet_on_vpy_drains_vspipe_stderr():
-    """vspipe 的 stderr 必须落文件/DEVNULL，不能挂在管道上。
+    """vspipe 的 stderr 必须被**并发排空**，不能挂着不读。
 
     stage1 踩过：PIPE 不读 → 64KB 满 → vspipe 阻塞 → ffmpeg 读到无效数据。
-    这条用源码断言钉住，避免以后"顺手"改成 PIPE。
+
+    R26-A04：实现从"落 DEVNULL/文件"改成走 `StreamTap` —— 它内部给
+    producer 的 stderr 起独立线程持续读（有界环形尾部），
+    **同样不会阻塞 vspipe**，而且顺便把摘要带出来。
+    断言仍守住"不许挂 PIPE 不读"这条意图，只是跟上实现。
     """
     s = _src(_S2)
     i = s.index("def _run_idet_on_vpy")
-    block = s[i:i + 2000]
-    assert "subprocess.DEVNULL" in block
+    block = s[i:i + 3000]
+    assert "StreamTap" in block, "检查遍应走 tap（R26-A04）"
+    assert "consumer_err_bytes" in block, (
+        "idet 的输出在 consumer 的 stderr 里，必须放宽保留量")
+    # 仍然不许"直接给 Popen 挂 PIPE 而不消费" —— 新实现里 PIPE 归 StreamTap
     assert 'stderr=subprocess.PIPE' not in block.replace(" ", "")
 
 
