@@ -146,6 +146,12 @@ class WriteLedger:
         self._by: Dict[str, Dict[str, int]] = {
             c: {"events": 0, "bytes": 0} for c in CATEGORIES}
         self._unknown: List[str] = []
+        #: 按对象角色的小计（media/verify/marker/...）
+        self._by_role: Dict[str, Dict[str, int]] = {}
+        #: 覆盖写次数（同一次写入不计两次存量，但覆盖是事实）
+        self._overwrites = 0
+        #: 目录快照看到的**存量增量**（只用于泄漏检查，不是写入量）
+        self._present_delta = 0
 
     def record(self, category: str, nbytes: Optional[int] = None,
                *, path: str = "") -> None:
@@ -165,10 +171,73 @@ class WriteLedger:
         self.record(cat, path=path)
         return cat
 
+    def record_write(self, category: str, nbytes: int, *,
+                     role: str = "", path: str = "",
+                     overwrote: bool = False) -> None:
+        """记一次**真实发生的成功写入**（R26-A07）。
+
+        与 `record_path()` 的区别：`record_path` 会去 `os.path.getsize`
+        问"现在多大"，而"现在多大"回答不了这五个问题 —— 复核给的精确反例：
+
+        | 行为 | 实际写入 | 目录差法 |
+        |---|---:|---:|
+        | 新建并保留 | 1024 | 1024 ✓ |
+        | 同一 stage 内新建后删除 | 1024 | **0** |
+        | 仅删除旧文件 | 0 | **1024** |
+        | 等长覆盖 | 1024 | **0** |
+        | 截断并写 512 | 512 | **0** |
+
+        所以**写入量必须由 writer 在写成功的那一刻上报**，不能事后从
+        目录状态推断。删除只影响"存量"，不增加 `written`（这里不做任何
+        减法：删除不该调用本方法）。
+
+        Args:
+            category: 六类之一（见 `CATEGORIES`）。
+            nbytes: **本次成功写出的字节数**。覆盖写要传新写的量，
+                不是"文件最终大小"。
+            role: 对象角色（`media`/`verify`/`marker`/...），供按 attempt
+                归属统计。
+            path: 目标路径（只作审计，不参与计量）。
+            overwrote: 是否覆盖了已有对象（同一次写入不重复计"存量"）。
+        """
+        if category not in self._by:
+            self._unknown.append("%s:%s" % (category, path or nbytes))
+            return
+        n = int(nbytes or 0)
+        if n < 0:
+            self._unknown.append("%s:negative(%s)" % (category, n))
+            return
+        self._by[category]["events"] += 1
+        self._by[category]["bytes"] += n
+        # 逐 role 的小计：便于回答"最终成品写了多少 / 备份写了多少"
+        if role:
+            _r = self._by_role.setdefault(role, {"events": 0, "bytes": 0})
+            _r["events"] += 1
+            _r["bytes"] += n
+        if overwrote:
+            self._overwrites += 1
+
+    def observe_present_delta(self, nbytes: int) -> None:
+        """记一次**目录存量增量**（不是写入量）。
+
+        R26-A07：目录快照回答不了"写过多少"（5 种行为错 4 种），
+        但它仍有一个正当用途：**发现泄漏**（中间件该被清理却还在）。
+        所以它单独记，**不混进 `by_category` 的 `bytes`**，避免
+        "看起来写了很多"和"实际剩了很多"互相污染。
+        """
+        n = int(nbytes or 0)
+        self._present_delta += max(0, n)
+
     def summary(self) -> Dict[str, Any]:
         return {
             "by_category": {k: dict(v) for k, v in self._by.items()},
+            "by_role": {k: dict(v) for k, v in self._by_role.items()},
+            "overwrites": int(self._overwrites),
+            "present_delta": int(self._present_delta),
             "unknown_categories": list(self._unknown),
+            # 语义说明：这里是**累计成功写入**，不是目录存量。
+            # 存量另由 `scan()` 给，两者不能互相替代。
+            "semantics": "cumulative successful writes (not directory state)",
         }
 
 

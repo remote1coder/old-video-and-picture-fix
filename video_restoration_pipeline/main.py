@@ -559,18 +559,56 @@ def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
     finally:
         if _l is not None and _tmp_root:
             try:
-                from write_ledger import classify as _wl_classify
+                # ==== R26-A07：目录差**只作为存量信号** ====
+                #
+                # 复核给了精确的五行表：同一 stage 内"新建后删除"、
+                # "仅删除旧文件"、"等长覆盖"、"截断写 512" 这四种行为，
+                # 目录差法与真实写入量**全都不一致**（0 / 1024 / 0 / 0
+                # 对 1024 / 0 / 1024 / 512）。
+                #
+                # 所以这里不再往 `by_category` 里记 written —— 那会让
+                # "written=0"同时表示"没写"和"写了又删"，无法区分。
+                # 真正的写入量由 writer 通过 `record_write()` 上报
+                # （`publisher` 的复制/覆盖/备份是主要来源）。
+                #
+                # 目录差的正当用途是**发现泄漏**：中间件该被清理却还在。
+                # 它单独记进 `present_delta`，不污染按类别的写入表。
                 _post = _dir_snapshot(_tmp_root)
+                _delta = 0
                 for _fp, _sz in _post.items():
                     _old = _pre.get(_fp, 0)
                     if _sz > _old:
-                        _l.record(_wl_classify(_fp, output_path=_out_for_cat),
-                                  nbytes=_sz - _old, path=_fp)
-                for _fp, _sz in _pre.items():
-                    if _fp not in _post:
-                        # 被清理了，但写入确实发生过
-                        _l.record(_wl_classify(_fp, output_path=_out_for_cat),
-                                  nbytes=_sz, path=_fp)
+                        _delta += _sz - _old
+                _l.observe_present_delta(_delta)
+
+                # ---- R26-A07：读 stage7 上报的**真实写入量** ----
+                #
+                # `publisher` 跑在子进程里，拿不到父进程的 ledger；
+                # 它把 `copyfile` 的字节数写进 `{output}.writes.json`，
+                # 这里读回来累加。同卷 rename 计 0（不算写）。
+                #
+                # 这是**唯一**可信的写入来源：目录差在 5 种行为里错 4 种。
+                if str(script_name).startswith("stage7") and _out_for_cat:
+                    _wp = str(_out_for_cat) + ".writes.json"
+                    try:
+                        import json as _jwl
+                        with open(_wp, "r", encoding="utf-8") as _wf:
+                            _wd = _jwl.load(_wf) or {}
+                        for _cat, _n in ((_wd.get("by_category") or {})
+                                         .items()):
+                            try:
+                                _l.record_write(
+                                    str(_cat), int(_n),
+                                    role="publish",
+                                    path=_out_for_cat)
+                            except Exception:
+                                pass
+                    except FileNotFoundError:
+                        # 没有 sidecar = 这一代没走 publisher（或旧版本）；
+                        # 不当错误，但也不假装"写过 0 字节"。
+                        _l.observe_present_delta(0)
+                    except Exception as _we:
+                        _l.record("__ledger_error__", nbytes=0)
             except Exception:
                 # 记账失败不能影响主流程，但也不能静默 —— 留一条未知类别
                 try:

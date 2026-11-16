@@ -5143,6 +5143,37 @@ def main():
             # 事务成功：候选件已被消费，两个待转正的报告也已就位
             _side_tmp = None
             _fc_pending = None
+
+            # ==== R26-A07：把 publisher 量到的写入量落 sidecar ====
+            #
+            # 为什么不在 verify 报告里：verify 是**发布事务的成员**，
+            # 它必须和媒体一起落位，事后改它就破坏了"整代一致"。
+            # 而写入量只有 publish 跑完才知道。
+            #
+            # 这是**真实写入**（跨卷复制 / 备份 / 回滚恢复的 copyfile），
+            # 同卷 rename 计 0 —— 由 `_promote_into_place()` 返回。
+            # 父进程（main）读这份 sidecar 累加进 ledger，因为 ledger
+            # 在父进程里，子进程拿不到那个对象。
+            try:
+                import json as _jw2
+                _pw = dict(getattr(_pres, "writes", None) or {})
+                with open(str(output_path) + ".writes.json", "w",
+                          encoding="utf-8") as _wf2:
+                    _jw2.dump({
+                        "schema": "generation-writes/1",
+                        "attempt_id": _attempt_id,
+                        "by_category": _pw,
+                        "note": ("bytes actually written by the publish "
+                                 "transaction; same-volume rename counts 0"),
+                    }, _wf2, ensure_ascii=False, indent=2)
+            except Exception as _we2:
+                # sidecar 写不出来不影响这一代的有效性（媒体已落位），
+                # 但必须留痕：否则"written=0"会被误读成"没写"。
+                logger.warning(
+                    "STAGE7_WRITES_SIDECAR_FAIL",
+                    "the generation was published but its write amounts "
+                    "could not be recorded; the ledger will not see them",
+                    attempt_id=_attempt_id, error=str(_we2))
             _published_by_copy = False
             logger.info(
                 "STAGE7_PUBLISHED",

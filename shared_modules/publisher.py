@@ -113,11 +113,18 @@ class PublishResult:
     __slots__ = ("ok", "phase", "failed_at", "restored", "errors",
                  "journal_path", "attempt_id", "published", "recovery",
                  "cleanup_pending", "terminal_pending",
-                 "generation_receipt")
+                 "generation_receipt", "writes")
 
     def __init__(self, attempt_id: str, journal_path: str):
         self.attempt_id = attempt_id
         self.journal_path = journal_path
+        #: R26-A07：本事务**实际写出的字节**，按类别与角色分。
+        #:
+        #: 为什么由 publisher 自己报：它才知道哪一次 `copyfile` 真的落了盘。
+        #: `os.replace` 是同卷 rename，**不写字节**，所以不计入。
+        #: 这份数据随 verify 报告回到父进程，由父进程的 ledger 记账 ——
+        #! publisher 跑在子进程里，没有父进程的 ledger 对象。
+        self.writes: Dict[str, int] = {}
         self.ok = False
         self.phase: Optional[str] = None
         self.failed_at: Optional[str] = None
@@ -188,16 +195,20 @@ def _stat_identity(path: str):
 
 
 def _promote_into_place(staging: str, final: str, expected_digest: str,
-                        attempt_id: str, logger=None) -> None:
+                        attempt_id: str, logger=None) -> int:
     """把候选件落到最终路径，**跨卷也安全**。
 
-    同卷：`os.replace` 只是改名，字节必然一致。
+    同卷：`os.replace` 只是改名，字节必然一致 —— **返回 0**。
     跨卷：先复制到**目标卷的私有暂存**，核对摘要后再 `replace` ——
     绝不直接往正式文件复制（复制中断会留下截断的成品，把上一代一起毁掉）。
+    **返回实际写出的字节数**（R26-A07：写入量只能由写的人报）。
+
+    Returns:
+        本次落位**新写入**的字节数。同卷 rename 是 0。
     """
     try:
         os.replace(staging, final)
-        return
+        return 0
     except OSError as exc:
         if getattr(exc, "errno", None) not in (18, 1):     # EXDEV / EPERM
             # 只有"跨卷"这一类才走复制路径；其它错误原样抛
@@ -206,6 +217,10 @@ def _promote_into_place(staging: str, final: str, expected_digest: str,
     xvol = f"{final}.xvol-{attempt_id}.partial"
     try:
         shutil.copyfile(staging, xvol)
+        # 跨卷走的是**复制**（真的写字节）；同卷是 rename（不写）。
+        # 这里只**量**出来，累加由调用方做 —— 本函数是模块级工具，
+        # 不该知道 ledger / PublishResult 的存在。
+        _written = int(os.path.getsize(xvol) if os.path.exists(xvol) else 0)
         _st, _dig = file_state(xvol)
         if _st != "PRESENT" or _dig != expected_digest:
             raise OSError(
@@ -229,6 +244,7 @@ def _promote_into_place(staging: str, final: str, expected_digest: str,
             logger.warning("PUBLISH_STAGING_CLEANUP_FAIL",
                            "Cross-volume publish succeeded but the staging "
                            "file could not be removed", staging=staging)
+    return _written
 
 
 def _decision_allows(decision: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -394,6 +410,16 @@ def publish(artifacts: List[Artifact], journal_path: str, backup_dir: str,
                 bk = _backup_path(backup_dir, art.final, attempt_id)
                 try:
                     shutil.copyfile(art.final, bk)
+                    try:
+                        # R26-A07：备份也是一次真实写入，且可能很大
+                        # （整片成品）。记在**结果对象**上 —— 本函数是
+                        # `publish()` 的方法体，`self` 是 Publisher，
+                        # 没有 ledger。
+                        res.writes["old_generation_backup"] = (
+                            res.writes.get("old_generation_backup", 0)
+                            + int(os.path.getsize(bk)))
+                    except OSError:
+                        pass
                 except OSError as exc:
                     res.failed_at = "backup"
                     res.errors.append(
@@ -810,6 +836,8 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
     removed: List[str] = []
     failed: List[Dict[str, Any]] = []
     impossible: List[str] = []
+    #: R26-A07：回滚/恢复时真的会 copyfile 回来，这些字节要上报。
+    _writes: Dict[str, int] = {}
     #: 目标 → (kind, state, digest)，预检结论，执行阶段据此复核
     plans: Dict[str, Tuple[str, str, Optional[str]]] = {}
 
@@ -890,6 +918,13 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
                 continue
             tmp = _restore_tmp_path(fin, attempt_id)
             shutil.copyfile(snap["backup"], tmp)
+            try:
+                # R26-A07：从备份复制回来同样写字节
+                _writes["old_generation_backup"] = (
+                    _writes.get("old_generation_backup", 0)
+                    + int(os.path.getsize(tmp)))
+            except OSError:
+                pass
             _tst, _tdig = file_state(tmp)
             if _tst != "PRESENT" or _tdig != snap["old_digest"]:
                 try:
@@ -937,6 +972,7 @@ def _restore_locked(snapshot: Dict[str, Dict[str, Any]], attempt_id: str,
     return {"restored": restored, "removed": removed, "failed": failed,
             "impossible": impossible, "fully_restored": ok,
             "recovery_required": bool(impossible or failed),
+            "writes": _writes,
             "target_states": {k: plans[k][0] for k in snapshot}}
 
 
