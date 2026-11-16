@@ -587,6 +587,24 @@ done
 - 编排层汇总日志：`logs/general.log`
 - 格式：JSON Lines（每行一条独立 JSON，**不是**单个 JSON 文档）
 
+### 8.1b 写入记账（`WRITE_LEDGER`）
+
+每次跑批收尾会打一组 `WRITE_LEDGER` 行，**两个数分开列**：
+
+```
+write ledger (bytes)
+  intermediate_media     present=      123456 B (3 files)   written=    98765432 B (12 events)
+  final_candidate        present=     4567890 B (1 files)   written=     4567890 B (1 events)
+  ...
+```
+
+* `present=` 是**跑完还剩下的**（`scan()`）；
+* `written=` 是**这次真的写过的**（运行期 `record()`，**删掉的也算**）。
+
+只看 `present` 会把"中间件被清理了"误读成"没写过"。`written` 全为 0
+有两种情况：真的没写，或记账没接上 —— 后者会在日志里留
+`WRITE_LEDGER_FAIL`。**不要用清理后的存量去估算 SSD 损耗。**
+
 ### 8.2 查看日志
 ```bash
 # 跟踪最新日志
@@ -842,6 +860,22 @@ python photo_restoration_pipeline/main.py ... --no-wsl-redirect
 
 打开强制开关后仍会发布，但会记 ERROR 级日志，且问题写进
 `<output>.fullchain.json` / `<output>.verify.json` 跟随文件 —— **不等于验过**。
+
+### 12.1b 第 26 轮收紧的几条（会改变你看到的退出码）
+
+| 变化 | 你会看到什么 |
+|---|---|
+| `publish_decision.verified` 必须明确 `true` | 报告的 `publish_decision` 里缺这个字段 → 完成验证失败（rc=82）|
+| 视频最终时间轴不许 `NOT_APPLICABLE` | 报告写 NA → `check 'final_timeline' claims NOT_APPLICABLE but the plan does not allow it` |
+| 全链报告必须带 `attempt_id`、`checks` 非空、每项有布尔 `ok` | 缺任一 → `the fullchain report does not support completion: ...` |
+| 计划外的检查项失败不再被忽略 | 自定义检查写 `FAIL` 或 `hard_error: true` → 完成验证失败 |
+| **强制导出不覆盖正式代** | 开了强制开关且 `verified=false` → 产物进 `<输出目录>/.diagnostic-<attempt>/`，**退出码 89**，正式路径不动 |
+| 帧序采样无判别力 | 保留 `UNVERIFIED`（不再用首末感知哈希提升为 PASS）；这是**合法**的未验证，仍可发布 |
+| 比较器默认 `native_exact` | 两边源格式不同 → **拒绝**，提示用 `mode="converted"` |
+| `gpu_memory_fallback` 缺省 | 不再默认允许降倍率/换后端；需显式配 `true` |
+
+**诊断目录的用法**：`89` 的产物不是"这一代的正式成果"，而是留给你排查的。
+确认没问题后，重新用**不带强制开关**的方式跑一遍，正式代才会更新。
 
 ### 12.2 全链核对三档模式
 

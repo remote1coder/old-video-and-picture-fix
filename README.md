@@ -141,7 +141,9 @@ The two pipelines use **different interpreters**; mixing them fails:
 - Exit codes (as actually used in code): `80` missing dependency / `81` bad
   argument / `82` input·IO·stage failure / `83` GPU / `84` encode·IO /
   `85` permission (reserved, unused) / `86` validation·gate failure /
-  `87` resource exhausted·timeout / `88` cancelled (orchestrator only).
+  `87` resource exhausted·timeout / `88` cancelled (orchestrator only) /
+  `89` **unverified** — the generation is published/exported but its
+  verification did not pass (see "Artifact Verification" below).
   `3` means skipped (already exists, nothing to do).
 
 #### Batch Notes (important)
@@ -310,6 +312,41 @@ A check only **passes when it is explicitly `True`**. `ok: null` (could not be
 measured) is treated as **not verified** and blocks publishing, as does an
 exception thrown by the verifier itself. Hard errors — blank frames,
 unreadable source, missing output — block in every mode.
+
+The same principle now covers the **publish decision** itself (round 26):
+
+* `publish_decision.verified` must be an explicit `true` — absent, `null` or
+  the string `"true"` do not count as proof. The old rule only looked at
+  `publish`, so deleting the `verified` field still passed completion.
+* A **video** deliverable may **not** report its final timeline as
+  `NOT_APPLICABLE`. For a single image NA is legitimate; for video it means
+  the check was skipped. An unknown media kind is treated as **video**
+  (strictest).
+* When the plan requires a full-chain comparison, the `fullchain` report must
+  carry an `attempt_id`, a **non-empty** `checks` object, and a **boolean
+  `ok`** on every entry. An empty set is not "nothing failed".
+* Checks **outside the plan** cannot be ignored when they fail:
+  `FAIL`/`ERROR`/`hard_error` are reported; a new check that *passes* is not
+  reported (forward compatible).
+* **A forced export never replaces the official generation**: when the user
+  publishes despite a failed check, the whole generation goes to
+  `<output dir>/.diagnostic-<attempt>/`, the official path is untouched, and
+  the exit code is `89`. A legitimate "unverified but publishable" result
+  (e.g. too few discriminating frame-order samples) still publishes normally
+  and is merely marked unverified.
+
+**Frame order** stays `UNVERIFIED` when the samples carry no discriminating
+power. It is **no longer** promoted to a pass by "first/last perceptual hash +
+frame count": the perceptual-hash threshold allows a Hamming distance of up
+to 12 (it never promised bit equality), and `[0,1,2,3,4,5]` and
+`[0,1,4,3,2,5]` share both ends and the length, so the endpoints cannot
+prove the interior order.
+
+**The comparator has two levels**: `native_exact` (default) requires the
+**source** format to equal the comparison format and refuses otherwise —
+ffmpeg's `-pix_fmt` converts silently, and "equal after conversion" is not
+"natively equal". Use `mode="converted"` when a converted comparison is
+what you actually want; the report then records both source formats.
 
 `full_chain_verify_mode` selects how strict the full-chain gate is:
 `frames_only` (default, lowest false positives) / `relative` / `absolute`.
@@ -481,7 +518,9 @@ python photo_restoration_pipeline/main.py \
   写 `E:/...` 会被 MSYS 拆坏成 `E` + `/codex/...`。
 - 退出码语义（按代码实际使用统计）：`80` 依赖缺失 / `81` 参数错误 /
   `82` 输入·IO·阶段失败 / `83` GPU / `84` 编码·IO / `85` 权限（保留未用）/
-  `86` 校验·门禁失败 / `87` 资源不足·超时 / `88` 取消（仅编排层）。
+  `86` 校验·门禁失败 / `87` 资源不足·超时 / `88` 取消（仅编排层）/
+  `89` **未验证** —— 产物已发布或导出，但验证没有通过（详见下面的
+  「成品核对体系」）。
   `3` 表示跳过（已存在、无需处理）。
 
 #### 跑批注意（重要）
@@ -634,6 +673,31 @@ PIL ImageCms，而 Pillow 的 CMS 只支持 8-bit；置 `true` 会在这种降�
 
 实测 204 个真实手机素材，固定阈值误杀 **31%**（漂移是老素材自带的），
 改用相对判据后降到 **1.5%**。
+
+**同一原则也适用于"发布决定"本身**（第 26 轮收紧）：
+
+* `publish_decision.verified` **必须是明确的 `true`** —— 缺失、`null`、
+  字符串 `"true"` 都不算证明。原来的判据只查 `publish`，于是"删掉
+  `verified` 字段"照样能通过完成验证。
+* **视频的最终时间轴不允许 `NOT_APPLICABLE`**。图片的 NA 是合法不适用，
+  视频的 NA 是"该做的检查没做"。类型未知时按**视频**（最严）处理。
+* 计划要求全链核对时，`fullchain` 报告**必须带 `attempt_id`**，
+  且 `checks` 不能为空、**每一项必须有布尔 `ok`**。
+  空字典与"全通过"是两件事。
+* 计划之外的检查项**失败也不能忽略**：`FAIL`/`ERROR`/`hard_error` 一律报；
+  新增项**通过**不报（前向兼容）。
+* **强制导出不覆盖正式代**：用户明知某项未通过仍要出片时，整代写到
+  `<输出目录>/.diagnostic-<attempt>/`，正式路径一字节不动，返回 `89`。
+  正常的"未验证但允许发布"（如帧序采样不足）仍走正式路径，只在报告里标未验证。
+
+**帧序判据**：采样点没有判别力时保留 `UNVERIFIED`，**不再**用
+"首末帧感知哈希 + 帧数"提升为通过 —— 感知哈希的阈值允许汉明距离 ≤12
+（从未承诺逐位相同），且 `[0,1,2,3,4,5]` 与 `[0,1,4,3,2,5]` 的首末与
+长度都一样，端点证不出内部顺序。
+
+**比较器分两级**：`native_exact`（默认）要求两边的**源格式就是比较格式**，
+否则拒绝 —— ffmpeg 的 `-pix_fmt` 会静默转换，"转完相同"不等于"原生相同"；
+确实要比较转换后的表示时用 `mode="converted"`，报告里会写明源格式与损失。
 
 `full_chain_verify_mode` 决定全链核对的严格度：
 `frames_only`（默认，误杀最低）/ `relative` / `absolute`。

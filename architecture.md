@@ -178,6 +178,50 @@ All shared modules are in `shared_modules/` directory.
 | **Timeline Plan** | `timeline_plan.py` | 三个独立结论的跨阶段载体：① `source_verified`（源时间轴可信）② `transform_applied_verified`（用户请求的变换是否落地）③ `output_measured`（输出是否测得）；`claim_source_verified()` 是唯一判定入口 |
 | **Frame Conservation** | `frame_conservation.py` | 中间产物帧数守恒：元数据快查（帧率+时长，几乎免费）+ 小文件精确计数；`expected_fps` 不符时只告警（VFR 无单一帧率） |
 | **Rate Spec** | `rate_spec.py` | 有理数帧率解析（`30000/1001` 精确保留），不做浮点近似 |
+| **Work Format** | `work_format.py` | 工作表示 vs 交付格式分层（`auto/preserve/444/420`），能力前置核验，降级需显式接受 |
+| **Storage Policy** | `storage_policy.py` | 中间存储策略的唯一决策点：`mode=lossy` 无 `lossy_allowed` → **开跑前 rc=85**；有损代数硬上限 |
+| **Resource Limits** | `resource_limits.py` | 资源占用目标（默认 `max_fraction=0.80`）：VS 线程 / ffmpeg 线程 / SVT-AV1 逻辑核 |
+| **Lease** | `lease.py` | 有界槽位池 + 协作式取消通道。**构造时预分配** `capacity × slot_bytes`，`acquire` 复用同一块 —— 物理占用有上界，与账目一致 |
+| **Governor** | `governor.py` | RAM/VRAM **联合**预算（一次原子申请，避免跨阶段互等）；`observe_capacity()` 探测失败返回 `known=False`，**不填 0** |
+| **Write Ledger** | `write_ledger.py` | G11 六类写入记账：`scan()` 看**现存**、`WriteLedger.record()` 看**发生过**，两者分开报不合并 |
+| **Perf Report** | `perf_report.py` | 每 stage 耗时与帧吞吐（数据源是 job 日志，不是估算） |
+| **Required Checks** | `required_checks.py` | **由计划派生**必需检查集合（不由报告自报）；`derive(media_kind=)` 区分视频/图片；`evaluate_checks()` 对未登记项的 FAIL/hard_error 不静默 |
+| **Check Result** | `check_result.py` | 四态（PASS/FAIL/UNVERIFIED/NOT_APPLICABLE）+ `publish_decision()` 唯一发布决定 |
+| **Frame Contract** | `frame_contract.py` | 帧边界合同（帧数/尺寸/格式/位深/通道序/有序摘要/域）；`domain_matches_pix_fmt()` 要求摘要域与边界同族 |
+| **Stream Digest** | `stream_digest.py` | `vspipe | ffmpeg -f framemd5` 的有序逐帧摘要；**合取所有生产者 rc**（PA03） |
+| **Stream AI Template** | `stream_ai_template.py` | 零落盘 AI 子进程脚本模板。**同时算输出与输入两份摘要**：`FRAMES_DIGEST`（写出）与 `IN_FRAMES_DIGEST`+`IN_STREAM`（消费） |
+| **Stage67 Fusion** | `stage67_fusion.py` | S6→S7 执行组：stage6 只出 vpy + 交接单，stage7 用 vspipe 直连编码 |
+| **Stage Deps** | `stage_deps.py` | 参数 → stage 归属表（`param_affects_stage`）；最小重算的依据 |
+| **Stage Events** | `stage_events.py` | 结构化阶段事件（stage/phase/attempt/pid/process_started_at/seq），供故障注入按**本次执行**定位 |
+| **Frame Transport** | `frame_transport.py` | PNG / 共享内存自适应决策（`plan_transport`）；按可用内存算可放帧数，守住 `min_free_bytes` 底线 |
+| **VS Render** | `vs_render.py` | VapourSynth 渲染入口；`vs.deterministic=true` 时在 `core = vs.core` 之后、**任何 filter 之前**写 `num_threads = 1` |
+| **Executor Fingerprint** | `exec_fingerprint.py` | 记录"真的跑了什么"（backend/precision/工具版本），不只记配置 |
+| **Generation Evidence** | `generation_evidence.py` | 颜色成组描述（matrix/range/primaries/transfer）+ 边界守恒判定 |
+| **Fullchain Report** | `fullchain_report.py` | 全链比对报告（absolute 档的漂移筛查，当体检工具用而非拒绝依据） |
+| **Fused Receipt** | `fused_receipt.py` | 融合回执的**共享**验证器（main / stage5 同一份，避免两处漂移） |
+| **Color Probe** | `color_probe.py` | 发布前色彩保真守卫（按扩展名分派读法）；视频/照片共用 |
+| **Color Diagnose** | `color_diagnose.py` | `--diagnose-color` 只读诊断：双条件判"染料退化"vs"物体本色"，**不改一个像素** |
+
+### 4.0.1 第 26 轮的判据变化（与第 25 轮交接冲突的地方以此为准）
+
+| 判据 | 第 26 轮之前 | 现在 |
+|---|---|---|
+| `publish_decision.verified` | 缺失/`null` 当"没说不合格" | **必须明确 `true`**，否则拒（C01）|
+| 视频 `final_timeline` | 允许 `NOT_APPLICABLE` | **不允许**（`derive(media_kind="video")`；未知按视频）（C02）|
+| 未登记的检查项 | 完全忽略 | **FAIL/ERROR/`hard_error` 必须报**；通过不报（C03）|
+| fullchain `checks` | 空字典算通过 | **空不得算通过**（C04）|
+| fullchain `attempt_id` | 只在非空时比对 | **计划要求时必须存在**（C05）|
+| fullchain 每项 `ok` | 只判 `is False` | **必须是布尔**，缺失即不合格（C06）|
+| 强制导出（`forced`）| 覆盖正式路径 | **导出到 `.diagnostic-<attempt>/`**，正式代不动，rc=89 |
+| `frame_order` 无判别力 | 用首末 pHash + 帧数提升为 PASS | **保留 UNVERIFIED**（pHash 允许距离 ≤12，端点证不出内部顺序）|
+| 时长比对 | 选了视频流口径后又被容器覆盖 | **选定后一直用**，`checks.duration.basis` 记录口径 |
+| 比较器 | 一律 `-pix_fmt` 强制转换后比 | **`native_exact`（默认）要求源格式==比较格式**；`converted` 显式选择 |
+| `require_time` | 只比容器时长 | 加**起点 / 逐帧 PTS / 末帧间隔** |
+| `digest_vpy` | 只查 ffmpeg rc | **合取 `vspipe` rc**（PA03）|
+| `gpu_fallback_allowed({})` | `True`（缺省即授权） | **`False`**（缺省不授权降质）|
+| `LeasePool` 缓冲区 | 每次借新建 `bytearray` | **构造时预分配**，物理占用受 `capacity` 限制（PA05）|
+| 生产资源准入 | 只有测试注入 `_governor` 才生效 | **`process_job` 建 per-job governor**；探测失败不建并记 UNKNOWN |
+| G11 写入 | 收尾只 `scan()` | **`run_stage` 前后快照差集记账**；删掉的仍计入 |
 
 ### 4.0 计划 → 执行 → 成套发布（第十六轮定型）
 
