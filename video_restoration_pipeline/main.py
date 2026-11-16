@@ -1131,6 +1131,23 @@ def build_params_identity(config: Dict[str, Any], job: Dict[str, Any],
 #: 模型文件的候选扩展名（只用于"给了名字没给路径"时定位）。
 _MODEL_EXTS = (".pth", ".onnx", ".bin", ".pt", ".safetensors")
 
+#: `R25-04 / I01` —— 名字与**实际权重文件名**对不上的模型。
+#:
+#: 审核复现：`face_restore='GFPGAN'` 时解析器找 `GFPGAN.pth`，
+#: 而 `stage5_ai_face.run_gfpgan()` 的默认权重是 `GFPGANv1.4.pth`
+#: （该文件第 345 行）。于是 main 解析为空、指纹不含这两个权重的字节，
+#: 换掉权重 A/B 指纹不变 —— 身份与实际加载彻底脱节。
+#:
+#: 规则：**worker 读哪个文件，解析器就找哪个**。这里按"先精确名、
+#: 再别名"的顺序，别名表就是 worker 的默认值。
+_MODEL_BASENAME_ALIASES = {
+    "gfpgan": ("GFPGAN.pth", "GFPGANv1.4.pth"),
+    "codeformer": ("codeformer.pth", "CodeFormer.pth"),
+    "realesrgan": ("RealESRGAN_x4plus.pth", "RealESRGAN_x2plus.pth"),
+    "realesr-general-x4v3": ("realesr-general-x4v3.pth",
+                             "realesr-general-x4v3.onnx"),
+}
+
 
 def _resolve_model_path(name_or_path: Any,
                         params: Optional[Dict[str, Any]] = None) -> str:
@@ -1166,6 +1183,11 @@ def _resolve_model_path(name_or_path: Any,
     cands = [base]
     if not os.path.splitext(base)[1]:
         cands = [base + ext for ext in _MODEL_EXTS]
+        # R25-04/I01：**别名优先**。worker 读的是 `GFPGANv1.4.pth`，
+        # 而 `GFPGAN.pth` 并不存在 —— 只按名字拼扩展名永远找不到真文件。
+        _alias = _MODEL_BASENAME_ALIASES.get(base.lower())
+        if _alias:
+            cands = [a for a in _alias] + cands
     for root in roots:
         for c in cands:
             p = os.path.join(root, c)
@@ -1202,6 +1224,45 @@ def _model_file_digest(path: str) -> str:
     return h.hexdigest()[:32]
 
 
+_TOOL_VERSION_CACHE: Optional[str] = None
+
+
+def _tool_versions() -> str:
+    """**实际探测**关键工具的版本，供实现指纹使用（R25-04/I02）。
+
+    审核：原来指纹只有 `VIDEO_IMPL_VERSION` + Python + 模型名/字节，
+    换个 FFmpeg 或 VapourSynth 版本指纹不变 —— 而这两者直接决定像素。
+
+    只记**首行版本串**（够区分实现，又不把整段 build config 塞进身份）。
+    探测失败记 ``unknown``：**"不知道"不能等价于"没变"**，
+    但也不能让身份计算失败（主流程要继续跑）。
+
+    进程内缓存：一次运行里 ffmpeg -version 只花一次时间。
+    """
+    global _TOOL_VERSION_CACHE
+    if _TOOL_VERSION_CACHE is not None:
+        return _TOOL_VERSION_CACHE
+    parts: List[str] = []
+
+    try:
+        _r = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True,
+            errors="replace", timeout=20, shell=False)
+        _line = (_r.stdout or "").splitlines()[0] if _r.stdout else ""
+        parts.append("ffmpeg:" + (_line.strip()[:90] or "unknown"))
+    except Exception:
+        parts.append("ffmpeg:unknown")
+
+    try:
+        import vapoursynth as _vs           # noqa: F401  (探测用)
+        parts.append("vs:" + str(getattr(_vs, "__version__", "unknown")))
+    except Exception:
+        parts.append("vs:absent")
+
+    _TOOL_VERSION_CACHE = "|".join(parts)
+    return _TOOL_VERSION_CACHE
+
+
 def _impl_fingerprint(params: Optional[Dict[str, Any]] = None) -> str:
     """实现 / 模型 / 工具指纹（R22-A02）。
 
@@ -1216,6 +1277,9 @@ def _impl_fingerprint(params: Optional[Dict[str, Any]] = None) -> str:
     文件的字节摘要并进来（解析不到文件时退回"只有名字"，行为同旧版）。
     """
     parts = [str(VIDEO_IMPL_VERSION), "py" + sys.version.split()[0]]
+    # R25-04/I02：工具实现也是身份的一部分 —— 换 FFmpeg / VS 版本
+    # 会改变像素，但原来完全不在指纹里。
+    parts.append(_tool_versions())
     if isinstance(params, dict):
         _um = str(params.get("upscale_model") or "")
         _fr = str(params.get("face_restore") or "")
