@@ -2146,7 +2146,9 @@ def _verify_generation_locked(p: str, job: Dict[str, Any],
                 pass
         _pl2 = planned if isinstance(planned, dict) else \
             _planned_generation_roles(p, config, params)
-        _req2 = _rc2.derive(_pl2, params, config)
+        # R25-01/C02：视频的 final_timeline 不允许 NA —— 必须显式声明媒体类型，
+        # 不能靠"未知"默认放宽。
+        _req2 = _rc2.derive(_pl2, params, config, media_kind="video")
         _vres = _rc2.decide(_req2, [], _dec_final, forced_keys=_forced)
         if verdict_out is not None:
             verdict_out.clear()
@@ -2328,6 +2330,17 @@ def _verify_report_problems(doc: Dict[str, Any], *,
     elif dec.get("publish") is not True:
         probs.append("the report's own publish decision is "
                      f"{dec.get('publish')!r}, not True")
+    elif dec.get("verified") is not True:
+        # R25-01 / C01：**必须明确 verified=true**。
+        #
+        # 原来只查 `publish is True`，于是"删掉 verified 字段"照样通过 ——
+        # 缺失被当成"没说不合格"，等于**没有正面证明也算验证过**。
+        # null / 字符串 "true" / 缺失 三种都不算：这些都不是"生产者
+        # 明确声明过验证通过"，而验证的意义恰恰在于那个明确声明。
+        probs.append(
+            "verify report does not declare publish_decision.verified=true "
+            f"(got {dec.get('verified')!r}); a missing or non-boolean value "
+            "is not proof that the generation was verified")
 
     # ---- 7) 身份归属（说明用）----
     if (_att and execution_attempt and publication_attempt
@@ -2386,6 +2399,16 @@ def _fullchain_report_problems(doc: Dict[str, Any], *,
     _fc_rule = (((required or {}).get("checks") or {})
                 .get("fullchain") or {})
 
+    # ---- R25-01/C05：计划要求全链时，attempt_id 必须存在 ----
+    #
+    # 原来只在 `_att` 非空时才比对归属 —— 于是"删掉 attempt_id"直接跳过
+    # 整个归属检查。缺字段不等于"这次不需归属"，而是"无法证明属于本代"。
+    if _fc_rule.get("required") and not _att:
+        probs.append(
+            "the plan requires a full-chain comparison, but the report "
+            "carries no attempt_id; its ownership of this generation "
+            "cannot be proven")
+
     # ---- 不适用（C06）----
     if str(doc.get("status") or "").upper() == "NOT_APPLICABLE":
         if _fc_rule.get("required"):
@@ -2412,9 +2435,25 @@ def _fullchain_report_problems(doc: Dict[str, Any], *,
                      "that the chain was actually compared")
     elif not isinstance(checks, dict):
         probs.append("fullchain report's checks is not an object")
+    elif not checks:
+        # R25-01/C04：空 `{}` 走不进下面的 for 循环，于是"一条检查都没有"
+        # 被判成"没有失败的检查"。空集合与"全通过"是两件事。
+        probs.append("fullchain report's checks is empty; an empty set of "
+                     "check results does not show that anything was compared")
     else:
         for name, row in checks.items():
-            if isinstance(row, dict) and row.get("ok") is False:
+            if not isinstance(row, dict):
+                probs.append(f"fullchain check {name!r} is not an object")
+                continue
+            # R25-01/C06：`ok` 必须是**真布尔**。`frames: {}` 这种空检查行
+            # 原来因为 `row.get("ok") is False` 为假而被放过 ——
+            # "没写结论"和"结论是通过"不是一回事。
+            _okv = row.get("ok")
+            if not isinstance(_okv, bool):
+                probs.append(
+                    f"fullchain check {name!r} has no boolean ok field "
+                    f"(got {_okv!r}); an absent verdict is not a pass")
+            elif _okv is False:
                 probs.append(f"fullchain check {name!r} failed")
     return probs
 
@@ -2526,7 +2565,7 @@ def verify_generation_objects(final_path: str, job: Optional[Dict[str, Any]] = N
     # ---- B02：必需检查由**计划**派生，报告只提供观测 ----
     try:
         import required_checks as _rc
-        _required = _rc.derive(pl, params)
+        _required = _rc.derive(pl, params, media_kind="video")
     except Exception as _rce:                # pragma: no cover - 部署异常
         return (False, f"cannot derive the required checks: {_rce}")
 

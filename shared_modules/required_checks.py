@@ -111,13 +111,18 @@ def _wants_transform(params: Optional[Dict[str, Any]]) -> bool:
 
 def derive(planned: Optional[Dict[str, Any]] = None,
            params: Optional[Dict[str, Any]] = None,
-           config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           config: Optional[Dict[str, Any]] = None,
+           media_kind: Optional[str] = None) -> Dict[str, Any]:
     """由**有效计划**推导本次发布的必需检查集合。
 
     Args:
         planned: `_planned_generation_roles()` 的结果（`required`/`optional`）。
         params: 生效参数（读 `full_chain_verify`、音频/变换相关开关）。
         config: 配置（保留，供后续扩展）。
+        media_kind: ``"video"`` / ``"photo"`` / ``None``（未知）。
+            **R25-01/C02**：视频的 `final_timeline` 不能用图片的 NA 规则放行。
+            未知时按**最严**处理（等同视频），因为"不知道是图片"不能
+            当成"可能是图片"来放宽。
 
     Returns:
         ``{schema, checks: {name: {required, allowed, force_key, scope,
@@ -137,6 +142,18 @@ def derive(planned: Optional[Dict[str, Any]] = None,
     required_roles = dict(pl.get("required") or {})
     opt_roles = dict(pl.get("optional") or {})
 
+    # 未知媒体类型 → 按视频（最严）处理。理由：放宽是有代价的，
+    # 而"没告诉我是什么"不该换来更宽的判据。
+    _kind = str(media_kind or "").strip().lower()
+    _is_photo = (_kind == "photo")
+    if not _is_photo:
+        # 没显式给就尝试从输入路径推断（照片格式白名单）
+        _inp = str(p.get("input_path") or "")
+        _ext = _inp.rsplit(".", 1)[-1].lower() if "." in _inp else ""
+        if _ext in ("jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp",
+                    "heic", "heif", "avif"):
+            _is_photo = True
+
     checks: Dict[str, Dict[str, Any]] = {}
 
     # ---- 底线两项：不能由报告关掉 ----
@@ -149,12 +166,18 @@ def derive(planned: Optional[Dict[str, Any]] = None,
     }
     checks["final_timeline"] = {
         "required": True,
-        # 时间测量本身可以在"没有时间轴概念"的产物上不适用（如单张图），
-        # 但视频发布必须有结论。
-        "allowed": ["PASS", "NOT_APPLICABLE"],
+        # R25-01/C02：**视频不能 NA**。
+        #
+        # 原来无条件允许 NOT_APPLICABLE，理由是"单张图没有时间轴概念"。
+        # 但视频也走了同一条规则 —— 报告写 `final_timeline=NA` 就绕过了
+        # 整条时间轴验收。图片的 NA 是**合法不适用**，视频的 NA 是
+        # **该做的检查没做**。两者必须分开。
+        "allowed": (["PASS", "NOT_APPLICABLE"] if _is_photo else ["PASS"]),
         "force_key": "allow_verify_fail_publish",
-        "scope": "final timeline measured after the last mux",
-        "not_applicable_allowed": True,
+        "scope": ("final timeline measured after the last mux"
+                  if not _is_photo else
+                  "single-image deliverables have no timeline to measure"),
+        "not_applicable_allowed": bool(_is_photo),
     }
 
     # ---- 帧序：允许 UNVERIFIED，但 FAIL 不合格 ----
@@ -295,7 +318,29 @@ def evaluate_checks(report_checks: Any,
                 f"requires it; a report may not relax its own acceptance "
                 f"(the plan wins)")
 
-    # 报告里出现计划没定义的检查项：不判错（可能新增），但状态已在上文校验
+    # 报告里出现计划没定义的检查项：**不能静默忽略**（R25-01/C03）。
+    #
+    # 原来的注释是"可能新增，不判错"——但审核用 `timeline_mapping=FAIL`
+    # 加 `hard_error=True` 打穿了它：一项明确的硬错误，只要名字没被计划
+    # 登记，就完全不参与判定。
+    #
+    # 取舍：新增项**通过**不报（前向兼容，允许生产者多做事）；
+    # 但**失败或硬错误**必须报 —— 生产者自己都不认为它过了，消费者
+    # 没有理由把它当成不存在。
+    for name, row in report_checks.items():
+        if name in spec or not isinstance(row, dict):
+            continue
+        st = str(row.get("status") or "").upper()
+        if row.get("hard_error") is True:
+            probs.append(
+                f"check {name!r} is not part of the plan but the report marks "
+                f"it as a hard error (status={st!r}); an unplanned hard "
+                f"failure cannot be ignored")
+        elif st in ("FAIL", "ERROR"):
+            probs.append(
+                f"check {name!r} is not part of the plan but the report says "
+                f"{st!r}; an unplanned failing check cannot be ignored")
+
     return probs
 
 
