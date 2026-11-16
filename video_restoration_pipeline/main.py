@@ -18,6 +18,7 @@ import json
 import time
 import uuid
 import hashlib
+import shutil
 import argparse
 import subprocess
 from pathlib import Path
@@ -1313,43 +1314,155 @@ def _model_file_digest(path: str) -> str:
     return h.hexdigest()[:32]
 
 
-_TOOL_VERSION_CACHE: Optional[str] = None
+#: 每个工具的**结构化**身份（R26-A09：原来是一个全局字符串缓存）。
+_TOOL_IDENTITY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _binary_prefix_digest(path: str, nbytes: int = 1 << 20) -> str:
+    """二进制文件的**前 1 MiB** sha256（前 16 位十六进制）。
+
+    R26-A09：只记版本串不足以区分"同版本不同二进制"—— 同一份
+    `ffmpeg version 2023-11-13-git-67a2571a55` 可以是不同 build
+    （不同 libx264 / 不同 SVT 提交）。取二进制前缀摘要能把它们分开，
+    又不用读整个 100 MB。
+    """
+    p = str(path or "").strip()
+    if not p or not os.path.isfile(p):
+        return ""
+    h = hashlib.sha256()
+    try:
+        with open(p, "rb") as f:
+            left = nbytes
+            while left > 0:
+                chunk = f.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                h.update(chunk)
+                left -= len(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()[:16]
+
+
+def _tool_entry(name: str, *, binary: str = "",
+                version_cmd: Optional[List[str]] = None,
+                version: str = "") -> Dict[str, Any]:
+    """探测一个工具，返回 ``{name, version, binary, binary_digest,
+    known, error}``。
+
+    **返回码必须检查**（R26-A09）：原来只取 stdout 首行，
+    没看 `returncode` —— 一个崩掉的 `ffmpeg -version` 会留下空版本串，
+    被当成"某版本"。
+    """
+    entry: Dict[str, Any] = {
+        "name": name, "version": "", "binary": binary,
+        "binary_digest": "", "known": False, "error": "",
+    }
+    if version_cmd:
+        try:
+            r = subprocess.run(version_cmd, capture_output=True, text=True,
+                               errors="replace", timeout=20, shell=False)
+            if r.returncode != 0:
+                entry["error"] = "exit %s" % r.returncode
+            else:
+                first = (r.stdout or "").strip().splitlines()
+                entry["version"] = first[0].strip() if first else ""
+        except Exception as exc:
+            entry["error"] = str(exc)[:120]
+    elif version:
+        entry["version"] = version
+    if binary:
+        entry["binary_digest"] = _binary_prefix_digest(binary)
+    entry["known"] = bool(entry["version"] or entry["binary_digest"])
+    return entry
+
+
+def _tool_identity() -> Dict[str, Any]:
+    """本次实际使用的**工具/运行时身份**（R26-A09）。
+
+    Returns:
+        ``{"tools": {name: entry}, "parts": [str], "unknown": [name],
+        "strict_reuse_ok": bool}``。
+
+    * `parts` 进指纹；
+    * `unknown` 列出探测失败的工具；
+    * `strict_reuse_ok=False` 表示**关键身份未知** —— 调用方据此
+      禁止跨次严格复用（"不知道"不能当成"没变"）。
+    """
+    global _TOOL_IDENTITY_CACHE
+    if _TOOL_IDENTITY_CACHE.get("_done"):
+        return _TOOL_IDENTITY_CACHE
+
+    tools: Dict[str, Dict[str, Any]] = {}
+
+    # ffmpeg / ffprobe：版本 + 二进制前缀摘要
+    for name in ("ffmpeg", "ffprobe"):
+        b = shutil.which(name) or ""
+        tools[name] = _tool_entry(name, binary=b,
+                                  version_cmd=[name, "-version"])
+
+    # VapourSynth：**必须查 worker 实际用的解释器**（R26-A09）。
+    # 原来 `import vapoursynth` 查的是 main 自己的解释器；而 stage1/6 的
+    # vs 渲染跑在 `ai_runtime` 解析出来的那个 python 里。
+    try:
+        import ai_runtime as _airt
+        _wpy = _airt.resolve_ai_interpreter(logger=None)
+    except Exception:
+        _wpy = ""
+    if _wpy:
+        try:
+            r = subprocess.run(
+                [_wpy, "-c",
+                 "import vapoursynth as v; print(getattr(v,'__version__','?'))"],
+                capture_output=True, text=True, errors="replace",
+                timeout=30, shell=False)
+            _ver = ((r.stdout or "").strip().splitlines() or [""])[0]
+            tools["vapoursynth"] = _tool_entry(
+                "vapoursynth", binary=str(_wpy),
+                version=(_ver if r.returncode == 0 else ""))
+            if r.returncode != 0:
+                tools["vapoursynth"]["error"] = "exit %s" % r.returncode
+        except Exception as exc:
+            tools["vapoursynth"] = _tool_entry("vapoursynth", binary=str(_wpy))
+            tools["vapoursynth"]["error"] = str(exc)[:120]
+    else:
+        tools["vapoursynth"] = _tool_entry("vapoursynth")
+        tools["vapoursynth"]["error"] = "no AI interpreter resolved"
+
+    # G'MIC：照片链用，视频链通常没有 —— 探测失败不算关键未知
+    _gmic = shutil.which("gmic") or ""
+    if _gmic:
+        tools["gmic"] = _tool_entry("gmic", binary=_gmic,
+                                    version_cmd=["gmic", "-version"])
+
+    parts: List[str] = []
+    unknown: List[str] = []
+    for name in sorted(tools):
+        e = tools[name]
+        parts.append("%s:%s:%s" % (name, e["version"] or "-",
+                                   e["binary_digest"] or "-"))
+        # ffmpeg / ffprobe / vapoursynth 是**关键**：它们直接决定像素
+        if name in ("ffmpeg", "ffprobe", "vapoursynth") and not e["known"]:
+            unknown.append(name)
+
+    out = {
+        "_done": True,
+        "tools": tools,
+        "parts": parts,
+        "unknown": unknown,
+        # 关键工具未知 → 不许跨次严格复用
+        "strict_reuse_ok": not unknown,
+    }
+    _TOOL_IDENTITY_CACHE = out
+    return out
 
 
 def _tool_versions() -> str:
-    """**实际探测**关键工具的版本，供实现指纹使用（R25-04/I02）。
+    """工具身份的**字符串形式**（供 `_impl_fingerprint` 用）。
 
-    审核：原来指纹只有 `VIDEO_IMPL_VERSION` + Python + 模型名/字节，
-    换个 FFmpeg 或 VapourSynth 版本指纹不变 —— 而这两者直接决定像素。
-
-    只记**首行版本串**（够区分实现，又不把整段 build config 塞进身份）。
-    探测失败记 ``unknown``：**"不知道"不能等价于"没变"**，
-    但也不能让身份计算失败（主流程要继续跑）。
-
-    进程内缓存：一次运行里 ffmpeg -version 只花一次时间。
+    保留这个名字是为了不动已有调用点；真实信息在 `_tool_identity()` 里。
     """
-    global _TOOL_VERSION_CACHE
-    if _TOOL_VERSION_CACHE is not None:
-        return _TOOL_VERSION_CACHE
-    parts: List[str] = []
-
-    try:
-        _r = subprocess.run(
-            ["ffmpeg", "-version"], capture_output=True, text=True,
-            errors="replace", timeout=20, shell=False)
-        _line = (_r.stdout or "").splitlines()[0] if _r.stdout else ""
-        parts.append("ffmpeg:" + (_line.strip()[:90] or "unknown"))
-    except Exception:
-        parts.append("ffmpeg:unknown")
-
-    try:
-        import vapoursynth as _vs           # noqa: F401  (探测用)
-        parts.append("vs:" + str(getattr(_vs, "__version__", "unknown")))
-    except Exception:
-        parts.append("vs:absent")
-
-    _TOOL_VERSION_CACHE = "|".join(parts)
-    return _TOOL_VERSION_CACHE
+    return "|".join(_tool_identity().get("parts") or []) or "tools:unknown"
 
 
 def _impl_fingerprint(params: Optional[Dict[str, Any]] = None) -> str:
