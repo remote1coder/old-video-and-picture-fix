@@ -54,6 +54,7 @@ import json
 import math
 import os
 import subprocess
+import threading
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 #: 单次读取块大小（流式）。
@@ -385,6 +386,34 @@ def iter_frames(path: str, pix_fmt: str, width: int, height: int,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
 
+    # R25-03：**stderr 必须并发排空**。
+    #
+    # 原来只在 `finally` 里 `proc.stderr.read()` —— 而那时 stdout 已经读完了。
+    # 只要 ffmpeg 往 stderr 写满管道缓冲（默认 64 KiB，多流/多警告的片
+    # 几秒就到），它就阻塞在写上；父进程又在等 stdout 的新数据 →
+    # 双方互等，`wait()` 永不返回。Python 官方文档明确提示这个双管道陷阱。
+    #
+    # 做法：起一个守护线程持续读 stderr，内存只保留**有界环形尾部**
+    # （诊断够用，不会因整片日志撑爆内存）。
+    _err_tail: List[bytes] = []
+    _err_lock = threading.Lock()
+
+    def _drain_stderr() -> None:
+        try:
+            while True:
+                _b = proc.stderr.read(4096)
+                if not _b:
+                    break
+                with _err_lock:
+                    _err_tail.append(_b)
+                    if len(_err_tail) > 64:          # ≈ 256 KiB 上限
+                        del _err_tail[0]
+        except Exception:
+            pass
+
+    _err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    _err_thread.start()
+
     def _gen():
         try:
             while True:
@@ -403,9 +432,9 @@ def iter_frames(path: str, pix_fmt: str, width: int, height: int,
                 proc.stdout.close()
             except Exception:
                 pass
-            _err = b""
+            # 排空线程自己会读到 EOF；这里只等它收尾（有界等待）
             try:
-                _err = proc.stderr.read() or b""
+                _err_thread.join(timeout=10)
             except Exception:
                 pass
             try:
@@ -413,6 +442,8 @@ def iter_frames(path: str, pix_fmt: str, width: int, height: int,
             except Exception:
                 pass
             info["rc"] = proc.wait()
+            with _err_lock:
+                _err = b"".join(_err_tail)
             info["stderr_tail"] = _err[-400:].decode("utf-8", "replace")
 
     return _gen(), info
