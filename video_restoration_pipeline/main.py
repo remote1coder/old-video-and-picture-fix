@@ -490,8 +490,97 @@ def _resolve_log_dir(log_dir: Any) -> str:
     return str((SCRIPT_DIR.parent / _raw).resolve())
 
 
+#: G11 / R25-09：进程内的写入累加器（每个 job 一个，由 `process_job` 轮换）。
+_LEDGER = None
+
+
+def _active_ledger():
+    """取当前 job 的写入累加器（没有就新建）。
+
+    为什么用进程内单例而不是塞进 `params`：`params` 会被 JSON 序列化
+    传给子进程，**对象塞不进去**；而 stage 脚本自己也有一份 params
+    副本，写回去也不会回到父进程。记账必须在**父进程**完成。
+    """
+    global _LEDGER
+    if _LEDGER is None:
+        try:
+            from write_ledger import WriteLedger as _WL
+            _LEDGER = _WL()
+        except Exception:
+            _LEDGER = False        # 不可用就明确置假，别每次重试
+    return _LEDGER or None
+
+
+def reset_ledger():
+    """每个 job 开始时重置（避免跨 job 累加）。"""
+    global _LEDGER
+    _LEDGER = None
+
+
+def _dir_snapshot(root: str) -> Dict[str, int]:
+    """按**字节数**给目录拍快照（只记文件，不跟符号链接）。"""
+    out: Dict[str, int] = {}
+    if not root or not os.path.isdir(root):
+        return out
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            try:
+                if os.path.islink(fp):
+                    continue
+                out[fp] = os.path.getsize(fp)
+            except OSError:
+                continue
+    return out
+
+
 def run_stage(script_name: str, job: Dict[str, Any], params: Dict[str, Any],
               config_path: str) -> Tuple[int, str]:
+    """`_run_stage_inner` 的包装：**前后快照 → 差集记账**（G11 / R25-09）。
+
+    复核指出：原来只在收尾 `scan()` + `render()`，没有任何 `record()`，
+    于是"中间媒体 0.0 MB"证明的是**清理后剩下的存量**，不是"没写过"。
+    PA04 实验（写 1024 字节再删掉）在这种口径下 `written` 全是 0。
+
+    记账规则：
+      * 新增或被改大的文件 → 记**增量**（分块更新不能重复累计全尺寸）；
+      * 变小不记（那是在清理，不是写入）；
+      * **快照里有、结束后没有**的文件 → 用快照时的字节数记账。
+        删掉不等于没写过 —— 这正是原口径最大的盲区。
+    """
+    _l = _active_ledger()
+    _tmp_root = str((params or {}).get("temp_dir") or "")
+    _out_for_cat = str((params or {}).get("output_path") or "")
+    _pre = _dir_snapshot(_tmp_root) if _tmp_root else {}
+
+    try:
+        return _run_stage_inner(script_name, job, params, config_path)
+    finally:
+        if _l is not None and _tmp_root:
+            try:
+                from write_ledger import classify as _wl_classify
+                _post = _dir_snapshot(_tmp_root)
+                for _fp, _sz in _post.items():
+                    _old = _pre.get(_fp, 0)
+                    if _sz > _old:
+                        _l.record(_wl_classify(_fp, output_path=_out_for_cat),
+                                  nbytes=_sz - _old, path=_fp)
+                for _fp, _sz in _pre.items():
+                    if _fp not in _post:
+                        # 被清理了，但写入确实发生过
+                        _l.record(_wl_classify(_fp, output_path=_out_for_cat),
+                                  nbytes=_sz, path=_fp)
+            except Exception:
+                # 记账失败不能影响主流程，但也不能静默 —— 留一条未知类别
+                try:
+                    _l.record("__ledger_error__", nbytes=0)
+                except Exception:
+                    pass
+
+
+def _run_stage_inner(script_name: str, job: Dict[str, Any],
+                     params: Dict[str, Any],
+                     config_path: str) -> Tuple[int, str]:
     """Run a stage script and return (exit_code, stderr)."""
     script_path = SCRIPT_DIR / "stages" / script_name
     if not script_path.exists():
@@ -3408,6 +3497,9 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     job_id = job["job_id"]
     input_path = job["input_path"]
 
+    # G11 / R25-09：每个 job 从零开始记，避免跨 job 累加。
+    reset_ledger()
+
     # R15-03：计划阶段**零落盘**。所有日志先进缓冲（同时打 stderr），
     # 路径校验通过、job logger 建好之后再回放 —— 这样"越界路径的 job
     # 在授权根外造出日志目录"就不可能发生。
@@ -4506,7 +4598,16 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
             _wl_paths.append(os.path.dirname(os.path.abspath(_wl_out)))
         _wl = _wl_scan(_wl_paths, output_path=_wl_out,
                        temp_dir=str(params.get("temp_dir") or ""))
-        for _line in _wl_render(_wl):
+        # G11 / R25-09：**两个数分开报** —— scan 是"还剩下的"，
+        # ledger 是"这次写过的"。只报前者会把"清理掉了"读成"没写过"。
+        _lsum = None
+        _l_act = _active_ledger()
+        if _l_act is not None:
+            try:
+                _lsum = _l_act.summary()
+            except Exception:
+                _lsum = None
+        for _line in _wl_render(_wl, _lsum):
             job_logger.info("WRITE_LEDGER", _line, job_id=job_id)
     except Exception as _wle:            # 记账失败不阻断任务，但必须可见
         job_logger.warning("WRITE_LEDGER_FAIL",
