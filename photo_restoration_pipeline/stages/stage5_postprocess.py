@@ -2088,3 +2088,59 @@ if __name__ == "__main__":
     if rc is None:
         rc = 86  # validation failure — main() must always return explicit exit code
     sys.exit(rc)
+
+
+# ---------------------------------------------------------------- 内存快路径
+def postprocess_bytes(data: bytes, params: dict, *, logger=None) -> dict:
+    """S5 的**内存入口**：复用 `_apply_selective_processing()` 的核心。
+
+    为什么是"复用"而不是"另写一套"：指令 §N27-04 明确要求
+    "抽取共享处理核心，file adapter 和 stream adapter 调用相同算法，
+    不要维护两套逐渐分叉的参数解释"。这里只换 I/O，算法完全走同一个函数
+    （`src_array=` 参数本来就是为"绕开 Pillow 的 16bit 缺陷"而加的）。
+
+    **不包含** resize（`parse_lanczos_target`）—— 那一步在 file 模式里
+    由调用方按目标尺寸决定；内存模式下目标尺寸属于**计划**，应由编排层
+    在调用前确定并写进 params，不在本函数里猜。
+
+    Returns:
+        ``{"ok", "png", "bit_depth", "width", "height", "error"}``。
+    """
+    import numpy as _np
+    out = {"ok": False, "png": b"", "bit_depth": 0, "width": 0,
+           "height": 0, "error": ""}
+    try:
+        from media_io import read_png_bytes as _rp, encode_png as _enc
+    except Exception as exc:
+        out["error"] = "cannot import media_io: %s" % exc
+        return out
+    try:
+        arr = _rp(data)
+    except Exception as exc:
+        out["error"] = "input is not a decodable PNG: %s" % exc
+        return out
+    if arr.dtype != _np.uint16 or arr.ndim != 3 or arr.shape[2] != 3:
+        out["error"] = ("expects RGB16 PNG; got %r %s"
+                        % (arr.shape, arr.dtype))
+        return out
+    try:
+        res, bd = _apply_selective_processing(
+            None, params, logger, src_array=arr)
+    except Exception as exc:
+        out["error"] = ("selective processing failed: %s: %s"
+                        % (type(exc).__name__, exc))
+        return out
+    if not isinstance(res, _np.ndarray):
+        out["error"] = ("expected a uint16 array back for 16bit input, got %s"
+                        % type(res).__name__)
+        return out
+    out["bit_depth"] = int(bd)
+    png = _enc(res)
+    back = _rp(png)
+    if back.shape != arr.shape:
+        out["error"] = ("selective processing changed the geometry: %r -> %r"
+                        % (arr.shape, back.shape))
+        return out
+    out.update({"ok": True, "png": png, "width": int(arr.shape[1]),
+                "height": int(arr.shape[0])})
+    return out
