@@ -279,25 +279,41 @@ def evaluate_checks(report_checks: Any,
 
     spec = dict((required or {}).get("checks") or {})
 
-    seen: Dict[str, str] = {}
+    # R26-A03：**必须按名字取行**。
+    #
+    # 原来第一个循环把 `row` 留给第二个循环用 —— 而第二个循环的变量是
+    # `rule`，`row` 是**上一个循环最后一次迭代的残留值**。于是
+    # "报告自称 required=False 吗"这一条永远在检查**最后一项**，
+    # 与当前 `name` 无关。审核实测：合法的必需 PASS 项和可选 PASS 项
+    # 只互换顺序，一份被错拒、一份通过 —— 这是确定的变量引用错误，
+    # 不是媒体随机性。
+    #
+    # 现在把整行存进 `seen`，第二个循环按名字取。
+    seen: Dict[str, Dict[str, Any]] = {}
+    malformed: set = set()
     for name, row in report_checks.items():
         if not isinstance(row, dict):
             probs.append(f"check {name!r} is not an object")
+            malformed.add(str(name))
             continue
         st = str(row.get("status") or "").upper()
-        seen[str(name)] = st
+        seen[str(name)] = row
         if st not in KNOWN_STATUSES:
             probs.append(f"check {name!r} has an unknown status {st!r}")
 
     for name, rule in spec.items():
-        st = seen.get(name)
-        allowed = {str(x).upper() for x in (rule.get("allowed") or [])}
-        if st is None:
+        cur = seen.get(name)
+        if cur is None:
+            if str(name) in malformed:
+                # 已经在上面报过"不是对象"，不重复报"缺失"
+                continue
             if rule.get("required"):
                 probs.append(
                     f"the plan requires the {name!r} check but the report "
                     f"does not contain it")
             continue
+        st = str(cur.get("status") or "").upper()
+        allowed = {str(x).upper() for x in (rule.get("allowed") or [])}
         if st == "NOT_APPLICABLE" and not rule.get("not_applicable_allowed"):
             probs.append(
                 f"check {name!r} claims NOT_APPLICABLE but the plan does not "
@@ -312,7 +328,9 @@ def evaluate_checks(report_checks: Any,
         # 报告说 required=True 而计划说 False：报告**更严**，无害，不报。
         # 报告说 required=False 而计划说 True：报告在给自己**降标准**，
         # 这正是 R24-A01 的核心漏洞，必须报出来。
-        if rule.get("required") and row.get("required") is False:
+        #
+        # R26-A03：这里必须用 `cur`（本 name 那一行），不能用残留的 `row`。
+        if rule.get("required") and cur.get("required") is False:
             probs.append(
                 f"check {name!r} declares required=False but the plan "
                 f"requires it; a report may not relax its own acceptance "

@@ -77,14 +77,20 @@ def test_required_unverified_ignores_an_unrelated_force_key():
     assert d["publish"] is False, d
 
 
-def test_optional_unverified_still_publishes_but_not_verified():
-    """可选质量项保持原行为：不阻断，但 verified=False。"""
+def test_optional_unverified_publishes_without_lowering_verified():
+    """可选质量项：不阻断，**也不降 verified**（R26-A01 / 指令 §1.1）。
+
+    旧断言 `verified is False` 把"可选启发式没结论"与"必需证据缺失"
+    混为一谈。现在只有必需项缺失/未证明才让 verified 落下来；
+    可选状态仍记在 `unverified_optional` 里。
+    """
     d = CR.publish_decision(
         [_r("frame_order", CR.UNVERIFIED, required=False, severity="warning"),
          _r("mechanical", CR.PASS)],
         enabled_forces=set())
     assert d["publish"] is True, d
-    assert d["verified"] is False
+    assert d["verified"] is True, d
+    assert d["unverified_optional"] == ["frame_order"], d
 
 
 def test_all_pass_is_verified():

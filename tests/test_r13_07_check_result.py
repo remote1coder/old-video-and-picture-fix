@@ -91,16 +91,32 @@ def test_quality_fail_without_force_blocks():
     assert d["publish"] is False
 
 
-def test_unverified_publishes_but_is_not_verified():
-    """方法无判别力 → 可以出片，但**结论是"未验证"**。
+def test_unverified_optional_publishes_and_stays_verified():
+    """方法无判别力 → 可以出片，且**不拖累 verified**（R26-A01）。
 
-    依据审核："静态画面导致帧序方法无判别力，并不等于帧序错乱；
-    记录方法限制。" 所以不阻断，也绝不算通过。
+    指令 §1.1：`verified=True` 表示**本次计划的必需证据全部满足**，
+    不要求每一种可选启发式都得出肯定结论。
+
+    旧断言是 `verified is False` —— 那会让"静态画面让帧序方法失效"
+    这种**合法局限**永远无法形成 verified 代，于是要么永远走诊断，
+    要么有人去放宽发布门。现在改为：publish 不变，verified 不被拖累，
+    但**这个可选状态必须仍被记录**（`unverified_optional`）。
     """
-    r = cr.CheckResult("frame_order", cr.UNVERIFIED, reason="no verdict")
-    d = cr.publish_decision([r], force_enabled=False)
+    # 真实一代总有正面证据（机械核对/时间测量），必须给一条 PASS ——
+    # 否则 `bool(passes)` 为假，verified 本来就该 False（没有正面证据）。
+    # `severity="warning"` 是生产者对"这不是硬门"的**明确声明**；
+    # 不标就按硬门（fail-closed）。stage7 对 frame_order 就是这么标的。
+    r = cr.CheckResult("frame_order", cr.UNVERIFIED, reason="no verdict",
+                       severity="warning")
+    ok = cr.CheckResult("mechanical", cr.PASS, required=True)
+    d = cr.publish_decision([ok, r], force_enabled=False)
     assert d["publish"] is True, "方法局限不该判整个作业失败"
-    assert d["verified"] is False, "没能给出结论就不是验证通过"
+    assert d["verified"] is True, "可选的 UNVERIFIED 不该让必需证据失效"
+    assert d["unverified_optional"] == ["frame_order"], (
+        "状态必须仍被记录，不能因为不影响 verified 就悄悄丢掉")
+    # 反方向：只有 UNVERIFIED、没有任何 PASS → 不能声称 verified
+    d2 = cr.publish_decision([r], force_enabled=False)
+    assert d2["verified"] is False, "没有正面证据就不能声称已验证"
 
 
 # ---------------------------------------------------------------- 汇总

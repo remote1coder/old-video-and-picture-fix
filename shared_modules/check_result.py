@@ -206,15 +206,53 @@ def publish_decision(results: Iterable[CheckResult],
         return key in set(enabled_forces)
 
     reasons = {r.name: r.reason for r in rs if r.reason}
+    # ---- R26-A01 + 指令 §1.1：`verified` 只要求**必需项** ----
+    #
+    # 原来是 `not fails and not unver` —— 任何一项 UNVERIFIED（**包括可选**）
+    # 都会让 verified=False。后果：静态画面让帧序方法失效（合法的
+    # "方法无判别力"），整代就永远不可能 verified，于是要么永远走诊断，
+    # 要么有人去放宽发布门。
+    #
+    # 指令原话：`verified=True` 表示**本次计划的必需证据全部满足**、
+    # 没有阻断性错误；它**不要求每一种可选启发式都得出肯定结论**。
+    # 所以这里只看 required 的项。
+    #
+    # `severity == "warning"` 的项同样不参与 verified 计算：
+    # 生产者自己把它标成警告，消费方不能把它升级成硬门（R26-A02）。
+    def _hard(r: "CheckResult") -> bool:
+        """这一项是不是**硬门**。
+
+        R26-A02：判据用 `severity`，不用 `required`。
+        `required` 的默认值是 `False`，所以"没声明"和"明确声明可选"
+        长得一样 —— 拿它判会把未声明的 FAIL 放过（审核的
+        `test_quality_fail_without_force_blocks` 就是这样）。
+
+        `severity="warning"` 是生产者**明确**声明"这不是硬门"；
+        其余（`info` / `error` / 未声明）一律按硬门 —— **fail-closed**。
+        """
+        # `required=True` 一律是硬门，哪怕生产者把它标成 warning
+        # （`timeline_mapping` 就是这样：它必需，但"未验证"不是错误级）。
+        if getattr(r, "required", False) is True:
+            return True
+        # 未声明必需性时 fail-closed：只有**明确**标成 warning 的才放过。
+        return str(getattr(r, "severity", "") or "").lower() != "warning"
+
+    _req_fail = [r for r in fails if _hard(r)]
+    _req_unver = [r for r in unver if _hard(r)]
+
     decision = {
         "publish": True,
-        "verified": bool(passes) and not fails and not unver and not blocked,
+        "verified": bool(passes) and not _req_fail and not _req_unver
+                    and not blocked,
         "blocked_by": blocked,
         "forced": False,
         "reasons": reasons,
         # 警告不阻断，但必须跟着结论走，不能只在日志里
         "warnings": warn,
         "forced_checks": [],
+        # 审计用：哪些项让 verified 落下来（可选 UNVERIFIED 不算）
+        "unverified_required": [r.name for r in _req_unver],
+        "unverified_optional": [r.name for r in unver if not _hard(r)],
     }
 
     if blocked:
@@ -223,24 +261,32 @@ def publish_decision(results: Iterable[CheckResult],
 
     # ``UNVERIFIED`` 表示"这次没能给出结论"（方法无判别力、输入不可用等）。
     # 它**不是通过**，但也不等于缺陷：静态画面让帧序方法失效，不该因此
-    # 判整个作业失败。所以它只让 verified=False，不阻断发布。
-    # （是否允许输出"未验证"的产物属于 profile 策略；默认允许并如实标注。）
+    # 判整个作业失败。所以**可选的** UNVERIFIED 只记状态，不阻断、也不降
+    # verified（R26-A01）；**必需的** UNVERIFIED 阻断（R21-C04）。
     if fails:
-        not_forced = [r for r in fails if not _force_ok(r)]
-        if not_forced:
-            decision["publish"] = False
-            decision["blocked_by"] = [r.name for r in not_forced]
-            return decision
-        decision["forced"] = True
-        decision["forced_checks"] = [r.name for r in fails]
-        decision["verified"] = False
+        # R26-A02：`severity="warning"` 的 FAIL 是生产者自己标的警告，
+        # 不是硬门。原来它照样 `publish=False`，与 producer 的意图相反。
+        _hard_fails = [r for r in fails if _hard(r)]
+        _warn_fails = [r for r in fails if not _hard(r)]
+        if _warn_fails:
+            decision["warnings"] = (list(decision.get("warnings") or [])
+                                    + [r.name for r in _warn_fails])
+        if _hard_fails:
+            not_forced = [r for r in _hard_fails if not _force_ok(r)]
+            if not_forced:
+                decision["publish"] = False
+                decision["blocked_by"] = [r.name for r in not_forced]
+                return decision
+            decision["forced"] = True
+            decision["forced_checks"] = [r.name for r in _hard_fails]
+            decision["verified"] = False
     # ---- R21-C04：**必需**检查的 UNVERIFIED 必须阻断 ----
     # 审核反例：只给 `final_timeline=UNVERIFIED` → publish=true。
     # "测不出来"于是等于"没问题"。必需性由检查项自己声明：
     #   * 完整性/时间等必需门：UNVERIFIED 不可发布（可被 force_key 强制，
     #     强制后 verified=False 且记录在 forced_checks 里）；
-    #   * 可选的主观质量/低置信启发式：仍只降 verified，不阻断。
-    _unver_required = [r for r in unver if getattr(r, "required", False)]
+    #   * 可选的主观质量/低置信启发式：只记状态，不阻断也不降 verified。
+    _unver_required = [r for r in unver if _hard(r)]
     if _unver_required:
         _not_forced = [r for r in _unver_required if not _force_ok(r)]
         if _not_forced:
@@ -251,6 +297,7 @@ def publish_decision(results: Iterable[CheckResult],
         decision["forced"] = True
         decision["forced_checks"] = ([r.name for r in _unver_required]
                                      + decision["forced_checks"])
-    if unver:
         decision["verified"] = False
+    # R26-A01：**不再**因为存在可选 UNVERIFIED 就把 verified 置 False。
+    # verified 的定义是"必需证据全部满足"，不是"所有启发式都给了肯定答案"。
     return decision

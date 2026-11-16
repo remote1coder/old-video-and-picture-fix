@@ -4357,7 +4357,7 @@ def main():
                 UNVERIFIED as _CR_UNV)
             _align_ok = _align_pre.get("ok")
             if _align_ok is False:
-                _fc_align = _CR("frame_order", _CR_FAIL,
+                _fc_align = _CR("frame_order", _CR_FAIL, severity="error",
                                 reason="sampled frames indicate shifted order",
                                 method="artifact_verify.verify_frame_alignment",
                                 evidence={"flipped": _align_pre.get("flipped"),
@@ -4403,6 +4403,7 @@ def main():
             else:
                 _fc_align = _CR(
                     "frame_order", _CR_PASS,
+                    severity="warning",
                     method="artifact_verify.verify_frame_alignment",
                     evidence={"flipped": _align_pre.get("flipped"),
                               "checked": len(_align_pre.get("points") or [])})
@@ -4812,26 +4813,26 @@ def main():
                 "measured on the attempt's private candidate before publish; "
                 "the published file is the same bytes")
 
-            # ==== R25-01 / D01：**强制导出**不许覆盖正式代 ====
+            # ==== R26-A01：**不满足计划的一代，任何情况下都不覆盖正式代** ====
             #
-            # 审核原文："验证失败/未知的**强制导出**在发布前选独立
-            # diagnostic 路径；旧正式代所有对象保持原样。"
+            # 上一版把条件写成 `verified is not True and forced`，等于把
+            # 关闭条件从"verified=False 就不许覆盖"改成了"只有 forced 才不许"——
+            # 而原始 D01 恰恰是 `verified=False, forced=False`。审核用真实
+            # 决策器+发布器复现：五个对象（媒体/verify/fullchain/done/journal）
+            # 全被替换，随后完成验证才拒绝。**返回失败无法撤销已经发生的覆盖。**
             #
-            # 所以触发条件是 **`forced`**（用户显式打开了某个强制开关），
-            # 不是"验证未通过"。区别很重要：
-            #   * `verified=False, forced=False` —— 例如 frame_order
-            #     采样点不足判 UNVERIFIED。这是**合法的正常发布**，
-            #     产物就是要进正式路径，只是报告里标未验证。
-            #   * `verified=False, forced=True` —— 用户明知某项 FAIL/UNVERIFIED
-            #     仍要出片。这时产物**不是**"这一代的正式成果"，而是
-            #     一份诊断件；拿它覆盖上一代已验证的成品是本末倒置。
+            # 现在无条件：只要本代不是 verified，就只走诊断路径。
+            # 这正是"先由冻结计划决定必需项、发布前确认满足"的直接推论。
             #
-            # 判断依据是 `publish_decision`，**不是事后的返回码**。
-            if (_dec.get("verified") is not True
-                    and bool(_dec.get("forced"))):
+            # 配套（R26-A01 / 指令 §1.1）：`publish_decision` 的 verified
+            # 已改成"**只要求必需项**"。可选项（如帧序采样不足判 UNVERIFIED）
+            # 不再让 verified=False，所以合法的"未验证但可发布"仍能正常发布，
+            # 不会因为这条无条件分叉而被误赶到诊断目录。
+            if _dec.get("verified") is not True:
                 _diag_parent = os.path.dirname(os.path.abspath(output_path))
                 _diag_root = os.path.join(_diag_parent,
                                           f".diagnostic-{_attempt_id}")
+                _diag_missing: List[str] = []
                 try:
                     os.makedirs(_diag_root, exist_ok=True)
                     _diag_media = os.path.join(
@@ -4856,8 +4857,42 @@ def main():
                                 _fc_pending[0],
                                 os.path.join(_diag_root,
                                              os.path.basename(_fc_pending[1])))
-                        except OSError:
-                            pass
+                        except OSError as _fe:
+                            # R26-A01：**不能吞**。必要条件搬不过去，
+                            # 这一代就是"不完整的诊断代"，不能报 89 让人
+                            # 以为拿到了一份完整产物。
+                            _diag_missing.append(
+                                "fullchain: %s" % _fe)
+                    # 诊断代自己的状态清单（审核要求：完整/不完整分开）
+                    _diag_state = {
+                        "schema": "diagnostic-generation/1",
+                        "attempt_id": _attempt_id,
+                        "complete": not _diag_missing,
+                        "missing": _diag_missing,
+                        "media": os.path.basename(output_path),
+                        "objects": (["media", "verify"]
+                                    + ([] if _diag_missing else ["fullchain"])),
+                        "reason": _ver_doc["diagnostic_reason"],
+                    }
+                    try:
+                        with open(os.path.join(_diag_root, "_diagnostic.json"),
+                                  "w", encoding="utf-8") as _fd2:
+                            _json_diag.dump(_diag_state, _fd2,
+                                            ensure_ascii=False, indent=2)
+                    except OSError as _se:
+                        _diag_missing.append("state: %s" % _se)
+                        _diag_state["complete"] = False
+                        _diag_state["missing"] = list(_diag_missing)
+                    if _diag_missing:
+                        logger.error(
+                            "STAGE7_DIAGNOSTIC_INCOMPLETE",
+                            "The diagnostic export is INCOMPLETE: a required "
+                            "sidecar could not be placed. Do not treat this "
+                            "directory as a full generation.",
+                            attempt_id=_attempt_id, diagnostic_root=_diag_root,
+                            missing=_diag_missing,
+                            blocked_by=_dec.get("blocked_by"))
+                        return 82
                     logger.error(
                         "STAGE7_DIAGNOSTIC_EXPORT",
                         "This generation was NOT verified; it was exported "
@@ -4865,7 +4900,8 @@ def main():
                         "was left untouched.",
                         attempt_id=_attempt_id, diagnostic_root=_diag_root,
                         blocked_by=_dec.get("blocked_by"),
-                        reasons=_dec.get("reasons"))
+                        reasons=_dec.get("reasons"),
+                        complete=True)
                     return 89
                 except OSError as _de2:
                     logger.error(
