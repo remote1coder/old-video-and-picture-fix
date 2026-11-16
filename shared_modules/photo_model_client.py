@@ -62,6 +62,8 @@ class ModelWorkerClient:
         self.gpu_id = int(gpu_id)
         self.startup_timeout = float(startup_timeout)
         self._proc: Optional[subprocess.Popen] = None
+        self._err_file = None
+        self._err_path = ""
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -72,12 +74,36 @@ class ModelWorkerClient:
             raise RuntimeError("client is closed")
         if self._proc is not None and self._proc.poll() is None:
             return self._proc
+        # **stderr 落文件，不能用 PIPE**：
+        #   * 挂 PIPE 不读 → 缓冲区（64 KiB）满了 worker 就阻塞在写上；
+        #   * 而且它继承了父进程的 stdout —— 父进程若用
+        #     `subprocess.run(capture_output=True)` 等"写端全关"，
+        #     worker 不退就永远等不完（实测：pytest 里直接 SIGTERM）。
+        #
+        # 落文件同时解决了诊断：崩溃时能读到尾部。
+        import tempfile as _tf
+        self._err_file = _tf.NamedTemporaryFile(
+            prefix="photo_worker_", suffix=".err", delete=False)
+        self._err_path = self._err_file.name
         self._proc = subprocess.Popen(
             [self.python, self.worker],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=self._err_file,
             text=True, encoding="utf-8", bufsize=1, shell=False)
         return self._proc
+
+    def _stderr_tail(self, n: int = 500) -> str:
+        """读 worker 的 stderr 尾部（诊断用）。"""
+        try:
+            self._err_file.flush()
+        except Exception:
+            pass
+        try:
+            with open(self._err_path, "r", encoding="utf-8",
+                      errors="replace") as f:
+                return f.read()[-n:]
+        except Exception:
+            return ""
 
     def close(self) -> None:
         self._closed = True
@@ -99,11 +125,21 @@ class ModelWorkerClient:
                     p.kill()
                 except Exception:
                     pass
-        for s in (p.stdin, p.stdout, p.stderr):
+        for _s in (p.stdin, p.stdout):
             try:
-                s.close()
+                _s.close()
             except Exception:
                 pass
+        try:
+            if self._err_file is not None:
+                self._err_file.close()
+        except Exception:
+            pass
+        try:
+            if self._err_path and os.path.exists(self._err_path):
+                os.remove(self._err_path)
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -121,11 +157,7 @@ class ModelWorkerClient:
                 p.stdin.flush()
             except Exception as exc:
                 # 进程已经死了：读出 stderr 尾巴再报错（没有它没法诊断）
-                tail = ""
-                try:
-                    tail = (p.stderr.read() or "")[-500:]
-                except Exception:
-                    pass
+                tail = self._stderr_tail()
                 self._proc = None
                 return {"ok": False,
                         "error": "worker stdin closed: %s | stderr=%s"
@@ -136,11 +168,7 @@ class ModelWorkerClient:
             except Exception as exc:
                 return {"ok": False, "error": "read failed: %s" % exc}
             if not line:
-                tail = ""
-                try:
-                    tail = (p.stderr.read() or "")[-500:]
-                except Exception:
-                    pass
+                tail = self._stderr_tail()
                 self._proc = None
                 return {"ok": False,
                         "error": "worker produced no response (crashed?) "

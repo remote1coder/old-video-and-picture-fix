@@ -1208,6 +1208,12 @@ def main():
     parser.add_argument("--log-dir", default="./logs")
     parser.add_argument("--temp-dir", default="./temp")
     parser.add_argument("--no-wsl-redirect", action="store_true")
+    # N27-05：执行模式。默认 file（逐 stage 子进程 + TIFF 交接），
+    # `inproc` 走内存链（S1–S5 同进程，S6 写最终候选）。
+    # 不给就沿用配置里的 `photo_chain_mode`。
+    parser.add_argument("--photo-chain-mode", default=None,
+                        choices=["file", "inproc"],
+                        help="file (default) or inproc (in-memory chain)")
 
     # FIX-P10-11: Replace --cleanup-intermediates and --no-cleanup
     # with --keep-intermediates per v7.32 §3.10.17
@@ -1311,6 +1317,9 @@ def main():
 
     # Build common CLI params
     cli_params = {}
+    # N27-05：执行模式（None 表示没指定 → 不写进 params，配置说了算）
+    if getattr(args, "photo_chain_mode", None):
+        cli_params["photo_chain_mode"] = str(args.photo_chain_mode)
     if args.output:
         _out = args.output
         # FIX-2026-10-22：单文件模式下 `--output` 若指向**已存在的目录**，
