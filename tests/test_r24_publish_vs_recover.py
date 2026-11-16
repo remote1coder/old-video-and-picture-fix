@@ -22,7 +22,7 @@ import json
 import multiprocessing as mp
 import os
 import sys
-from typing import Dict
+from typing import Dict, Optional
 
 import pytest
 
@@ -91,6 +91,13 @@ def _publish_worker(root, idx, barrier, q):
         media_size=len(media))
     arts.append(P.Artifact("marker", _mkst, out + ".done.json"))
 
+    # R25-11：**在 publish 之前**把这一代的期望摘要算好。
+    #
+    # 这是独立期望：它来自 staging 文件的字节（publish 是字节复制），
+    # 与 journal 无关。完成后通过 queue 交给测试进程 —— 于是
+    # "journal 说新代是什么"不再自动成为标准答案。
+    expected = {a.name: _sha(a.staging) for a in arts}
+
     try:
         barrier.wait(timeout=60)
     except Exception:
@@ -105,6 +112,8 @@ def _publish_worker(root, idx, barrier, q):
                         keep_backups=True)
         q.put({"role": "publish", "ok": bool(res.ok), "phase": res.phase,
                "failed_at": res.failed_at,
+               # 独立期望：publish 前从 staging 字节算的
+               "expected": expected,
                "errors": [str(e)[:160] for e in (res.errors or [])[:2]]})
     except Exception as exc:                     # pragma: no cover
         q.put({"role": "publish", "ok": False, "phase": "exception",
@@ -243,12 +252,29 @@ def _run_pair(root):
     return out
 
 
-def _assert_whole_generation(out: str, old_sha: Dict[str, str]) -> None:
+def _assert_whole_generation(out: str, old_sha: Dict[str, str],
+                            new_sha: Optional[Dict[str, str]] = None) -> None:
     """整代 oracle：必须是**完整旧代**或**完整新代**，不能混合。
 
     抽成独立函数是为了能被"自检"直接调用 —— 审核 O01 指出，
     R24 的判据里写了 `or True` 且算完不用，等于没有 oracle。
     没有 self-test 的 oracle 迟早会退化成装饰品。
+
+    ## R25-11 / R26-A02：新代期望**不能来自被测 journal**
+
+    原来 COMMITTED 分支的期望是 `new_expected`（从 journal.records 里读
+    `new_digest`）—— 于是"journal 说新代是什么，实际就得是什么"，
+    journal 自己成了标准答案。复核 O01 把 fullchain/marker 换成异代**并
+    同步改 journal 的摘要**，oracle 照样通过。
+
+    现在要求调用方传**测试在竞争前独立算好的** `new_sha`（就是
+    `_seed_interrupted_transaction()` 返回的 `cand_sha`：从 staging
+    文件按字节算的摘要，与 journal 无关）。
+
+    journal 仍然要读，但它只作为**被核对对象**：COMMITTED 时它记的
+    `new_digest` 必须与独立期望一致 —— 不一致说明 journal 与实际不符。
+
+    `new_sha` 缺省时，COMMITTED 分支**直接失败**（不许退回信 journal）。
     """
     final = {
         "media": _sha(out),
@@ -280,12 +306,21 @@ def _assert_whole_generation(out: str, old_sha: Dict[str, str]) -> None:
                              == final["media"])
 
     if phase == "COMMITTED":
+        assert new_sha is not None, (
+            "COMMITTED 的期望必须由测试**独立**提供（new_sha）；"
+            "不许从被测 journal 里读标准答案")
         assert bool(all(new_expected.values())), (
             "journal 是 COMMITTED，但它没有记录完整的新代摘要；"
             f"new_expected={new_expected}")
-        assert final == new_expected, (
-            "journal 说 COMMITTED，但目标不是**完整的**新代：\n"
-            f"  期望 {new_expected}\n  实际 {final}")
+        # ① 实际 == 独立期望（这是**唯一**的通过条件）
+        assert final == new_sha, (
+            "目标不是**测试预期的**完整新代：\n"
+            f"  期望(独立) {new_sha}\n  实际 {final}")
+        # ② journal 与实际一致（journal 是被核对对象，不是期望来源）
+        assert new_expected == new_sha, (
+            "journal 记录的 new_digest 与实际新代不符 —— journal 被篡改或"
+            "事务没有正确收尾：\n"
+            f"  journal {new_expected}\n  实际(独立) {new_sha}")
         assert media_self_consistent, (
             "verify 报告描述的不是落盘的媒体（混代）")
     else:
@@ -306,7 +341,14 @@ def test_publish_and_recover_never_leave_a_mixed_generation(tmp_path):
     # （原来的"判据 2/3"引用了 oracle 内部的局部变量 is_old，
     #  一旦触发就是 NameError 而不是 AssertionError ——
     #  O01 那种"注入混代看测试会不会红"的自检因此抓不到。）
-    _assert_whole_generation(out, old_sha)
+    # R25-11：期望来自 **publish 方在 publish 之前**从 staging 字节算的摘要，
+    # 不是从被测 journal 里读的 new_digest。
+    _exp = None
+    for _r in results:
+        if _r.get("role") == "publish" and _r.get("expected"):
+            _exp = _r["expected"]
+            break
+    _assert_whole_generation(out, old_sha, _exp)
 
     # 独立复核：最终必须有媒体与 marker（不采信进程自报）
     assert _sha(out) != "<absent>", "最终没有任何媒体"
@@ -322,12 +364,17 @@ def test_the_oracle_itself_rejects_a_mixed_generation(tmp_path):
     此反例证明测试门无效" —— 所以判据必须自己也被检一次。
     """
     root = str(tmp_path)
-    old_sha, _ = _seed_interrupted_transaction(root)
+    old_sha, _new_sha = _seed_interrupted_transaction(root)
     out = os.path.join(root, "clip_restored.mkv")
 
     # 先让现场收敛到一个合法终态
-    _run_pair(root)
-    _assert_whole_generation(out, old_sha)      # 合法状态不炸
+    _res = _run_pair(root)
+    _exp = None
+    for _r in _res:
+        if _r.get("role") == "publish" and _r.get("expected"):
+            _exp = _r["expected"]
+            break
+    _assert_whole_generation(out, old_sha, _exp)   # 合法状态不炸
 
     # 再把 fullchain 换成**异代内容**（不改 journal / marker）
     with open(out + ".fullchain.json", "w", encoding="utf-8") as f:
@@ -336,4 +383,51 @@ def test_the_oracle_itself_rejects_a_mixed_generation(tmp_path):
 
     import pytest as _pytest
     with _pytest.raises(AssertionError):
-        _assert_whole_generation(out, old_sha)
+        _assert_whole_generation(out, old_sha, _exp)
+
+
+def test_the_oracle_catches_joint_tampering(tmp_path):
+    """O01 的关键反例：**联合篡改**必须被抓。
+
+    复核原话："O01同时把fullchain/marker改为异代且同步改journal的新摘要，
+    oracle仍通过。这个实验只说明判据不独立。"
+
+    根因就是新代期望来自被测 journal。现在期望是 publish 方在发布前从
+    staging 字节算的，所以**即使把 journal 也改成一致的**，oracle 仍然
+    会拒绝 —— 因为实际文件不等于那份独立期望。
+    """
+    root = str(tmp_path)
+    old_sha, _ = _seed_interrupted_transaction(root)
+    out = os.path.join(root, "clip_restored.mkv")
+
+    res = _run_pair(root)
+    exp = None
+    for r in res:
+        if r.get("role") == "publish" and r.get("expected"):
+            exp = r["expected"]
+            break
+    _assert_whole_generation(out, old_sha, exp)     # 合法终态不炸
+
+    # ---- 联合篡改：换掉 fullchain，并把 journal 的摘要同步改成新的 ----
+    alien = json.dumps({"generation": "alien", "ok": True,
+                        "checks": {"frames": {"ok": True},
+                                   "duration": {"ok": True},
+                                   "not_black": {"ok": True}}}).encode()
+    with open(out + ".fullchain.json", "wb") as f:
+        f.write(alien)
+
+    import publish_journal as J
+    jp = out + ".journal.json"
+    doc = J.read_journal(jp)
+    for path, rec in (doc.get("records") or {}).items():
+        if path.endswith(".fullchain.json"):
+            rec["new_digest"] = _sha(path)
+            rec["backup_digest"] = _sha(path)
+    J.write_journal(jp, doc)
+
+    import pytest as _pytest
+    with _pytest.raises(AssertionError) as _ei:
+        _assert_whole_generation(out, old_sha, exp)
+    msg = str(_ei.value)
+    assert "独立" in msg or "完整新代" in msg, (
+        "oracle 应该因为'实际 != 独立期望'而拒绝，实际报的是：%s" % msg)
