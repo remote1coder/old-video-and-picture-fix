@@ -14,11 +14,13 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "shared_modules"))
-sys.path.insert(0, str(ROOT / "photo_restoration_pipeline" / "stages"))
 
 import gmic_stdio as G  # noqa: E402
 import media_io  # noqa: E402
-import stage1_preprocess as s1  # noqa: E402
+from conftest import load_stage  # noqa: E402
+
+# 与 test_r26_a10 同理：按路径加载，不插 sys.path
+s1 = load_stage("photo_restoration_pipeline", "stage1_preprocess")
 
 pytestmark = pytest.mark.skipif(not G.find_gmic(),
                                 reason="gmic executable not found")

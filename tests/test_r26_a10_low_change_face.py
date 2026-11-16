@@ -16,9 +16,12 @@ import tifffile
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "shared_modules"))
-sys.path.insert(0, str(ROOT / "photo_restoration_pipeline" / "stages"))
 
-import stage4_ai_face as s4  # noqa: E402
+from conftest import load_stage  # noqa: E402
+
+# 按绝对路径加载，**不插 sys.path** —— 两条链有同名模块，
+# 收集阶段插路径会让后面的测试拿到错的那一份。
+s4 = load_stage("photo_restoration_pipeline", "stage4_ai_face")
 
 
 class _Log:
