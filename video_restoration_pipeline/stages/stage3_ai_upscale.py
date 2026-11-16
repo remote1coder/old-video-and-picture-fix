@@ -92,11 +92,22 @@ def _resolve_ai_python(logger=None) -> Optional[str]:
 
 
 def gpu_fallback_allowed(params) -> bool:
-    """显存不足时是否允许自动降级（R23-13）。
+    """显存不足时是否允许自动降级。
 
-    关掉它意味着"宁可失败，也不要在 CPU 上悄悄跑几个小时"。
+    **R25-05/R09：缺省不授权。**
+
+    原来是 `_bool_param(..., True)` —— 于是 `gpu_fallback_allowed({})`
+    返回 True，一份**不含该键**的参数集就等于"允许降倍率/换后端"。
+    审核指出：默认放宽让"质量暗改"只需一个遗漏就能发生。
+
+    语义澄清：这个开关是"**允许在资源不足时改变质量**"的授权，
+    不是"允许尝试"的开关。没有它就该**等资源 / 缩并发 / 明确失败**，
+    而不是换一个更差的模型继续跑。
+
+    注意：`config.yaml` 里显式写 `gpu_memory_fallback: true` 的站点
+    仍然算用户授权（那是人为选择）；本条只改"**缺失**时的默认值"。
     """
-    return _bool_param((params or {}).get("gpu_memory_fallback"), True)
+    return _bool_param((params or {}).get("gpu_memory_fallback"), False)
 
 
 def _bool_param(value, default: bool) -> bool:

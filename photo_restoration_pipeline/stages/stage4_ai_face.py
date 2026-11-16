@@ -70,7 +70,7 @@ def _box_xywh_to_xyxy(box):
 
 def feather_blend(original_path: str, restored_path: str, output_path: str,
                   feather_width: int = 8, bit_depth: int = 8,
-                  face_boxes=None) -> bool:
+                  face_boxes=None, logger=None) -> bool:
     """Blend restored face region back into original image with feathering.
 
     Uses per-pixel absolute difference to detect modified regions,
@@ -117,6 +117,31 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
 
         from PIL import Image, ImageFilter
 
+        # R25-05/R07：**确实没有脸**时，在读任何图之前就交付原图。
+        #
+        # 语义区分（重要）：
+        #   * `face_boxes is None` —— 调用方**没提供**人脸信息（老接口、
+        #     或只做纯差异混合的调用）。保持原有行为：按差异算 mask，
+        #     不夹 ROI。生产的两处调用点都会显式传，所以这条不是生产路径。
+        #   * `face_boxes == []` —— **检测过，确实没有脸**。合法不适用：
+        #     原样交付，不能当成"修复失败"，也不能去读不存在的修复图。
+        if face_boxes is not None and not face_boxes:
+            try:
+                shutil.copyfile(original_path, output_path)
+            except OSError as _ce:
+                if logger:
+                    logger.error(
+                        "STAGE4_FACE_NOFACE_COPY_FAILED",
+                        "No faces were detected and the original could not "
+                        "be copied to the output path", error=str(_ce))
+                return False
+            if logger:
+                logger.info(
+                    "STAGE4_FACE_NOT_APPLICABLE",
+                    "No face boxes for this image; the original is delivered "
+                    "unchanged (this is 'not applicable', not a restored face)")
+            return True
+
         # ---- 2) 读修复图（模型输出恒为 8bit）----
         rest_img = Image.open(restored_path).convert("RGB")
         if _orig16 is not None:
@@ -153,18 +178,44 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
             mask = mask * _roi.astype(np.float32)
         mask_ratio = float(np.mean(mask))
 
-        # 一帧都没改：正确答案是**原图**，不是修复图。
-        # （旧实现在这里 copy 修复图，等于把整张 8bit 结果当成 16bit 交付。）
+        # 一帧都没改：分三种情况。
+        #   * `face_boxes is None`（调用方未提供人脸信息，按差异混合）
+        #     → 差异为零意味着**模型确实没改**，交付原图并算成功。
+        #   * `face_boxes` 非空（检测到了脸）→ mask 为空说明差异判据或
+        #     ROI 出了问题，交付原图但**报失败**（不能声称修复过）。
+        #   * `face_boxes == []` 已在读图前返回，不会到这里。
         if not mask.any():
-            shutil.copyfile(original_path, output_path)
-            return True
+            if face_boxes is None:
+                shutil.copyfile(original_path, output_path)
+                if logger:
+                    logger.info(
+                        "STAGE4_FACE_NO_CHANGE",
+                        "The model produced no change over the whole frame; "
+                        "the original is delivered unchanged")
+                return True
+            if logger:
+                logger.error(
+                    "STAGE4_FACE_MASK_EMPTY",
+                    "Faces were detected but the blend mask is empty; "
+                    "delivering the original and reporting failure instead "
+                    "of claiming the face was restored",
+                    faces=len(face_boxes or []))
+            try:
+                shutil.copyfile(original_path, output_path)
+            except OSError:
+                pass
+            return False
 
-        if mask_ratio > 0.95:
-            # 差一点全改：模型确实重写了整幅，保留修复结果并按目标位深写出
-            if bit_depth == 16:
-                return _save_uint16(rest8 * 257.0, output_path)
-            shutil.copyfile(restored_path, output_path)
-            return True
+        # R25-05/R08：**删掉 mask_ratio>0.95 的整图快捷路径**。
+        #
+        # 原来这里直接 `_save_uint16(rest8 * 257.0)` —— 把 8bit 修复图
+        # 当作整幅结果写出，ROI 外的 16bit 背景被压成 8bit 量级再抬回。
+        # 审核反例：100×100 uint16 原图值 10001、修复图 255、近全图 ROI，
+        # ROI 外 600 个通道样本全从 10001 变成 65535。
+        #
+        # 高覆盖本身不需要特殊路径：下面的正常混合在 mask≈1 时自然就是
+        # "几乎全用修复值"，而在 mask=0 处逐位保留原值。少一条分支，
+        # 就少一条绕过 16bit 混合的路。
 
         # ---- 4) 羽化 + 混合 ----
         mask_img = Image.fromarray((mask * 255).astype(np.uint8))
@@ -204,13 +255,29 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
             result = Image.fromarray(blended)
             result.save(output_path)
         return True
-    except Exception:
-        # 兜底必须是**原图**：写修复图等于偷偷降位深（8bit）且没有回执。
+    except Exception as _be:
+        # R25-05/R07：**兜底不能报成功**。
+        #
+        # 原来这里是"复制原图 + return True" —— 于是一次修复失败
+        # （修复图不存在、位深读不出来、写盘失败）在调用方看来是
+        # "人脸修复已完成"，只是结果碰巧和原图一样。保住原图是对的，
+        # 但那是**失败时的保全**，不是"修复成功"。
         try:
             shutil.copyfile(original_path, output_path)
-            return True
-        except Exception:
-            return False
+            if logger:
+                logger.warning(
+                    "STAGE4_FACE_BLEND_FAILED_KEPT_ORIGINAL",
+                "Face blending failed; the original was kept so nothing is "
+                "lost, but the face restoration did NOT complete",
+                error=str(_be))
+        except Exception as _ce:
+            if logger:
+                logger.error(
+                    "STAGE4_FACE_BLEND_FAILED_NO_FALLBACK",
+                "Face blending failed and the original could not be copied "
+                "either; no usable output was produced",
+                error=str(_be), copy_error=str(_ce))
+        return False
 
 
 def _save_uint16(arr16, output_path: str) -> bool:
