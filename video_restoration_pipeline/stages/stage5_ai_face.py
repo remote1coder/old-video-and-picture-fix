@@ -84,16 +84,37 @@ class StreamingDecoder:
     frame_idx / fps. Falls back to CFR estimation if ffprobe fails.
     """
 
-    def __init__(self, video_path: str, pix_fmt: str = "rgb24"):
+    def __init__(self, video_path: str, pix_fmt: str = "rgb24",
+                 width: int = 0, height: int = 0, fps: float = 0.0,
+                 frames_total: int = 0):
+        """Args:
+            video_path: 视频路径；**``"-"`` 表示从 stdin 读 y4m**
+                （R25-07 / N26-07：S4→S5 不落 step4 媒体时走这条）。
+            width/height/fps/frames_total: stdin 模式下**必须**由调用方给
+                —— 没有文件可 probe，猜尺寸等于把错误埋进像素里。
+        """
         self.video_path = video_path
         self.pix_fmt = pix_fmt
         self.bytes_per_frame: int = 0
-        self.width: int = 0
-        self.height: int = 0
-        self.fps: float = 25.0
-        self.frames_total: int = 0
+        self.width: int = int(width or 0)
+        self.height: int = int(height or 0)
+        self.fps: float = float(fps or 25.0)
+        self.frames_total: int = int(frames_total or 0)
         self._vfr_pts: List[float] = []  # FIX-R2: pre-read PTS list
-        self._probe()
+        # stdin 模式：没有容器可探测，几何与时长由调用方声明
+        self._from_stdin = (str(video_path) == "-")
+        if self._from_stdin:
+            if not (self.width and self.height):
+                raise ValueError(
+                    "StreamingDecoder('-') needs width/height from the "
+                    "caller: there is no container to probe, and guessing "
+                    "the geometry would corrupt every frame downstream")
+        else:
+            self._probe()
+        if self.pix_fmt == "rgb48":
+            self.bytes_per_frame = self.width * self.height * 6
+        else:
+            self.bytes_per_frame = self.width * self.height * 3
         self._proc: Optional[subprocess.Popen] = None
 
     def _probe(self) -> None:
@@ -136,12 +157,22 @@ class StreamingDecoder:
             self.bytes_per_frame = self.width * self.height * 3
 
     def __enter__(self):
-        cmd = [
-            "ffmpeg", "-hide_banner", "-v", "error",
-            "-i", self.video_path,
-            "-pix_fmt", self.pix_fmt,
-            "-f", "rawvideo", "-"
-        ]
+        if self._from_stdin:
+            # N26-07：S4→S5 走管道时，输入是上游 stage3 的 y4m。
+            # `-f yuv4mpegpipe` 必须在 `-i -` **之前**（放后面无效）。
+            cmd = [
+                "ffmpeg", "-hide_banner", "-v", "error",
+                "-f", "yuv4mpegpipe", "-i", "-",
+                "-pix_fmt", self.pix_fmt,
+                "-f", "rawvideo", "-"
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-hide_banner", "-v", "error",
+                "-i", self.video_path,
+                "-pix_fmt", self.pix_fmt,
+                "-f", "rawvideo", "-"
+            ]
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
         return self
