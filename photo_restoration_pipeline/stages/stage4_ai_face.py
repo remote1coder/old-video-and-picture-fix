@@ -160,30 +160,55 @@ def feather_blend(original_path: str, restored_path: str, output_path: str,
         # ---- 3) mask：一律在 8bit 量纲（0..255）上算，与位深无关 ----
         diff = np.mean(np.abs(rest8 - orig_arr), axis=2)
         threshold = 255.0 * 0.05
-        mask = (diff > threshold).astype(np.float32)
-        # ---- ROI 硬边界：差异掩模必须落在人脸框之内 ----
-        # 只靠"差异 > 5%"是不够的：GFPGAN 的 `face_restore_upscale=2`
-        # 会把**整幅**放大后再被这里缩回 1×，重采样的振铃会让框外零星像素
-        # 越过阈值（实测 2502 个、max 196/65535）。给它一个人脸框的硬约束，
-        # "ROI 外逐位不变"就从"实测成立"变成**结构上成立**。
+        # ==== R26-A10：mask 由**已确认的人脸区域**决定，不由差异阈值决定 ====
+        #
+        # 原来 `mask = (diff > 12.75).astype(float32)` —— 用"变化够不够大"
+        # 判"模型有没有干活"。复核指出：**有效但细微的修复可能没有任何
+        # 像素越过阈值**（例如只去掉一点点噪点/轻微锐化），于是
+        # "有脸但 mask 为空" 就把一次成功的修复判成失败。
+        #
+        # 现在分两支：
+        #   * **给了人脸框** → mask = ROI（框 + 3σ 羽化 pad），框内**一律**
+        #     取修复值。差异只用于**报告**（`mean_abs_diff`），不参与判定。
+        #     模型输出若与原图相同，框内就是原值 —— 无害，也不假报成功。
+        #   * **没给人脸框**（纯差异混合的调用）→ 保持旧行为。
         _roi = None
         if face_boxes:
-            _roi = np.zeros(mask.shape, dtype=bool)
+            _roi = np.zeros(diff.shape, dtype=bool)
             # 留 3σ：高斯羽化的支撑约 3×radius，边界要留够才不会切到软边
             _pad = max(1, 3 * int(feather_width))
             for _b in face_boxes:
                 _x1, _y1, _x2, _y2 = _box_xywh_to_xyxy(_b)
                 _roi[max(0, int(_y1) - _pad):int(_y2) + _pad,
                      max(0, int(_x1) - _pad):int(_x2) + _pad] = True
-            mask = mask * _roi.astype(np.float32)
-        mask_ratio = float(np.mean(mask))
+            if not _roi.any():
+                # 有脸**却**算出空 ROI：说明框坐标全在画面外。
+                # 这不是"低变化"，是真错误 —— 交付原图并报失败。
+                if logger:
+                    logger.error(
+                        "STAGE4_FACE_ROI_OUTSIDE_FRAME",
+                        "face boxes were given but none of them intersect "
+                        "the image; refusing to blend nothing and call it "
+                        "a restored face",
+                        boxes=len(face_boxes or []),
+                        image=f"{diff.shape[1]}x{diff.shape[0]}")
+                try:
+                    shutil.copyfile(original_path, output_path)
+                except OSError:
+                    pass
+                return False
+            mask = _roi.astype(np.float32)
+            _mean_abs_diff = (float(np.mean(diff[_roi]))
+                              if _roi.any() else 0.0)
+        else:
+            mask = (diff > threshold).astype(np.float32)
+            _mean_abs_diff = float(np.mean(diff)) if diff.size else 0.0
 
-        # 一帧都没改：分三种情况。
+        # 一帧都没改：分两种。
         #   * `face_boxes is None`（调用方未提供人脸信息，按差异混合）
         #     → 差异为零意味着**模型确实没改**，交付原图并算成功。
-        #   * `face_boxes` 非空（检测到了脸）→ mask 为空说明差异判据或
-        #     ROI 出了问题，交付原图但**报失败**（不能声称修复过）。
-        #   * `face_boxes == []` 已在读图前返回，不会到这里。
+        #   * `face_boxes` 非空 → mask 现在等于 ROI，**不可能为空**
+        #     （空 ROI 已在上面按"框在画外"拒绝）。
         if not mask.any():
             if face_boxes is None:
                 shutil.copyfile(original_path, output_path)
