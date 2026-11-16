@@ -82,7 +82,7 @@ def _build_and_publish(root, job, media=b"GENERATION-BYTES", attempt="att1"):
                                      "required": True},
                    },
                    "publish_decision": {"publish": True, "verified": True}}))
-    _w(str(stage / "fullchain.json"), json.dumps({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
+    _w(str(stage / "fullchain.json"), json.dumps({"ok": True, "attempt_id": attempt, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
     arts = [
         P.Artifact("media", str(stage / "media.bin"), out),
         P.Artifact("verify", str(stage / "verify.json"), out + ".verify.json"),

@@ -91,7 +91,7 @@ def _gen(tmp_path, *, with_reports=True, with_journal=True,
                                  "blocked_by": [], "forced": False,
                                  "reasons": {}},
         }))
-        _write(final + ".fullchain.json", json.dumps({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
+        _write(final + ".fullchain.json", json.dumps({"ok": True, "attempt_id": "att1", "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
     if with_journal:
         # R22-A01：journal 的 targets 必须覆盖**同一代**的全部对象。
         # 真实 publisher 就是 `sorted(set(finals))`；旧夹具只写媒体，

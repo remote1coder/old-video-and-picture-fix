@@ -96,7 +96,7 @@ def _publish_generation(tmp_path, job, *, media=b"NEW-MEDIA-BYTES",
                    },
                    "publish_decision": {"publish": True, "verified": True}}))
     _w(os.path.join(stage, "fullchain.json"),
-       json.dumps({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
+       json.dumps({"ok": True, "attempt_id": "att1", "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}))
 
     arts = [
         P.Artifact("media", os.path.join(stage, "media.bin"), out),

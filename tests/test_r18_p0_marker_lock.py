@@ -144,7 +144,7 @@ def _publish_full(tmp_path, media_bytes=b"GEN-A", input_bytes=b"src"):
         }, f)
     with open(os.path.join(stage, "fullchain.json"), "w",
               encoding="utf-8") as f:
-        json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
+        json.dump({"ok": True, "attempt_id": "att1", "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
 
     arts = [
         _P.Artifact("media", os.path.join(stage, "media.bin"), out),

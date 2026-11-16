@@ -2543,6 +2543,13 @@ def _fullchain_report_problems(doc: Dict[str, Any], *,
     if _att:
         _ok_att = {x for x in (str(execution_attempt or ""),
                                str(publication_attempt or "")) if x}
+        # C11 / R24-01：回拷时发布编号是"执行编号 + -wsl"。fullchain 报告
+        # 是**执行时**写的（记执行编号），所以当调用方只拿得到发布编号时
+        # （`params` 里没有 attempt），也要接受 `att1-wsl` 对应的 `att1`。
+        # 这不是放宽：关系由 `receipts.build_execution_binding()` 定义，
+        # 只认那一个后缀，别的后缀仍是外来代。
+        if _ok_att and any(x.endswith("-wsl") for x in _ok_att):
+            _ok_att |= {x[:-4] for x in list(_ok_att) if x.endswith("-wsl")}
         if _ok_att and _att not in _ok_att:
             probs.append(
                 f"fullchain report belongs to attempt {_att!r}, which is "

@@ -78,7 +78,7 @@ def _publish_full(tmp_path, *, media=b"GENUINE", attempt="att1",
         }, f)
     with open(os.path.join(stage, "fullchain.json"), "w",
               encoding="utf-8") as f:
-        json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
+        json.dump({"ok": True, "attempt_id": attempt, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
 
     arts = [
         _P.Artifact("media", os.path.join(stage, "media.bin"), out),
@@ -283,7 +283,7 @@ def test_two_attempts_do_not_corrupt_the_marker(tmp_path):
             }, f)
         with open(os.path.join(stage, "fullchain.json"), "w",
                   encoding="utf-8") as f:
-            json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
+            json.dump({"ok": True, "attempt_id": attempt, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
         arts = [
             _P.Artifact("media", os.path.join(stage, "media.bin"), out),
             _P.Artifact("verify", os.path.join(stage, "verify.json"),

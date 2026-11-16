@@ -537,7 +537,7 @@ def _write_receipt(final, src):
                         "digest": "0" * 64,
                         "input": vmain.build_input_identity(str(src))}}, f)
     with open(str(final) + ".fullchain.json", "w", encoding="utf-8") as f:
-        _json.dump({"ok": True, "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
+        _json.dump({"ok": True, "attempt_id": "att1", "checks": {"frames": {"ok": True}, "duration": {"ok": True}, "not_black": {"ok": True}}}, f)
     import publish_journal as _pj
     # R23-B01：journal 必须与 marker 绑定同一个 attempt（生产 publisher 会写）
     _pj.write_journal(str(final) + ".journal.json",

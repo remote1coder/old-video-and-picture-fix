@@ -107,7 +107,8 @@ def test_dual_hum_still_works_with_custom_harmonics():
 # ------------------------------------------------ 3. 行为：GPU 回退开关
 
 @pytest.mark.parametrize("value,allowed", [
-    (None, True), (True, True), ("true", True), (1, True),
+    # R25-05：缺省**不再**授权降质 —— None 从 True 改为 False
+    (None, False), (True, True), ("true", True), (1, True),
     (False, False), ("false", False), (0, False), ("no", False),
 ])
 def test_gpu_fallback_flag_is_parsed_strictly(value, allowed):

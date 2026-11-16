@@ -4812,17 +4812,23 @@ def main():
                 "measured on the attempt's private candidate before publish; "
                 "the published file is the same bytes")
 
-            # ==== R25-01 / D01：未验证的一代**不许覆盖正式代** ====
+            # ==== R25-01 / D01：**强制导出**不许覆盖正式代 ====
             #
-            # 原来 `verified=False` 只影响返回码，产物照样通过 publisher
-            # 覆盖正式路径 —— 于是"一次诊断导出"会把上一代已验证的成品
-            # 换成未验证的。而"未验证"恰恰意味着**不知道它好不好**，
-            # 拿它替换已知良好的旧代是本末倒置。
+            # 审核原文："验证失败/未知的**强制导出**在发布前选独立
+            # diagnostic 路径；旧正式代所有对象保持原样。"
             #
-            # 做法：在 publisher 之前分叉。未验证 → 整代写到
-            # `<输出目录>/.diagnostic-<attempt>/`，正式路径一个字节不动；
-            # 判断依据是 `publish_decision.verified`，**不是事后的返回码**。
-            if _dec.get("verified") is not True:
+            # 所以触发条件是 **`forced`**（用户显式打开了某个强制开关），
+            # 不是"验证未通过"。区别很重要：
+            #   * `verified=False, forced=False` —— 例如 frame_order
+            #     采样点不足判 UNVERIFIED。这是**合法的正常发布**，
+            #     产物就是要进正式路径，只是报告里标未验证。
+            #   * `verified=False, forced=True` —— 用户明知某项 FAIL/UNVERIFIED
+            #     仍要出片。这时产物**不是**"这一代的正式成果"，而是
+            #     一份诊断件；拿它覆盖上一代已验证的成品是本末倒置。
+            #
+            # 判断依据是 `publish_decision`，**不是事后的返回码**。
+            if (_dec.get("verified") is not True
+                    and bool(_dec.get("forced"))):
                 _diag_parent = os.path.dirname(os.path.abspath(output_path))
                 _diag_root = os.path.join(_diag_parent,
                                           f".diagnostic-{_attempt_id}")
