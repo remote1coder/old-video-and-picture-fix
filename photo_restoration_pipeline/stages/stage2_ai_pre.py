@@ -430,3 +430,99 @@ if __name__ == "__main__":
     if rc is None:
         rc = 86
     sys.exit(rc)
+
+
+# ---------------------------------------------------------------- 内存快路径
+def correct_channels_bytes(data: bytes, params: dict, *,
+                           degraded_channels=None,
+                           logger=None) -> dict:
+    """S2 的**内存入口**：PNG 字节 → 校正后 PNG 字节。
+
+    与 `run_stage2_ai_pre()` 的分工：那条走文件 + sidecar + 跳过判定；
+    本函数只做"数组变换"这一段，退化信息由**调用方**给出
+    （来自 stage1 的 `channel_meta.json` 或 `detect_channel_degradation()`）。
+
+    Args:
+        degraded_channels: 退化通道列表。两种历史结构都接受
+            （`{"channel": 0, ...}` 或裸整数），与 `run_stage2_ai_pre()`
+            的规范化逻辑一致。给 `None` 或空 → **原样返回**（没有退化）。
+
+    Returns:
+        ``{"ok", "png", "changed", "corrected_channels", "warnings",
+        "error", "width", "height"}``。
+    """
+    import numpy as _np
+    out = {"ok": False, "png": b"", "changed": False,
+           "corrected_channels": [], "warnings": [], "error": "",
+           "width": 0, "height": 0}
+    try:
+        from media_io import read_png_bytes as _rp, encode_png as _enc
+    except Exception as exc:
+        out["error"] = "cannot import media_io: %s" % exc
+        return out
+    try:
+        arr = _rp(data)
+    except Exception as exc:
+        out["error"] = "input is not a decodable PNG: %s" % exc
+        return out
+    if arr.dtype != _np.uint16 or arr.ndim != 3 or arr.shape[2] != 3:
+        out["error"] = ("expects RGB16 PNG; got %r %s"
+                        % (arr.shape, arr.dtype))
+        return out
+
+    _dcs = degraded_channels or []
+    if not _dcs:
+        # 没有退化 → 原样返回（**不是失败**：跳过是合法结果）
+        out.update({"ok": True, "png": data, "changed": False,
+                    "width": int(arr.shape[1]), "height": int(arr.shape[0])})
+        return out
+
+    formula = params.get("channel_correction_formula", "iec61966-2-1")
+    if formula != "iec61966-2-1":
+        # 与 file 模式一致：非 IEC 公式是参数错误，不静默退回 pow(2.2)
+        out["error"] = ("unsupported channel_correction_formula=%r; only "
+                        "'iec61966-2-1' is allowed" % (formula,))
+        return out
+
+    linear = _sRGB_to_linear(arr.astype(_np.float32) / 65535.0)
+    means = [float(linear[:, :, c].mean()) for c in range(3)]
+    stds = [float(linear[:, :, c].std()) for c in range(3)]
+    ref_idx = int(_np.argsort(means)[1])
+    ref_mean, ref_std = means[ref_idx], stds[ref_idx]
+    ref_ch = linear[:, :, ref_idx]
+
+    corrected = linear.copy()
+    for entry in _dcs:
+        raw = entry.get("channel") if isinstance(entry, dict) else entry
+        try:
+            c = int(raw)
+        except (TypeError, ValueError):
+            out["warnings"].append(
+                "skipped unrecognised channel descriptor: %r" % (entry,))
+            continue
+        if not 0 <= c < 3:
+            out["warnings"].append("skipped out-of-range channel %d" % c)
+            continue
+        if c == ref_idx:
+            continue
+        corrected[:, :, c] = correct_channel(
+            linear[:, :, c], params, ref_ch, ref_mean, ref_std)
+        out["corrected_channels"].append(c)
+
+    srgb = _linear_to_sRGB(_np.clip(corrected, 0.0, 1.0))
+    out16 = _np.clip(_np.rint(srgb * 65535.0), 0, 65535).astype(_np.uint16)
+    png = _enc(out16)
+
+    # 自己读回来核一遍（防止编码器/数组形状漂移）
+    try:
+        back = _rp(png)
+    except Exception as exc:
+        out["error"] = "produced PNG cannot be decoded: %s" % exc
+        return out
+    if back.shape != arr.shape or back.dtype != _np.uint16:
+        out["error"] = ("representation drifted: %r %s"
+                        % (back.shape, back.dtype))
+        return out
+    out.update({"ok": True, "png": png, "changed": True,
+                "width": int(arr.shape[1]), "height": int(arr.shape[0])})
+    return out
