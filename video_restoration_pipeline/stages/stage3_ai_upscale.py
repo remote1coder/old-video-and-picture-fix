@@ -1001,6 +1001,11 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 帧率必须用 `-framerate`（rawvideo 输入的专用选项）。
     # 实测用 `-r 25` 放在 -i 之前，输出被写成 48.52s（≈6.18fps）而不是
     # 300/25=12.0s —— 时间戳整个错掉。输出侧再加一个 `-r` 兜底。
+    # R26-A04 / N27-04：**管道模式** —— 成品写到 stdout 而不是文件。
+    # 这条路径会同时失去四样核对能力，逐项在下面注明如何降级。
+    # 定义位置必须在 `enc_cmd` 构造**之前**（否则 UnboundLocalError）。
+    _stdout_mode = (str(output_mkv) == "-")
+
     _enc_head = ["ffmpeg", "-hide_banner", "-v", "error", "-y",
                  "-f", "rawvideo", "-vcodec", "rawvideo",
                  "-pix_fmt", "rgb48le", "-s", f"{out_w}x{out_h}",
@@ -1110,9 +1115,6 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 失败原因在这里累积，**收尾统一交给下面的 finally**。
     # 不在 except 里直接 return：那样会绕过公共清理路径（见下方注释）。
     _failed = None
-    # R26-A04 / N27-04：**管道模式** —— 成品写到 stdout 而不是文件。
-    # 这条路径会同时失去四样核对能力，逐项在下面注明如何降级。
-    _stdout_mode = (str(output_mkv) == "-")
     # R26-A04：tap 进程与它的摘要路径要在 try 之外可见 —— 收尾要核它的 rc。
     tap = None
     # 放在 `output_mkv` 旁边而不是 tmpd 里：`_two_pass_check` 在
