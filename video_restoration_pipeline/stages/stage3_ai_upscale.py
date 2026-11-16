@@ -1092,7 +1092,11 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 颜色标签必须与主流程 PNG 路线一致（COL-04），否则中间产物不带
     # colorspace 标签，下游 stage7 会按自己的猜测补标签 → 可能错标。
     enc_cmd += list(color_opts or [])
-    enc_cmd += ["-an", str(output_mkv)]
+    if _stdout_mode:
+        # 管道模式：Matroska 到 stdout（`-f` 必须在 `-` 之前）
+        enc_cmd += ["-an", "-f", "matroska", "-"]
+    else:
+        enc_cmd += ["-an", str(output_mkv)]
 
     dec = ai = enc = None
     # stderr 一律落临时文件：管道 stdout 已经移交给下游进程，
@@ -1106,6 +1110,9 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     # 失败原因在这里累积，**收尾统一交给下面的 finally**。
     # 不在 except 里直接 return：那样会绕过公共清理路径（见下方注释）。
     _failed = None
+    # R26-A04 / N27-04：**管道模式** —— 成品写到 stdout 而不是文件。
+    # 这条路径会同时失去四样核对能力，逐项在下面注明如何降级。
+    _stdout_mode = (str(output_mkv) == "-")
     # R26-A04：tap 进程与它的摘要路径要在 try 之外可见 —— 收尾要核它的 rc。
     tap = None
     # 放在 `output_mkv` 旁边而不是 tmpd 里：`_two_pass_check` 在
@@ -1187,8 +1194,17 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
             #   * 编码器边跑边写 output_mkv，卡住就不长了（真进展）；
             #   * 素材再长、机器再慢，只要还在推进就永不超时。
             # 参照 systemd WatchdogSec：管的是**两次心跳的间隔**，不是总时长。
-            _hw = (lambda: (os.path.getsize(output_mkv)
-                            if os.path.exists(output_mkv) else 0))
+            if _stdout_mode:
+                # 降级 ①：没有成品文件可看大小。用 AI 侧 stderr 文件的
+                # 增长当"还在推进"的信号 —— 它不是"产出增长"，只是
+                # "进程还在动"，所以语义更弱（见 docstring 的说明）。
+                _ai_err_hb = err_paths.get("ai", "")
+                _hw = (lambda: (os.path.getsize(_ai_err_hb)
+                                if _ai_err_hb and os.path.exists(_ai_err_hb)
+                                else 0))
+            else:
+                _hw = (lambda: (os.path.getsize(output_mkv)
+                                if os.path.exists(output_mkv) else 0))
             if _cg_mod is not None and hasattr(_cg_mod, "wait_with_heartbeat"):
                 _cg_mod.wait_with_heartbeat(
                     [p for p in (src, dec, ai, enc) if p is not None],
@@ -1300,7 +1316,10 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                        f"| dec_err={dec_txt[-200:]} "
                        f"| enc_err={enc_txt[-200:]} "
                        f"| script_kept_at={tmpd}"), ai_frames
-    if not os.path.exists(str(output_mkv)):
+    # 降级 ②：管道模式没有文件可查"出片了没"。
+    # 判据退化成"编码器 rc==0"（上面已经检查过），**不能**再声称
+    # "产出了可读的成品"。
+    if not _stdout_mode and not os.path.exists(str(output_mkv)):
         return False, "encoder produced no output", ai_frames
 
     # ---- 帧数必须以**编码器落盘的事实**为准，不能只信 AI 自报 ----
@@ -1309,16 +1328,28 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     #   ② 即便打印，"AI 写了 N 帧"也不等于"编码器写进了 N 帧"——
     #      管道中间丢帧是真实故障形态，两边都数才能发现。
     enc_frames = 0
-    try:
-        enc_frames = int(_count_video_frames(str(output_mkv)) or 0)
-    except Exception:
-        enc_frames = 0
-    if ai_frames and enc_frames and ai_frames != enc_frames:
-        return False, (f"frame count mismatch across the boundary: AI wrote "
-                       f"{ai_frames} frames, the encoder wrote {enc_frames} "
-                       f"— frames were lost or duplicated in the pipe"), \
-            enc_frames
-    frames = enc_frames or ai_frames
+    if _stdout_mode:
+        # 降级 ③：没有成品文件可数帧。只能用 AI 自报的 `FRAMES=`，
+        # 并明确"未落盘核对" —— 这是**能力缺口**，不能说成"已核对"。
+        frames = ai_frames
+        if logger:
+            logger.warning(
+                "STAGE3_STDOUT_FRAMES_UNPROVEN",
+                "the stream wrote Matroska to stdout, so the encoded frame "
+                "count could NOT be re-read from disk; this generation's "
+                "frame count rests on the AI's self-report only",
+                ai_frames=ai_frames)
+    else:
+        try:
+            enc_frames = int(_count_video_frames(str(output_mkv)) or 0)
+        except Exception:
+            enc_frames = 0
+        if ai_frames and enc_frames and ai_frames != enc_frames:
+            return False, (f"frame count mismatch across the boundary: AI wrote "
+                           f"{ai_frames} frames, the encoder wrote {enc_frames} "
+                           f"— frames were lost or duplicated in the pipe"), \
+                enc_frames
+        frames = enc_frames or ai_frames
 
     # 成功：清掉临时脚本与 stderr 文件。失败会提前 return，
     # 那时**保留** tmpd 以便排查（项目约定：失败必须留证据）。
@@ -1446,7 +1477,14 @@ def _write_stream_frame_contract(*, output_mkv, out_w, out_h, requested_fmt,
     """
     from frame_contract import (build_contract, write_contract,
                                 contract_problems)
-    probed = _probe_output_video(str(output_mkv))
+    # R26-A04 / N27-04 降级 ④：**管道模式没有成品可 probe**。
+    # 合同里的 delivery 段会因此 `pix_fmt_proven=False`、
+    # `frames_digest_proven=False` —— 这是如实降级，不是省掉检查。
+    _to_stdout = (str(output_mkv) == "-")
+    if _to_stdout:
+        probed = {}
+    else:
+        probed = _probe_output_video(str(output_mkv))
     pix_fmt = str(probed.get("pix_fmt") or "")
     width = int(probed.get("width") or 0) or int(out_w)
     height = int(probed.get("height") or 0) or int(out_h)
@@ -1506,6 +1544,11 @@ def _write_stream_frame_contract(*, output_mkv, out_w, out_h, requested_fmt,
 
     # 把自己知道的缺口写进合同（而不是只留在日志里）
     gaps = []
+    if _to_stdout:
+        gaps.append(
+            "delivery was written to stdout (pipe mode): the encoded "
+            "container could not be probed, so format/geometry/frame-count "
+            "of the delivered file are NOT verified by this contract")
     # 交付边界的逐帧摘要当前**不计算**（要在编码后读回成品，成本另计）。
     # 这是设计事实，写进 gaps 让读者知道"这条边界没有摘要"，
     # 而不是假装它有。
