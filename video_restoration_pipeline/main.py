@@ -3526,6 +3526,55 @@ def process_job(job: Dict[str, Any], config: Dict[str, Any],
     params = merge_params(job, config, cli_overrides, _pre_log)
     params["output_path"] = job.get("output_path", "")
 
+    # ==== R25-08 / N26-05：**生产里真的建一个资源协调器** ====
+    #
+    # 复核指出：原来只有"调用方注入 `_governor`"这一条路，而生产树里
+    # **没有任何地方创建它** —— 所以 `run_stage` 的准入闸门在生产上
+    # 从未生效，只有测试能触发。
+    #
+    # 这里按 §2.3 的口径建：预算 = 可用容量 × 目标比例，且**探测失败
+    # 就不建**（"不知道余量"不能当成"余量充足"，也不能当成"没余量"）。
+    # 调用方已经注入时不覆盖 —— 编排层可以贴自己的预算。
+    if not params.get("_governor"):
+        try:
+            from governor import ResourceGovernor as _RG
+            from governor import observe_capacity as _obs_cap
+            from resource_limits import resolve as _rl_resolve
+            _rl = _rl_resolve(params, config) or {}
+            _frac = float(_rl.get("max_fraction") or 0.80)
+            _cap = _obs_cap() or {}
+            _ram_avail = _cap.get("ram_bytes")
+            if _cap.get("ram_known") and _ram_avail:
+                # 只取一部分作为**本 job 的执行组预算**：整机目标不是
+                # "一个 job 可以吃满"，并发/其他软件也要留位置。
+                _ram_budget = max(1, int(int(_ram_avail) * _frac * 0.25))
+                params["_governor"] = _RG(
+                    _ram_budget, 0, name="job:%s" % job_id)
+                # 单个 stage 的"最小可前进"额度：取预算的 1/8。
+                # 给 0 会让 reserve(0,0) 变成空操作，闸门形同不存在。
+                params["_governor_stage_ram"] = max(
+                    1, _ram_budget // 8)
+                params["_governor_stage_vram"] = 0
+                params["_governor_wait_s"] = 30.0
+                _pre_log.info(
+                    "RESOURCE_GOVERNOR_READY",
+                    "built a per-job resource governor for the admission gate",
+                    ram_budget=_ram_budget, max_fraction=_frac,
+                    ram_available=int(_ram_avail))
+            else:
+                # 探测不到 ≠ 资源充足：不建 governor，闸门自然跳过，
+                # 但日志要写明"这一代没有资源准入"。
+                _pre_log.warning(
+                    "RESOURCE_GOVERNOR_UNKNOWN",
+                    "available memory could not be probed; the admission "
+                    "gate is NOT active for this job (unknown is not "
+                    "treated as plenty)", capacity=_cap)
+        except Exception as _ge:
+            _pre_log.warning(
+                "RESOURCE_GOVERNOR_FAILED",
+                "could not build the resource governor; the admission gate "
+                "is NOT active for this job", error=str(_ge))
+
     # ---- R20-A03：给本次执行一个**可核对的 attempt 标识** ----
     # 审核：融合回执"按 job+stem glob、字典序最后一个"决定 stage4 是否完成，
     # 于是上一轮残留的回执会让本轮误判。修法是让每个回执带 attempt，

@@ -118,6 +118,18 @@ class LeasePool:
         self._cond = threading.Condition(self._lock)
         self._closed = False
         self._slots: List[Optional[FrameLease]] = [None] * self.capacity
+        # R25-08 / PA05：**预分配**槽位缓冲区。
+        #
+        # 原来 `_issue()` 每次 `bytearray(self.slot_bytes)` 新建一块 ——
+        # 借还四次，如果消费者继续持有旧 buffer，内存里**真的有 4 块**，
+        # 而账目 `live=0, bytes_live=0, balanced=True` 一点异常都看不出来。
+        # 复核就是这么打穿的：容量 1×1024 的池保留了 4096 字节。
+        #
+        # 预分配后，物理上限就是 `capacity * slot_bytes`，与账目一致：
+        # 归还即回收，下一次借到的是**同一块**（内容会被覆盖，
+        # 这正是"有界槽位"的语义 —— 消费者不能再访问已归还的槽）。
+        self._buffers: List[bytearray] = [
+            bytearray(self.slot_bytes) for _ in range(self.capacity)]
         #: 每个 slot 见过的最大 seq（防旧帧覆盖）
         self._last_seq: List[int] = [-1] * self.capacity
         self._live: Dict[str, FrameLease] = {}
@@ -179,7 +191,7 @@ class LeasePool:
         lease = FrameLease(
             lease_id=uuid.uuid4().hex[:16], slot=slot, seq=seq, owner=str(owner),
             bytes=self.slot_bytes, acquired_at=time.monotonic(), ttl=ttl,
-            buffer=bytearray(self.slot_bytes), meta=dict(meta or {}))
+            buffer=self._buffers[slot], meta=dict(meta or {}))
         self._slots[slot] = lease
         self._last_seq[slot] = seq
         self._live[lease.lease_id] = lease
