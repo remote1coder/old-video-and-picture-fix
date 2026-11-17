@@ -86,7 +86,7 @@ class StreamingDecoder:
 
     def __init__(self, video_path: str, pix_fmt: str = "rgb24",
                  width: int = 0, height: int = 0, fps: float = 0.0,
-                 frames_total: int = 0):
+                 frames_total: int = 0, in_format: str = ""):
         """Args:
             video_path: 视频路径；**``"-"`` 表示从 stdin 读 y4m**
                 （R25-07 / N26-07：S4→S5 不落 step4 媒体时走这条）。
@@ -103,6 +103,9 @@ class StreamingDecoder:
         self._vfr_pts: List[float] = []  # FIX-R2: pre-read PTS list
         # stdin 模式：没有容器可探测，几何与时长由调用方声明
         self._from_stdin = (str(video_path) == "-")
+        # 管道模式下 stdin 没法探测格式，必须由调用方声明。
+        # 编排层用的是 Matroska（ffv1）—— 与 stage3 的 stdout 一致。
+        self._in_format = str(in_format or "yuv4mpegpipe")
         if self._from_stdin:
             if not (self.width and self.height):
                 raise ValueError(
@@ -162,7 +165,7 @@ class StreamingDecoder:
             # `-f yuv4mpegpipe` 必须在 `-i -` **之前**（放后面无效）。
             cmd = [
                 "ffmpeg", "-hide_banner", "-v", "error",
-                "-f", "yuv4mpegpipe", "-i", "-",
+                "-f", self._in_format, "-i", "-",
                 "-pix_fmt", self.pix_fmt,
                 "-f", "rawvideo", "-"
             ]
@@ -1756,7 +1759,9 @@ def _run_streaming_face_restore(input_source: str, output_path: str,
             "-",
             width=int(params.get("stream_width") or 0),
             height=int(params.get("stream_height") or 0),
-            fps=float(params.get("stream_fps") or 0))
+            fps=float(params.get("stream_fps") or 0),
+            # 与 stage3 的 stdout 协议一致（Matroska + ffv1）
+            in_format=str(params.get("stream_in_format") or "matroska"))
     else:
         decoder_info = StreamingDecoder(input_source)
     width, height = decoder_info.width, decoder_info.height
@@ -2255,7 +2260,11 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
 
     # FIX-P9-3: validate AI upscale completion order per v7.32 §3.10.5
     # When AI upscale is enabled, stage3 output MUST exist before stage5 runs
-    if ai_enabled and input_source:
+    #
+    # N27-04：`input_source == "-"` 时**跳过**这道检查 —— 管道模式下 stage3
+    # 的产物就是 stdin 这一股流，磁盘上没有 step3 文件可找。顺序由编排层
+    # 保证（同一组管道里 stage3 在前），不是靠 glob 证明。
+    if ai_enabled and input_source and str(input_source) != "-":
         # FIX-B7（关键）：stage3 在 **force 模式**下会把产物改名为
         # `_step3_forced_upscale_p<hash>.mkv`（见 stage3_ai_upscale 的
         # "V-P-031 fix: force_allow suffix"）。stage4 与 stage7 都已改成
@@ -2322,9 +2331,75 @@ def main() -> int:  # FIX-P9-1: explicit int return type per v7.32 §3.5 / v6.32
 
     logger.info("STAGE5_START", f"Face restore: {face_restore}", input=input_source)
 
+    # ==== 管道模式：先把 stdin **spool 到临时文件** ====
+    #
+    # 为什么必须 spool：人脸检测（`_detect_faces`）会把 stdin 读掉。
+    # 之后再想"无脸就把上游原样传给下游"已经没数据了 —— 实测落出
+    # 0 字节的 step5，stage6 报 `STAGE6_INPUT_CORRUPT`。
+    #
+    # 代价：这一份 spool 就是"为随机访问物化的端点"（指令 §1.4 允许
+    # 编码器/检测器必须文件输入时登记一个端点）。它在管道的**中间**，
+    # 处理完立即删除 —— 与"每个 stage 各落一份 step4"不是一回事。
+    _spool_path = ""
+    if str(input_source) == "-":
+        _sp_stem = Path(str(params.get("input_path") or "stream")).stem
+        _spool_path = os.path.join(
+            temp_dir, f"{job_id}_{_sp_stem}_s3s5.spool.mkv")
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+            with open(_spool_path, "wb") as _sf:
+                shutil.copyfileobj(sys.stdin.buffer, _sf, 1 << 20)
+        except Exception as _spe:
+            logger.error("STAGE5_SPOOL_FAIL",
+                         "cannot spool stdin to a temporary file; the pipe "
+                         "cannot be processed", error=str(_spe))
+            return 82
+        logger.info("STAGE5_SPOOLED",
+                    "Spooled the upstream stream so detection and a possible "
+                    "no-face passthrough both see the same bytes",
+                    path=_spool_path,
+                    bytes=os.path.getsize(_spool_path))
+        input_source = _spool_path
+
     # Face detection
     face_segments, face_boxes_for_color, face_landmarks_for_color = _detect_faces(input_source, params, logger)
     if not face_segments:
+        if _spool_path:
+            # 无脸 + 管道：把 spool 原样交付（内容与扩展名一致，下游能解）
+            try:
+                _cli_out2 = str(getattr(args, "output", None) or "")
+                if _cli_out2 == "-":
+                    with open(_spool_path, "rb") as _sf2:
+                        shutil.copyfileobj(_sf2, sys.stdout.buffer, 1 << 20)
+                    sys.stdout.buffer.flush()
+                elif _cli_out2:
+                    shutil.copyfile(_spool_path, _cli_out2)
+                else:
+                    from checkpoint import compute_param_hash as _cph2
+                    _ph2 = _cph2(str(params.get("input_path") or ""),
+                                 params)
+                    _stem2 = Path(str(
+                        params.get("input_path") or "")).stem
+                    _def = os.path.join(
+                        temp_dir,
+                        f"{job_id}_{_stem2}_step5_face_p{_ph2}.mkv")
+                    shutil.copyfile(_spool_path, _def)
+            except Exception as _pe2:
+                logger.error("STAGE5_PASSTHROUGH_FAIL",
+                             "no face detected and the passthrough failed",
+                             error=str(_pe2))
+                return 82
+            finally:
+                try:
+                    if _spool_path and os.path.exists(_spool_path):
+                        os.remove(_spool_path)
+                except OSError:
+                    pass
+            logger.info(
+                "STAGE5_NO_FACE_PASSTHROUGH",
+                "No faces detected; delivered the upstream stream unchanged "
+                "(this is 'not applicable', not a failure)")
+            return 0
         logger.info("STAGE5_NO_FACE", "No faces detected, skipping face restore")
         return 3
 

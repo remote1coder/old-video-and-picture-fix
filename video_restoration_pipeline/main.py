@@ -5446,6 +5446,21 @@ def run_s3_s5_pipe(job: Dict[str, Any], params: Dict[str, Any],
     # ---- stage3 的 params：输出到 stdout ----
     p3 = dict(params)
     p3["_stream_output"] = "-"
+    # `_stream_s1` 的 `vs_script` 是主流程在 stage1 之后才注入的
+    # （`params["_stream_s1"] = {"vs_script": ...}`），而管道跑到这里
+    # 还没到那一步。自己读一次交接单 —— stage3 的流式分支需要它
+    # 才能从 vpy 读源（否则它会以为"stream_full 没跑起来"→ rc=86）。
+    _vpy_for_pipe = _read_stream_s1_script(
+        params, str(job.get("job_id") or ""),
+        str(job.get("input_path") or ""), logger)
+    if _vpy_for_pipe:
+        p3["_stream_s1"] = {"emit_only": True, "vs_script": _vpy_for_pipe}
+    else:
+        logger.error(
+            "S3S5_PIPE_NO_VPY",
+            "stage1 left no usable VapourSynth hand-off; the streaming path "
+            "cannot start and there is no step2 media to fall back to")
+        return (86, "no stage1 vpy for the S3->S5 pipe")
 
     # ---- stage5 的 params：从 stdin 读 ----
     #
@@ -5453,32 +5468,80 @@ def run_s3_s5_pipe(job: Dict[str, Any], params: Dict[str, Any],
     # 产物探一次（那是 stage3 的输入，分辨率与 stage3 输出只差 scale）。
     p5 = dict(params)
     p5["upstream_artifact"] = "-"
-    _src = str(params.get("upstream_artifact") or "")
     _scale = int(params.get("upscale_scale") or 2)
     _w = _h = 0
     _fps = 0.0
+    _tmpd = str(params.get("temp_dir") or "./temp")
+    _stem = Path(str(job.get("input_path") or "")).stem
+
+    # ---- 优先：探 **stage1 的 vpy** ----
+    #
+    # stage3 的输入就是这个 vpy 的输出，所以它是几何的**权威来源**：
+    # 源分辨率先被 stage1 的去隔行/裁切/reize 动过，直接探源会错。
+    # `vspipe --info` 只求值图，不渲染帧 —— 便宜且准确。
     try:
-        import subprocess as _sp
-        _probe_src = _src or ""
-        if _probe_src and os.path.isfile(_probe_src):
-            _r = _sp.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                          "-show_entries",
-                          "stream=width,height,r_frame_rate",
-                          "-of", "csv=p=0", _probe_src],
-                         capture_output=True, text=True, errors="replace",
-                         timeout=30, shell=False)
-            if _r.returncode == 0 and _r.stdout.strip():
-                _parts = _r.stdout.strip().split(",")
-                _w = int(_parts[0]) * _scale
-                _h = int(_parts[1]) * _scale
-                if len(_parts) > 2 and "/" in _parts[2]:
-                    _num, _den = _parts[2].split("/")
-                    _fps = float(_num) / float(_den) if float(_den) else 0.0
+        import json as _j2
+        _s1p = os.path.join(_tmpd, "%s_%s_step1_stream.json"
+                            % (job.get("job_id"), _stem))
+        _vpy = ""
+        if os.path.isfile(_s1p):
+            with open(_s1p, "r", encoding="utf-8") as _f:
+                _vpy = str((_j2.load(_f) or {}).get("vs_script") or "")
+        if _vpy and os.path.isfile(_vpy):
+            _ri = subprocess.run(["vspipe", "--info", _vpy],
+                                 capture_output=True, text=True,
+                                 errors="replace", timeout=120, shell=False)
+            if _ri.returncode == 0:
+                for _ln in (_ri.stdout or "").splitlines():
+                    _ln = _ln.strip()
+                    if _ln.startswith("Width:"):
+                        _w = int(_ln.split(":", 1)[1])
+                    elif _ln.startswith("Height:"):
+                        _h = int(_ln.split(":", 1)[1])
+                    elif _ln.startswith("FPS:"):
+                        _fr = _ln.split(":", 1)[1].strip().split()[0]
+                        if "/" in _fr:
+                            _n, _d = _fr.split("/")
+                            _fps = float(_n) / float(_d) if float(_d) else 0.0
+                        else:
+                            _fps = float(_fr)
+            else:
+                logger.warning("S3S5_PIPE_VPYINFO_FAIL",
+                               "vspipe --info failed; falling back to the "
+                               "source probe", rc=_ri.returncode,
+                               stderr=(_ri.stderr or "")[-200:])
     except Exception as _e:
-        logger.warning("S3S5_PIPE_PROBE_FAIL",
-                       "cannot probe the upstream geometry for the stdin "
-                       "consumer; the pipe will fail with a clear error "
-                       "instead of guessing", error=str(_e))
+        logger.warning("S3S5_PIPE_VPYINFO_ERROR",
+                       "cannot probe the stage1 script", error=str(_e))
+
+    # ---- 退化：探源 + scale ----
+    if not (_w and _h and _fps):
+        _src = str(job.get("input_path") or "")
+        try:
+            import subprocess as _sp
+            if _src and os.path.isfile(_src):
+                _r = _sp.run(["ffprobe", "-v", "error", "-select_streams",
+                              "v:0", "-show_entries",
+                              "stream=width,height,r_frame_rate",
+                              "-of", "csv=p=0", _src],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=30, shell=False)
+                if _r.returncode == 0 and _r.stdout.strip():
+                    _parts = _r.stdout.strip().split(",")
+                    _w = int(_parts[0]) * _scale
+                    _h = int(_parts[1]) * _scale
+                    if len(_parts) > 2 and "/" in _parts[2]:
+                        _num, _den = _parts[2].split("/")
+                        _fps = float(_num) / float(_den) if float(_den) else 0.0
+        except Exception as _e:
+            logger.warning("S3S5_PIPE_PROBE_FAIL",
+                           "cannot probe the upstream geometry for the stdin "
+                           "consumer; the pipe will fail with a clear error "
+                           "instead of guessing", error=str(_e))
+    else:
+        # 从 vpy 拿到的是**stage3 的输入**几何，stage3 还要 ×scale
+        _w *= _scale
+        _h *= _scale
     if not (_w and _h and _fps):
         logger.error(
             "S3S5_PIPE_NO_GEOMETRY",

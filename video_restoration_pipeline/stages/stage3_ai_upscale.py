@@ -1093,12 +1093,22 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     #      这就是"修一个分支、漏另一个分支"的老毛病。
     # 现在收敛成一句：任何路径都显式写，值 = 调用方给的 or 默认。
     enc_cmd += ["-pix_fmt", str(out_pix_fmt or "yuv420p16le")]
+    # 管道与落盘**同一条编码路径**（ffv1 无损）：这样"管道模式"不会
+    # 偷偷换成另一种编码，两边产物可直接对照。
     enc_cmd += ["-c:v", "ffv1", "-r", str(fps_str)]
     # 颜色标签必须与主流程 PNG 路线一致（COL-04），否则中间产物不带
     # colorspace 标签，下游 stage7 会按自己的猜测补标签 → 可能错标。
     enc_cmd += list(color_opts or [])
     if _stdout_mode:
-        # 管道模式：Matroska 到 stdout（`-f` 必须在 `-` 之前）
+        # ==== 管道边的协议是 **Matroska（ffv1）** ====
+        #
+        # 曾试过 y4m：`yuv420p16le` 不是 y4m 的官方像素格式（规范只有
+        # 8bit），要 `-strict -1` 才肯写；而且下游 stage5 的"无脸透传"
+        # 会把 y4m 原样写成 `.mkv`，stage6 按 mkv 解立刻
+        # `STAGE6_INPUT_CORRUPT`（内容与扩展名不符）。
+        #
+        # Matroska 有真正的编码器（ffv1 无损），带宽也更小，
+        # 而且扩展名与内容一致 —— 下游按 matroska 读即可。
         enc_cmd += ["-an", "-f", "matroska", "-"]
     else:
         enc_cmd += ["-an", str(output_mkv)]
@@ -1117,9 +1127,15 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
     _failed = None
     # R26-A04：tap 进程与它的摘要路径要在 try 之外可见 —— 收尾要核它的 rc。
     tap = None
-    # 放在 `output_mkv` 旁边而不是 tmpd 里：`_two_pass_check` 在
-    # `_stream_raw_upscale` 之外调用，它只知道 output_mkv。
-    _tap_digest_path = str(output_mkv) + ".formal_tap.json"
+    # 管道模式下 `output_mkv == "-"`，`"-" + ".formal_tap.json"` 会把
+    # sidecar 写到**当前工作目录**（实测在仓库根造出 `-.formal_tap.json` /
+    # `-.exec.json` / `-.frame_contract.json`）。改成落到计划内的临时目录：
+    # 优先用 `contract_path` 的目录（它就在 temp 下），退化到 `tmpd`。
+    if str(output_mkv) == "-":
+        _side_dir = (os.path.dirname(str(contract_path or "")) or str(tmpd))
+    else:
+        _side_dir = os.path.dirname(str(output_mkv)) or str(tmpd)
+    _tap_digest_path = os.path.join(_side_dir, "formal_tap.json")
     try:
         src = None
         # ==== R26-A04：正式遍在 y4m 上装 tap ====
@@ -1146,8 +1162,13 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                               / "shared_modules" / "stream_tap.py")
             with open(err_paths["tap"], "wb") as _ft:
                 tap = subprocess.Popen(
+                    # **必须用 `--opt=value`**：管道模式下摘要路径是
+                    # `-.formal_tap.json`（以 `-` 开头），argparse 会把它
+                    # 当成另一个选项，报 "expected one argument" 然后退出
+                    # —— 管道立刻断，vspipe 写 stdout 失败（errno 22）、
+                    # ffmpeg 读到 "Header too large"。
                     [sys.executable, _tap_script,
-                     "--digest-out", _tap_digest_path],
+                     "--digest-out=" + _tap_digest_path],
                     stdin=src.stdout, stdout=subprocess.PIPE, stderr=_ft,
                     bufsize=10 ** 8)
             src.stdout.close()      # 让 src→tap 直接连通
@@ -1172,9 +1193,17 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                                   env=env, bufsize=10 ** 8)
         dec.stdout.close()          # 让 dec→ai 直接连通
         with open(err_paths["enc"], "wb") as _fc:
-            enc = subprocess.Popen(enc_cmd, stdin=ai.stdout,
-                                   stdout=subprocess.DEVNULL, stderr=_fc,
-                                   bufsize=10 ** 8)
+            # ==== 管道模式：**编码器的 stdout 必须继承本进程的 stdout** ====
+            #
+            # 原来无条件 `stdout=subprocess.DEVNULL` —— 写文件时没问题
+            # （编码器自己知道写哪），但管道模式下 `-f matroska -` 的输出
+            # 就是**整个 stage 的产物**，丢掉它等于下游拿到 0 字节：
+            # 实测 stage5 spool 出 0 字节 → step5 0 字节 →
+            # stage6 `STAGE6_INPUT_CORRUPT`。整条链看起来"都跑完了"。
+            enc = subprocess.Popen(
+                enc_cmd, stdin=ai.stdout,
+                stdout=(None if _stdout_mode else subprocess.DEVNULL),
+                stderr=_fc, bufsize=10 ** 8)
         ai.stdout.close()           # 让 ai→enc 直接连通
 
         # 三个子进程都登记到取消守卫：Ctrl+C/取消时必须把它们一起杀掉，
@@ -1209,7 +1238,11 @@ def _stream_raw_upscale(input_video, output_mkv, width, height, scale,
                                 if os.path.exists(output_mkv) else 0))
             if _cg_mod is not None and hasattr(_cg_mod, "wait_with_heartbeat"):
                 _cg_mod.wait_with_heartbeat(
-                    [p for p in (src, dec, ai, enc) if p is not None],
+                    # R26-A04：**tap 也要等**。它原来是管道里的一员，
+                    # 但收尾没把它列进去 —— 于是 `tap.returncode` 一直是
+                    # None，`rc_ok` 永远为假，整条流式路径被判失败后
+                    # 回退到 PNG（而 stream_full 没有 PNG 可退 → rc=86）。
+                    [p for p in (src, tap, dec, ai, enc) if p is not None],
                     heartbeat=_hw,
                     inactivity_timeout=inactivity_s,
                     logger=logger, label="stage3-stream")
@@ -1572,7 +1605,14 @@ def _write_stream_frame_contract(*, output_mkv, out_w, out_h, requested_fmt,
         logger.warning("STAGE3_FRAME_CONTRACT_INCOMPLETE",
                        "frame-boundary contract is not usable as evidence",
                        problems=contract_problems(c), gaps=gaps)
-    path = contract_path or f"{output_mkv}.frame_contract.json"
+    # 管道模式下 `"-" + ".frame_contract.json"` 会写到当前工作目录
+    # （实测在仓库根造出 `-.frame_contract.json`）。落到 temp。
+    if contract_path:
+        path = contract_path
+    else:
+        # 调用方必须给 contract_path；这里只做兜底。
+        path = (f"{output_mkv}.frame_contract.json"
+                if str(output_mkv) != "-" else "pipe_frame_contract.json")
     if not write_contract(path, c):
         if logger:
             logger.warning("STAGE3_FRAME_CONTRACT_UNWRITABLE",
@@ -2778,7 +2818,11 @@ def _two_pass_check(temp_dir: str, job_id: str, input_name: str,
     _fml_tap = None
     if output_mkv:
         try:
-            with open(str(output_mkv) + ".formal_tap.json", "r",
+            # 管道模式下 sidecar 在 temp（不是 `-.formal_tap.json`）
+            _fml_path = (os.path.join(temp_dir, "formal_tap.json")
+                         if str(output_mkv) == "-"
+                         else str(output_mkv) + ".formal_tap.json")
+            with open(_fml_path, "r",
                       encoding="utf-8") as _ff:
                 _fml_tap = _json.load(_ff) or None
         except (OSError, ValueError):
@@ -3271,7 +3315,8 @@ def main():
                         "ai_enabled": ai_enabled,
                         "vs_bit_depth": params.get("vs_bit_depth", 16),  # FIX-P8-5
                     }
-                    _skip_hash = compute_param_hash(stage2_output, _skip_core_params)
+                    _skip_hash = compute_param_hash(
+                        stage2_output or _svpy, _skip_core_params)
                     _skip_inter = (f"{job_id}_{Path(input_name).stem}"
                                    f"_step3_upscale_p{_skip_hash}")
                     if combined_banned and force_allow:
@@ -3304,7 +3349,11 @@ def main():
         "ai_enabled": ai_enabled,
         "vs_bit_depth": params.get("vs_bit_depth", 16),  # FIX-P8-5
     }
-    param_hash = compute_param_hash(stage2_output, core_params)
+    # R26-A04：stream_full 下**没有 step2 媒体**，身份基准改用 stage1 的
+    # vpy（它才是这一代真正的输入）。传空串会让 `compute_param_hash`
+    # 打出 "input identity degraded for ''" 并退化成三元组 —— 那是
+    # "身份降级"，不是"这条路上正常无文件"。
+    param_hash = compute_param_hash(stage2_output or _svpy, core_params)
 
     logger.info("STAGE3_START", "AI upscaling",
                 model=model, scale=scale, backend=backend,
@@ -3798,6 +3847,15 @@ def main():
                                          if _bpf else None),
                         width=_s_dims[0], height=_s_dims[1], scale=scale,
                         fps_str=_s_fps, model=model,
+                        # N27-04：合同路径必须显式给。管道模式下
+                        # `output_mkv` 是 `"-"`，用它拼后缀会把合同
+                        # 写到当前工作目录（实测在仓库根出现
+                        # `-.frame_contract.json`）。
+                        contract_path=(
+                            os.path.join(temp_dir, f"{job_id}_"
+                                         f"{Path(input_name).stem}"
+                                         f"_step34_frame_contract.json")
+                            if str(_s_out) == "-" else ""),
                         model_dir=str(SCRIPT_DIR.parent / "models"),
                         ai_py=_s_ai_py, gpu_id=0,
                         timeout_s=None,
@@ -3819,7 +3877,15 @@ def main():
                             "expected_frames": int(total_frames or 0),
                         },
                         meta=_s_meta)
-                    if _s_ok and os.path.exists(_s_out) and os.path.getsize(_s_out) > 0:
+                    # N27-04：管道模式下产物在 stdout，**磁盘上没有文件可查**。
+                    # `os.path.exists("-")` 恒为假 —— 不加这个分支，
+                    # 一条已经成功的管道会被判成失败然后回退到 PNG，
+                    # 而 stream_full 没有 PNG 可退（rc=86）。
+                    _ok_out = bool(_s_ok) and (
+                        str(_s_out) == "-"
+                        or (os.path.exists(_s_out)
+                            and os.path.getsize(_s_out) > 0))
+                    if _ok_out:
                         if _cancel_guard is not None:
                             try:
                                 _cancel_guard.release_outputs()
@@ -4007,11 +4073,18 @@ def main():
                                     "param_digest": str(
                                         params.get("_frozen_param_digest") or ""),
                                     "output": str(_s_out),
-                                    "output_size": os.path.getsize(_s_out),
+                                    # N27-04：管道模式下产物在 stdout —— 没有
+                                    # 文件可量、可摘要。**明确标未证明**，
+                                    # 不拿 0 或空串冒充"量过了"。
+                                    "output_size": (None if str(_s_out) == "-"
+                                                    else os.path.getsize(_s_out)),
                                     # R21-C06：回执必须绑定**内容摘要**。
                                     # 只有 size 时"同大小替换"能直接冒充；
                                     # 消费方也无法证明这份产物就是它验过的那份。
-                                    "output_sha256": _sha256_file(_s_out) or "",
+                                    "output_sha256": ("" if str(_s_out) == "-"
+                                                      else (_sha256_file(_s_out) or "")),
+                                    # 消费方可据此判断"这份回执证明到什么程度"
+                                    "output_proven": str(_s_out) != "-",
                                     "frames": _s_n,
                                     "filter_chain_sha256": _sha256_text(_s_chain or ""),
                                     "out_pix_fmt": _s_pix_fmt,
